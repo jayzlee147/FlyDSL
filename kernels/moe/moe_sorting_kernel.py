@@ -179,13 +179,24 @@ def _lds_store_raw(raw_ptr, val, idx):
 # _make_cache_key, and dict lookup, reducing dispatch from ~70 us to ~5 us.
 # ---------------------------------------------------------------------------
 _oneshot_cf_cache = {}  # (num_experts, topk, max_tokens, unit_size, has_mask, device) -> CompiledFunction
-_oneshot_fused_cf_cache = {}  # fused oneshot: same key + (dtype_str, renormalize) -> CompiledFunction
+_oneshot_fused_cf_cache = {}  # fused oneshot constexprs + device -> CompiledFunction
 _multiphase_cf_cache = {}  # (num_experts, topk, unit_size, kernel_name, *constexpr_vals) -> CompiledFunction
-_dummy_mask_cache = {}  # device -> torch.Tensor(1, dtype=i32, value=1)
+_dummy_mask_cache = {}  # (device, stream) -> torch.Tensor(1, dtype=i32, value=1)
 
 # Caches for moe_softmax_sort_flydsl's unfused fallback path.
-_topk_fallback_scratch_cache = {}  # (device, M, topk) -> (topk_weights, topk_ids, tei)
+_topk_fallback_scratch_cache = {}  # (device, stream, M, topk) -> scratch tensors
 _topk_fallback_builder_cache = {}  # (num_experts, topk, dtype_str, renormalize) -> launch_fn
+
+
+def _get_dummy_mask(device):
+    """Return stream-local initialized mask storage for the no-EP path."""
+
+    key = (device, int(torch.cuda.current_stream(device).cuda_stream))
+    mask_tensor = _dummy_mask_cache.get(key)
+    if mask_tensor is None:
+        mask_tensor = torch.ones(1, dtype=torch.int32, device=device)
+        _dummy_mask_cache[key] = mask_tensor
+    return mask_tensor
 
 
 # `_compute_topk_gating_layout` and `_emit_topk_gating_softmax_body` are
@@ -2112,10 +2123,7 @@ def moe_sorting_flydsl(
     # EP: prepare mask tensor and flag.
     has_mask = expert_mask is not None
     if not has_mask:
-        mask_tensor = _dummy_mask_cache.get(device)
-        if mask_tensor is None:
-            mask_tensor = torch.ones(1, dtype=torch.int32, device=device)
-            _dummy_mask_cache[device] = mask_tensor
+        mask_tensor = _get_dummy_mask(device)
     else:
         mask_tensor = expert_mask
 
@@ -2148,7 +2156,13 @@ def moe_sorting_flydsl(
             n_grid_blocks,
         )
         cache_key = (num_experts, topk, max_tokens, unit_size, has_mask, device.index)
-        _launch_cached(_oneshot_cf_cache, cache_key, launch_oneshot, oneshot_args, torch.cuda.current_stream())
+        _launch_cached(
+            _oneshot_cf_cache,
+            cache_key,
+            launch_oneshot,
+            oneshot_args,
+            torch.cuda.current_stream(device),
+        )
     else:
         mesh_stride = ((M + unit_size - 1) // unit_size) * unit_size
         ws_mesh_bytes = num_experts * mesh_stride
@@ -2160,7 +2174,7 @@ def moe_sorting_flydsl(
         _, launch_p0v2_p23, launch_4k_fused = compile_moe_sorting(
             num_experts=num_experts, topk=topk, unit_size=unit_size, has_mask=has_mask
         )
-        stream = torch.cuda.current_stream()
+        stream = torch.cuda.current_stream(device)
         n_zero_blocks = min((moe_buf_elems + BLOCK_SIZE - 1) // BLOCK_SIZE, num_cu * target_occupancy)
         k4_grid = num_experts + n_zero_blocks
         base_key = (num_experts, topk, unit_size, has_mask, device.index)
@@ -2228,14 +2242,15 @@ def _supports_fused_oneshot(num_experts: int, topk: int, dtype_str: str) -> bool
         return False
 
 
-def _alloc_topk_fallback(device, M, topk, num_experts):
+def _alloc_topk_fallback(device, stream, M, topk):
     """Allocate / cache HBM buffers used by the unfused 2-kernel fallback.
 
     `topk_weights` is f32, `topk_ids` is i32, both shaped `[M, topk]`.
     `tei` is `[M, topk]` i32 (consumed by gating but unused downstream).
-    The cache is keyed on shape so different M values get separate buffers.
+    The cache is keyed on stream and shape so concurrent streams never race on
+    routing scratch.
     """
-    key = (device, M, topk)
+    key = (device, int(stream.cuda_stream), M, topk)
     cached = _topk_fallback_scratch_cache.get(key)
     if cached is not None:
         return cached
@@ -2261,6 +2276,8 @@ def moe_softmax_sort_flydsl(
     expert_mask=None,
     renormalize=True,
     num_local_tokens=None,
+    workspace=None,
+    topk_scratch=None,
 ):
     """Fused entry point: gating logits → softmax → top-K → sort.
 
@@ -2289,6 +2306,12 @@ def moe_softmax_sort_flydsl(
                       DeepSeek V3 / vLLM convention).
     num_local_tokens: optional override for the dynamic M (matches the
                       `moe_sorting_flydsl` convention).
+    workspace        : optional pre-allocated int32 scratch for the multiphase
+                       sorting fallback. Ignored by the fused/oneshot path.
+    topk_scratch     : optional ``(weights_f32, ids_i32, expert_indices_i32)``
+                       buffers, each shaped ``[M, topk]``, for the 2-kernel
+                       gating fallback. Supplying these avoids global scratch
+                       reuse and permits independent stream-local workspaces.
     """
     if num_local_tokens is not None:
         M = num_local_tokens.item() if isinstance(num_local_tokens, torch.Tensor) else int(num_local_tokens)
@@ -2301,10 +2324,7 @@ def moe_softmax_sort_flydsl(
 
     has_mask = expert_mask is not None
     if not has_mask:
-        mask_tensor = _dummy_mask_cache.get(device)
-        if mask_tensor is None:
-            mask_tensor = torch.ones(1, dtype=torch.int32, device=device)
-            _dummy_mask_cache[device] = mask_tensor
+        mask_tensor = _get_dummy_mask(device)
     else:
         mask_tensor = expert_mask
 
@@ -2350,7 +2370,11 @@ def moe_softmax_sort_flydsl(
         )
     else:
         # Fallback: run gating and sort as two separate kernels.
-        topk_weights, topk_ids, tei = _alloc_topk_fallback(device, M, topk, num_experts)
+        stream = torch.cuda.current_stream(device)
+        if topk_scratch is None:
+            topk_weights, topk_ids, tei = _alloc_topk_fallback(device, stream, M, topk)
+        else:
+            topk_weights, topk_ids, tei = topk_scratch
 
         builder_key = (num_experts, topk, dtype_str, renormalize)
         launch_topk = _topk_fallback_builder_cache.get(builder_key)
@@ -2369,7 +2393,6 @@ def moe_softmax_sort_flydsl(
             )
             _topk_fallback_builder_cache[builder_key] = launch_topk
 
-        stream = torch.cuda.current_stream()
         launch_topk(
             gating_logits,
             topk_weights,
@@ -2390,6 +2413,7 @@ def moe_softmax_sort_flydsl(
             unit_size=unit_size,
             expert_mask=expert_mask,
             num_local_tokens=M,
+            workspace=workspace,
         )
 
     return sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, moe_buf
@@ -2422,10 +2446,20 @@ def launch_moe_sorting_oneshot_fused_path(
     scratch tensors — all per-token-K data is staged in LDS inside the
     kernel.
     """
-    cache_key = (num_experts, topk, max_tokens, unit_size, n_grid_blocks, dtype_str, renormalize, has_mask)
+    cache_key = (
+        num_experts,
+        topk,
+        max_tokens,
+        unit_size,
+        n_grid_blocks,
+        dtype_str,
+        renormalize,
+        has_mask,
+        gating_logits.device.index,
+    )
     cf = _oneshot_fused_cf_cache.get(cache_key)
     if cf is not None:
-        stream = torch.cuda.current_stream()
+        stream = torch.cuda.current_stream(gating_logits.device)
         cf(
             gating_logits,
             sorted_ids,
@@ -2450,7 +2484,7 @@ def launch_moe_sorting_oneshot_fused_path(
         unit_size=unit_size,
         has_mask=has_mask,
     )
-    stream = torch.cuda.current_stream()
+    stream = torch.cuda.current_stream(gating_logits.device)
     launch_fn(
         gating_logits,
         sorted_ids,

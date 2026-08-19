@@ -1,6 +1,6 @@
 # Pre-built kernel library guide
 
-This guide covers the available FlyDSL kernels — normalization, softmax, GEMM, and attention — along with their configuration options, supported data types, pipeline designs, and shared utilities.
+This guide covers the available FlyDSL kernels — normalization, softmax, GEMM, attention, and MoE — along with their configuration options, supported data types, pipeline designs, and shared utilities.
 
 ## Quick reference
 
@@ -12,6 +12,7 @@ This guide covers the available FlyDSL kernels — normalization, softmax, GEMM,
 | **Softmax backward** | `build_softmax_bwd_module(N, dtype)` | Layout API (`@flyc.kernel`) | f32, f16, bf16 | fp32 dot reduction, native-dtype register buffering |
 | **GEMM** | `compile_preshuffle_gemm(...)` | `@flyc.kernel` | fp8, int8, fp16, bf16 | Preshuffle B, ping-pong LDS, MFMA 16x16 |
 | **FlashAttention** | `build_flash_attn_func_module(...)` | `@flyc.kernel` | bf16, f16 (any arch); fp8 e4m3fn (gfx950, D=128, dense) | Dual-wave SWP fwd, GQA/MQA, causal, descale ABI |
+| **SonicMoE forward** | `SonicMoE(config, weights)` | Host-composed FlyDSL | BF16 activation; BF16 or MXFP4 weight | Routing/top-k + sort, gather+SwiGLU GEMM, weighted down scatter |
 
 All kernels use the `@flyc.kernel`/`@flyc.jit` API from `flydsl.compiler` and `flydsl.expr` (`python/flydsl/`).
 
@@ -297,6 +298,175 @@ python3 tests/kernels/test_flash_attn_fwd.py --dtype fp8 --compare --warmup 10 -
 
 ---
 
+## 3c. SonicMoE BF16/A16W4 forward (`kernels/moe/sonic.py`)
+
+The gfx950 inference path composes the existing FlyDSL routing and
+`moe_2stage_a16wmix` MFMA kernels. The routing stage rounds each expert's rows to
+`tile_m` and records packed token/slot indices. Stage 1 gathers the original BF16
+rows while loading A and fuses `silu(gate) * up`; stage 2 consumes the sorted BF16
+intermediate and performs routing-weighted BF16 atomic scatter. No explicit
+gathered activation tensor is materialized.
+
+```python
+from kernels.moe.sonic import (
+    SonicMoE,
+    SonicMoEConfig,
+    prepare_sonic_bf16_weights,
+    prepare_sonic_mxfp4_weights,
+)
+
+cfg = SonicMoEConfig(
+    hidden_size=4096, intermediate_size=14336,
+    num_experts=256, top_k=8,
+    tile_m=32, tile_n=128, tile_k=128,
+)
+# w1: [E, 2*I, H] in [gate | up] order; w2: [E, H, I].
+# Choose one prepared format. Weight preparation is outside the hot path.
+weights = prepare_sonic_bf16_weights(w1, w2, cfg)
+# weights = prepare_sonic_mxfp4_weights(w1, w2, cfg)
+op = SonicMoE(cfg, weights)
+out = op(hidden_states_bf16, router_logits_bf16)
+```
+
+Weights are preshuffled once during preparation. Workspaces and compiled launchers
+are reused. Power-of-two expert counts up to 1024 use the FlyDSL router; other
+counts (for example E=896) use a PyTorch softmax/top-k fallback followed by the
+same FlyDSL sort and grouped GEMMs. Call `forward_topk` to supply routing directly.
+
+`prepare_sonic_mxfp4_weights` is the validated weight-only A16W4 path. It quantizes
+each contiguous 32-value weight block to packed E2M1 FP4 with one E8M0 scale,
+then converts both values and scales to the gfx950 kernel layouts. Activations and
+the stage-1 intermediate remain BF16; the kernels upconvert weights and execute
+BF16 MFMA. It is therefore **not** activation MXFP8/A8W4 and does not use the
+CDNA4 scaled-MFMA instruction. Compare kernel correctness against the dequantized
+quantized weights; a comparison with the original BF16 weights additionally
+contains the expected model-quantization error.
+
+Packed standard-layout weights use a 64-bit per-expert resource base, so the
+complete expert tensor may exceed the 4 GiB 32-bit buffer-offset range. Each
+individual expert must still satisfy that range, and the current preshuffled
+E8M0 scale resource has a 4 GiB whole-tensor span limit. Prepared buffers are
+checked for exact shape, padded scale length, contiguity, dtype, device, and
+alignment before any raw pointer reaches a kernel. MXFP4 tiles require
+`tile_k >= 128` in both stages.
+
+Shape-bucket autotuning is available as a separate wrapper:
+
+```python
+from kernels.moe.sonic_autotune import SonicMoEAutotuner
+
+op = SonicMoEAutotuner(
+    cfg,
+    weights,
+    warmup=5,
+    rep=20,
+)
+out = op(hidden_states_bf16, router_logits_bf16)
+print(op.best_config, op.last_results)
+```
+
+The tuner benchmarks the complete router + sort + two-GEMM forward, validates
+candidate output against the base configuration, and keys winners by a
+power-of-two token bucket, model shape, dtypes, device/architecture, FlyDSL
+and PyTorch/ROCm versions, candidate set, and kernel source hash. Candidate
+workspaces are released after every measurement so search memory does not grow
+with the candidate count. Only correctness-validated searches are persisted; the
+disk cache uses a lock plus atomic replacement for concurrent processes. Its
+default location is `~/.flydsl/autotune/sonic_moe.json`; set
+`FLYDSL_AUTOTUNE_CACHE_DIR` or pass `cache_dir=` to relocate it. Pass
+`force_tune=True` on a call to remeasure a key.
+
+Tile choice also depends on the expert-load distribution, not only tensor shape.
+Tune with representative router logits. If one shape has materially different
+traffic profiles, construct separate tuners with `profile_key="uniform"`,
+`profile_key="decode-skew"`, or another stable application label so their disk
+cache entries do not collide.
+
+This API is inference-forward only: no bias, saved pre-activation, backward,
+varlen-K dW, or dSwiGLU is provided. The BF16 atomic output is non-deterministic at
+the last few bits. See `examples/06-sonicMoE.py` for correctness and warm-cache
+benchmarking.
+
+An optimized training path needs more than a generic GEMM fallback: it must retain
+or recompute gate/up pre-activations, add dSwiGLU, provide transposed grouped dX
+GEMMs, expose actual and padded expert offsets, implement expert-ragged-K dW, and
+perform segmented bias reductions. The current sorter and forward workspace do
+not expose or lifetime-manage that state, so the inference API deliberately
+rejects tensors requiring gradients.
+
+### Scaled-MFMA status
+
+The existing `kernels/moe/mxfp_moe/` A4W4/A8W4 implementation is not exposed by
+`SonicMoE`: its repository tests mark the fused end-to-end modes as known-broken
+and unsafe to run after observed low cosine and illegal-address/JIT corruption.
+The next activation-low-precision mode should be a distinct `a8w4_mx` compute
+mode, with per-1x32 MXFP8 payload/scales and a scaled-MFMA local pipeline adapted
+from `kernels/mega_moe/`. It also needs indexed token/scale gather and a local
+weighted-scatter epilogue. Calling the validated A16W4 path “A8W4” would hide both
+the numerical and performance distinction.
+
+### gfx950 tuning notes
+
+Tune against the complete `(tokens, H, I, E, top_k)` bucket rather than choosing
+`tile_m` from padding alone. `tile_m` controls both per-expert rounding and MFMA
+workgroup efficiency; `tile_n`/`tile_k` trade loop count against LDS and VGPR
+pressure. The default tuner starts from `tile_m={16,32,64,128}` and
+`tile_n,tile_k={128,256}`, pruning candidates that fail the constructor's DMA,
+divisibility, or 160 KiB LDS guards. The cache policy, XCD swizzle, waves-per-EU,
+and persistent stage-2 switches are also exposed on `SonicMoEConfig` for a custom
+candidate sweep.
+
+For decode, workspace sizing is based on the number of routes that can actually
+activate experts. With `R=tokens*top_k`, `A=min(E,R)`, and distinct top-k IDs per
+token, the padded block bound is the smaller of
+`floor((R + A*(tile_m-1))/tile_m)` and `A*ceil(tokens/tile_m)`. Thus
+`T=1, E=896, top_k=2, tile_m=32` reserves and launches two blocks (64 rows), not
+896 empty expert blocks.
+
+For one MI355X warm-cache run at `T=128, H=4096, I=14336, E=8, top_k=2`, with
+weight preparation and JIT excluded, the measured points were:
+
+| Stage-1/2 tile `(M,N,K)` | Padding ratio | Latency | Useful throughput |
+|---|---:|---:|---:|
+| `(16,128,128)` | 1.25 | 999.39 us | 90.25 TFLOP/s |
+| `(32,128,128)` | 1.50 | 708.96 us | 127.22 TFLOP/s |
+| `(64,128,128)` | 2.00 | 488.86 us | 184.50 TFLOP/s |
+| `(64,128,256)` | 2.00 | 494.98 us | 182.22 TFLOP/s |
+| `(64,256,128)` | 2.00 | 533.49 us | 169.06 TFLOP/s |
+| `(128,128,128)` | 4.00 | 619.74 us | 145.54 TFLOP/s |
+
+This is a tuning example, not a universal default: expert imbalance and token
+bucket size change the rounding cost substantially. Reproduce a point with:
+
+```bash
+PYTHONPATH=. python examples/06-sonicMoE.py \
+  --tokens 128 --hidden-size 4096 --intermediate-size 14336 \
+  --experts 8 --top-k 2 --tile-m 64 --tile-n 128 --tile-k 128 \
+  --weight-dtype bf16
+```
+
+Run the validated A16W4 path or let the shape-bucket tuner choose the tiles with:
+
+```bash
+PYTHONPATH=. python examples/06-sonicMoE.py \
+  --tokens 128 --hidden-size 1024 --intermediate-size 1024 \
+  --experts 8 --top-k 2 --weight-dtype mxfp4 --check
+
+PYTHONPATH=. python examples/06-sonicMoE.py \
+  --tokens 128 --hidden-size 1024 --intermediate-size 1024 \
+  --experts 8 --top-k 2 --weight-dtype mxfp4 --autotune \
+  --autotune-warmup 3 --autotune-iters 10 \
+  --autotune-profile-key representative-prefill --check
+```
+
+For A16W4, `--check` reports two separate quantities: kernel output versus a
+dequantized-weight oracle (the correctness gate), and that quantized oracle versus
+the original BF16 model (model-dependent quantization quality). Weight preparation,
+reference computation, autotuning, and first-call JIT are excluded from the final
+warm-cache timing.
+
+---
+
 ## 4. Shared utilities
 
 ### 4.1 Common kernel helpers (`kernels/common/kernels_common.py`)
@@ -394,6 +564,7 @@ What operation do you need?
 │       └── See kernels/gemm/preshuffle_gemm.py
 │
 ├── MoE (Mixture of Experts)
+│   ├── SonicMoE BF16/A16W4 forward → SonicMoE (kernels/moe/sonic.py)
 │   ├── Blockscale MoE (gate+up+reduce)
 │   └── Standard MoE (fp8/f16/bf16/int8/int4)
 │       └── → kernels/moe/moe_gemm_2stage.py
@@ -413,6 +584,8 @@ What operation do you need?
 | `kernels/gemm/preshuffle_gemm.py` | GEMM (preshuffle layout) |
 | `kernels/moe/moe_gemm_2stage.py` | MoE GEMM 2-stage (gate/up + reduce) |
 | `kernels/moe/mxfp_moe/` | Fused a4w4/a8w4 MoE 2-stage GEMM (device fp4 re-quant) |
+| `kernels/moe/sonic.py` | gfx950 SonicMoE BF16/A16W4 inference forward orchestration |
+| `kernels/moe/sonic_autotune.py` | Shape-bucket SonicMoE tile autotuner and disk cache |
 | `kernels/attention/pa_decode_fp8.py` | Paged attention decode (FP8) |
 | `kernels/attention/flash_attn_generic.py` | FlashAttention generic fallback |
 | `kernels/attention/flash_attn_gfx950.py` | FlashAttention gfx950 bf16/f16 fast path |
@@ -441,6 +614,7 @@ What operation do you need?
 | `tests/kernels/test_preshuffle_gemm.py` | GEMM fp8/int8/fp16/bf16 |
 | `tests/kernels/test_moe_gemm.py` | MoE GEMM |
 | `tests/kernels/test_moe_reduce.py` | MoE reduce kernel |
+| `tests/kernels/test_sonic_moe.py` | SonicMoE BF16/A16W4 correctness, autotuning, routing, workspace, validation |
 | `tests/kernels/test_pa.py` | Paged attention decode |
 | `tests/kernels/test_flash_attn_fwd.py` | FlashAttention |
 | `tests/kernels/test_layernorm.py` | LayerNorm |

@@ -198,16 +198,14 @@ def _gemm2_body_a16w4(
     by_n = n_block_idx * fx.Int32(TILE_N)
     expert_off = e * fx.Int32(N_OUT)
 
-    # bf16 W overflows the 32-bit num_records / i32 byte-offset at large E; fold the
-    # per-expert base into the i64 resource addr and index within the expert. mxfp4/int4
-    # keep the whole-tensor path.
-    if const_expr(_is_bf16):
-        _w_per_expert_bytes = N_OUT * (K * 2)
-        w_base_i64 = fx.Int64(arg_bq) + fx.Int64(e) * fx.Int64(_w_per_expert_bytes)
-        w_tiles = _global_i32_buffer_tiles(w_base_i64, min(_w_per_expert_bytes, 0xFFFFFFFF), 4)
-    else:
-        _w_bytes = NE * N_OUT * K_HALF
-        w_tiles = _global_i32_buffer_tiles(arg_bq, min(_w_bytes, 0xFFFFFFFF), 4)
+    # Standard-layout W is contiguous per expert. Fold that expert's byte offset into
+    # the 64-bit resource base so large expert sets do not overflow a whole-tensor
+    # 32-bit buffer offset. (Stage 2 has no GUGU layout, so every current mode folds.)
+    _w_per_expert_bytes = N_OUT * (K * 2 if _is_bf16 else K_HALF)
+    w_base_i64 = fx.Int64(arg_bq) + fx.Int64(e) * fx.Int64(_w_per_expert_bytes)
+    w_tiles = _global_i32_buffer_tiles(
+        w_base_i64, min(_w_per_expert_bytes, 0xFFFFFFFF), 4
+    )
     # W dwordx4 load via BufferCopy128b atom (cache modifier in the aux field).
     w_copy_atom = fx.make_copy_atom(fx.rocdl.BufferCopy128b(b_cache_mod), fx.Int32)
     w_reg_lay = fx.make_layout(4, 1)
@@ -402,9 +400,8 @@ def _gemm2_body_a16w4(
     for ni in range_constexpr(num_acc_n):
         col_g = by_n + n_tile_base + fx.Int32(ni * 16) + lane_mod_16
         col_g_list.append(col_g)
-        # bf16 W folds expert_off into the resource base (see w_tiles); mxfp4/int4 index it.
-        _row_expert_off = fx.Int32(0) if const_expr(_is_bf16) else expert_off
-        row_w = _row_expert_off + col_g
+        # The resource base already selects the expert (see w_tiles).
+        row_w = col_g
         n_blk_list.append(row_w // fx.Int32(16))
         n_intra_list.append(row_w % fx.Int32(16))
         ng = expert_off + by_n + n_tile_base + fx.Int32(ni * 16)

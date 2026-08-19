@@ -15,7 +15,20 @@ from flydsl._mlir.dialects import builtin
 from flydsl._mlir.dialects import gpu as _gpu
 from flydsl._mlir.dialects import scf as _scf
 from flydsl.runtime.device import get_rocm_arch
-from flydsl.runtime.device import get_warp_size as get_warp_size
+
+try:
+    # Mainline FlyDSL exposes this helper from the runtime package.
+    from flydsl.runtime.device import get_warp_size as get_warp_size
+except ImportError:
+    # Released 0.3.1 wheels keep it in kernels_common. Retain the narrow
+    # fallback so a source checkout can use the matching pre-built MLIR wheel.
+    from flydsl.runtime.device import is_rdna_arch
+
+    def get_warp_size(arch=None):
+        if arch is None:
+            arch = get_rocm_arch()
+        return 32 if is_rdna_arch(arch) else 64
+
 
 # Memory/atomic primitives now live in mem_ops; re-exported here for back-compat.
 from kernels.common.mem_ops import _create_llvm_ptr

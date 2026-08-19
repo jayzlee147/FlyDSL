@@ -214,11 +214,12 @@ def _gemm1_body_a16w4(
     inter_i32 = fx.Int32(INTER)
 
     # ---- buffer resources -----------------------------------------------------
-    # bf16 W [E, N_OUT, K] whole-tensor extent overflows the 32-bit num_records/i32
-    # byte-offset at large E (E896: 6.6GB): fold the per-expert base into the i64
-    # resource addr and index within the expert. mxfp4/int4 keep the whole-tensor path.
-    if const_expr(_is_bf16):
-        _w_per_expert_bytes = N_OUT * (K * 2)
+    # Standard-layout W is contiguous per expert. Fold that expert's byte offset into
+    # the 64-bit resource base so large expert sets do not overflow a whole-tensor
+    # 32-bit buffer offset. GUGU retains its existing global indexing/layout.
+    _fold_w_expert = _is_bf16 or w_layout == "standard"
+    if const_expr(_fold_w_expert):
+        _w_per_expert_bytes = N_OUT * (K * 2 if _is_bf16 else K_HALF)
         w_base_i64 = fx.Int64(arg_bq) + fx.Int64(e) * fx.Int64(_w_per_expert_bytes)
         w_tiles = _global_i32_buffer_tiles(w_base_i64, min(_w_per_expert_bytes, 0xFFFFFFFF), 4)
     else:
@@ -479,8 +480,8 @@ def _gemm1_body_a16w4(
             scale_mni_up.append(scale_mni)
             scale_np_up.append(fx.Int32(1))
         else:
-            # bf16 W folds expert_off into the resource base (see w_tiles); mxfp4/int4 index it.
-            _row_expert_off = fx.Int32(0) if const_expr(_is_bf16) else expert_off
+            # Standard W folds expert_off into the resource base (see w_tiles).
+            _row_expert_off = fx.Int32(0) if const_expr(_fold_w_expert) else expert_off
             row_gate = _row_expert_off + col_g
             row_up = row_gate + inter_i32
             n_blk_gate.append(row_gate // fx.Int32(16))
