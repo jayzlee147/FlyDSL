@@ -3,9 +3,12 @@
 
 """device runtime registry and compile-backend pairing."""
 
+import threading
+
 import pytest
 
 import flydsl.runtime.device_runtime as dr
+import flydsl.runtime.device_runtime.rocm as rocm_runtime
 
 pytestmark = [pytest.mark.l0_backend_agnostic]
 
@@ -53,6 +56,119 @@ def test_rocm_runtime_kind_matches_compile_backend(monkeypatch):
     rt = dr.get_device_runtime()
     assert rt.kind == "rocm"
     dr.ensure_compile_runtime_compatible("rocm", runtime=rt)
+
+
+def test_rocm_current_device_loads_rocm_7_soname(monkeypatch):
+    """ROCm 7 images may install only the versioned ``.so.7`` runtime."""
+
+    class _FakeHipGetDevice:
+        argtypes = None
+        restype = None
+
+        def __call__(self, device_ptr):
+            device_ptr._obj.value = 3
+            return 0
+
+    class _FakeHipLibrary:
+        hipGetDevice = _FakeHipGetDevice()
+
+    attempted = []
+
+    def _load_library(soname):
+        attempted.append(soname)
+        if soname != "libamdhip64.so.7":
+            raise OSError(soname)
+        return _FakeHipLibrary()
+
+    monkeypatch.setattr(rocm_runtime, "_HIP_LIB", None)
+    monkeypatch.setattr(rocm_runtime, "_HIP_LIB_TRIED", False)
+    monkeypatch.setattr(rocm_runtime.ctypes, "CDLL", _load_library)
+
+    assert rocm_runtime._hip_get_device() == 3
+    assert attempted == ["libamdhip64.so", "libamdhip64.so.7"]
+
+
+def test_rocm_current_device_initializes_library_once_across_threads(monkeypatch):
+    class _FakeHipGetDevice:
+        argtypes = None
+        restype = None
+
+        def __call__(self, device_ptr):
+            device_ptr._obj.value = 3
+            return 0
+
+    class _FakeHipLibrary:
+        hipGetDevice = _FakeHipGetDevice()
+
+    first_load_started = threading.Event()
+    release_first_load = threading.Event()
+    second_lock_attempted = threading.Event()
+    second_finished = threading.Event()
+    attempted = []
+    results = []
+    errors = []
+
+    class _TrackingLock:
+        def __init__(self):
+            self._lock = threading.Lock()
+
+        def __enter__(self):
+            if threading.current_thread().name == "hip-second":
+                second_lock_attempted.set()
+            self._lock.acquire()
+            return self
+
+        def __exit__(self, exc_type, exc_value, traceback):
+            self._lock.release()
+
+    def _load_library(soname):
+        attempted.append(soname)
+        if soname == "libamdhip64.so":
+            first_load_started.set()
+            if not release_first_load.wait(timeout=5):
+                raise TimeoutError("HIP library probe was not released")
+            raise OSError(soname)
+        if soname == "libamdhip64.so.7":
+            return _FakeHipLibrary()
+        raise OSError(soname)
+
+    def _get_device():
+        try:
+            results.append(rocm_runtime._hip_get_device())
+        except Exception as error:
+            errors.append(error)
+        finally:
+            if threading.current_thread().name == "hip-second":
+                second_finished.set()
+
+    monkeypatch.setattr(rocm_runtime, "_HIP_LIB", None)
+    monkeypatch.setattr(rocm_runtime, "_HIP_LIB_TRIED", False)
+    monkeypatch.setattr(rocm_runtime, "_HIP_LIB_LOCK", _TrackingLock())
+    monkeypatch.setattr(rocm_runtime.ctypes, "CDLL", _load_library)
+
+    first = threading.Thread(target=_get_device, name="hip-first")
+    second = threading.Thread(target=_get_device, name="hip-second")
+    first.start()
+    try:
+        assert first_load_started.wait(timeout=5)
+        assert rocm_runtime._HIP_LIB_TRIED is False
+        second.start()
+        assert second_lock_attempted.wait(timeout=5)
+        assert not second_finished.is_set()
+        assert rocm_runtime._HIP_LIB_TRIED is False
+    finally:
+        release_first_load.set()
+        first.join(timeout=5)
+        if second.ident is not None:
+            second.join(timeout=5)
+
+    assert not first.is_alive()
+    assert not second.is_alive()
+    assert not errors
+    assert results == [3, 3]
+    assert attempted == ["libamdhip64.so", "libamdhip64.so.7"]
+    assert rocm_runtime._HIP_LIB_TRIED is True
+    assert isinstance(rocm_runtime._HIP_LIB, _FakeHipLibrary)
 
 
 def test_ensure_mismatch_raises():

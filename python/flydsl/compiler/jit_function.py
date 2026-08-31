@@ -59,6 +59,30 @@ EXTRA_SOURCE_DIRS: List[str] = []
 CacheInfo = namedtuple("CacheInfo", ["hits", "misses", "currsize", "disk_size"])
 
 
+def _current_device_cache_signature() -> tuple[str, int]:
+    """Identify the runtime device that will own a materialized GPU module.
+
+    Device binaries are architecture-specific, but ``CompiledArtifact`` also
+    owns an execution engine whose GPU module is loaded into the device that is
+    current when the engine is materialized.  Consequently both the artifact's
+    in-process cache entry and its ``CallState`` must be device-local even when
+    a JIT function has no explicit stream argument (or receives an opaque raw
+    stream handle that carries no device metadata).
+
+    This signature is used only for the in-process execution cache.  The
+    serialized compiled artifact is portable across logical devices with the
+    same :class:`GPUTarget`, so disk/AOT identity deliberately excludes it.
+    """
+
+    # Keep the runtime import lazy: device-runtime selection imports compiler
+    # backend metadata, so importing it at module initialization would create a
+    # cycle.
+    from ..runtime.device_runtime import get_device_runtime
+
+    runtime = get_device_runtime()
+    return runtime.kind, int(runtime.current_device_id())
+
+
 class FileLock:
     """fcntl-based file lock supporting shared and exclusive modes."""
 
@@ -1152,12 +1176,16 @@ class JitFunction:
         self.manager_key = None
         self._manager_owner_cls = None
         self.cache_manager = None
-        self._call_state_cache = {}  # cache_key -> CallState
+        # Compiled IR is portable across logical devices with the same target;
+        # ExecutionEngines/function pointers and their CallStates are not.
+        self._artifact_cache = {}  # artifact_key -> unmaterialized CompiledArtifact
+        self._call_state_cache = {}  # execution_key -> CallState
+        self._execution_cache_lock = threading.Lock()
         self._sig = None  # lazy: set on first call
         self._has_self_param = False  # lazy: set in _ensure_sig
         self._backend_target = None  # lazy: GPUTarget resolved once in _ensure_sig
-        self._mem_cache = {}
-        self._last_compiled = None  # (cache_key, CompiledArtifact) for compile()
+        self._mem_cache = {}  # execution_key -> device-local CompiledArtifact
+        self._last_compiled = None  # (artifact/execution key, CompiledArtifact) for compile()
         self._extern_linkage_keys = set()
 
         # owner_cls -> first-compile snapshot of the used globals; RAISE on any
@@ -1341,13 +1369,57 @@ class JitFunction:
         return cache[owner_cls]
 
     def _build_full_cache_key(self, bound_arguments, *, owner_cls=None, bound_self=None, effective_hints=None):
-        """Build the complete cache key: arg signatures + stable globals snapshot + self type."""
+        """Build the portable artifact key.
+
+        The target architecture remains part of the argument-derived suffix,
+        but the current logical device does not: the same compiled IR/binary is
+        valid on every device with that target.  Device identity is added only
+        by :meth:`_build_execution_cache_key` before materializing an engine.
+        """
+
         cache_key = self._globals_key_prefix(owner_cls) + self._resolve_and_make_cache_key(
             bound_arguments, effective_hints=effective_hints
         )
         if bound_self is not None:
             cache_key = (("_self_type_", type(bound_self)),) + cache_key
         return cache_key
+
+    @staticmethod
+    def _build_execution_cache_key(cache_key):
+        """Add runtime-device identity for device-loaded in-process state."""
+
+        return (("_device_", _current_device_cache_signature()),) + cache_key
+
+    def _execution_artifact(self, execution_key, portable_artifact):
+        """Return the one device-local clone published for ``execution_key``.
+
+        Two threads can miss the runtime cache concurrently after finding the
+        same portable artifact.  Publishing under a lock prevents a later clone
+        from replacing the object that owns an already-created function pointer.
+        """
+
+        with self._execution_cache_lock:
+            compiled_func = self._mem_cache.get(execution_key)
+            if compiled_func is None:
+                compiled_func = portable_artifact.clone_unmaterialized()
+                self._mem_cache[execution_key] = compiled_func
+            self._last_compiled = (execution_key, compiled_func)
+            return compiled_func
+
+    def _execution_call_state(self, execution_key, sig, args_tuple, compiled_func):
+        """Build at most one published :class:`CallState` per execution key."""
+
+        state = self._call_state_cache.get(execution_key)
+        if state is not None:
+            return state
+
+        candidate = _build_call_state(
+            sig,
+            args_tuple,
+            compiled_func._get_func_exe(),
+        )
+        with self._execution_cache_lock:
+            return self._call_state_cache.setdefault(execution_key, candidate)
 
     @staticmethod
     def _cache_key_to_str(cache_key) -> str:
@@ -1381,7 +1453,7 @@ class JitFunction:
 
         # Resolve once so cache identity and compilation use the same options.
         effective_hints = self._effective_compile_hints()
-        cache_key = self._build_full_cache_key(
+        artifact_key = self._build_full_cache_key(
             bound.arguments,
             owner_cls=owner_cls,
             bound_self=bound_self,
@@ -1395,40 +1467,59 @@ class JitFunction:
 
         ensure_compile_runtime_pairing_from_env(compile_backend_name())
 
-        # Fast path: reuse pre-built CallState (no ctypes alloc, no DLPack)
-        call_state = self._call_state_cache.get(cache_key)
-        if call_state is not None:
-            if env.compile.compile_only:
-                return None
-            return call_state(args_tuple)
+        # COMPILE_ONLY must stay entirely device-runtime agnostic: portable
+        # artifact identity is sufficient, and asking for the current logical
+        # device may instantiate a runtime that is unavailable on an AOT host.
+        compile_only = env.compile.compile_only
+        execution_key = None
+        if not compile_only:
+            execution_key = self._build_execution_cache_key(artifact_key)
 
-        # Normal path: check in-process cache first, then optional disk cache.
-        # In run_only mode the disk cache is read regardless of enable_cache, since
-        # AOT-only execution treats the on-disk cache as the deployment artifact.
+            # Fast path: reuse pre-built device-local CallState (no ctypes
+            # allocation, no DLPack conversion, and no engine lookup).
+            call_state = self._call_state_cache.get(execution_key)
+            if call_state is not None:
+                cached_func = self._mem_cache.get(execution_key)
+                if cached_func is not None:
+                    self._last_compiled = (execution_key, cached_func)
+                return call_state(args_tuple)
+
+            # An engine may already exist for this device even if its CallState
+            # was cleared independently.  Rebuild only the lightweight state.
+            cached_func = self._mem_cache.get(execution_key)
+            if cached_func is not None:
+                self._last_compiled = (execution_key, cached_func)
+                state = self._execution_call_state(execution_key, sig, args_tuple, cached_func)
+                return state(args_tuple)
+
+        # Check the in-process portable artifact cache, then the optional disk
+        # cache.  In run_only mode the disk cache is read regardless of
+        # enable_cache, since AOT-only execution treats the on-disk cache as the
+        # deployment artifact.
         run_only = env.runtime.run_only
         use_disk_cache = env.runtime.enable_cache or run_only
-        allow_disk_cache = use_disk_cache and cache_key not in self._extern_linkage_keys
+        allow_disk_cache = use_disk_cache and artifact_key not in self._extern_linkage_keys
         _rejected_link_libs = False
-        cached_func = self._mem_cache.get(cache_key)
-        if cached_func is None and allow_disk_cache and not env.debug.dump_ir:
-            str_key = self._cache_key_to_str(cache_key)
-            cached_func = self.cache_manager.get(str_key) if self.cache_manager else None
-            if cached_func is not None and getattr(cached_func, "_link_libs", None):
+        portable_artifact = self._artifact_cache.get(artifact_key)
+        if portable_artifact is None and allow_disk_cache and not env.debug.dump_ir:
+            str_key = self._cache_key_to_str(artifact_key)
+            portable_artifact = self.cache_manager.get(str_key) if self.cache_manager else None
+            if portable_artifact is not None and getattr(portable_artifact, "_link_libs", None):
                 _rejected_link_libs = True
-                cached_func = None
-            if cached_func is not None:
-                self._mem_cache[cache_key] = cached_func
+                portable_artifact = None
+            if portable_artifact is not None:
+                self._artifact_cache[artifact_key] = portable_artifact
 
-        if cached_func is not None:
-            if env.compile.compile_only:
+        if portable_artifact is not None:
+            if compile_only:
+                self._last_compiled = (artifact_key, portable_artifact)
                 return None
-            # Build CallState via JitArgument registry (same dispatch as compile path)
-            state = _build_call_state(
-                sig,
-                args_tuple,
-                cached_func._get_func_exe(),
-            )
-            self._call_state_cache[cache_key] = state
+
+            # Never materialize the portable template.  JitCacheManager's own
+            # memory cache can return the same Python object on calls made from
+            # different devices, so each device receives a fresh runtime owner.
+            compiled_func = self._execution_artifact(execution_key, portable_artifact)
+            state = self._execution_call_state(execution_key, sig, args_tuple, compiled_func)
             return state(args_tuple)
 
         if run_only:
@@ -1438,7 +1529,7 @@ class JitFunction:
                 f"FLYDSL_RUNTIME_RUN_ONLY=1 but no usable AOT cache for "
                 f"{self.func.__name__}: "
                 f"manager_key={self.manager_key}, "
-                f"cache_key={self._cache_key_to_str(cache_key)[:96]}..., "
+                f"cache_key={self._cache_key_to_str(artifact_key)[:96]}..., "
                 f"cache_dir={cdir} (exists={cdir_exists})"
             )
             if _rejected_link_libs:
@@ -1451,12 +1542,12 @@ class JitFunction:
 
         _hints_ctx = CompilationContext.compile_hints(effective_hints) if effective_hints else nullcontext()
 
-        compiled_func = None  # will be set inside lock or compile path
+        portable_artifact = None  # set by the cache-lock hit or compile path
 
         # Determine whether to use compile_lock for cross-process safety.
         _use_compile_lock = use_disk_cache and self.cache_manager and not env.debug.dump_ir
         if _use_compile_lock:
-            str_key = self._cache_key_to_str(cache_key)
+            str_key = self._cache_key_to_str(artifact_key)
             _compile_lock_ctx = self.cache_manager.compile_lock(str_key)
         else:
             _compile_lock_ctx = nullcontext((None, None))
@@ -1464,9 +1555,8 @@ class JitFunction:
         with _compile_lock_ctx as (_lock_result, _cache_writer):
             if _lock_result is not None and not getattr(_lock_result, "_link_libs", None):
                 # Cache hit after waiting for another process to compile.
-                compiled_func = _lock_result
-                self._mem_cache[cache_key] = compiled_func
-                self._last_compiled = (cache_key, compiled_func)
+                portable_artifact = _lock_result
+                self._artifact_cache[artifact_key] = portable_artifact
             else:
                 with _create_mlir_context() as ctx, _hints_ctx:
                     param_names, jit_args, dsl_types, constexpr_values = convert_to_jit_arguments(sig, bound)
@@ -1536,7 +1626,7 @@ class JitFunction:
                             "use embedded codegen for kernels that require #fly.explicit_module."
                         )
                     if extern_linked:
-                        self._extern_linkage_keys.add(cache_key)
+                        self._extern_linkage_keys.add(artifact_key)
                         # Switch to explicit Python-side module loading so
                         # post_load_processors can receive hipModule_t handles.
                         # Also clear targets set at construction: the backend attach-target
@@ -1553,7 +1643,7 @@ class JitFunction:
                         link_libs=link_libs,
                     )
 
-                    compiled_func = CompiledArtifact(
+                    portable_artifact = CompiledArtifact(
                         compiled_module,
                         self.func.__name__,
                         original_ir,
@@ -1562,33 +1652,27 @@ class JitFunction:
                         uses_explicit_module=extern_linked,
                     )
 
-                    # Always keep a reference to the latest compilation result so
-                    # flyc.compile() can retrieve it even when caching is disabled.
-                    self._last_compiled = (cache_key, compiled_func)
-
-                    # Keep compiled artifacts alive within the process even when disk
-                    # cache is disabled. This preserves code object lifetime for
-                    # profiler/roctracer teardown and enables fast same-process reuse.
-                    self._mem_cache[cache_key] = compiled_func
+                    # The original artifact stays unmaterialized and can seed a
+                    # separate device-local runtime object for every GPU.
+                    self._artifact_cache[artifact_key] = portable_artifact
                     if _cache_writer and not extern_linked:
                         try:
-                            _cache_writer(compiled_func)
+                            _cache_writer(portable_artifact)
                         except Exception as e:
                             log().warning(f"Failed to write compile cache: {e}")
 
-        # OUTSIDE lock: engine init + kernel launch
-        if env.compile.compile_only:
+        # OUTSIDE lock: engine init + kernel launch.  The portable artifact is
+        # intentionally never materialized, including on a fresh compilation.
+        if compile_only:
+            self._last_compiled = (artifact_key, portable_artifact)
             return None
 
-        # The in-process CompiledArtifact cache above owns the ExecutionEngine/
-        # code object, so the function pointer remains valid even when disk
-        # cache is off.
-        state = _build_call_state(
-            sig,
-            args_tuple,
-            compiled_func._get_func_exe(),
-        )
-        self._call_state_cache[cache_key] = state
+        compiled_func = self._execution_artifact(execution_key, portable_artifact)
+
+        # The device-local CompiledArtifact cache owns the ExecutionEngine/code
+        # object, so the function pointer remains valid even when disk cache is
+        # off.
+        state = self._execution_call_state(execution_key, sig, args_tuple, compiled_func)
         return state(args_tuple)
 
 
@@ -1666,23 +1750,24 @@ def _compile_impl(func, *args) -> Optional[CompiledFunction]:
     sig = jf._sig  # guaranteed initialized after __call__
     bound = sig.bind(*args)
     bound.apply_defaults()
-    cache_key = jf._build_full_cache_key(bound.arguments)
+    artifact_key = jf._build_full_cache_key(bound.arguments)
+    execution_key = jf._build_execution_cache_key(artifact_key)
     args_tuple = tuple(bound.arguments.values())
 
     # Look up the CompiledArtifact.  We must hold a direct reference to it
     # because it owns the ExecutionEngine and GPU code objects — if it gets
     # GC'd, the function pointer inside CallState becomes dangling.
-    artifact = jf._mem_cache.get(cache_key)
+    artifact = jf._mem_cache.get(execution_key)
     if artifact is None:
         # Cache disabled — retrieve from _last_compiled (set unconditionally
         # by __call__).  This does not alter __call__'s caching semantics.
         last = jf._last_compiled
-        if last is not None and last[0] == cache_key:
+        if last is not None and last[0] == execution_key:
             artifact = last[1]
     if artifact is None:
         raise RuntimeError("flyc.compile(): compilation succeeded but no cached artifact found.")
 
-    call_state = jf._call_state_cache.get(cache_key)
+    call_state = jf._call_state_cache.get(execution_key)
     if call_state is None:
         call_state = _build_call_state(sig, args_tuple, artifact._get_func_exe())
 

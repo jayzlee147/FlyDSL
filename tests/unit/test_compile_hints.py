@@ -42,6 +42,7 @@ def _noop_launch(stream: fx.Stream = fx.Stream(None)):
 
 
 def _reset_jit_caches(jit_fn):
+    jit_fn._artifact_cache.clear()
     jit_fn._call_state_cache.clear()
     jit_fn._mem_cache.clear()
     jit_fn._last_compiled = None
@@ -218,8 +219,8 @@ class TestCacheKeyIncludesTarget:
 
     def test_cache_key_contains_target(self):
         """Cache key must carry an arch-only ('_target_', GPUTarget). The kernel
-        binary is device-independent, so the key has no device id and the same
-        artifact is shared across same-arch GPUs."""
+        binary and portable artifact are device-independent. Materialized
+        artifacts and their function pointers remain device-local."""
         from flydsl.compiler.backends import GPUTarget, get_backend
 
         jf = _noop_launch

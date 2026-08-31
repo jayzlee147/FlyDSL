@@ -47,13 +47,14 @@ class CacheProgramB:
 
 
 def reset_jit(jit_fn):
+    jit_fn._artifact_cache.clear()
     jit_fn._call_state_cache.clear()
     jit_fn._mem_cache.clear()
     jit_fn._last_compiled = None
     jit_fn.manager_key = None
     jit_fn._manager_owner_cls = None
     jit_fn.cache_manager = None
-    jit_fn._target = None
+    jit_fn._backend_target = None
 
     jit_fn._sig = None
     jit_fn._has_self_param = False

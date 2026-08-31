@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import ctypes
+import threading
 from typing import ClassVar
 
 from ..device import get_rocm_device_count
@@ -14,22 +15,30 @@ from .base import DeviceRuntime
 # Cached HIP runtime handle (``libamdhip64``); cached once.
 _HIP_LIB = None
 _HIP_LIB_TRIED = False
+_HIP_LIB_LOCK = threading.Lock()
 
 
 def _hip_get_device() -> int:
     """Active HIP device index via ``hipGetDevice``."""
     global _HIP_LIB, _HIP_LIB_TRIED
     if not _HIP_LIB_TRIED:
-        _HIP_LIB_TRIED = True
-        for soname in ("libamdhip64.so", "libamdhip64.so.6", "libamdhip64.so.5"):
-            try:
-                lib = ctypes.CDLL(soname)
-                lib.hipGetDevice.argtypes = [ctypes.POINTER(ctypes.c_int)]
-                lib.hipGetDevice.restype = ctypes.c_int
-                _HIP_LIB = lib
-                break
-            except OSError:
-                continue
+        with _HIP_LIB_LOCK:
+            if not _HIP_LIB_TRIED:
+                for soname in (
+                    "libamdhip64.so",
+                    "libamdhip64.so.7",
+                    "libamdhip64.so.6",
+                    "libamdhip64.so.5",
+                ):
+                    try:
+                        lib = ctypes.CDLL(soname)
+                        lib.hipGetDevice.argtypes = [ctypes.POINTER(ctypes.c_int)]
+                        lib.hipGetDevice.restype = ctypes.c_int
+                        _HIP_LIB = lib
+                        break
+                    except OSError:
+                        continue
+                _HIP_LIB_TRIED = True
     if _HIP_LIB is None:
         return 0
     dev = ctypes.c_int(0)

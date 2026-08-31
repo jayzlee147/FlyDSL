@@ -236,6 +236,35 @@ class CompiledArtifact:
         self._func_exe = None
         self._lock = threading.Lock()
 
+    def clone_unmaterialized(self) -> "CompiledArtifact":
+        """Return a device-unbound copy of this compiled artifact.
+
+        The serialized IR and post-load metadata are portable across logical
+        devices with the same compile target.  The ExecutionEngine, loaded GPU
+        modules, and function pointer are not: they are created against the
+        device that is current during materialization.  Runtime caches therefore
+        clone the portable artifact once per device before calling
+        :meth:`_get_func_exe`.
+
+        This deliberately does not use a pickle round trip.  Extern-linked
+        artifacts may contain valid in-process post-load processors that are not
+        representable as ``module:qualname`` and are consequently memory-only.
+        """
+
+        clone = object.__new__(type(self))
+        clone._ir_text = self._ir_text
+        clone._entry = self._entry
+        clone._source_ir = self._source_ir
+        clone._post_load_processors = list(self._post_load_processors)
+        clone._link_libs = list(self._link_libs)
+        clone._uses_explicit_module = self._uses_explicit_module
+        clone._module = None
+        clone._engine = None
+        clone._jit_module = None
+        clone._func_exe = None
+        clone._lock = threading.Lock()
+        return clone
+
     def __getstate__(self):
         # Serialise post-load processors by fully-qualified name so the
         # pickle stream carries no concrete callables.

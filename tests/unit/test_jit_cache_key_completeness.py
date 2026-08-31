@@ -87,12 +87,11 @@ def test_env_var_not_cached_within_process(monkeypatch):
     assert k1 != k2
 
 
-def test_cache_key_is_device_independent():
-    """The cache key's target is arch-only, with no device id component.
+def test_artifact_cache_key_is_device_independent():
+    """The portable artifact key's target is arch-only, with no device id.
 
-    The compiled kernel binary is device-independent, so a single in-process
-    artifact / func_exe is shared across same-arch GPUs (as on main). Folding a
-    device id into the key would needlessly split the cache per device.
+    The compiled kernel binary/template is shared across same-arch GPUs, while
+    each GPU gets a distinct materialized artifact and function pointer.
     """
     from flydsl.compiler.backends import GPUTarget, get_backend
 
@@ -102,10 +101,13 @@ def test_cache_key_is_device_independent():
 
     A = torch.zeros(8, dtype=torch.float32)
     k._ensure_sig()
-    key1 = _key(k, A)
-    target_entry = next(v for n, v in key1 if n == "_target_")
+    bound = k._sig.bind(A)
+    bound.apply_defaults()
+    artifact_key = k._build_full_cache_key(bound.arguments)
+    target_entry = next(v for n, v in artifact_key if n == "_target_")
     assert isinstance(target_entry, GPUTarget)
     assert target_entry == get_backend().target
+    assert all(name != "_device_" for name, _value in artifact_key)
 
 
 def test_globals_snapshot_folded_into_cache_key_default_mode():

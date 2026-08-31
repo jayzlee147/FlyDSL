@@ -23,7 +23,9 @@ backward (varlen-K dW, dSwiGLU, and bias reductions) is not implemented here.
 from __future__ import annotations
 
 import functools
-from dataclasses import dataclass
+import threading
+from collections import OrderedDict
+from dataclasses import dataclass, field
 
 import torch
 
@@ -47,6 +49,7 @@ from kernels.moe.moe_sorting_kernel import (
 _GFX950_LDS_BYTES = 160 * 1024
 _MAX_BUFFER_BYTE_OFFSET = 0xFFFFFFFF
 _MAX_SIGNED_I32 = 0x7FFFFFFF
+_DEFAULT_MAX_CACHED_WORKSPACES = 8
 _SUPPORTED_ROUTER_DTYPES = {
     torch.float32: "f32",
     torch.float16: "f16",
@@ -245,6 +248,12 @@ class SonicMoEWorkspace:
     router_topk_expert_indices: torch.Tensor
     intermediate: torch.Tensor
     output: torch.Tensor
+    _launch_lock: threading.Lock = field(
+        default_factory=threading.Lock,
+        init=False,
+        repr=False,
+        compare=False,
+    )
 
     @functools.cached_property
     def storage_ptrs(self) -> frozenset[int]:
@@ -776,7 +785,12 @@ def _get_stage1_launcher(
     config: SonicMoEConfig,
     b_cache_mod: int,
     weight_dtype: str,
+    device_index: int,
 ):
+    # ``device_index`` is intentionally part of the LRU key.  Compiled
+    # launchers cache a device-loaded function after first use and cannot be
+    # shared across ROCm devices in one process.
+    del device_index
     return compile_gemm1_a16w4_port(
         BM=config.tile_m,
         D_HIDDEN=config.hidden_size,
@@ -800,7 +814,10 @@ def _get_stage2_launcher(
     config: SonicMoEConfig,
     b_cache_mod: int,
     weight_dtype: str,
+    device_index: int,
 ):
+    # See _get_stage1_launcher: keep a distinct loaded function per device.
+    del device_index
     return compile_gemm2_a16w4_port(
         BM=config.tile_m,
         NE=config.num_experts,
@@ -819,14 +836,24 @@ def _get_stage2_launcher(
 class SonicMoE:
     """Reusable gfx950 SonicMoE A16 forward operator.
 
-    Workspaces are cached per ``(device, stream, token_count)``.  The returned default
-    output aliases that workspace and is overwritten by the next call with the
-    same key; pass ``out=`` when the caller owns output storage. Independent streams
-    receive independent workspaces. Call :meth:`clear_workspace` when highly dynamic
-    token counts would otherwise retain too much device memory.
+    Up to ``max_cached_workspaces`` workspaces are retained in LRU order, keyed by
+    ``(device, stream, token_count)``. The returned default output aliases that
+    workspace and is overwritten by the next call with the same key; pass ``out=``
+    when the caller owns output storage. Independent streams receive independent
+    workspaces, while calls sharing a cache key serialize their complete kernel
+    enqueue sequence. Eviction only drops the operator's reference: an in-progress
+    call retains its workspace locally, and its buffers are allocated and used on
+    the keyed stream so PyTorch's stream-aware allocator defers unsafe reuse. Call
+    :meth:`clear_workspace` to release all cached entries eagerly.
     """
 
-    def __init__(self, config: SonicMoEConfig, weights: SonicMoEWeights):
+    def __init__(
+        self,
+        config: SonicMoEConfig,
+        weights: SonicMoEWeights,
+        *,
+        max_cached_workspaces: int = _DEFAULT_MAX_CACHED_WORKSPACES,
+    ):
         prepared_shape = (
             weights.config.hidden_size,
             weights.config.intermediate_size,
@@ -853,24 +880,44 @@ class SonicMoE:
         else:
             _validate_bf16_resource_limits(config)
         _validate_prepared_weight_storage(weights, config)
+        if isinstance(max_cached_workspaces, bool) or not isinstance(
+            max_cached_workspaces, int
+        ):
+            raise TypeError("max_cached_workspaces must be an integer")
+        if max_cached_workspaces <= 0:
+            raise ValueError("max_cached_workspaces must be positive")
         self.config = config
         self.weights = weights
-        self._workspaces: dict[tuple[int, int, int], SonicMoEWorkspace] = {}
+        self._max_cached_workspaces = max_cached_workspaces
+        self._workspaces: OrderedDict[
+            tuple[int, int, int], SonicMoEWorkspace
+        ] = OrderedDict()
+        self._workspace_lock = threading.RLock()
         self.workspace: SonicMoEWorkspace | None = None
 
     def clear_workspace(self) -> None:
-        self._workspaces.clear()
-        self.workspace = None
+        with self._workspace_lock:
+            self._workspaces.clear()
+            self.workspace = None
 
     def reserve(self, tokens: int) -> SonicMoEWorkspace:
         stream_id = int(torch.cuda.current_stream(self.weights.device).cuda_stream)
         key = (self.weights.device.index or 0, stream_id, int(tokens))
-        workspace = self._workspaces.get(key)
-        if workspace is None:
-            workspace = SonicMoEWorkspace.allocate(self.config, int(tokens), self.weights.device)
-            self._workspaces[key] = workspace
-        self.workspace = workspace
-        return workspace
+        with self._workspace_lock:
+            workspace = self._workspaces.get(key)
+            if workspace is None:
+                workspace = SonicMoEWorkspace.allocate(
+                    self.config,
+                    int(tokens),
+                    self.weights.device,
+                )
+                self._workspaces[key] = workspace
+                while len(self._workspaces) > self._max_cached_workspaces:
+                    self._workspaces.popitem(last=False)
+            else:
+                self._workspaces.move_to_end(key)
+            self.workspace = workspace
+            return workspace
 
     def _validate_hidden(self, hidden_states: torch.Tensor) -> int:
         if not hidden_states.is_cuda:
@@ -955,6 +1002,7 @@ class SonicMoE:
             cfg,
             _stage1_cache_mod(cfg, tokens),
             self.weights.weight_dtype,
+            hidden_states.device.index or 0,
         )
         grid1 = gemm1_a16w4_grid(
             cfg.tile_m,
@@ -989,6 +1037,7 @@ class SonicMoE:
             cfg,
             _stage2_cache_mod(cfg, tokens),
             self.weights.weight_dtype,
+            hidden_states.device.index or 0,
         )
         grid2 = gemm2_a16w4_grid(
             cfg.tile_m,
@@ -1029,6 +1078,17 @@ class SonicMoE:
         ``router_logits`` is ``[tokens, num_experts]`` in FP32/FP16/BF16.
         """
 
+        if not hidden_states.is_cuda:
+            raise ValueError("hidden_states must be on a ROCm device")
+        with torch.cuda.device(hidden_states.device):
+            return self._forward_from_logits(hidden_states, router_logits, out)
+
+    def _forward_from_logits(
+        self,
+        hidden_states: torch.Tensor,
+        router_logits: torch.Tensor,
+        out: torch.Tensor | None,
+    ) -> torch.Tensor:
         tokens = self._validate_hidden(hidden_states)
         if not router_logits.is_cuda or router_logits.device != hidden_states.device:
             raise ValueError("router_logits must be on the same ROCm device as hidden_states")
@@ -1076,26 +1136,27 @@ class SonicMoE:
             router_logits,
             *self.weights.tensors,
         )
-        moe_softmax_sort_flydsl(
-            router_logits,
-            workspace.sorted_token_ids,
-            workspace.sorted_weights,
-            workspace.sorted_expert_ids,
-            workspace.num_valid_ids,
-            output,
-            self.config.num_experts,
-            self.config.top_k,
-            dtype_str,
-            unit_size=self.config.tile_m,
-            renormalize=self.config.renormalize,
-            workspace=workspace.sorting_workspace,
-            topk_scratch=(
-                workspace.router_topk_weights,
-                workspace.router_topk_ids,
-                workspace.router_topk_expert_indices,
-            ),
-        )
-        return self._run_grouped_gemms(hidden_states, workspace, output)
+        with workspace._launch_lock:
+            moe_softmax_sort_flydsl(
+                router_logits,
+                workspace.sorted_token_ids,
+                workspace.sorted_weights,
+                workspace.sorted_expert_ids,
+                workspace.num_valid_ids,
+                output,
+                self.config.num_experts,
+                self.config.top_k,
+                dtype_str,
+                unit_size=self.config.tile_m,
+                renormalize=self.config.renormalize,
+                workspace=workspace.sorting_workspace,
+                topk_scratch=(
+                    workspace.router_topk_weights,
+                    workspace.router_topk_ids,
+                    workspace.router_topk_expert_indices,
+                ),
+            )
+            return self._run_grouped_gemms(hidden_states, workspace, output)
 
     def forward_topk(
         self,
@@ -1113,6 +1174,23 @@ class SonicMoE:
         consumed as-is; normalize them before this call when desired.
         """
 
+        if not hidden_states.is_cuda:
+            raise ValueError("hidden_states must be on a ROCm device")
+        with torch.cuda.device(hidden_states.device):
+            return self._forward_topk_on_current_device(
+                hidden_states,
+                topk_ids,
+                topk_weights,
+                out,
+            )
+
+    def _forward_topk_on_current_device(
+        self,
+        hidden_states: torch.Tensor,
+        topk_ids: torch.Tensor,
+        topk_weights: torch.Tensor,
+        out: torch.Tensor | None,
+    ) -> torch.Tensor:
         tokens = self._validate_hidden(hidden_states)
         expected = (tokens, self.config.top_k)
         if tuple(topk_ids.shape) != expected or tuple(topk_weights.shape) != expected:
@@ -1146,19 +1224,20 @@ class SonicMoE:
             topk_weights,
             *self.weights.tensors,
         )
-        moe_sorting_flydsl(
-            topk_ids,
-            topk_weights,
-            workspace.sorted_token_ids,
-            workspace.sorted_weights,
-            workspace.sorted_expert_ids,
-            workspace.num_valid_ids,
-            output,
-            self.config.num_experts,
-            unit_size=self.config.tile_m,
-            workspace=workspace.sorting_workspace,
-        )
-        return self._run_grouped_gemms(hidden_states, workspace, output)
+        with workspace._launch_lock:
+            moe_sorting_flydsl(
+                topk_ids,
+                topk_weights,
+                workspace.sorted_token_ids,
+                workspace.sorted_weights,
+                workspace.sorted_expert_ids,
+                workspace.num_valid_ids,
+                output,
+                self.config.num_experts,
+                unit_size=self.config.tile_m,
+                workspace=workspace.sorting_workspace,
+            )
+            return self._run_grouped_gemms(hidden_states, workspace, output)
 
 
 @torch.no_grad()

@@ -4,6 +4,8 @@
 """Correctness and API-contract tests for gfx950 SonicMoE A16W16/A16W4."""
 
 import math
+import threading
+import weakref
 from dataclasses import replace
 
 import pytest
@@ -15,6 +17,8 @@ from kernels.moe.sonic import (
     SonicMoEConfig,
     SonicMoEWeights,
     SonicMoEWorkspace,
+    _get_stage1_launcher,
+    _get_stage2_launcher,
     _quantize_mxfp4_weight,
     prepare_sonic_bf16_weights,
     prepare_sonic_mxfp4_weights,
@@ -233,6 +237,168 @@ def test_sonic_moe_reuses_workspace_by_device_stream_and_token_count():
     assert op.workspace is workspace_t7
 
 
+def test_sonic_moe_workspace_cache_is_bounded_lru():
+    config = _config()
+    _, w1, w2, _ = _make_case()
+    op = SonicMoE(
+        config,
+        prepare_sonic_bf16_weights(w1, w2, config),
+        max_cached_workspaces=2,
+    )
+
+    workspace_t7 = op.reserve(7)
+    workspace_t3 = op.reserve(3)
+    cached = tuple(op._workspaces.values())
+    assert cached[0] is workspace_t7
+    assert cached[1] is workspace_t3
+
+    assert op.reserve(7) is workspace_t7
+    cached = tuple(op._workspaces.values())
+    assert cached[0] is workspace_t3
+    assert cached[1] is workspace_t7
+
+    workspace_t5 = op.reserve(5)
+    cached = tuple(op._workspaces.values())
+    assert cached[0] is workspace_t7
+    assert cached[1] is workspace_t5
+
+    replacement_t3 = op.reserve(3)
+    cached = tuple(op._workspaces.values())
+    assert replacement_t3 is not workspace_t3
+    assert cached[0] is workspace_t5
+    assert cached[1] is replacement_t3
+    assert op.workspace is replacement_t3
+
+    op.clear_workspace()
+    assert not op._workspaces
+    assert op.workspace is None
+
+
+@pytest.mark.parametrize(
+    ("capacity", "exception"),
+    [(0, ValueError), (-1, ValueError), (True, TypeError), (1.5, TypeError)],
+)
+def test_sonic_moe_rejects_invalid_workspace_cache_capacity(capacity, exception):
+    config = _config()
+    _, w1, w2, _ = _make_case()
+    weights = prepare_sonic_bf16_weights(w1, w2, config)
+
+    with pytest.raises(exception, match="max_cached_workspaces"):
+        SonicMoE(config, weights, max_cached_workspaces=capacity)
+
+
+@pytest.mark.parametrize("entrypoint", ["router", "topk"])
+def test_sonic_moe_serializes_same_workspace_enqueues(monkeypatch, entrypoint):
+    config = _config()
+    x, w1, w2, router_logits = _make_case()
+    topk_ids, topk_weights = _topk_from_logits(router_logits, config)
+    op = SonicMoE(config, prepare_sonic_bf16_weights(w1, w2, config))
+    stream = torch.cuda.Stream(device=x.device)
+    with torch.cuda.device(x.device), torch.cuda.stream(stream):
+        workspace = op.reserve(TOKENS)
+
+    first_sort_entered = threading.Event()
+    second_lock_attempted = threading.Event()
+    second_sort_entered = threading.Event()
+    release_first_sort = threading.Event()
+    first_gemms_entered = threading.Event()
+    release_first_gemms = threading.Event()
+    order = []
+    errors = []
+    result_lock = threading.Lock()
+
+    class TrackingLock:
+        def __init__(self):
+            self._lock = threading.Lock()
+
+        def __enter__(self):
+            if threading.current_thread().name == "sonic-second":
+                second_lock_attempted.set()
+            self._lock.acquire()
+            return self
+
+        def __exit__(self, exc_type, exc_value, traceback):
+            self._lock.release()
+
+    workspace._launch_lock = TrackingLock()
+
+    def fake_sort(*args, **kwargs):
+        del args, kwargs
+        name = threading.current_thread().name
+        with result_lock:
+            order.append((name, "sort"))
+        if name == "sonic-first":
+            first_sort_entered.set()
+            if not release_first_sort.wait(timeout=5):
+                raise TimeoutError("first sort was not released")
+        else:
+            second_sort_entered.set()
+
+    def fake_grouped_gemms(hidden_states, active_workspace, out):
+        assert hidden_states is x
+        assert active_workspace is workspace
+        name = threading.current_thread().name
+        with result_lock:
+            order.append((name, "gemms"))
+        if name == "sonic-first":
+            first_gemms_entered.set()
+            if not release_first_gemms.wait(timeout=5):
+                raise TimeoutError("first GEMMs were not released")
+        return out
+
+    monkeypatch.setattr("kernels.moe.sonic.moe_softmax_sort_flydsl", fake_sort)
+    monkeypatch.setattr("kernels.moe.sonic.moe_sorting_flydsl", fake_sort)
+    monkeypatch.setattr(op, "_run_grouped_gemms", fake_grouped_gemms)
+
+    outputs = (torch.empty_like(x), torch.empty_like(x))
+
+    def run(output):
+        try:
+            with torch.cuda.device(x.device), torch.cuda.stream(stream):
+                if entrypoint == "router":
+                    result = op(x, router_logits, out=output)
+                else:
+                    result = op.forward_topk(
+                        x,
+                        topk_ids,
+                        topk_weights,
+                        out=output,
+                    )
+            assert result is output
+        except Exception as error:
+            with result_lock:
+                errors.append(error)
+
+    first = threading.Thread(target=run, args=(outputs[0],), name="sonic-first")
+    second = threading.Thread(target=run, args=(outputs[1],), name="sonic-second")
+    first.start()
+    try:
+        assert first_sort_entered.wait(timeout=5)
+        second.start()
+        assert second_lock_attempted.wait(timeout=5)
+        assert not second_sort_entered.is_set()
+        release_first_sort.set()
+        assert first_gemms_entered.wait(timeout=5)
+        assert not second_sort_entered.is_set()
+        release_first_gemms.set()
+    finally:
+        release_first_sort.set()
+        release_first_gemms.set()
+        first.join(timeout=5)
+        if second.ident is not None:
+            second.join(timeout=5)
+
+    assert not first.is_alive()
+    assert not second.is_alive()
+    assert not errors
+    assert order == [
+        ("sonic-first", "sort"),
+        ("sonic-first", "gemms"),
+        ("sonic-second", "sort"),
+        ("sonic-second", "gemms"),
+    ]
+
+
 def test_sonic_moe_workspace_bound_scales_with_active_experts():
     """Decode must not allocate or launch one padded tile for every expert."""
 
@@ -399,9 +565,16 @@ def test_sonic_moe_uses_independent_workspaces_across_streams():
     config = _config()
     x_a, w1, w2, logits_a = _make_case(seed=37)
     x_b, _, _, logits_b = _make_case(seed=41)
-    op = SonicMoE(config, prepare_sonic_bf16_weights(w1, w2, config))
+    op = SonicMoE(
+        config,
+        prepare_sonic_bf16_weights(w1, w2, config),
+        max_cached_workspaces=1,
+    )
     expected_a = sonic_moe_reference(x_a, w1, w2, logits_a, config)
     expected_b = sonic_moe_reference(x_b, w1, w2, logits_b, config)
+    out_a = torch.empty_like(expected_a)
+    out_b = torch.empty_like(expected_b)
+    out_a_again = torch.empty_like(expected_a)
 
     default_stream = torch.cuda.current_stream(x_a.device)
     stream_a = torch.cuda.Stream(device=x_a.device)
@@ -410,18 +583,109 @@ def test_sonic_moe_uses_independent_workspaces_across_streams():
     stream_b.wait_stream(default_stream)
 
     with torch.cuda.stream(stream_a):
-        actual_a = op(x_a, logits_a)
-        workspace_a = op.workspace
+        actual_a = op(x_a, logits_a, out=out_a)
+        workspace_a_ref = weakref.ref(op.workspace)
     with torch.cuda.stream(stream_b):
-        actual_b = op(x_b, logits_b)
-        workspace_b = op.workspace
+        actual_b = op(x_b, logits_b, out=out_b)
+        workspace_b_ref = weakref.ref(op.workspace)
+    assert workspace_a_ref() is None
+    with torch.cuda.stream(stream_a):
+        actual_a_again = op(x_a, logits_a, out=out_a_again)
+        workspace_a_again = op.workspace
+    assert workspace_b_ref() is None
 
     torch.cuda.synchronize()
-    assert workspace_a is not None
-    assert workspace_b is not None
-    assert workspace_a is not workspace_b
+    assert actual_a is out_a
+    assert actual_b is out_b
+    assert actual_a_again is out_a_again
+    assert workspace_a_again is not None
+    assert len(op._workspaces) == 1
+    assert next(iter(op._workspaces.values())) is workspace_a_again
     _assert_close(actual_a, expected_a)
     _assert_close(actual_b, expected_b)
+    _assert_close(actual_a_again, expected_a)
+
+
+@pytest.mark.multi_gpu
+def test_sonic_moe_selects_input_device_and_restores_current_device():
+    if torch.cuda.device_count() < 2:
+        pytest.skip("requires at least two ROCm GPUs")
+
+    for index in (0, 1):
+        device = torch.device("cuda", index)
+        arch = str(getattr(torch.cuda.get_device_properties(device), "gcnArchName", ""))
+        if not arch.startswith("gfx950"):
+            pytest.skip(f"SonicMoE test requires two gfx950 devices, found {device}={arch!r}")
+
+    target_device = torch.device("cuda", 1)
+    with torch.cuda.device(target_device):
+        config = _config()
+        x, w1, w2, router_logits = _make_case(seed=71)
+        assert x.device == target_device
+        topk_ids, topk_weights = _topk_from_logits(router_logits, config)
+        expected = sonic_moe_reference(x, w1, w2, router_logits, config)
+        op = SonicMoE(config, prepare_sonic_bf16_weights(w1, w2, config))
+        router_out = torch.empty_like(expected)
+        topk_out = torch.empty_like(expected)
+
+    with torch.cuda.device(0):
+        assert torch.cuda.current_device() == 0
+        actual_router = op(x, router_logits, out=router_out)
+        assert torch.cuda.current_device() == 0
+        actual_topk = op.forward_topk(x, topk_ids, topk_weights, out=topk_out)
+        assert torch.cuda.current_device() == 0
+
+    torch.cuda.synchronize(target_device)
+    assert actual_router is router_out
+    assert actual_topk is topk_out
+    _assert_close(actual_router, expected)
+    _assert_close(actual_topk, expected)
+
+
+@pytest.mark.multi_gpu
+def test_sonic_moe_runs_sequentially_on_two_devices():
+    """A launcher materialized on cuda:0 must not be reused on cuda:1."""
+
+    from flydsl.compiler.jit_function import _current_device_cache_signature
+    from flydsl.runtime.device_runtime import get_device_runtime
+
+    if torch.cuda.device_count() < 2:
+        pytest.skip("requires at least two ROCm GPUs")
+
+    devices = (torch.device("cuda", 0), torch.device("cuda", 1))
+    for device in devices:
+        properties = torch.cuda.get_device_properties(device)
+        arch = str(getattr(properties, "gcnArchName", ""))
+        if not arch.startswith("gfx950"):
+            pytest.skip(f"SonicMoE test requires two gfx950 devices, found {device}={arch!r}")
+
+    config = _config()
+    results = []
+    _get_stage1_launcher.cache_clear()
+    _get_stage2_launcher.cache_clear()
+    try:
+        for device, seed in zip(devices, (61, 67)):
+            with torch.cuda.device(device):
+                assert get_device_runtime().current_device_id() == device.index
+                assert _current_device_cache_signature() == ("rocm", device.index)
+                x, w1, w2, router_logits = _make_case(seed=seed)
+                assert x.device == device
+
+                expected = sonic_moe_reference(x, w1, w2, router_logits, config)
+                actual = SonicMoE(config, prepare_sonic_bf16_weights(w1, w2, config))(
+                    x, router_logits
+                )
+                torch.cuda.synchronize(device)
+                results.append((actual, expected))
+
+        assert _get_stage1_launcher.cache_info().currsize == 2
+        assert _get_stage2_launcher.cache_info().currsize == 2
+    finally:
+        _get_stage1_launcher.cache_clear()
+        _get_stage2_launcher.cache_clear()
+
+    for actual, expected in results:
+        _assert_close(actual, expected)
 
 
 def test_sonic_moe_non_power_of_two_router_fallback():
