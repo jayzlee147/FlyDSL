@@ -27,7 +27,7 @@ import torch
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl.expr import gpu, range_constexpr
+from flydsl.expr import const_expr, gpu, range_constexpr
 from flydsl.expr.arith import ArithValue
 from flydsl.expr.typing import T
 from kernels.common import buffer_ops
@@ -42,7 +42,12 @@ _ragged_cf_cache = {}
 
 
 @functools.lru_cache(maxsize=128)
-def _compile_moe_ragged_sorting(*, num_experts: int, unit_size: int = UNIT_SIZE):
+def _compile_moe_ragged_sorting(
+    *,
+    num_experts: int,
+    unit_size: int = UNIT_SIZE,
+    emit_route_ids: bool = False,
+):
     """Build the four-kernel flat-route counting sort."""
 
     if num_experts <= 0:
@@ -56,7 +61,9 @@ def _compile_moe_ragged_sorting(*, num_experts: int, unit_size: int = UNIT_SIZE)
         expert_cursors: fx.Tensor,
         sorted_token_ids: fx.Tensor,
         sorted_weights: fx.Tensor,
+        sorted_route_ids: fx.Tensor,
         moe_buf_i32: fx.Tensor,
+        i32_routes: fx.Int32,
         i32_tokens: fx.Int32,
         i32_max_padded: fx.Int32,
         i32_moe_buf_elems: fx.Int32,
@@ -70,6 +77,8 @@ def _compile_moe_ragged_sorting(*, num_experts: int, unit_size: int = UNIT_SIZE)
         cursor_rsrc = buffer_ops.create_buffer_resource(expert_cursors, max_size=True)
         ids_rsrc = buffer_ops.create_buffer_resource(sorted_token_ids, max_size=True)
         weights_rsrc = buffer_ops.create_buffer_resource(sorted_weights, max_size=True)
+        if const_expr(emit_route_ids):
+            route_ids_rsrc = buffer_ops.create_buffer_resource(sorted_route_ids, max_size=True)
         out_rsrc = buffer_ops.create_buffer_resource(moe_buf_i32, max_size=True)
 
         frequency_iters = (c_num_experts + stride - c_one) // stride
@@ -96,6 +105,8 @@ def _compile_moe_ragged_sorting(*, num_experts: int, unit_size: int = UNIT_SIZE)
                 # low-24-bit decode.
                 buffer_ops.buffer_store(i32_tokens, ids_rsrc, index)
                 buffer_ops.buffer_store(c_zero, weights_rsrc, index)
+                if const_expr(emit_route_ids):
+                    buffer_ops.buffer_store(i32_routes, route_ids_rsrc, index)
 
         output_iters = (i32_moe_buf_elems + stride - c_one) // stride
         for iteration in range(
@@ -174,6 +185,7 @@ def _compile_moe_ragged_sorting(*, num_experts: int, unit_size: int = UNIT_SIZE)
         expert_cursors: fx.Tensor,
         sorted_token_ids: fx.Tensor,
         sorted_weights: fx.Tensor,
+        sorted_route_ids: fx.Tensor,
         i32_routes: fx.Int32,
     ):
         c_num_experts = fx.Int32(num_experts)
@@ -185,6 +197,8 @@ def _compile_moe_ragged_sorting(*, num_experts: int, unit_size: int = UNIT_SIZE)
             weights_rsrc = buffer_ops.create_buffer_resource(route_weights, max_size=True)
             sorted_ids_rsrc = buffer_ops.create_buffer_resource(sorted_token_ids, max_size=True)
             sorted_w_rsrc = buffer_ops.create_buffer_resource(sorted_weights, max_size=True)
+            if const_expr(emit_route_ids):
+                sorted_route_rsrc = buffer_ops.create_buffer_resource(sorted_route_ids, max_size=True)
 
             token = buffer_ops.buffer_load(token_rsrc, gid, vec_width=1, dtype=T.i32)
             expert = buffer_ops.buffer_load(expert_rsrc, gid, vec_width=1, dtype=T.i32)
@@ -195,6 +209,8 @@ def _compile_moe_ragged_sorting(*, num_experts: int, unit_size: int = UNIT_SIZE)
                 )
                 buffer_ops.buffer_store(token, sorted_ids_rsrc, position)
                 buffer_ops.buffer_store(weight_bits, sorted_w_rsrc, position)
+                if const_expr(emit_route_ids):
+                    buffer_ops.buffer_store(gid, sorted_route_rsrc, position)
 
     @flyc.jit
     def launch_ragged_sorting(
@@ -205,6 +221,7 @@ def _compile_moe_ragged_sorting(*, num_experts: int, unit_size: int = UNIT_SIZE)
         expert_cursors: fx.Tensor,
         sorted_token_ids: fx.Tensor,
         sorted_weights: fx.Tensor,
+        sorted_route_ids: fx.Tensor,
         sorted_expert_ids: fx.Tensor,
         num_valid_ids: fx.Tensor,
         moe_buf_i32: fx.Tensor,
@@ -221,7 +238,9 @@ def _compile_moe_ragged_sorting(*, num_experts: int, unit_size: int = UNIT_SIZE)
             expert_cursors,
             sorted_token_ids,
             sorted_weights,
+            sorted_route_ids,
             moe_buf_i32,
+            i32_routes,
             i32_tokens,
             i32_max_padded,
             i32_moe_buf_elems,
@@ -255,6 +274,7 @@ def _compile_moe_ragged_sorting(*, num_experts: int, unit_size: int = UNIT_SIZE)
             expert_cursors,
             sorted_token_ids,
             sorted_weights,
+            sorted_route_ids,
             i32_routes,
         )
         scatter.launch(
@@ -292,6 +312,7 @@ def moe_ragged_sorting_flydsl(
     tokens: int,
     max_padded_routes: int,
     unit_size: int = UNIT_SIZE,
+    sorted_route_ids: torch.Tensor | None = None,
 ):
     """Group a flat route list into the metadata consumed by grouped GEMMs.
 
@@ -309,6 +330,16 @@ def moe_ragged_sorting_flydsl(
         raise TypeError("token_indices and expert_indices must be int32")
     if route_weights.dtype != torch.float32:
         raise TypeError("route_weights must be float32")
+    if sorted_route_ids is not None:
+        if sorted_route_ids.dtype != torch.int32:
+            raise TypeError("sorted_route_ids must be int32")
+        if sorted_route_ids.device != token_indices.device:
+            raise ValueError("sorted_route_ids must be on the route tensor device")
+        if not sorted_route_ids.is_contiguous() or int(sorted_route_ids.numel()) < max_padded_routes:
+            raise ValueError(
+                "sorted_route_ids must be contiguous with at least "
+                f"{max_padded_routes} elements"
+            )
 
     device = token_indices.device
     stream = torch.cuda.current_stream(device)
@@ -324,7 +355,9 @@ def moe_ragged_sorting_flydsl(
     launch_fn = _compile_moe_ragged_sorting(
         num_experts=num_experts,
         unit_size=unit_size,
+        emit_route_ids=sorted_route_ids is not None,
     )
+    sorted_route_ids_arg = expert_cursors if sorted_route_ids is None else sorted_route_ids
     args = (
         token_indices,
         expert_indices,
@@ -333,6 +366,7 @@ def moe_ragged_sorting_flydsl(
         expert_cursors,
         sorted_token_ids,
         sorted_weights,
+        sorted_route_ids_arg,
         sorted_expert_ids,
         num_valid_ids,
         moe_buf_i32,
@@ -343,7 +377,7 @@ def moe_ragged_sorting_flydsl(
         clear_grid,
         route_grid,
     )
-    cache_key = (num_experts, unit_size, device.index)
+    cache_key = (num_experts, unit_size, sorted_route_ids is not None, device.index)
     _launch_cached(_ragged_cf_cache, cache_key, launch_fn, args, stream)
 
     return (

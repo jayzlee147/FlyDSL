@@ -9,7 +9,7 @@ import pytest
 import torch
 
 from flydsl.runtime.device import get_rocm_arch
-from kernels.moe.sonic import SonicMoEConfig, sonic_moe_backward
+from kernels.moe.sonic import SonicMoEConfig, sonic_moe_backward, sonic_moe_backward_routes
 
 pytestmark = [pytest.mark.l2_device, pytest.mark.rocm_lower]
 
@@ -269,6 +269,83 @@ def _backward_reference(
     return (*result, db1, db2) if has_bias else result
 
 
+@torch.no_grad()
+def _backward_routes_reference(
+    x,
+    w1,
+    w2,
+    token_indices,
+    expert_indices,
+    route_weights,
+    grad_output,
+    *,
+    activation_name="swiglu",
+    b1=None,
+    b2=None,
+):
+    """Match the flat-route backward's explicit A16 boundaries."""
+
+    tokens, hidden_size = x.shape
+    num_experts, projection_size, _ = w1.shape
+    routes = int(route_weights.numel())
+    intermediate_size = w2.shape[-1]
+    expected_projection_size = intermediate_size * (2 if activation_name in _GLU_ACTIVATIONS else 1)
+    assert projection_size == expected_projection_size
+    dx_routes = torch.empty((routes, hidden_size), dtype=x.dtype, device=x.device)
+    dw1 = torch.zeros_like(w1)
+    dw2 = torch.zeros_like(w2)
+    droute_weights = torch.empty_like(route_weights)
+    has_bias = b1 is not None
+    assert has_bias == (b2 is not None)
+    db1 = torch.zeros_like(b1) if b1 is not None else None
+    db2 = torch.zeros_like(b2) if b2 is not None else None
+
+    for expert in range(num_experts):
+        route_ids = (expert_indices == expert).nonzero(as_tuple=False).flatten()
+        if route_ids.numel() == 0:
+            continue
+        tokens_e = token_indices[route_ids].long()
+        x_e = x[tokens_e]
+        dout_e = grad_output[tokens_e]
+        scores_e = route_weights[route_ids]
+
+        preactivation = x_e.float() @ w1[expert].float().transpose(0, 1)
+        if b1 is not None:
+            preactivation = preactivation + b1[expert].float()
+        preactivation = preactivation.to(x.dtype)
+        activation, _ = _activation_reference(
+            preactivation,
+            torch.zeros(
+                (preactivation.shape[0], intermediate_size),
+                dtype=torch.float32,
+                device=x.device,
+            ),
+            intermediate_size,
+            activation_name,
+        )
+        projection = activation.float() @ w2[expert].float().transpose(0, 1)
+        if b2 is not None:
+            projection = projection + b2[expert].float()
+        projection = projection.to(x.dtype)
+        droute_weights[route_ids] = (dout_e.float() * projection.float()).sum(dim=1)
+        dy = (dout_e.float() * scores_e[:, None]).to(x.dtype)
+        da = (dy.float() @ w2[expert].float()).to(x.dtype).float()
+        _, dz = _activation_reference(preactivation, da, intermediate_size, activation_name)
+
+        dw2[expert] = (dy.float().transpose(0, 1) @ activation.float()).to(x.dtype)
+        dw1[expert] = (dz.float().transpose(0, 1) @ x_e.float()).to(x.dtype)
+        dx_routes[route_ids] = (dz.float() @ w1[expert].float()).to(x.dtype)
+        if db1 is not None:
+            db1[expert] = dz.float().sum(dim=0).to(x.dtype)
+            db2[expert] = dy.float().sum(dim=0).to(x.dtype)
+
+    dx_fp32 = torch.zeros((tokens, hidden_size), dtype=torch.float32, device=x.device)
+    if routes:
+        dx_fp32.index_add_(0, token_indices.long(), dx_routes.float())
+    result = (dx_fp32.to(x.dtype), dw1, dw2, droute_weights)
+    return (*result, db1, db2) if has_bias else result
+
+
 @pytest.mark.parametrize(
     "tokens,hidden_size,intermediate_size,num_experts,topk",
     (
@@ -480,6 +557,189 @@ def test_sonic_moe_backward_activation_variants_match_a16_reference(
     torch.testing.assert_close(actual[3], expected[3], rtol=5e-4, atol=5e-4)
 
 
+@pytest.mark.parametrize("activation_name", _ACTIVATIONS)
+@pytest.mark.parametrize("dtype,compute_dtype", _DTYPES, ids=("bf16", "fp16"))
+def test_sonic_moe_backward_routes_matches_a16_reference(
+    activation_name,
+    dtype,
+    compute_dtype,
+):
+    tokens, hidden_size, intermediate_size, num_experts = 7, 128, 64, 5
+    config = _config(
+        hidden_size,
+        intermediate_size,
+        num_experts,
+        1,
+        activation=activation_name,
+        compute_dtype=compute_dtype,
+    )
+    fixed_case = _make_case(
+        tokens,
+        hidden_size,
+        intermediate_size,
+        num_experts,
+        1,
+        seed=347,
+        activation=activation_name,
+        dtype=dtype,
+    )
+    x, w1, w2, _, _, grad_output = fixed_case
+    # Tokens 1, 4, and 5 have no routes. The first two routes deliberately
+    # duplicate (token=0, expert=1), and expert 4 remains unused.
+    token_indices = torch.tensor([0, 0, 0, 2, 3, 3, 6], dtype=torch.int32, device=x.device)
+    expert_indices = torch.tensor([1, 1, 3, 0, 2, 0, 2], dtype=torch.int32, device=x.device)
+    route_weights = torch.tensor(
+        [0.75, 0.25, -0.1, 0.0, 1.25, 0.4, 0.8],
+        dtype=torch.float32,
+        device=x.device,
+    )
+    b1, b2 = _make_biases(w1, w2, seed=349)
+
+    actual = sonic_moe_backward_routes(
+        x,
+        w1,
+        w2,
+        token_indices,
+        expert_indices,
+        route_weights,
+        grad_output,
+        config,
+        b1=b1,
+        b2=b2,
+    )
+    expected = _backward_routes_reference(
+        x,
+        w1,
+        w2,
+        token_indices,
+        expert_indices,
+        route_weights,
+        grad_output,
+        activation_name=activation_name,
+        b1=b1,
+        b2=b2,
+    )
+    torch.cuda.synchronize()
+
+    assert len(actual) == 6
+    for actual_gradient, expected_gradient in zip(actual, expected):
+        if actual_gradient.dtype == torch.float32:
+            rtol, atol = 5e-4, 5e-4
+        else:
+            rtol, atol = 3e-2, 5e-2
+        torch.testing.assert_close(
+            actual_gradient.float(),
+            expected_gradient.float(),
+            rtol=rtol,
+            atol=atol,
+        )
+    assert torch.count_nonzero(actual[0][torch.tensor([1, 4, 5], device=x.device)]) == 0
+    assert torch.count_nonzero(actual[1][-1]) == 0
+    assert torch.count_nonzero(actual[2][-1]) == 0
+    assert torch.count_nonzero(actual[4][-1]) == 0
+    assert torch.count_nonzero(actual[5][-1]) == 0
+
+
+@pytest.mark.parametrize("with_bias", (False, True), ids=("no-bias", "bias"))
+@pytest.mark.parametrize("dtype,compute_dtype", _DTYPES, ids=("bf16", "fp16"))
+def test_sonic_moe_backward_routes_supports_globally_empty_routes(
+    with_bias,
+    dtype,
+    compute_dtype,
+):
+    config = _config(128, 64, 4, 1, compute_dtype=compute_dtype)
+    x, w1, w2, _, _, grad_output = _make_case(7, 128, 64, 4, 1, seed=353, dtype=dtype)
+    empty_i32 = torch.empty(0, dtype=torch.int32, device=x.device)
+    empty_f32 = torch.empty(0, dtype=torch.float32, device=x.device)
+    b1, b2 = _make_biases(w1, w2, seed=359) if with_bias else (None, None)
+
+    actual = sonic_moe_backward_routes(
+        x,
+        w1,
+        w2,
+        empty_i32,
+        empty_i32,
+        empty_f32,
+        grad_output,
+        config,
+        b1=b1,
+        b2=b2,
+    )
+    torch.cuda.synchronize()
+
+    assert len(actual) == (6 if with_bias else 4)
+    assert all(torch.count_nonzero(gradient) == 0 for gradient in actual)
+    assert actual[0].dtype == actual[1].dtype == actual[2].dtype == dtype
+    assert actual[3].dtype == torch.float32
+
+
+@pytest.mark.parametrize("dtype,compute_dtype", _DTYPES, ids=("bf16", "fp16"))
+def test_sonic_moe_backward_routes_spans_multiple_expert_tiles(dtype, compute_dtype):
+    tokens, hidden_size, intermediate_size, num_experts = 70, 128, 64, 4
+    config = _config(
+        hidden_size,
+        intermediate_size,
+        num_experts,
+        1,
+        compute_dtype=compute_dtype,
+    )
+    x, w1, w2, _, _, grad_output = _make_case(
+        tokens,
+        hidden_size,
+        intermediate_size,
+        num_experts,
+        1,
+        seed=367,
+        dtype=dtype,
+    )
+    token_indices = torch.arange(65, dtype=torch.int32, device=x.device).repeat_interleave(2)
+    expert_indices = torch.tensor([0, 1], dtype=torch.int32, device=x.device).repeat(65)
+    route_weights = torch.linspace(-0.4, 1.2, 130, dtype=torch.float32, device=x.device)
+    b1, b2 = _make_biases(w1, w2, seed=373)
+
+    actual = sonic_moe_backward_routes(
+        x,
+        w1,
+        w2,
+        token_indices,
+        expert_indices,
+        route_weights,
+        grad_output,
+        config,
+        b1=b1,
+        b2=b2,
+    )
+    expected = _backward_routes_reference(
+        x,
+        w1,
+        w2,
+        token_indices,
+        expert_indices,
+        route_weights,
+        grad_output,
+        b1=b1,
+        b2=b2,
+    )
+    torch.cuda.synchronize()
+
+    for actual_gradient, expected_gradient in zip(actual, expected):
+        if actual_gradient.dtype == torch.float32:
+            rtol, atol = 2e-3, 4e-3
+        else:
+            rtol, atol = 3e-2, 5e-2
+        torch.testing.assert_close(
+            actual_gradient.float(),
+            expected_gradient.float(),
+            rtol=rtol,
+            atol=atol,
+        )
+    assert torch.count_nonzero(actual[0][65:]) == 0
+    assert torch.count_nonzero(actual[1][2:]) == 0
+    assert torch.count_nonzero(actual[2][2:]) == 0
+    assert torch.count_nonzero(actual[4][2:]) == 0
+    assert torch.count_nonzero(actual[5][2:]) == 0
+
+
 @pytest.mark.parametrize("dtype,compute_dtype", _DTYPES, ids=("bf16", "fp16"))
 def test_sonic_moe_backward_repeated_calls_do_not_alias_workspace(dtype, compute_dtype):
     config = _config(128, 64, 4, 2, compute_dtype=compute_dtype)
@@ -526,3 +786,41 @@ def test_sonic_moe_backward_rejects_unsupported_contracts():
     assert not noncontiguous_dout.is_contiguous()
     with pytest.raises(ValueError, match="grad_output must be contiguous"):
         sonic_moe_backward(*args[:-1], noncontiguous_dout, _config(128, 64, 4, 2))
+
+    token_indices = torch.tensor([0, 2, 4], dtype=torch.int32, device=args[0].device)
+    expert_indices = torch.tensor([0, 1, 2], dtype=torch.int32, device=args[0].device)
+    route_weights = torch.ones(3, dtype=torch.float32, device=args[0].device)
+    route_config = _config(128, 64, 4, 1)
+    with pytest.raises(ValueError, match="one-dimensional"):
+        sonic_moe_backward_routes(
+            args[0],
+            args[1],
+            args[2],
+            token_indices[:, None],
+            expert_indices,
+            route_weights,
+            args[-1],
+            route_config,
+        )
+    with pytest.raises(TypeError, match="token_indices and expert_indices must be int32"):
+        sonic_moe_backward_routes(
+            args[0],
+            args[1],
+            args[2],
+            token_indices.long(),
+            expert_indices,
+            route_weights,
+            args[-1],
+            route_config,
+        )
+    with pytest.raises(TypeError, match="route_weights must be float32"):
+        sonic_moe_backward_routes(
+            args[0],
+            args[1],
+            args[2],
+            token_indices,
+            expert_indices,
+            route_weights.half(),
+            args[-1],
+            route_config,
+        )

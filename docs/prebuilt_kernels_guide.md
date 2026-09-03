@@ -13,7 +13,7 @@ This guide covers the available FlyDSL kernels — normalization, softmax, GEMM,
 | **GEMM** | `compile_preshuffle_gemm(...)` | `@flyc.kernel` | fp8, int8, fp16, bf16 | Preshuffle B, ping-pong LDS, MFMA 16x16 |
 | **FlashAttention** | `build_flash_attn_func_module(...)` | `@flyc.kernel` | bf16, f16 (any arch); fp8 e4m3fn (gfx950, D=128, dense) | Dual-wave SWP fwd, GQA/MQA, causal, descale ABI |
 | **SonicMoE forward** | `SonicMoE(config, weights)` | Host-composed FlyDSL | BF16/FP16 activation and dense weight; MXFP4 weight with BF16 activation | Routing/top-k + sort, fused activation, weighted down scatter |
-| **SonicMoE backward** | `sonic_moe_backward(...)` | Host-composed FlyDSL | BF16/FP16 activation, dense weight, optional bias | Fixed-K gradients for all seven Sonic activations |
+| **SonicMoE backward** | `sonic_moe_backward(...)`, `sonic_moe_backward_routes(...)` | Host-composed FlyDSL | BF16/FP16 activation, dense weight, optional bias | Fixed-K and flat ragged-route gradients for all seven Sonic activations |
 
 All kernels use the `@flyc.kernel`/`@flyc.jit` API from `flydsl.compiler` and `flydsl.expr` (`python/flydsl/`).
 
@@ -319,6 +319,7 @@ from kernels.moe.sonic import (
     prepare_sonic_fp16_weights,
     prepare_sonic_mxfp4_weights,
     sonic_moe_backward,
+    sonic_moe_backward_routes,
 )
 
 cfg = SonicMoEConfig(
@@ -342,7 +343,7 @@ weights_fp16 = prepare_sonic_fp16_weights(w1_fp16, w2_fp16, cfg_fp16)
 out_fp16 = SonicMoE(cfg_fp16, weights_fp16)(hidden_states_fp16, router_logits_fp16)
 
 # Initial training API: logical dense expert-major weights, explicit fixed-K
-# routes, BF16, any supported activation, and optional expert bias. Omitting
+# routes, BF16/FP16, any supported activation, and optional expert bias. Omitting
 # b1/b2 keeps the original four-result return contract.
 dx, dw1, dw2, droute_scores, db1, db2 = sonic_moe_backward(
     hidden_states_bf16,
@@ -350,6 +351,21 @@ dx, dw1, dw2, droute_scores, db1, db2 = sonic_moe_backward(
     w2,
     topk_ids_i32,
     topk_scores_f32,
+    grad_output_bf16,
+    cfg,
+    b1=b1,
+    b2=b2,
+)
+
+# Flat routes preserve one score-gradient destination per original edge,
+# including duplicate (token, expert) pairs and tokens with zero routes.
+dx, dw1, dw2, droute_scores, db1, db2 = sonic_moe_backward_routes(
+    hidden_states_bf16,
+    w1,
+    w2,
+    token_indices_i32,
+    expert_indices_i32,
+    route_scores_f32,
     grad_output_bf16,
     cfg,
     b1=b1,
@@ -418,10 +434,10 @@ cache entries do not collide.
 
 Optional expert-major BF16/FP16 `b1`/`b2` are prepared with the weights and fused
 before the activation and route weighting, respectively. The initial
-`sonic_moe_backward` path supports dense BF16/FP16 weights, fixed-K routing, every
-supported activation, and optional expert bias. It independently re-sorts
-routes and recomputes the materialized pre-activation and projection, so it does
-not retain or alias an inference workspace across calls. The bring-up
+The backward paths support dense BF16/FP16 weights, fixed-K or flat ragged
+routing, every supported activation, and optional expert bias. They independently
+re-sort routes and recompute the materialized pre-activation and projection, so
+they do not retain or alias an inference workspace across calls. The bring-up
 implementation uses per-expert A16W16 GEMMs and one host synchronization to read
 expert frequencies; activation, routing, reduction, and every tensor
 calculation remain FlyDSL device kernels. The
@@ -429,8 +445,9 @@ calculation remain FlyDSL device kernels. The
 backward GEMMs, so this is not bitwise parity with a legacy FP32-scaled Triton
 grouped GEMM.
 
-Backward for flat ragged routes is not yet provided by this entry point. The
-packed A16 atomic forward output is non-deterministic at the last few bits. See
+Flat-route backward accumulates routed input gradients through an FP32 atomic
+buffer, so high-fan-in tokens can be non-deterministic at the last few bits. The
+packed A16 atomic forward output has the same property. See
 `examples/06-sonicMoE.py` for correctness and warm-cache benchmarking.
 
 ### Scaled-MFMA status

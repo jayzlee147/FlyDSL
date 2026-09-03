@@ -18,10 +18,10 @@ Weights may be dense BF16/FP16 (A16W16) or per-1x32 E8M0-scaled MXFP4
 (A16W4). MXFP4 currently uses BF16 activations; dense weights use the compute
 dtype selected by :class:`SonicMoEConfig`.
 The reusable :class:`SonicMoE` object remains an inference-forward API.  This
-module also exports the standalone ``sonic_moe_backward`` entry point for
-dense BF16/FP16 fixed-K training across all supported activations, including
-optional expert bias gradients. Flat ragged routes remain staged follow-up
-work.
+module also exports standalone ``sonic_moe_backward`` and
+``sonic_moe_backward_routes`` entry points for dense BF16/FP16 fixed-K and flat
+ragged-route training across all supported activations, including optional
+expert bias gradients.
 """
 
 from __future__ import annotations
@@ -49,7 +49,10 @@ from kernels.moe.moe_sorting_kernel import (
     moe_sorting_flydsl,
     moe_sorting_get_workspace_size,
 )
-from kernels.moe.sonic_backward import sonic_moe_backward as sonic_moe_backward
+from kernels.moe.sonic_backward import (
+    sonic_moe_backward as sonic_moe_backward,
+    sonic_moe_backward_routes as sonic_moe_backward_routes,
+)
 
 _GFX950_LDS_BYTES = 160 * 1024
 _MAX_BUFFER_BYTE_OFFSET = 0xFFFFFFFF
@@ -1657,6 +1660,7 @@ __all__ = [
     "prepare_sonic_fp16_weights",
     "prepare_sonic_mxfp4_weights",
     "sonic_moe_backward",
+    "sonic_moe_backward_routes",
     "sonic_moe_mxfp4_reference",
     "sonic_moe_reference",
 ]
