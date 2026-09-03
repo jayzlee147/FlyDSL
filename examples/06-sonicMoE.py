@@ -23,6 +23,7 @@ from kernels.moe.sonic import (
     SonicMoE,
     SonicMoEConfig,
     prepare_sonic_bf16_weights,
+    prepare_sonic_fp16_weights,
     prepare_sonic_mxfp4_weights,
     sonic_moe_mxfp4_reference,
     sonic_moe_reference,
@@ -42,7 +43,7 @@ def _parse_args():
     parser.add_argument("--tile-k", type=int, default=128)
     parser.add_argument("--down-tile-n", type=int, default=None)
     parser.add_argument("--down-tile-k", type=int, default=None)
-    parser.add_argument("--weight-dtype", choices=("bf16", "mxfp4"), default="bf16")
+    parser.add_argument("--weight-dtype", choices=("bf16", "fp16", "mxfp4"), default="bf16")
     parser.add_argument(
         "--activation",
         choices=("swiglu", "geglu", "reglu", "gelu_tanh_approx", "relu", "silu", "relu_sq"),
@@ -71,6 +72,8 @@ def main():
     if args.warmup < 0 or args.iters <= 0:
         raise ValueError("--warmup must be >= 0 and --iters must be > 0")
 
+    compute_dtype = "bf16" if args.weight_dtype == "mxfp4" else args.weight_dtype
+    torch_dtype = torch.bfloat16 if compute_dtype == "bf16" else torch.float16
     config = SonicMoEConfig(
         hidden_size=args.hidden_size,
         intermediate_size=args.intermediate_size,
@@ -82,35 +85,31 @@ def main():
         down_tile_n=args.down_tile_n,
         down_tile_k=args.down_tile_k,
         activation=args.activation,
+        compute_dtype=compute_dtype,
     )
     device = torch.device("cuda")
     torch.manual_seed(args.seed)
-    x = torch.randn(args.tokens, args.hidden_size, device=device, dtype=torch.bfloat16)
-    w1 = (
-        torch.randn(
-            args.experts,
-            args.intermediate_size
-            * (2 if args.activation in ("swiglu", "geglu", "reglu") else 1),
-            args.hidden_size,
-            device=device,
-            dtype=torch.bfloat16,
-        )
-        / math.sqrt(args.hidden_size)
-    )
-    w2 = (
-        torch.randn(
-            args.experts,
-            args.hidden_size,
-            args.intermediate_size,
-            device=device,
-            dtype=torch.bfloat16,
-        )
-        / math.sqrt(args.intermediate_size)
-    )
-    router_logits = torch.randn(args.tokens, args.experts, device=device, dtype=torch.bfloat16)
+    x = torch.randn(args.tokens, args.hidden_size, device=device, dtype=torch_dtype)
+    w1 = torch.randn(
+        args.experts,
+        args.intermediate_size * (2 if args.activation in ("swiglu", "geglu", "reglu") else 1),
+        args.hidden_size,
+        device=device,
+        dtype=torch_dtype,
+    ) / math.sqrt(args.hidden_size)
+    w2 = torch.randn(
+        args.experts,
+        args.hidden_size,
+        args.intermediate_size,
+        device=device,
+        dtype=torch_dtype,
+    ) / math.sqrt(args.intermediate_size)
+    router_logits = torch.randn(args.tokens, args.experts, device=device, dtype=torch_dtype)
 
     if args.weight_dtype == "mxfp4":
         prepared = prepare_sonic_mxfp4_weights(w1, w2, config)
+    elif args.weight_dtype == "fp16":
+        prepared = prepare_sonic_fp16_weights(w1, w2, config)
     else:
         prepared = prepare_sonic_bf16_weights(w1, w2, config)
     if args.autotune:
@@ -123,7 +122,7 @@ def main():
         )
     else:
         op = SonicMoE(config, prepared)
-    out = torch.empty((args.tokens, args.hidden_size), device=device, dtype=torch.bfloat16)
+    out = torch.empty((args.tokens, args.hidden_size), device=device, dtype=torch_dtype)
 
     # Cold call performs JIT compilation. Subsequent calls dispatch cached binaries.
     op(x, router_logits, out=out)
@@ -151,9 +150,7 @@ def main():
         )
         out_f32 = out.float()
         ref_f32 = ref.float()
-        cosine = torch.nn.functional.cosine_similarity(
-            out_f32.flatten(), ref_f32.flatten(), dim=0
-        ).item()
+        cosine = torch.nn.functional.cosine_similarity(out_f32.flatten(), ref_f32.flatten(), dim=0).item()
         ref_norm = torch.linalg.vector_norm(ref_f32)
         out_norm = torch.linalg.vector_norm(out_f32)
         if ref_norm.item() == 0.0:
@@ -166,7 +163,7 @@ def main():
             norm_ratio = (out_norm / ref_norm).item()
         max_abs = (out_f32 - ref_f32).abs().max().item()
         max_reference = ref_f32.abs().max().item()
-        reference_name = "quantized-weight" if args.weight_dtype == "mxfp4" else "BF16"
+        reference_name = "quantized-weight" if args.weight_dtype == "mxfp4" else args.weight_dtype.upper()
         print(
             f"kernel-vs-{reference_name}: cosine={cosine:.7f}, "
             f"relative_l2={relative_l2:.6f}, norm_ratio={norm_ratio:.6f}, "
@@ -207,14 +204,7 @@ def main():
     latency_us = start.elapsed_time(end) * 1000.0 / args.iters
     # GLU stage 1 has two projections; pointwise activations have one. Stage 2 has one.
     projection_count = 3 if args.activation in ("swiglu", "geglu", "reglu") else 2
-    useful_flops = (
-        2.0
-        * projection_count
-        * args.tokens
-        * args.top_k
-        * args.hidden_size
-        * args.intermediate_size
-    )
+    useful_flops = 2.0 * projection_count * args.tokens * args.top_k * args.hidden_size * args.intermediate_size
     useful_tflops = useful_flops / (latency_us * 1e-6) / 1e12
     if op.workspace is None:
         raise RuntimeError("SonicMoE workspace was not initialized")

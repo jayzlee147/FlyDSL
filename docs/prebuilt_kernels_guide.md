@@ -12,7 +12,7 @@ This guide covers the available FlyDSL kernels — normalization, softmax, GEMM,
 | **Softmax backward** | `build_softmax_bwd_module(N, dtype)` | Layout API (`@flyc.kernel`) | f32, f16, bf16 | fp32 dot reduction, native-dtype register buffering |
 | **GEMM** | `compile_preshuffle_gemm(...)` | `@flyc.kernel` | fp8, int8, fp16, bf16 | Preshuffle B, ping-pong LDS, MFMA 16x16 |
 | **FlashAttention** | `build_flash_attn_func_module(...)` | `@flyc.kernel` | bf16, f16 (any arch); fp8 e4m3fn (gfx950, D=128, dense) | Dual-wave SWP fwd, GQA/MQA, causal, descale ABI |
-| **SonicMoE forward** | `SonicMoE(config, weights)` | Host-composed FlyDSL | BF16 activation/bias; BF16 or MXFP4 weight | Routing/top-k + sort, fused activation, weighted down scatter |
+| **SonicMoE forward** | `SonicMoE(config, weights)` | Host-composed FlyDSL | BF16/FP16 activation and dense weight; MXFP4 weight with BF16 activation | Routing/top-k + sort, fused activation, weighted down scatter |
 
 All kernels use the `@flyc.kernel`/`@flyc.jit` API from `flydsl.compiler` and `flydsl.expr` (`python/flydsl/`).
 
@@ -298,21 +298,24 @@ python3 tests/kernels/test_flash_attn_fwd.py --dtype fp8 --compare --warmup 10 -
 
 ---
 
-## 3c. SonicMoE BF16/A16W4 forward (`kernels/moe/sonic.py`)
+## 3c. SonicMoE A16W16/A16W4 forward (`kernels/moe/sonic.py`)
 
 The gfx950 inference path composes the existing FlyDSL routing and
 `moe_2stage_a16wmix` MFMA kernels. The routing stage rounds each expert's rows to
-`tile_m` and records packed token/slot indices. Stage 1 gathers the original BF16
-rows while loading A and fuses the selected activation; stage 2 consumes the
-sorted BF16 intermediate and performs routing-weighted BF16 atomic scatter. No
+`tile_m` and records packed token/slot indices. Stage 1 gathers the original
+BF16/FP16 rows while loading A and fuses the selected activation; stage 2 consumes
+the sorted A16 intermediate and performs routing-weighted packed A16 atomic scatter. No
 explicit gathered activation tensor is materialized. Supported activations are
 SwiGLU, GEGLU, ReGLU, GELU-tanh, ReLU, SiLU, and ReLU squared.
 
 ```python
+from dataclasses import replace
+
 from kernels.moe.sonic import (
     SonicMoE,
     SonicMoEConfig,
     prepare_sonic_bf16_weights,
+    prepare_sonic_fp16_weights,
     prepare_sonic_mxfp4_weights,
 )
 
@@ -330,6 +333,11 @@ weights = prepare_sonic_bf16_weights(w1, w2, cfg, b1=b1, b2=b2)
 # weights = prepare_sonic_mxfp4_weights(w1, w2, cfg, b1=b1, b2=b2)
 op = SonicMoE(cfg, weights)
 out = op(hidden_states_bf16, router_logits_bf16)
+
+# Dense FP16 uses the same logical layouts and native FP16 MFMA.
+cfg_fp16 = replace(cfg, compute_dtype="fp16")
+weights_fp16 = prepare_sonic_fp16_weights(w1_fp16, w2_fp16, cfg_fp16)
+out_fp16 = SonicMoE(cfg_fp16, weights_fp16)(hidden_states_fp16, router_logits_fp16)
 ```
 
 Weights are preshuffled once during preparation. Workspaces and compiled launchers
@@ -386,10 +394,10 @@ traffic profiles, construct separate tuners with `profile_key="uniform"`,
 `profile_key="decode-skew"`, or another stable application label so their disk
 cache entries do not collide.
 
-This API is inference-forward only. Optional expert-major BF16 `b1`/`b2` are
+This API is inference-forward only. Optional expert-major BF16/FP16 `b1`/`b2` are
 prepared with the weights and fused before the activation and route weighting,
 respectively. Saved pre-activation, backward, varlen-K dW, and activation
-derivatives are not yet provided. The BF16 atomic output is non-deterministic at
+derivatives are not yet provided. The packed A16 atomic output is non-deterministic at
 the last few bits. See `examples/06-sonicMoE.py` for correctness and warm-cache
 benchmarking.
 
@@ -570,7 +578,7 @@ What operation do you need?
 │       └── See kernels/gemm/preshuffle_gemm.py
 │
 ├── MoE (Mixture of Experts)
-│   ├── SonicMoE BF16/A16W4 forward → SonicMoE (kernels/moe/sonic.py)
+│   ├── SonicMoE A16W16/A16W4 forward → SonicMoE (kernels/moe/sonic.py)
 │   ├── Blockscale MoE (gate+up+reduce)
 │   └── Standard MoE (fp8/f16/bf16/int8/int4)
 │       └── → kernels/moe/moe_gemm_2stage.py
@@ -590,7 +598,7 @@ What operation do you need?
 | `kernels/gemm/preshuffle_gemm.py` | GEMM (preshuffle layout) |
 | `kernels/moe/moe_gemm_2stage.py` | MoE GEMM 2-stage (gate/up + reduce) |
 | `kernels/moe/mxfp_moe/` | Fused a4w4/a8w4 MoE 2-stage GEMM (device fp4 re-quant) |
-| `kernels/moe/sonic.py` | gfx950 SonicMoE BF16/A16W4 inference forward orchestration |
+| `kernels/moe/sonic.py` | gfx950 SonicMoE A16W16/A16W4 inference forward orchestration |
 | `kernels/moe/sonic_autotune.py` | Shape-bucket SonicMoE tile autotuner and disk cache |
 | `kernels/attention/pa_decode_fp8.py` | Paged attention decode (FP8) |
 | `kernels/attention/flash_attn_generic.py` | FlashAttention generic fallback |
@@ -620,7 +628,7 @@ What operation do you need?
 | `tests/kernels/test_preshuffle_gemm.py` | GEMM fp8/int8/fp16/bf16 |
 | `tests/kernels/test_moe_gemm.py` | MoE GEMM |
 | `tests/kernels/test_moe_reduce.py` | MoE reduce kernel |
-| `tests/kernels/test_sonic_moe.py` | SonicMoE BF16/A16W4 correctness, autotuning, routing, workspace, validation |
+| `tests/kernels/test_sonic_moe.py` | SonicMoE BF16/FP16/A16W4 correctness, autotuning, routing, workspace, validation |
 | `tests/kernels/test_pa.py` | Paged attention decode |
 | `tests/kernels/test_flash_attn_fwd.py` | FlashAttention |
 | `tests/kernels/test_layernorm.py` | LayerNorm |

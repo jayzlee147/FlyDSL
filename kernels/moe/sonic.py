@@ -12,10 +12,11 @@ The hot path is three logical stages:
 No gathered activation tensor is materialized.  Expert rows are represented by
 ``sorted_token_ids`` and each expert's row count is rounded to ``tile_m`` by the
 sorting kernel.  Stage 1 gathers the original activation rows while loading A;
-stage 2 consumes the sorted BF16 intermediate and scatters directly to tokens.
+stage 2 consumes the sorted 16-bit intermediate and scatters directly to tokens.
 
-Weights may be dense BF16 (A16W16) or per-1x32 E8M0-scaled MXFP4
-(A16W4); activations and the stage-1 intermediate remain BF16 in both modes.
+Weights may be dense BF16/FP16 (A16W16) or per-1x32 E8M0-scaled MXFP4
+(A16W4). MXFP4 currently uses BF16 activations; dense weights use the compute
+dtype selected by :class:`SonicMoEConfig`.
 This module is intentionally an inference-forward API.  The SonicMoE training
 backward (varlen-K dW, activation derivatives, and bias reductions) is not
 implemented here.
@@ -47,7 +48,6 @@ from kernels.moe.moe_sorting_kernel import (
     moe_sorting_get_workspace_size,
 )
 
-
 _GFX950_LDS_BYTES = 160 * 1024
 _MAX_BUFFER_BYTE_OFFSET = 0xFFFFFFFF
 _MAX_SIGNED_I32 = 0x7FFFFFFF
@@ -57,9 +57,11 @@ _SUPPORTED_ROUTER_DTYPES = {
     torch.float16: "f16",
     torch.bfloat16: "bf16",
 }
-_SUPPORTED_ACTIVATIONS = frozenset(
-    {"swiglu", "geglu", "reglu", "gelu_tanh_approx", "relu", "silu", "relu_sq"}
-)
+_COMPUTE_DTYPES = {
+    "bf16": torch.bfloat16,
+    "fp16": torch.float16,
+}
+_SUPPORTED_ACTIVATIONS = frozenset({"swiglu", "geglu", "reglu", "gelu_tanh_approx", "relu", "silu", "relu_sq"})
 _GLU_ACTIVATIONS = frozenset({"swiglu", "geglu", "reglu"})
 _GEMM1_ACTIVATIONS = {
     # gemm1's historical ``silu`` spelling means the fused SwiGLU epilogue.
@@ -99,14 +101,18 @@ class SonicMoEConfig:
     waves_per_eu: int | None = None
     persistent_stage2: bool = False
     activation: str = "swiglu"
+    compute_dtype: str = "bf16"
 
     def __post_init__(self) -> None:
+        if self.compute_dtype not in _COMPUTE_DTYPES:
+            raise ValueError(
+                f"unsupported compute_dtype {self.compute_dtype!r}; expected one of " f"{sorted(_COMPUTE_DTYPES)}"
+            )
         if not isinstance(self.activation, str):
             raise TypeError(f"activation must be a string, got {type(self.activation).__name__}")
         if self.activation not in _SUPPORTED_ACTIVATIONS:
             raise ValueError(
-                f"unsupported activation {self.activation!r}; expected one of "
-                f"{sorted(_SUPPORTED_ACTIVATIONS)}"
+                f"unsupported activation {self.activation!r}; expected one of " f"{sorted(_SUPPORTED_ACTIVATIONS)}"
             )
         positive = {
             "hidden_size": self.hidden_size,
@@ -123,22 +129,18 @@ class SonicMoEConfig:
             if int(value) <= 0:
                 raise ValueError(f"{name} must be positive, got {value}")
         if self.top_k > self.num_experts:
-            raise ValueError(
-                f"top_k ({self.top_k}) cannot exceed num_experts ({self.num_experts})"
-            )
+            raise ValueError(f"top_k ({self.top_k}) cannot exceed num_experts ({self.num_experts})")
         if self.top_k > 16:
             raise ValueError(f"top_k must be <= 16 for the gfx950 router, got {self.top_k}")
         if self.tile_m % 16 != 0:
             raise ValueError(f"tile_m must be a multiple of 16, got {self.tile_m}")
         if self.tile_n % 64 != 0 or self.stage2_tile_n % 64 != 0:
             raise ValueError(
-                "tile_n and down_tile_n must be multiples of 64, got "
-                f"{self.tile_n}/{self.stage2_tile_n}"
+                "tile_n and down_tile_n must be multiples of 64, got " f"{self.tile_n}/{self.stage2_tile_n}"
             )
         if self.tile_k % 32 != 0 or self.stage2_tile_k % 32 != 0:
             raise ValueError(
-                "tile_k and down_tile_k must be multiples of MFMA-K=32, got "
-                f"{self.tile_k}/{self.stage2_tile_k}"
+                "tile_k and down_tile_k must be multiples of MFMA-K=32, got " f"{self.tile_k}/{self.stage2_tile_k}"
             )
         if self.tile_k & (self.tile_k - 1) or self.stage2_tile_k & (self.stage2_tile_k - 1):
             raise ValueError(
@@ -149,27 +151,19 @@ class SonicMoEConfig:
         # cover an integral number of those 4096-byte transfer rounds.
         if (self.tile_m * self.tile_k) % 2048 != 0:
             raise ValueError(
-                "tile_m * tile_k must be a multiple of 2048 BF16 elements for "
-                "the stage1 direct-to-LDS copy"
+                "tile_m * tile_k must be a multiple of 2048 A16 elements for " "the stage1 direct-to-LDS copy"
             )
         if (self.tile_m * self.stage2_tile_k) % 2048 != 0:
             raise ValueError(
-                "tile_m * down_tile_k must be a multiple of 2048 BF16 elements for "
-                "the stage2 direct-to-LDS copy"
+                "tile_m * down_tile_k must be a multiple of 2048 A16 elements for " "the stage2 direct-to-LDS copy"
             )
         if self.hidden_size % 32 != 0 or self.intermediate_size % 32 != 0:
-            raise ValueError(
-                "hidden_size and intermediate_size must be multiples of 32 for the "
-                "BF16 preshuffle"
-            )
+            raise ValueError("hidden_size and intermediate_size must be multiples of 32 for the " "16-bit preshuffle")
         if self.hidden_size % self.tile_k != 0:
-            raise ValueError(
-                f"hidden_size ({self.hidden_size}) must be divisible by tile_k ({self.tile_k})"
-            )
+            raise ValueError(f"hidden_size ({self.hidden_size}) must be divisible by tile_k ({self.tile_k})")
         if self.intermediate_size % self.tile_n != 0:
             raise ValueError(
-                "intermediate_size "
-                f"({self.intermediate_size}) must be divisible by tile_n ({self.tile_n})"
+                "intermediate_size " f"({self.intermediate_size}) must be divisible by tile_n ({self.tile_n})"
             )
         if self.intermediate_size % self.stage2_tile_k != 0:
             raise ValueError(
@@ -178,8 +172,7 @@ class SonicMoEConfig:
             )
         if self.hidden_size % self.stage2_tile_n != 0:
             raise ValueError(
-                f"hidden_size ({self.hidden_size}) must be divisible by "
-                f"down_tile_n ({self.stage2_tile_n})"
+                f"hidden_size ({self.hidden_size}) must be divisible by " f"down_tile_n ({self.stage2_tile_n})"
             )
         if self.intermediate_size % 128 != 0:
             raise ValueError("intermediate_size must be divisible by 128")
@@ -196,13 +189,11 @@ class SonicMoEConfig:
         stage2_lds = self.tile_m * self.stage2_tile_k * 2 + self.tile_m * self.stage2_tile_n * 4
         if stage1_lds > _GFX950_LDS_BYTES:
             raise ValueError(
-                f"stage1 tile needs {stage1_lds} LDS bytes, exceeding gfx950's "
-                f"{_GFX950_LDS_BYTES} bytes"
+                f"stage1 tile needs {stage1_lds} LDS bytes, exceeding gfx950's " f"{_GFX950_LDS_BYTES} bytes"
             )
         if stage2_lds > _GFX950_LDS_BYTES:
             raise ValueError(
-                f"stage2 tile needs {stage2_lds} LDS bytes, exceeding gfx950's "
-                f"{_GFX950_LDS_BYTES} bytes"
+                f"stage2 tile needs {stage2_lds} LDS bytes, exceeding gfx950's " f"{_GFX950_LDS_BYTES} bytes"
             )
 
     @property
@@ -217,9 +208,7 @@ class SonicMoEConfig:
     def supports_flydsl_router(self) -> bool:
         """Whether the logits-to-top-k FlyDSL layout supports this expert count."""
 
-        return self.num_experts <= 1024 and not (
-            self.num_experts & (self.num_experts - 1)
-        )
+        return self.num_experts <= 1024 and not (self.num_experts & (self.num_experts - 1))
 
     @property
     def is_glu(self) -> bool:
@@ -234,8 +223,9 @@ class SonicMoEConfig:
 class SonicMoEWeights:
     """Prepared weights consumed by the gfx950 grouped MFMA kernels.
 
-    ``weight_dtype`` is either ``"bf16"`` (dense BF16) or ``"mxfp4"``
-    (per-1x32 E8M0-scaled FP4 weights with a BF16 activation/intermediate).
+    ``weight_dtype`` is ``"bf16"``/``"fp16"`` for dense A16W16 or ``"mxfp4"``
+    for per-1x32 E8M0-scaled FP4 weights. MXFP4 currently requires a BF16
+    activation/intermediate ABI.
     The logical weight shapes are captured by ``config``; tile-only config
     changes do not require another preshuffle.
     """
@@ -270,6 +260,10 @@ class SonicMoEWeights:
     @property
     def has_bias(self) -> bool:
         return self.stage1_bias is not None
+
+    @property
+    def compute_dtype(self) -> torch.dtype:
+        return _COMPUTE_DTYPES[self.config.compute_dtype]
 
 
 @dataclass
@@ -338,30 +332,24 @@ class SonicMoEWorkspace:
         # supports duplicates, so it cannot use that tighter bound.
         route_count = tokens * config.top_k if routes is None else int(routes)
         active_experts = min(config.num_experts, route_count)
-        padding_bound = (
-            route_count + active_experts * (config.tile_m - 1)
-        ) // config.tile_m
+        padding_bound = (route_count + active_experts * (config.tile_m - 1)) // config.tile_m
         if routes is None:
-            per_expert_bound = active_experts * (
-                (tokens + config.tile_m - 1) // config.tile_m
-            )
+            per_expert_bound = active_experts * ((tokens + config.tile_m - 1) // config.tile_m)
             max_blocks = min(padding_bound, per_expert_bound)
         else:
             max_blocks = padding_bound
         max_padded = max_blocks * config.tile_m
         if max_padded > _MAX_SIGNED_I32:
             raise ValueError(
-                "padded route count exceeds the sorting kernel's signed 32-bit "
-                f"index limit: {max_padded}"
+                "padded route count exceeds the sorting kernel's signed 32-bit " f"index limit: {max_padded}"
             )
         if max_padded * 4 > _MAX_BUFFER_BYTE_OFFSET:
             raise ValueError(
-                "sorted route metadata exceeds the kernel's 32-bit byte-offset "
-                f"limit: max_padded={max_padded}"
+                "sorted route metadata exceeds the kernel's 32-bit byte-offset " f"limit: max_padded={max_padded}"
             )
         if max_padded * config.intermediate_size * 2 > _MAX_BUFFER_BYTE_OFFSET:
             raise ValueError(
-                "sorted BF16 intermediate exceeds the kernel's 32-bit byte-offset limit: "
+                "sorted 16-bit intermediate exceeds the kernel's 32-bit byte-offset limit: "
                 f"max_padded={max_padded}, intermediate_size={config.intermediate_size}"
             )
         if routes is None:
@@ -403,46 +391,38 @@ class SonicMoEWorkspace:
                 if sorting_workspace_size
                 else None
             ),
-            expert_frequency=torch.empty(
-                config.num_experts, dtype=torch.int32, device=device
-            ),
-            router_topk_weights=torch.empty(
-                (tokens, config.top_k), dtype=torch.float32, device=device
-            ),
-            router_topk_ids=torch.empty(
-                (tokens, config.top_k), dtype=torch.int32, device=device
-            ),
-            router_topk_expert_indices=torch.empty(
-                (tokens, config.top_k), dtype=torch.int32, device=device
-            ),
+            expert_frequency=torch.empty(config.num_experts, dtype=torch.int32, device=device),
+            router_topk_weights=torch.empty((tokens, config.top_k), dtype=torch.float32, device=device),
+            router_topk_ids=torch.empty((tokens, config.top_k), dtype=torch.int32, device=device),
+            router_topk_expert_indices=torch.empty((tokens, config.top_k), dtype=torch.int32, device=device),
             intermediate=torch.empty(
                 (max(1, max_padded), config.intermediate_size),
-                dtype=torch.bfloat16,
+                dtype=_COMPUTE_DTYPES[config.compute_dtype],
                 device=device,
             ),
             output=torch.empty(
                 (tokens, config.hidden_size),
-                dtype=torch.bfloat16,
+                dtype=_COMPUTE_DTYPES[config.compute_dtype],
                 device=device,
             ),
         )
 
 
-def _preshuffle_bf16_weight(weight: torch.Tensor) -> torch.Tensor:
-    """Convert ``[..., N, K]`` BF16 rows to FlyDSL's 16x16 N-major layout."""
+def _preshuffle_16bit_weight(
+    weight: torch.Tensor,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    """Convert ``[..., N, K]`` FP16/BF16 rows to the 16x16 N-major layout."""
 
     n, k = weight.shape[-2:]
     if n % 16 != 0 or k % 32 != 0:
         raise ValueError(f"weight N/K must be divisible by 16/32, got {n}/{k}")
-    x = weight.detach().to(dtype=torch.bfloat16).contiguous()
+    if dtype not in (torch.float16, torch.bfloat16):
+        raise TypeError(f"dense SonicMoE weight dtype must be FP16 or BF16, got {dtype}")
+    x = weight.detach().to(dtype=dtype).contiguous()
     leading = x.numel() // (n * k)
-    # BK=32, KPack=8 BF16 values (16 bytes), BN=16.
-    return (
-        x.view(leading, n // 16, 16, k // 32, 4, 8)
-        .permute(0, 1, 3, 4, 2, 5)
-        .contiguous()
-        .view_as(x)
-    )
+    # BK=32, KPack=8 16-bit values (16 bytes), BN=16.
+    return x.view(leading, n // 16, 16, k // 32, 4, 8).permute(0, 1, 3, 4, 2, 5).contiguous().view_as(x)
 
 
 def _validate_weight_inputs(
@@ -470,7 +450,7 @@ def _prepare_biases(
     w1: torch.Tensor,
     config: SonicMoEConfig,
 ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
-    """Validate optional logical expert biases and materialize the BF16 ABI."""
+    """Validate optional logical expert biases and materialize the A16 ABI."""
 
     if (b1 is None) != (b2 is None):
         raise ValueError("b1 and b2 must either both be provided or both be None")
@@ -490,9 +470,10 @@ def _prepare_biases(
         raise ValueError("b1/b2 and expert weights must share a device")
     if not (b1.dtype.is_floating_point and b2.dtype.is_floating_point):
         raise TypeError(f"b1/b2 must be floating point, got {b1.dtype}/{b2.dtype}")
+    compute_dtype = _COMPUTE_DTYPES[config.compute_dtype]
     return (
-        b1.detach().to(dtype=torch.bfloat16, copy=True).contiguous(),
-        b2.detach().to(dtype=torch.bfloat16, copy=True).contiguous(),
+        b1.detach().to(dtype=compute_dtype, copy=True).contiguous(),
+        b2.detach().to(dtype=compute_dtype, copy=True).contiguous(),
     )
 
 
@@ -506,12 +487,13 @@ def _mxfp4_scale_storage_numel(experts: int, rows: int, k: int) -> int:
     return _round_up(experts * rows, 256) * _round_up(k // 32, 8)
 
 
-def _validate_bf16_resource_limits(config: SonicMoEConfig) -> None:
+def _validate_dense_resource_limits(config: SonicMoEConfig) -> None:
     # Each expert gets a 64-bit resource base, but offsets within it remain u32.
     gate_up_bytes_per_expert = config.stage1_projection_size * config.hidden_size * 2
     if gate_up_bytes_per_expert > _MAX_BUFFER_BYTE_OFFSET:
         raise ValueError(
-            "BF16 gate/up weights for one expert exceed the 32-bit byte-offset limit: "
+            "dense 16-bit gate/up weights for one expert exceed the 32-bit "
+            "byte-offset limit: "
             f"{gate_up_bytes_per_expert} bytes"
         )
 
@@ -529,12 +511,8 @@ def _validate_mxfp4_resource_limits(config: SonicMoEConfig) -> None:
     gate_scale_cols = _round_up(config.hidden_size // 32, 8)
     down_scale_cols = _round_up(config.intermediate_size // 32, 8)
     spans = {
-        "gate/up E8M0 scales": config.num_experts
-        * config.stage1_projection_size
-        * gate_scale_cols,
-        "down E8M0 scales": config.num_experts
-        * config.hidden_size
-        * down_scale_cols,
+        "gate/up E8M0 scales": config.num_experts * config.stage1_projection_size * gate_scale_cols,
+        "down E8M0 scales": config.num_experts * config.hidden_size * down_scale_cols,
     }
     for name, span in spans.items():
         if span > _MAX_BUFFER_BYTE_OFFSET:
@@ -571,20 +549,19 @@ def _validate_prepared_weight_storage(
         expected_b2 = (config.num_experts, config.hidden_size)
         if tuple(weights.stage1_bias.shape) != expected_b1:
             raise ValueError(
-                f"prepared stage1_bias must have shape {expected_b1}, "
-                f"got {tuple(weights.stage1_bias.shape)}"
+                f"prepared stage1_bias must have shape {expected_b1}, " f"got {tuple(weights.stage1_bias.shape)}"
             )
         if tuple(weights.stage2_bias.shape) != expected_b2:
             raise ValueError(
-                f"prepared stage2_bias must have shape {expected_b2}, "
-                f"got {tuple(weights.stage2_bias.shape)}"
+                f"prepared stage2_bias must have shape {expected_b2}, " f"got {tuple(weights.stage2_bias.shape)}"
             )
-        if weights.stage1_bias.dtype != torch.bfloat16 or weights.stage2_bias.dtype != torch.bfloat16:
-            raise TypeError("prepared SonicMoE biases must use torch.bfloat16 storage")
+        expected_dtype = _COMPUTE_DTYPES[config.compute_dtype]
+        if weights.stage1_bias.dtype != expected_dtype or weights.stage2_bias.dtype != expected_dtype:
+            raise TypeError(f"prepared SonicMoE biases must use {expected_dtype} storage")
         if weights.stage1_bias.data_ptr() % 2 or weights.stage2_bias.data_ptr() % 2:
             raise ValueError("prepared SonicMoE biases must be 2-byte aligned")
 
-    if weights.weight_dtype == "bf16":
+    if weights.weight_dtype in ("bf16", "fp16"):
         expected_gate_up = (
             config.num_experts,
             config.stage1_projection_size,
@@ -595,11 +572,20 @@ def _validate_prepared_weight_storage(
             config.hidden_size,
             config.intermediate_size,
         )
-        if weights.gate_up.dtype != torch.bfloat16 or weights.down.dtype != torch.bfloat16:
-            raise TypeError("BF16 prepared weights must use torch.bfloat16 storage")
+        expected_dtype = _COMPUTE_DTYPES[config.compute_dtype]
+        expected_format = config.compute_dtype
+        if weights.weight_dtype != expected_format:
+            raise ValueError(
+                "dense prepared weight format must match compute_dtype, got "
+                f"{weights.weight_dtype!r}/{config.compute_dtype!r}"
+            )
+        if weights.gate_up.dtype != expected_dtype or weights.down.dtype != expected_dtype:
+            raise TypeError(f"{expected_format.upper()} prepared weights must use " f"{expected_dtype} storage")
         if weights.gate_up_scale is not None or weights.down_scale is not None:
-            raise ValueError("BF16 prepared weights must not carry MXFP4 scale buffers")
+            raise ValueError("dense prepared weights must not carry MXFP4 scale buffers")
     else:
+        if config.compute_dtype != "bf16":
+            raise ValueError("MXFP4 prepared weights currently require compute_dtype='bf16'")
         expected_gate_up = (
             config.num_experts,
             config.stage1_projection_size,
@@ -641,14 +627,10 @@ def _validate_prepared_weight_storage(
 
     if tuple(weights.gate_up.shape) != expected_gate_up:
         raise ValueError(
-            f"prepared gate/up storage must have shape {expected_gate_up}, "
-            f"got {tuple(weights.gate_up.shape)}"
+            f"prepared gate/up storage must have shape {expected_gate_up}, " f"got {tuple(weights.gate_up.shape)}"
         )
     if tuple(weights.down.shape) != expected_down:
-        raise ValueError(
-            f"prepared down storage must have shape {expected_down}, "
-            f"got {tuple(weights.down.shape)}"
-        )
+        raise ValueError(f"prepared down storage must have shape {expected_down}, " f"got {tuple(weights.down.shape)}")
 
 
 def _f32_to_e8m0(values: torch.Tensor) -> torch.Tensor:
@@ -658,9 +640,7 @@ def _f32_to_e8m0(values: torch.Tensor) -> torch.Tensor:
     bits = values.view(torch.int32)
     exponent = ((bits >> 23) & 0xFF).to(torch.uint8)
     is_nan_or_inf = exponent == 0xFF
-    round_up = ((bits & 0x400000) > 0) & (
-        ((bits & 0x200000) > 0) | ((bits & 0x1FFFFF) > 0) | (exponent > 0)
-    )
+    round_up = ((bits & 0x400000) > 0) & (((bits & 0x200000) > 0) | ((bits & 0x1FFFFF) > 0) | (exponent > 0))
     rounded = (exponent.to(torch.int16) + round_up.to(torch.int16)).clamp_max(0xFE)
     return torch.where(
         is_nan_or_inf,
@@ -714,21 +694,13 @@ def _quantize_mxfp4_weight(weight: torch.Tensor) -> tuple[torch.Tensor, torch.Te
         # torch.bucketize(right=False) selects the lower code at every exact
         # midpoint. MXFP4 uses round-to-nearest-even, so the three midpoints
         # whose lower code is odd must select the upper (even) code instead.
-        rne_upper_tie = (
-            (normalized_abs == 0.75)
-            | (normalized_abs == 1.75)
-            | (normalized_abs == 3.5)
-        )
+        rne_upper_tie = (normalized_abs == 0.75) | (normalized_abs == 1.75) | (normalized_abs == 3.5)
         magnitude = magnitude + rne_upper_tie.to(torch.uint8)
         codes = magnitude | (torch.signbit(normalized).to(torch.uint8) << 3)
         packed_chunk = (codes[:, 1::2] << 4) | codes[:, ::2]
         chunk_rows = int(chunk.shape[0])
-        packed_rows[output_row : output_row + chunk_rows].copy_(
-            packed_chunk.view(chunk_rows, k // 2)
-        )
-        scale_rows[output_row : output_row + chunk_rows].copy_(
-            scale_e8m0.view(chunk_rows, k // 32)
-        )
+        packed_rows[output_row : output_row + chunk_rows].copy_(packed_chunk.view(chunk_rows, k // 2))
+        scale_rows[output_row : output_row + chunk_rows].copy_(scale_e8m0.view(chunk_rows, k // 32))
 
     if weight.is_contiguous():
         source_rows = weight.detach().view(experts * rows, k)
@@ -788,9 +760,7 @@ def _dequantize_mxfp4_weight(
     decoded = values[codes.long()]
     scale_f32 = _e8m0_to_f32(scales).repeat_interleave(32, dim=-1)
     if decoded.shape != scale_f32.shape:
-        raise ValueError(
-            f"packed/scales shapes are inconsistent: {tuple(decoded.shape)}/{tuple(scales.shape)}"
-        )
+        raise ValueError(f"packed/scales shapes are inconsistent: {tuple(decoded.shape)}/{tuple(scales.shape)}")
     return decoded * scale_f32
 
 
@@ -799,15 +769,10 @@ def _preshuffle_mxfp4_weight(weight: torch.Tensor) -> torch.Tensor:
 
     n, packed_k = (int(v) for v in weight.shape[-2:])
     if n % 16 != 0 or packed_k % 32 != 0:
-        raise ValueError(
-            f"packed MXFP4 weight N/(K/2) must be divisible by 16/32, got {n}/{packed_k}"
-        )
+        raise ValueError(f"packed MXFP4 weight N/(K/2) must be divisible by 16/32, got {n}/{packed_k}")
     leading = weight.numel() // (n * packed_k)
     return (
-        weight.view(leading, n // 16, 16, packed_k // 32, 2, 16)
-        .permute(0, 1, 3, 4, 2, 5)
-        .contiguous()
-        .view_as(weight)
+        weight.view(leading, n // 16, 16, packed_k // 32, 2, 16).permute(0, 1, 3, 4, 2, 5).contiguous().view_as(weight)
     )
 
 
@@ -827,12 +792,7 @@ def _preshuffle_e8m0_scale(scale: torch.Tensor) -> torch.Tensor:
         device=scale.device,
     )
     padded[:rows, :cols] = scale.reshape(rows, cols)
-    return (
-        padded.view(padded_rows // 32, 2, 16, padded_cols // 8, 2, 4)
-        .permute(0, 3, 5, 2, 4, 1)
-        .contiguous()
-        .view(-1)
-    )
+    return padded.view(padded_rows // 32, 2, 16, padded_cols // 8, 2, 4).permute(0, 3, 5, 2, 4, 1).contiguous().view(-1)
 
 
 def prepare_sonic_bf16_weights(
@@ -862,16 +822,52 @@ def prepare_sonic_bf16_weights(
     """
 
     _validate_weight_inputs(w1, w2, config)
-    _validate_bf16_resource_limits(config)
+    if config.compute_dtype != "bf16":
+        raise ValueError(
+            "prepare_sonic_bf16_weights requires config.compute_dtype='bf16', got " f"{config.compute_dtype!r}"
+        )
+    _validate_dense_resource_limits(config)
     stage1_bias, stage2_bias = _prepare_biases(b1, b2, w1, config)
 
     return SonicMoEWeights(
-        gate_up=_preshuffle_bf16_weight(w1),
-        down=_preshuffle_bf16_weight(w2),
+        gate_up=_preshuffle_16bit_weight(w1, torch.bfloat16),
+        down=_preshuffle_16bit_weight(w2, torch.bfloat16),
         dummy_scale=torch.zeros(1, dtype=torch.uint8, device=w1.device),
         config=config,
         stage1_bias=stage1_bias,
         stage2_bias=stage2_bias,
+    )
+
+
+def prepare_sonic_fp16_weights(
+    w1: torch.Tensor,
+    w2: torch.Tensor,
+    config: SonicMoEConfig,
+    *,
+    b1: torch.Tensor | None = None,
+    b2: torch.Tensor | None = None,
+) -> SonicMoEWeights:
+    """Validate and preshuffle dense FP16 stage-1/down-projection weights.
+
+    The logical layouts match :func:`prepare_sonic_bf16_weights`. Floating
+    inputs and optional expert biases are copied to contiguous FP16 storage.
+    """
+
+    if config.compute_dtype != "fp16":
+        raise ValueError(
+            "prepare_sonic_fp16_weights requires config.compute_dtype='fp16', got " f"{config.compute_dtype!r}"
+        )
+    _validate_weight_inputs(w1, w2, config)
+    _validate_dense_resource_limits(config)
+    stage1_bias, stage2_bias = _prepare_biases(b1, b2, w1, config)
+    return SonicMoEWeights(
+        gate_up=_preshuffle_16bit_weight(w1, torch.float16),
+        down=_preshuffle_16bit_weight(w2, torch.float16),
+        dummy_scale=torch.zeros(1, dtype=torch.uint8, device=w1.device),
+        config=config,
+        stage1_bias=stage1_bias,
+        stage2_bias=stage2_bias,
+        weight_dtype="fp16",
     )
 
 
@@ -892,12 +888,12 @@ def prepare_sonic_mxfp4_weights(
     :func:`prepare_sonic_bf16_weights`.
     """
 
+    if config.compute_dtype != "bf16":
+        raise ValueError("MXFP4 weights currently require config.compute_dtype='bf16'")
     _validate_weight_inputs(w1, w2, config)
     stage1_bias, stage2_bias = _prepare_biases(b1, b2, w1, config)
     if config.hidden_size % 64 != 0 or config.intermediate_size % 64 != 0:
-        raise ValueError(
-            "MXFP4 weight preshuffle requires hidden/intermediate sizes divisible by 64"
-        )
+        raise ValueError("MXFP4 weight preshuffle requires hidden/intermediate sizes divisible by 64")
     _validate_mxfp4_resource_limits(config)
     w1_quant, w1_scale = _quantize_mxfp4_weight(w1)
     w2_quant, w2_scale = _quantize_mxfp4_weight(w2)
@@ -951,6 +947,7 @@ def _get_stage1_launcher(
         xcd_swizzle=config.stage1_xcd_swizzle,
         waves_per_eu=config.waves_per_eu,
         w_dtype=weight_dtype,
+        a_dtype=config.compute_dtype,
         w_layout="standard",
         k_wave=1,
         round_preact_bf16=True,
@@ -979,6 +976,7 @@ def _get_stage2_launcher(
         b_cache_mod=b_cache_mod,
         waves_per_eu=config.waves_per_eu,
         w_dtype=weight_dtype,
+        a_dtype=config.compute_dtype,
         persist=config.persistent_stage2,
         has_bias=has_bias,
         round_projection_bf16=True,
@@ -1013,41 +1011,37 @@ class SonicMoE:
             weights.config.intermediate_size,
             weights.config.num_experts,
             weights.config.activation,
+            weights.config.compute_dtype,
         )
         requested_shape = (
             config.hidden_size,
             config.intermediate_size,
             config.num_experts,
             config.activation,
+            config.compute_dtype,
         )
         if prepared_shape != requested_shape:
             raise ValueError(
-                "prepared weights were created for different H/I/E/activation: "
+                "prepared weights were created for different H/I/E/activation/dtype: "
                 f"{prepared_shape} != {requested_shape}"
             )
-        if weights.weight_dtype not in ("bf16", "mxfp4"):
+        if weights.weight_dtype not in ("bf16", "fp16", "mxfp4"):
             raise ValueError(f"unsupported prepared weight dtype {weights.weight_dtype!r}")
         if weights.weight_dtype == "mxfp4":
             if config.tile_k < 128 or config.stage2_tile_k < 128:
-                raise ValueError(
-                    "MXFP4 requires tile_k and down_tile_k >= 128 for packed FP4 loads"
-                )
+                raise ValueError("MXFP4 requires tile_k and down_tile_k >= 128 for packed FP4 loads")
             _validate_mxfp4_resource_limits(config)
         else:
-            _validate_bf16_resource_limits(config)
+            _validate_dense_resource_limits(config)
         _validate_prepared_weight_storage(weights, config)
-        if isinstance(max_cached_workspaces, bool) or not isinstance(
-            max_cached_workspaces, int
-        ):
+        if isinstance(max_cached_workspaces, bool) or not isinstance(max_cached_workspaces, int):
             raise TypeError("max_cached_workspaces must be an integer")
         if max_cached_workspaces <= 0:
             raise ValueError("max_cached_workspaces must be positive")
         self.config = config
         self.weights = weights
         self._max_cached_workspaces = max_cached_workspaces
-        self._workspaces: OrderedDict[
-            tuple[int, int, int, int], SonicMoEWorkspace
-        ] = OrderedDict()
+        self._workspaces: OrderedDict[tuple[int, int, int, int], SonicMoEWorkspace] = OrderedDict()
         self._workspace_lock = threading.RLock()
         self.workspace: SonicMoEWorkspace | None = None
 
@@ -1084,11 +1078,11 @@ class SonicMoE:
             raise ValueError("hidden_states must be on a ROCm device")
         if hidden_states.device != self.weights.device:
             raise ValueError(
-                f"hidden_states and weights must share a device, got "
-                f"{hidden_states.device}/{self.weights.device}"
+                f"hidden_states and weights must share a device, got " f"{hidden_states.device}/{self.weights.device}"
             )
-        if hidden_states.dtype != torch.bfloat16:
-            raise TypeError(f"hidden_states must be BF16, got {hidden_states.dtype}")
+        expected_dtype = self.weights.compute_dtype
+        if hidden_states.dtype != expected_dtype:
+            raise TypeError(f"hidden_states must use {expected_dtype}, got {hidden_states.dtype}")
         if hidden_states.ndim != 2 or hidden_states.shape[1] != self.config.hidden_size:
             raise ValueError(
                 f"hidden_states must have shape [tokens, {self.config.hidden_size}], "
@@ -1105,7 +1099,7 @@ class SonicMoE:
             raise ValueError(f"tokens must be in [1, 2^24-1], got {tokens}")
         if tokens * self.config.hidden_size * 2 > _MAX_BUFFER_BYTE_OFFSET:
             raise ValueError(
-                "BF16 atomic output addressing exceeds the 32-bit byte-offset limit: "
+                "16-bit atomic output addressing exceeds the 32-bit byte-offset limit: "
                 f"tokens={tokens}, hidden_size={self.config.hidden_size}"
             )
         arch = get_rocm_arch()
@@ -1124,18 +1118,16 @@ class SonicMoE:
         expected = (workspace.tokens, self.config.hidden_size)
         if tuple(out.shape) != expected:
             raise ValueError(f"out must have shape {expected}, got {tuple(out.shape)}")
-        if out.device != self.weights.device or out.dtype != torch.bfloat16 or not out.is_contiguous():
-            raise ValueError("out must be contiguous BF16 on the same ROCm device as the weights")
+        expected_dtype = self.weights.compute_dtype
+        if out.device != self.weights.device or out.dtype != expected_dtype or not out.is_contiguous():
+            raise ValueError(f"out must be contiguous {expected_dtype} on the same ROCm device as the weights")
         if out.data_ptr() % 4:
-            raise ValueError("out must be 4-byte aligned for packed BF16 atomic scatter")
+            raise ValueError("out must be 4-byte aligned for packed 16-bit atomic scatter")
         if out.requires_grad:
             raise ValueError("SonicMoE is inference-only; out must not require gradients")
 
         workspace_storages = workspace.storage_ptrs
-        if any(
-            tensor.untyped_storage().data_ptr() in workspace_storages
-            for tensor in read_tensors
-        ):
+        if any(tensor.untyped_storage().data_ptr() in workspace_storages for tensor in read_tensors):
             raise ValueError("inputs and prepared weights must not alias internal workspace storage")
 
         out_storage = out.untyped_storage().data_ptr()
@@ -1175,16 +1167,8 @@ class SonicMoE:
             stage1,
             hidden_states.data_ptr(),
             self.weights.gate_up.data_ptr(),
-            (
-                self.weights.dummy_scale
-                if self.weights.gate_up_scale is None
-                else self.weights.gate_up_scale
-            ).data_ptr(),
-            (
-                self.weights.dummy_scale
-                if self.weights.stage1_bias is None
-                else self.weights.stage1_bias
-            ).data_ptr(),
+            (self.weights.dummy_scale if self.weights.gate_up_scale is None else self.weights.gate_up_scale).data_ptr(),
+            (self.weights.dummy_scale if self.weights.stage1_bias is None else self.weights.stage1_bias).data_ptr(),
             workspace.sorted_expert_ids.data_ptr(),
             workspace.num_valid_ids.data_ptr(),
             workspace.sorted_token_ids.data_ptr(),
@@ -1217,16 +1201,8 @@ class SonicMoE:
             stage2,
             workspace.intermediate.data_ptr(),
             self.weights.down.data_ptr(),
-            (
-                self.weights.dummy_scale
-                if self.weights.down_scale is None
-                else self.weights.down_scale
-            ).data_ptr(),
-            (
-                self.weights.dummy_scale
-                if self.weights.stage2_bias is None
-                else self.weights.stage2_bias
-            ).data_ptr(),
+            (self.weights.dummy_scale if self.weights.down_scale is None else self.weights.down_scale).data_ptr(),
+            (self.weights.dummy_scale if self.weights.stage2_bias is None else self.weights.stage2_bias).data_ptr(),
             workspace.sorted_expert_ids.data_ptr(),
             workspace.num_valid_ids.data_ptr(),
             workspace.sorted_token_ids.data_ptr(),
@@ -1271,9 +1247,7 @@ class SonicMoE:
             )
         dtype_str = _SUPPORTED_ROUTER_DTYPES.get(router_logits.dtype)
         if dtype_str is None:
-            raise TypeError(
-                f"router_logits must be FP32/FP16/BF16, got {router_logits.dtype}"
-            )
+            raise TypeError(f"router_logits must be FP32/FP16/BF16, got {router_logits.dtype}")
         if not router_logits.is_contiguous():
             raise ValueError("router_logits must be contiguous")
         if router_logits.requires_grad:
@@ -1376,18 +1350,12 @@ class SonicMoE:
     ) -> torch.Tensor:
         tokens = self._validate_hidden(hidden_states)
         if token_indices.ndim != 1 or expert_indices.ndim != 1 or route_weights.ndim != 1:
-            raise ValueError(
-                "token_indices, expert_indices, and route_weights must be one-dimensional"
-            )
+            raise ValueError("token_indices, expert_indices, and route_weights must be one-dimensional")
         routes = int(route_weights.numel())
         if int(token_indices.numel()) != routes or int(expert_indices.numel()) != routes:
-            raise ValueError(
-                "token_indices, expert_indices, and route_weights must have equal length"
-            )
+            raise ValueError("token_indices, expert_indices, and route_weights must have equal length")
         if routes > _MAX_SIGNED_I32:
-            raise ValueError(
-                f"route count exceeds the sorting kernel's signed 32-bit limit: {routes}"
-            )
+            raise ValueError(f"route count exceeds the sorting kernel's signed 32-bit limit: {routes}")
         if (
             not token_indices.is_cuda
             or not expert_indices.is_cuda
@@ -1399,16 +1367,11 @@ class SonicMoE:
             raise ValueError("route tensors must be on the same ROCm device as hidden_states")
         if token_indices.dtype != torch.int32 or expert_indices.dtype != torch.int32:
             raise TypeError(
-                "token_indices/expert_indices must be int32, got "
-                f"{token_indices.dtype}/{expert_indices.dtype}"
+                "token_indices/expert_indices must be int32, got " f"{token_indices.dtype}/{expert_indices.dtype}"
             )
         if route_weights.dtype != torch.float32:
             raise TypeError(f"route_weights must be float32, got {route_weights.dtype}")
-        if (
-            not token_indices.is_contiguous()
-            or not expert_indices.is_contiguous()
-            or not route_weights.is_contiguous()
-        ):
+        if not token_indices.is_contiguous() or not expert_indices.is_contiguous() or not route_weights.is_contiguous():
             raise ValueError("route tensors must be contiguous")
         if route_weights.requires_grad:
             raise ValueError("SonicMoE is inference-only; route_weights must not require gradients")
@@ -1430,8 +1393,7 @@ class SonicMoE:
             expected_frequency = (self.config.num_experts,)
             if tuple(frequency.shape) != expected_frequency:
                 raise ValueError(
-                    f"expert_frequency_out must have shape {expected_frequency}, "
-                    f"got {tuple(frequency.shape)}"
+                    f"expert_frequency_out must have shape {expected_frequency}, " f"got {tuple(frequency.shape)}"
                 )
             if (
                 not frequency.is_cuda
@@ -1439,9 +1401,7 @@ class SonicMoE:
                 or frequency.dtype != torch.int32
                 or not frequency.is_contiguous()
             ):
-                raise ValueError(
-                    "expert_frequency_out must be contiguous int32 on the same ROCm device"
-                )
+                raise ValueError("expert_frequency_out must be contiguous int32 on the same ROCm device")
             frequency_storage = frequency.untyped_storage().data_ptr()
             read_tensors = (
                 hidden_states,
@@ -1451,8 +1411,7 @@ class SonicMoE:
                 *self.weights.tensors,
             )
             if frequency_storage == output.untyped_storage().data_ptr() or any(
-                frequency_storage == tensor.untyped_storage().data_ptr()
-                for tensor in read_tensors
+                frequency_storage == tensor.untyped_storage().data_ptr() for tensor in read_tensors
             ):
                 raise ValueError("expert_frequency_out must not alias an input or output")
             if frequency_storage in workspace.storage_ptrs:
@@ -1529,8 +1488,7 @@ class SonicMoE:
             raise ValueError("topk ids/weights must be on the same ROCm device as hidden_states")
         if topk_ids.dtype != torch.int32 or topk_weights.dtype != torch.float32:
             raise TypeError(
-                f"topk_ids/topk_weights must be int32/float32, got "
-                f"{topk_ids.dtype}/{topk_weights.dtype}"
+                f"topk_ids/topk_weights must be int32/float32, got " f"{topk_ids.dtype}/{topk_weights.dtype}"
             )
         if not topk_ids.is_contiguous() or not topk_weights.is_contiguous():
             raise ValueError("topk ids/weights must be contiguous")
@@ -1573,9 +1531,9 @@ def sonic_moe_reference(
     b1: torch.Tensor | None = None,
     b2: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Approximate oracle with FP32 GEMMs and a BF16 stage-1 intermediate.
+    """Approximate oracle with FP32 GEMMs and A16 rounding boundaries.
 
-    The production kernel uses unordered BF16 atomic additions in stage 2, while
+    The production kernel uses unordered 16-bit atomic additions in stage 2, while
     this reference accumulates routes in FP32 and casts once at the end.  Small
     last-bit differences are therefore expected.
     """
@@ -1594,6 +1552,9 @@ def sonic_moe_reference(
         config.intermediate_size,
     ):
         raise ValueError("w2 shape does not match config")
+    compute_dtype = _COMPUTE_DTYPES[config.compute_dtype]
+    if hidden_states.dtype != compute_dtype:
+        raise TypeError(f"hidden_states must use {compute_dtype} for this config, got " f"{hidden_states.dtype}")
     prepared_b1, prepared_b2 = _prepare_biases(b1, b2, w1, config)
 
     probs = torch.softmax(router_logits.float(), dim=-1)
@@ -1602,7 +1563,11 @@ def sonic_moe_reference(
         route_weights = route_weights / route_weights.sum(dim=-1, keepdim=True)
 
     x = hidden_states.float()
-    w1f, w2f = w1.float(), w2.float()
+    # Match the prepare API: arbitrary floating-point source weights are first
+    # materialized in the configured A16 storage dtype before the kernel reads
+    # them.  Keeping that boundary in the oracle matters for FP32 source weights.
+    w1f = w1.to(compute_dtype).float()
+    w2f = w2.to(compute_dtype).float()
     b1f = None if prepared_b1 is None else prepared_b1.float()
     b2f = None if prepared_b2 is None else prepared_b2.float()
     result = torch.zeros(
@@ -1615,11 +1580,11 @@ def sonic_moe_reference(
         stage1 = torch.bmm(w1f[expert], x.unsqueeze(-1)).squeeze(-1)
         if b1f is not None:
             stage1 = stage1 + b1f[expert]
-        # The legacy grouped GEMM materializes BF16 preactivation before the
+        # The legacy grouped GEMM materializes A16 preactivation before the
         # activation kernel reloads it in FP32. The fused kernel preserves this
         # observable rounding boundary.
-        stage1 = stage1.to(torch.bfloat16).float()
-        # Stage 1 stores a BF16 sorted intermediate before stage 2 reloads it.
+        stage1 = stage1.to(compute_dtype).float()
+        # Stage 1 stores an A16 sorted intermediate before stage 2 reloads it.
         if config.activation == "swiglu":
             gate, up = stage1.split(config.intermediate_size, dim=-1)
             activated = torch.nn.functional.silu(gate) * up
@@ -1639,13 +1604,13 @@ def sonic_moe_reference(
             activated = torch.nn.functional.relu(stage1).square()
         else:  # guarded by SonicMoEConfig validation
             raise AssertionError(f"unexpected activation {config.activation!r}")
-        activated = activated.to(torch.bfloat16).float()
+        activated = activated.to(compute_dtype).float()
         projected = torch.bmm(w2f[expert], activated.unsqueeze(-1)).squeeze(-1)
         if b2f is not None:
             projected = projected + b2f[expert]
-        projected = projected.to(torch.bfloat16).float()
+        projected = projected.to(compute_dtype).float()
         result.add_(projected * route_weights[:, slot, None])
-    return result.to(torch.bfloat16)
+    return result.to(compute_dtype)
 
 
 @torch.no_grad()
@@ -1688,6 +1653,7 @@ __all__ = [
     "SonicMoEWeights",
     "SonicMoEWorkspace",
     "prepare_sonic_bf16_weights",
+    "prepare_sonic_fp16_weights",
     "prepare_sonic_mxfp4_weights",
     "sonic_moe_mxfp4_reference",
     "sonic_moe_reference",

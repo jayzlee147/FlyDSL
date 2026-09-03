@@ -40,7 +40,7 @@ NUM_CU = 256
 # Without it the guard runs as a plain Python if (dropped at trace), so the atomic-fadd
 # scatter fires on padded/OOB rows -- ~13x s2 regression (39us -> ~490us at E896).
 @flyc.jit
-def _atomic_bf16_epilog(
+def _atomic_a16_epilog(
     lds_acc_base_i32,
     accm,
     arg_out,
@@ -54,7 +54,9 @@ def _atomic_bf16_epilog(
     BM,
     N_OUT,
     BN,
+    out_dtype,
 ):
+    elem_dtype = fx.Float16 if const_expr(out_dtype == "fp16") else fx.BFloat16
     _kMChunks = kmchunks_for(BM)
     M_REPS = BM // 8
     # 4 waves split the BN(=TILE_N) tile (generic over BN, e.g. int4 tile_n=128).
@@ -99,7 +101,7 @@ def _atomic_bf16_epilog(
             for s in range_constexpr(_s_count):
                 idx0 = row_in_block * fx.Int32(BN) + col_start + fx.Int32(s * 64)
                 v2 = Vec(llvm.load(T.vec(2, T.f32), _gep3(lds_base, idx0 * fx.Int32(4))))
-                pk = Vec.from_elements([v2[0] * weight[mr], v2[1] * weight[mr]], fx.Float32).to(fx.BFloat16)
+                pk = Vec.from_elements([v2[0] * weight[mr], v2[1] * weight[mr]], fx.Float32).to(elem_dtype)
                 off = (row_base_addr + fx.Int32(s * 64)) * fx.Int32(2)
                 out_ptr = _gep1(out_base, off)
                 llvm.AtomicRMWOp(
@@ -135,17 +137,22 @@ def _gemm2_body_a16w4(
     NE,
     b_cache_mod=2,
     w_dtype="mxfp4",
+    a_dtype="bf16",
     use_k16=False,
     has_bias=False,
     round_projection_bf16=False,
 ):
-    """a16w4/a16wi4/a16w16 stage2 body. K=inter_dim (contraction), N=model_dim (N_OUT).
+    """A16W4/A16W16 stage2 body. K=inter_dim, N=model_dim.
 
-    A = bf16 stage1 intermediate by SORTED position. W2 = mxfp4/int4/bf16 (see gemm1).
-    Output = bf16 atomic-fadd (routing-weighted) scatter to [tokens, model_dim].
+    A is the BF16/FP16 stage1 intermediate by sorted position. W2 is
+    mxfp4/int4 (BF16 activation only) or matching dense BF16/FP16. Output uses
+    packed A16 atomic-fadd routing-weighted scatter to [tokens, model_dim].
     """
     _is_int4 = w_dtype == "int4"
-    _is_bf16 = w_dtype == "bf16"  # a16w16: raw bf16 W (unpacked, no scale, no upconvert)
+    _is_dense = w_dtype in ("bf16", "fp16")
+    _is_fp16 = a_dtype == "fp16"
+    elem_dtype = fx.Float16 if const_expr(_is_fp16) else fx.BFloat16
+    elem_ir_type = T.f16 if const_expr(_is_fp16) else T.bf16
     elem_bytes = 2
     KH_TILE_BYTES = TILE_K * elem_bytes
     LDS_STRIDE = TILE_K
@@ -204,11 +211,9 @@ def _gemm2_body_a16w4(
     # Standard-layout W is contiguous per expert. Fold that expert's byte offset into
     # the 64-bit resource base so large expert sets do not overflow a whole-tensor
     # 32-bit buffer offset. (Stage 2 has no GUGU layout, so every current mode folds.)
-    _w_per_expert_bytes = N_OUT * (K * 2 if _is_bf16 else K_HALF)
+    _w_per_expert_bytes = N_OUT * (K * 2 if _is_dense else K_HALF)
     w_base_i64 = fx.Int64(arg_bq) + fx.Int64(e) * fx.Int64(_w_per_expert_bytes)
-    w_tiles = _global_i32_buffer_tiles(
-        w_base_i64, min(_w_per_expert_bytes, 0xFFFFFFFF), 4
-    )
+    w_tiles = _global_i32_buffer_tiles(w_base_i64, min(_w_per_expert_bytes, 0xFFFFFFFF), 4)
     # W dwordx4 load via BufferCopy128b atom (cache modifier in the aux field).
     w_copy_atom = fx.make_copy_atom(fx.rocdl.BufferCopy128b(b_cache_mod), fx.Int32)
     w_reg_lay = fx.make_layout(4, 1)
@@ -218,7 +223,7 @@ def _gemm2_body_a16w4(
         _sw_bytes = NE * N_OUT * (scale_k_padded // 32)
     # Per-lane scalar scale gather via make_buffer_tensor 1-dword tiles + BufferCopy32b
     # scalar read (see gemm1._buffer_i32_scalar_read), replacing raw buffer_ops.
-    sw_tiles = None if _is_bf16 else _global_i32_buffer_tiles(arg_bscale, min(_sw_bytes, 0xFFFFFFFF), 1)
+    sw_tiles = None if _is_dense else _global_i32_buffer_tiles(arg_bscale, min(_sw_bytes, 0xFFFFFFFF), 1)
     sw_read_atom = fx.make_copy_atom(fx.rocdl.BufferCopy32b(0), fx.Int32)
 
     # ---- A gather (per-thread) -> LDS. A row = SORTED position m_row + row_local.
@@ -301,7 +306,7 @@ def _gemm2_body_a16w4(
         byte_off = row * fx.Int32(KH_TILE_BYTES) + col_swz_bytes
         r = fx.make_rmem_tensor(fx.make_layout(4, 1), fx.Int32)
         fx.copy_atom_call(a_copy_atom, fx.slice(s_x_i32x4_tiles, (None, byte_off // fx.Int32(16))), r)
-        return fx.Vector(fx.memref_load_vec(r)).bitcast(fx.BFloat16)
+        return fx.Vector(fx.memref_load_vec(r)).bitcast(elem_dtype)
 
     def load_b_raw(base_k, n_blk, n_intra):
         raw = []
@@ -338,7 +343,7 @@ def _gemm2_body_a16w4(
             # elem_idx is a bf16-elem offset; dword index = elem_idx*2/4, tile index = /4.
             r = fx.make_rmem_tensor(w_reg_lay, fx.Int32)
             fx.copy(w_copy_atom, fx.slice(w_tiles, (None, elem_idx // fx.Int32(8))), r)
-            raw.append(fx.Vector(fx.memref_load_vec(r)).bitcast(fx.BFloat16))  # v8bf16
+            raw.append(fx.Vector(fx.memref_load_vec(r)).bitcast(elem_dtype))
         return raw
 
     def load_b_scale(base_k, mni, n_pack):
@@ -383,8 +388,8 @@ def _gemm2_body_a16w4(
     vec2_bf16 = ir.Type.parse("vector<2xbf16>")
 
     def upconvert_b(raw, ku, scale_f32):
-        if const_expr(_is_bf16):
-            return raw[ku]  # already v8bf16 (no scale, no upconvert)
+        if const_expr(_is_dense):
+            return raw[ku]  # already the matching A16 MMA operand
         i32_val = _raw(raw[ku // 4][ku % 4])
         if const_expr(_is_int4):
             return _int4_nibble_to_bf16x8(fx.Int32(i32_val), scale_f32, use_k16=use_k16)
@@ -425,31 +430,31 @@ def _gemm2_body_a16w4(
     # Arch-gate: gfx950 K=32 (one MFMA/K-step); gfx942 (use_k16) splits each v8bf16 into
     # two v4bf16 halves -> TWO 16x16x16 MFMAs into the same acc (no 16x16x32 on gfx942).
     if const_expr(use_k16):
-        mma_atom = fx.make_mma_atom(fx.rocdl.MFMA(16, 16, 16, fx.BFloat16))
+        mma_atom = fx.make_mma_atom(fx.rocdl.MFMA(16, 16, 16, elem_dtype))
     else:
-        mma_atom = fx.make_mma_atom(fx.rocdl.MFMA(16, 16, 32, fx.BFloat16))
+        mma_atom = fx.make_mma_atom(fx.rocdl.MFMA(16, 16, 32, elem_dtype))
 
-    def _bf16_frag(v8):
-        t = fx.make_rmem_tensor(fx.make_layout(8, 1), fx.BFloat16)
+    def _a16_frag(v8):
+        t = fx.make_rmem_tensor(fx.make_layout(8, 1), elem_dtype)
         t.store(v8)
         return t
 
-    def _bf16_frag4(v8, half):
-        t = fx.make_rmem_tensor(fx.make_layout(4, 1), fx.BFloat16)
-        t.store(fx.Vector.from_elements([_raw(v8[half * 4 + j]) for j in range_constexpr(4)], fx.BFloat16))
+    def _a16_frag4(v8, half):
+        t = fx.make_rmem_tensor(fx.make_layout(4, 1), elem_dtype)
+        t.store(fx.Vector.from_elements([_raw(v8[half * 4 + j]) for j in range_constexpr(4)], elem_dtype))
         return t
 
     def _mma(acc, a8, b8):
         if const_expr(use_k16):
             for h in range_constexpr(2):
-                fx.gemm(mma_atom, acc, _bf16_frag4(a8, h), _bf16_frag4(b8, h), acc)
+                fx.gemm(mma_atom, acc, _a16_frag4(a8, h), _a16_frag4(b8, h), acc)
         else:
-            fx.gemm(mma_atom, acc, _bf16_frag(a8), _bf16_frag(b8), acc)
+            fx.gemm(mma_atom, acc, _a16_frag(a8), _a16_frag(b8), acc)
 
     for kt in range_constexpr(K_TILES_TOTAL):
         base_k = fx.Int32(kt * TILE_K)
         dma_a_tile_to_lds(base_k)
-        if const_expr(_is_bf16):
+        if const_expr(_is_dense):
             b_raw = [load_b_raw_bf16(base_k, n_blk_list[ni], n_intra_list[ni]) for ni in range_constexpr(num_acc_n)]
             b_sc = None
         else:
@@ -463,7 +468,7 @@ def _gemm2_body_a16w4(
         gpu.barrier()
         for ni in range_constexpr(num_acc_n):
             for ku in range_constexpr(k_unroll):
-                _bsc = None if const_expr(_is_bf16) else b_sc[ni][ku]
+                _bsc = None if const_expr(_is_dense) else b_sc[ni][ku]
                 bb = upconvert_b(b_raw[ni], ku, _bsc)
                 for mi in range_constexpr(m_repeat):
                     a8 = lds_load_a(mi, ku)
@@ -475,19 +480,17 @@ def _gemm2_body_a16w4(
     gpu.barrier()
     lds_acc_base_i32 = fx.Int32(fx.ptrtoint(lds_raw_ptr))
     if const_expr(has_bias):
-        bias_base = _global_base_ptr1(
-            fx.Int64(arg_bias) + fx.Int64(e) * fx.Int64(N_OUT * 2)
-        )
+        bias_base = _global_base_ptr1(fx.Int64(arg_bias) + fx.Int64(e) * fx.Int64(N_OUT * 2))
         bias_values = []
         for J in range_constexpr(num_acc_n):
             col = wave * fx.Int32(_n_per_wave) + fx.Int32(J * 16) + lane_mod_16
             bias_idx = by_n + col
             bias_raw = llvm.load(
-                T.bf16,
+                elem_ir_type,
                 _gep1(bias_base, bias_idx * fx.Int32(2)),
                 invariant=True,
             )
-            bias_values.append(fx.Float32(fx.BFloat16(bias_raw)))
+            bias_values.append(fx.Float32(elem_dtype(bias_raw)))
 
     accm_v = []
     for i in range_constexpr(m_repeat):
@@ -502,10 +505,10 @@ def _gemm2_body_a16w4(
             if const_expr(round_projection_bf16):
                 # Legacy Sonic stores grouped-GEMM output in BF16 before the
                 # FP32 route-score reduction reloads it.
-                vec = vec.to(fx.BFloat16).to(fx.Float32)
+                vec = vec.to(elem_dtype).to(fx.Float32)
             row.append(vec.ir_value())
         accm_v.append(row)
-    _atomic_bf16_epilog(
+    _atomic_a16_epilog(
         lds_acc_base_i32,
         accm_v,
         arg_out,
@@ -519,6 +522,7 @@ def _gemm2_body_a16w4(
         BM,
         N_OUT,
         TILE_N,
+        a_dtype,
     )
 
 
@@ -547,20 +551,28 @@ def compile_gemm2_a16w4_port(
     b_cache_mod=2,
     waves_per_eu=None,
     w_dtype="mxfp4",
+    a_dtype="bf16",
     persist=False,
     has_bias=False,
     round_projection_bf16=False,
 ):
-    """a16w4/a16wi4/a16w16 (bf16 intermediate A x mxfp4/int4/bf16 W2) stage2 builder.
+    """A16W4/A16W16 grouped down-projection builder.
 
     N_OUT = model_dim (down-proj output). D_INTER = inter_dim (contraction). Output
-    bf16 [tokens, model_dim] via atomic (routing-weighted) scatter.
+    uses the configured A16 dtype via packed atomic routing-weighted scatter.
 
     ``xcd_swizzle`` (>0) bijectively round-robins the launch index across the 8 XCDs to
     balance per-XCD/HBM traffic (gemm2 is HBM-bound), + optional M-group swizzle for
     per-XCD L2 locality (group = xcd_swizzle m-blocks).
     """
-    assert w_dtype in ("mxfp4", "int4", "bf16"), f"w_dtype must be 'mxfp4', 'int4' or 'bf16', got {w_dtype!r}"
+    assert w_dtype in ("mxfp4", "int4", "bf16", "fp16"), (
+        "w_dtype must be 'mxfp4', 'int4', 'bf16' or 'fp16', " f"got {w_dtype!r}"
+    )
+    assert a_dtype in ("bf16", "fp16"), f"a_dtype must be 'bf16' or 'fp16', got {a_dtype!r}"
+    if w_dtype in ("bf16", "fp16"):
+        assert w_dtype == a_dtype, "dense w_dtype must match a_dtype"
+    else:
+        assert a_dtype == "bf16", "quantized weights currently require a_dtype='bf16'"
     assert isinstance(has_bias, bool), "has_bias must be bool"
     assert isinstance(round_projection_bf16, bool), "round_projection_bf16 must be bool"
     # Arch-gate K=16 (gfx942) vs K=32 (gfx950); see a16wmix_use_k16.
@@ -578,7 +590,8 @@ def compile_gemm2_a16w4_port(
     _lds_bytes = _a_bytes + _acc_bytes
 
     _wd_tag = "" if w_dtype == "mxfp4" else f"_{w_dtype}"
-    _name = f"gemm2_a16w4{_wd_tag}_port_ne{NE}_h{N_OUT}_i{_K}_bm{BM}_tn{TILE_N}"
+    _ad_tag = "" if a_dtype == "bf16" else f"_a{a_dtype}"
+    _name = f"gemm2_a16w4{_wd_tag}{_ad_tag}_port_ne{NE}_h{N_OUT}_i{_K}_bm{BM}_tn{TILE_N}"
     if b_cache_mod != 2:
         _name += f"_bcm{b_cache_mod}"
     if xcd_swizzle > 0:
@@ -664,6 +677,7 @@ def compile_gemm2_a16w4_port(
                 NE=NE,
                 b_cache_mod=b_cache_mod,
                 w_dtype=w_dtype,
+                a_dtype=a_dtype,
                 use_k16=_use_k16,
                 has_bias=has_bias,
                 round_projection_bf16=round_projection_bf16,

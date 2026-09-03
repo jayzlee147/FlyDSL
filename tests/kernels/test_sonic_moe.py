@@ -21,6 +21,7 @@ from kernels.moe.sonic import (
     _get_stage2_launcher,
     _quantize_mxfp4_weight,
     prepare_sonic_bf16_weights,
+    prepare_sonic_fp16_weights,
     prepare_sonic_mxfp4_weights,
     sonic_moe_mxfp4_reference,
     sonic_moe_reference,
@@ -59,15 +60,11 @@ def _gfx950_device():
     return torch.device("cuda")
 
 
-def _make_case(tokens=TOKENS, seed=17, activation="swiglu"):
+def _make_case(tokens=TOKENS, seed=17, activation="swiglu", dtype=torch.bfloat16):
     device = _gfx950_device()
     generator = torch.Generator(device=device).manual_seed(seed)
-    x = torch.randn(
-        (tokens, HIDDEN_SIZE), device=device, dtype=torch.float32, generator=generator
-    ).to(torch.bfloat16)
-    stage1_size = INTERMEDIATE_SIZE * (
-        2 if activation in ("swiglu", "geglu", "reglu") else 1
-    )
+    x = torch.randn((tokens, HIDDEN_SIZE), device=device, dtype=torch.float32, generator=generator).to(dtype)
+    stage1_size = INTERMEDIATE_SIZE * (2 if activation in ("swiglu", "geglu", "reglu") else 1)
     w1 = (
         torch.randn(
             (NUM_EXPERTS, stage1_size, HIDDEN_SIZE),
@@ -76,7 +73,7 @@ def _make_case(tokens=TOKENS, seed=17, activation="swiglu"):
             generator=generator,
         )
         / math.sqrt(HIDDEN_SIZE)
-    ).to(torch.bfloat16)
+    ).to(dtype)
     w2 = (
         torch.randn(
             (NUM_EXPERTS, HIDDEN_SIZE, INTERMEDIATE_SIZE),
@@ -85,10 +82,10 @@ def _make_case(tokens=TOKENS, seed=17, activation="swiglu"):
             generator=generator,
         )
         / math.sqrt(INTERMEDIATE_SIZE)
-    ).to(torch.bfloat16)
-    router_logits = torch.randn(
-        (tokens, NUM_EXPERTS), device=device, dtype=torch.float32, generator=generator
-    ).to(torch.bfloat16)
+    ).to(dtype)
+    router_logits = torch.randn((tokens, NUM_EXPERTS), device=device, dtype=torch.float32, generator=generator).to(
+        dtype
+    )
     return x, w1, w2, router_logits
 
 
@@ -102,9 +99,14 @@ def _topk_from_logits(router_logits, config):
 
 def _assert_close(actual, expected):
     assert actual.shape == expected.shape
-    assert actual.dtype == torch.bfloat16
+    assert actual.dtype == expected.dtype
     assert actual.device == expected.device
     torch.testing.assert_close(actual.float(), expected.float(), rtol=3e-2, atol=5e-2)
+
+
+def _prepare_dense_weights(w1, w2, config, *, b1=None, b2=None):
+    prepare = prepare_sonic_fp16_weights if config.compute_dtype == "fp16" else prepare_sonic_bf16_weights
+    return prepare(w1, w2, config, b1=b1, b2=b2)
 
 
 def test_sonic_moe_bf16_forward_matches_reference():
@@ -130,6 +132,99 @@ def test_sonic_moe_bf16_forward_matches_reference():
     _assert_close(out, expected)
 
 
+def test_sonic_moe_fp16_forward_matches_reference():
+    config = _config(compute_dtype="fp16")
+    x, w1, w2, router_logits = _make_case(dtype=torch.float16)
+    prepared = prepare_sonic_fp16_weights(w1, w2, config)
+    op = SonicMoE(config, prepared)
+
+    expected = sonic_moe_reference(x, w1, w2, router_logits, config)
+    actual = op(x, router_logits)
+    torch.cuda.synchronize()
+    _assert_close(actual, expected)
+
+    topk_ids, topk_weights = _topk_from_logits(router_logits, config)
+    actual_topk = op.forward_topk(x, topk_ids, topk_weights)
+    torch.cuda.synchronize()
+    _assert_close(actual_topk, expected)
+
+    out = torch.empty_like(expected)
+    returned = op(x, router_logits, out=out)
+    torch.cuda.synchronize()
+    assert returned is out
+    _assert_close(out, expected)
+
+
+def test_sonic_moe_fp16_reference_quantizes_fp32_source_weights():
+    config = _config(compute_dtype="fp16")
+    source_x, source_w1, source_w2, router_logits = _make_case(seed=119, dtype=torch.float32)
+    x = source_x.to(torch.float16)
+
+    expected = sonic_moe_reference(x, source_w1, source_w2, router_logits, config)
+    quantized_expected = sonic_moe_reference(
+        x,
+        source_w1.to(torch.float16),
+        source_w2.to(torch.float16),
+        router_logits,
+        config,
+    )
+    actual = SonicMoE(
+        config,
+        prepare_sonic_fp16_weights(source_w1, source_w2, config),
+    )(x, router_logits)
+    torch.cuda.synchronize()
+
+    assert torch.equal(expected, quantized_expected)
+    _assert_close(actual, expected)
+
+
+@pytest.mark.parametrize(
+    "activation",
+    ("swiglu", "geglu", "reglu", "gelu_tanh_approx", "relu", "silu", "relu_sq"),
+)
+def test_sonic_moe_fp16_activation_variants_with_bias_and_flat_routes(activation):
+    config = _config(activation=activation, compute_dtype="fp16")
+    x, w1, w2, router_logits = _make_case(seed=113, activation=activation, dtype=torch.float16)
+    generator = torch.Generator(device=x.device).manual_seed(127)
+    b1 = (
+        torch.randn(
+            (NUM_EXPERTS, config.stage1_projection_size),
+            device=x.device,
+            dtype=torch.float32,
+            generator=generator,
+        )
+        / 8
+    ).to(torch.float16)
+    b2 = (
+        torch.randn(
+            (NUM_EXPERTS, HIDDEN_SIZE),
+            device=x.device,
+            dtype=torch.float32,
+            generator=generator,
+        )
+        / 8
+    ).to(torch.float16)
+    op = SonicMoE(
+        config,
+        _prepare_dense_weights(w1, w2, config, b1=b1, b2=b2),
+    )
+    expected = sonic_moe_reference(x, w1, w2, router_logits, config, b1=b1, b2=b2)
+    topk_ids, topk_weights = _topk_from_logits(router_logits, config)
+
+    actual_fixed = op.forward_topk(x, topk_ids, topk_weights)
+    token_indices = torch.arange(TOKENS, dtype=torch.int32, device=x.device).repeat_interleave(config.top_k)
+    actual_flat = op.forward_routes(
+        x,
+        token_indices,
+        topk_ids.reshape(-1).contiguous(),
+        topk_weights.reshape(-1).contiguous(),
+    )
+    torch.cuda.synchronize()
+
+    _assert_close(actual_fixed, expected)
+    _assert_close(actual_flat, expected)
+
+
 @pytest.mark.parametrize(
     "activation",
     ("swiglu", "geglu", "reglu", "gelu_tanh_approx", "relu", "silu", "relu_sq"),
@@ -142,9 +237,7 @@ def test_sonic_moe_bf16_activation_variants_fixed_and_flat_routes(activation):
     topk_ids, topk_weights = _topk_from_logits(router_logits, config)
 
     actual_fixed = op.forward_topk(x, topk_ids, topk_weights)
-    token_indices = torch.arange(TOKENS, dtype=torch.int32, device=x.device).repeat_interleave(
-        config.top_k
-    )
+    token_indices = torch.arange(TOKENS, dtype=torch.int32, device=x.device).repeat_interleave(config.top_k)
     actual_flat = op.forward_routes(
         x,
         token_indices,
@@ -193,16 +286,12 @@ def test_sonic_moe_bf16_bias_matches_reference_fixed_and_flat_routes(activation)
     ).to(torch.bfloat16)
     prepared = prepare_sonic_bf16_weights(w1, w2, config, b1=b1, b2=b2)
     assert prepared.has_bias
-    expected = sonic_moe_reference(
-        x, w1, w2, router_logits, config, b1=b1, b2=b2
-    )
+    expected = sonic_moe_reference(x, w1, w2, router_logits, config, b1=b1, b2=b2)
     op = SonicMoE(config, prepared)
 
     actual_fixed = op(x, router_logits)
     topk_ids, topk_weights = _topk_from_logits(router_logits, config)
-    token_indices = torch.arange(
-        TOKENS, dtype=torch.int32, device=x.device
-    ).repeat_interleave(config.top_k)
+    token_indices = torch.arange(TOKENS, dtype=torch.int32, device=x.device).repeat_interleave(config.top_k)
     actual_flat = op.forward_routes(
         x,
         token_indices,
@@ -233,9 +322,7 @@ def test_sonic_moe_mxfp4_bias_matches_reference():
         dtype=torch.bfloat16,
     ).view(NUM_EXPERTS, HIDDEN_SIZE)
     prepared = prepare_sonic_mxfp4_weights(w1, w2, config, b1=b1, b2=b2)
-    expected = sonic_moe_mxfp4_reference(
-        x, w1, w2, router_logits, config, b1=b1, b2=b2
-    )
+    expected = sonic_moe_mxfp4_reference(x, w1, w2, router_logits, config, b1=b1, b2=b2)
     actual = SonicMoE(config, prepared)(x, router_logits)
     torch.cuda.synchronize()
     _assert_close(actual, expected)
@@ -255,14 +342,9 @@ def test_sonic_moe_bias_ragged_duplicate_zero_score_and_empty_routes():
         dtype=torch.bfloat16,
         device=device,
     )
-    b1 = torch.ones(
-        (NUM_EXPERTS, INTERMEDIATE_SIZE), dtype=torch.bfloat16, device=device
-    )
+    b1 = torch.ones((NUM_EXPERTS, INTERMEDIATE_SIZE), dtype=torch.bfloat16, device=device)
     b2 = torch.stack(
-        [
-            torch.full((HIDDEN_SIZE,), expert + 1, dtype=torch.bfloat16, device=device)
-            for expert in range(NUM_EXPERTS)
-        ]
+        [torch.full((HIDDEN_SIZE,), expert + 1, dtype=torch.bfloat16, device=device) for expert in range(NUM_EXPERTS)]
     )
     op = SonicMoE(
         config,
@@ -293,13 +375,9 @@ def test_sonic_moe_activation_preserves_legacy_bf16_preactivation_rounding():
     value = 1.5078125
     x = torch.zeros((1, HIDDEN_SIZE), dtype=torch.bfloat16, device=device)
     x[0, 0] = value
-    w1 = torch.zeros(
-        (1, INTERMEDIATE_SIZE, HIDDEN_SIZE), dtype=torch.bfloat16, device=device
-    )
+    w1 = torch.zeros((1, INTERMEDIATE_SIZE, HIDDEN_SIZE), dtype=torch.bfloat16, device=device)
     w1[0, :, 0] = value
-    w2 = torch.zeros(
-        (1, HIDDEN_SIZE, INTERMEDIATE_SIZE), dtype=torch.bfloat16, device=device
-    )
+    w2 = torch.zeros((1, HIDDEN_SIZE, INTERMEDIATE_SIZE), dtype=torch.bfloat16, device=device)
     op = SonicMoE(config, prepare_sonic_bf16_weights(w1, w2, config))
 
     op.forward_topk(
@@ -316,9 +394,7 @@ def test_sonic_moe_activation_preserves_legacy_bf16_preactivation_rounding():
     assert expected.item() != without_preactivation_rounding.item()
     assert torch.equal(
         op.workspace.intermediate[0],
-        torch.full(
-            (INTERMEDIATE_SIZE,), expected.item(), dtype=torch.bfloat16, device=device
-        ),
+        torch.full((INTERMEDIATE_SIZE,), expected.item(), dtype=torch.bfloat16, device=device),
     )
 
 
@@ -367,16 +443,12 @@ def test_sonic_moe_ragged_routes_match_reference_and_frequency():
     )
     torch.cuda.synchronize()
 
-    expected_frequency = torch.bincount(
-        expert_indices.to(torch.int64), minlength=NUM_EXPERTS
-    ).to(torch.int32)
+    expected_frequency = torch.bincount(expert_indices.to(torch.int64), minlength=NUM_EXPERTS).to(torch.int32)
     assert torch.equal(frequency, expected_frequency)
     assert op.workspace is not None
     assert op.workspace.routes == route_weights.numel()
     expected_blocks = sum(
-        (int(count) + config.tile_m - 1) // config.tile_m
-        for count in expected_frequency
-        if int(count) > 0
+        (int(count) + config.tile_m - 1) // config.tile_m for count in expected_frequency if int(count) > 0
     )
     assert int(op.workspace.num_valid_ids[0]) == expected_blocks * config.tile_m
     assert int(op.workspace.num_valid_ids[1]) == TOKENS
@@ -428,16 +500,19 @@ def test_sonic_moe_ragged_routes_match_reference_and_frequency():
     assert op.workspace is not None and op.workspace.max_m_blocks == 0
 
 
-def test_sonic_moe_ragged_high_fan_in_matches_fp32_reference():
-    """An up-rounded token may receive many experts and BF16 atomic contributions."""
+@pytest.mark.parametrize("dtype", (torch.bfloat16, torch.float16), ids=("bf16", "fp16"))
+def test_sonic_moe_ragged_high_fan_in_matches_fp32_reference(dtype):
+    """An up-rounded token may receive many experts and A16 atomic contributions."""
 
     device = _gfx950_device()
     tokens, experts = 3, 64
-    config = _config(num_experts=experts, top_k=1)
+    config = _config(
+        num_experts=experts,
+        top_k=1,
+        compute_dtype="fp16" if dtype == torch.float16 else "bf16",
+    )
     generator = torch.Generator(device=device).manual_seed(59)
-    x = torch.randn(
-        (tokens, HIDDEN_SIZE), dtype=torch.float32, device=device, generator=generator
-    ).to(torch.bfloat16)
+    x = torch.randn((tokens, HIDDEN_SIZE), dtype=torch.float32, device=device, generator=generator).to(dtype)
     w1 = (
         torch.randn(
             (experts, 2 * INTERMEDIATE_SIZE, HIDDEN_SIZE),
@@ -446,7 +521,7 @@ def test_sonic_moe_ragged_high_fan_in_matches_fp32_reference():
             generator=generator,
         )
         / math.sqrt(HIDDEN_SIZE)
-    ).to(torch.bfloat16)
+    ).to(dtype)
     w2 = (
         torch.randn(
             (experts, HIDDEN_SIZE, INTERMEDIATE_SIZE),
@@ -455,7 +530,7 @@ def test_sonic_moe_ragged_high_fan_in_matches_fp32_reference():
             generator=generator,
         )
         / math.sqrt(INTERMEDIATE_SIZE)
-    ).to(torch.bfloat16)
+    ).to(dtype)
     token_indices = torch.zeros(experts, dtype=torch.int32, device=device)
     expert_indices = torch.arange(experts, dtype=torch.int32, device=device)
     route_weights = torch.softmax(
@@ -466,14 +541,15 @@ def test_sonic_moe_ragged_high_fan_in_matches_fp32_reference():
 
     expected_row = torch.zeros(HIDDEN_SIZE, dtype=torch.float32, device=device)
     for expert in range(experts):
-        gate_up = (w1[expert].float() @ x[0].float()).to(torch.bfloat16).float()
+        gate_up = (w1[expert].float() @ x[0].float()).to(dtype).float()
         gate, up = gate_up.split(INTERMEDIATE_SIZE)
-        activated = (torch.nn.functional.silu(gate) * up).to(torch.bfloat16).float()
-        expected_row.add_((w2[expert].float() @ activated) * route_weights[expert])
+        activated = (torch.nn.functional.silu(gate) * up).to(dtype).float()
+        projected = (w2[expert].float() @ activated).to(dtype).float()
+        expected_row.add_(projected * route_weights[expert])
     expected = torch.zeros_like(x)
-    expected[0] = expected_row.to(torch.bfloat16)
+    expected[0] = expected_row.to(dtype)
 
-    op = SonicMoE(config, prepare_sonic_bf16_weights(w1, w2, config))
+    op = SonicMoE(config, _prepare_dense_weights(w1, w2, config))
     actual = op.forward_routes(
         x,
         token_indices,
@@ -503,14 +579,12 @@ def test_sonic_moe_mxfp4_weight_only_forward():
     )
     generator = torch.Generator(device=device).manual_seed(43)
     x = torch.randn((7, 256), device=device, dtype=torch.bfloat16, generator=generator)
-    w1 = (
-        torch.randn((4, 512, 256), device=device, dtype=torch.float32, generator=generator)
-        / math.sqrt(256)
-    ).to(torch.bfloat16)
-    w2 = (
-        torch.randn((4, 256, 256), device=device, dtype=torch.float32, generator=generator)
-        / math.sqrt(256)
-    ).to(torch.bfloat16)
+    w1 = (torch.randn((4, 512, 256), device=device, dtype=torch.float32, generator=generator) / math.sqrt(256)).to(
+        torch.bfloat16
+    )
+    w2 = (torch.randn((4, 256, 256), device=device, dtype=torch.float32, generator=generator) / math.sqrt(256)).to(
+        torch.bfloat16
+    )
     logits = torch.randn((7, 4), device=device, dtype=torch.bfloat16, generator=generator)
 
     prepared = prepare_sonic_mxfp4_weights(w1, w2, config)
@@ -526,9 +600,7 @@ def test_sonic_moe_mxfp4_weight_only_forward():
     actual = SonicMoE(config, prepared)(x, logits)
     torch.cuda.synchronize()
     _assert_close(actual, expected)
-    cosine = torch.nn.functional.cosine_similarity(
-        actual.float().flatten(), expected.float().flatten(), dim=0
-    ).item()
+    cosine = torch.nn.functional.cosine_similarity(actual.float().flatten(), expected.float().flatten(), dim=0).item()
     assert cosine >= 0.999
 
 
@@ -555,15 +627,9 @@ def test_sonic_moe_mxfp4_quantizer_uses_rne_midpoints():
     assert not packed[0, 2, 1:].any().item()
 
     blocks = weight.view(-1, 32)
-    reference_scale = gemm_common_utils.f32_to_e8m0(
-        blocks.abs().amax(dim=1) / 4.0
-    ).view(torch.uint8)
+    reference_scale = gemm_common_utils.f32_to_e8m0(blocks.abs().amax(dim=1) / 4.0).view(torch.uint8)
     reference_values = blocks / gemm_common_utils.e8m0_to_f32(reference_scale)[:, None]
-    reference_packed = (
-        gemm_common_utils.f32_to_mxfp4(reference_values)
-        .view(torch.uint8)
-        .view_as(packed)
-    )
+    reference_packed = gemm_common_utils.f32_to_mxfp4(reference_values).view(torch.uint8).view_as(packed)
     assert torch.equal(scale.view(-1), reference_scale)
     assert torch.equal(packed, reference_packed)
 
@@ -775,24 +841,18 @@ def test_sonic_moe_workspace_bound_scales_with_active_experts():
     config = _config(num_experts=896, top_k=2, tile_m=32)
     generator = torch.Generator(device=device).manual_seed(53)
     x = torch.randn((1, HIDDEN_SIZE), dtype=torch.bfloat16, device=device, generator=generator)
-    w1 = (
-        torch.randn(
-            (896, 2 * INTERMEDIATE_SIZE, HIDDEN_SIZE),
-            dtype=torch.bfloat16,
-            device=device,
-            generator=generator,
-        )
-        / math.sqrt(HIDDEN_SIZE)
-    )
-    w2 = (
-        torch.randn(
-            (896, HIDDEN_SIZE, INTERMEDIATE_SIZE),
-            dtype=torch.bfloat16,
-            device=device,
-            generator=generator,
-        )
-        / math.sqrt(INTERMEDIATE_SIZE)
-    )
+    w1 = torch.randn(
+        (896, 2 * INTERMEDIATE_SIZE, HIDDEN_SIZE),
+        dtype=torch.bfloat16,
+        device=device,
+        generator=generator,
+    ) / math.sqrt(HIDDEN_SIZE)
+    w2 = torch.randn(
+        (896, HIDDEN_SIZE, INTERMEDIATE_SIZE),
+        dtype=torch.bfloat16,
+        device=device,
+        generator=generator,
+    ) / math.sqrt(INTERMEDIATE_SIZE)
     logits = torch.randn((1, 896), dtype=torch.bfloat16, device=device, generator=generator)
     op = SonicMoE(config, prepare_sonic_bf16_weights(w1, w2, config))
     expected = sonic_moe_reference(x, w1, w2, logits, config)
@@ -852,9 +912,7 @@ def test_sonic_moe_autotuner_search_and_disk_cache(tmp_path):
         dtype=torch.bfloat16,
         device=x.device,
     )
-    b2 = torch.zeros(
-        (NUM_EXPERTS, HIDDEN_SIZE), dtype=torch.bfloat16, device=x.device
-    )
+    b2 = torch.zeros((NUM_EXPERTS, HIDDEN_SIZE), dtype=torch.bfloat16, device=x.device)
     biased_tuner = SonicMoEAutotuner(
         config,
         prepare_sonic_bf16_weights(w1, w2, config, b1=b1, b2=b2),
@@ -937,7 +995,7 @@ def test_sonic_moe_autotuner_search_and_disk_cache(tmp_path):
     recovered(x, router_logits)
     torch.cuda.synchronize()
     assert recovered.search_count == 1
-    assert '"version": 4' in non_object_cache_file.read_text(encoding="utf-8")
+    assert '"version": 5' in non_object_cache_file.read_text(encoding="utf-8")
 
 
 def test_sonic_moe_router_and_multiphase_sort_fallback():
@@ -1066,9 +1124,7 @@ def test_sonic_moe_runs_sequentially_on_two_devices():
                 assert x.device == device
 
                 expected = sonic_moe_reference(x, w1, w2, router_logits, config)
-                actual = SonicMoE(config, prepare_sonic_bf16_weights(w1, w2, config))(
-                    x, router_logits
-                )
+                actual = SonicMoE(config, prepare_sonic_bf16_weights(w1, w2, config))(x, router_logits)
                 torch.cuda.synchronize(device)
                 results.append((actual, expected))
 
@@ -1139,6 +1195,8 @@ def test_sonic_moe_config_validation():
         _config(activation="not-an-activation")
     with pytest.raises(TypeError, match="activation must be a string"):
         _config(activation=None)
+    with pytest.raises(ValueError, match="unsupported compute_dtype"):
+        _config(compute_dtype="fp32")
 
     large_mesh_config = _config(num_experts=300, top_k=1)
     with pytest.raises(ValueError, match="signed 32-bit byte-index"):
@@ -1164,9 +1222,7 @@ def test_sonic_moe_tensor_shape_and_dtype_validation():
         dtype=torch.bfloat16,
         device=x.device,
     )
-    b2 = torch.randn(
-        (NUM_EXPERTS, HIDDEN_SIZE), dtype=torch.bfloat16, device=x.device
-    )
+    b2 = torch.randn((NUM_EXPERTS, HIDDEN_SIZE), dtype=torch.bfloat16, device=x.device)
     with pytest.raises(ValueError, match="both be provided"):
         prepare_sonic_bf16_weights(w1, w2, config, b1=b1)
     with pytest.raises(ValueError, match="b1 must have shape"):
@@ -1189,9 +1245,7 @@ def test_sonic_moe_tensor_shape_and_dtype_validation():
         op(x[:, :-1], router_logits)
     with pytest.raises((TypeError, ValueError)):
         op(x.float(), router_logits)
-    misaligned_x_storage = torch.empty(
-        TOKENS * HIDDEN_SIZE + 1, device=x.device, dtype=torch.bfloat16
-    )
+    misaligned_x_storage = torch.empty(TOKENS * HIDDEN_SIZE + 1, device=x.device, dtype=torch.bfloat16)
     misaligned_x = misaligned_x_storage[1:].view(TOKENS, HIDDEN_SIZE)
     assert misaligned_x.is_contiguous() and misaligned_x.data_ptr() % 16
     with pytest.raises(ValueError, match="16-byte aligned"):
@@ -1208,9 +1262,7 @@ def test_sonic_moe_tensor_shape_and_dtype_validation():
         )
     with pytest.raises((TypeError, ValueError)):
         op(x, router_logits, out=x)
-    misaligned_out_storage = torch.empty(
-        TOKENS * HIDDEN_SIZE + 1, device=x.device, dtype=torch.bfloat16
-    )
+    misaligned_out_storage = torch.empty(TOKENS * HIDDEN_SIZE + 1, device=x.device, dtype=torch.bfloat16)
     misaligned_out = misaligned_out_storage[1:].view(TOKENS, HIDDEN_SIZE)
     assert misaligned_out.is_contiguous() and misaligned_out.data_ptr() % 4 == 2
     with pytest.raises(ValueError, match="4-byte aligned"):
@@ -1222,9 +1274,7 @@ def test_sonic_moe_tensor_shape_and_dtype_validation():
             out=torch.empty_like(x, requires_grad=True),
         )
     workspace = op.reserve(TOKENS)
-    internal_out_alias = workspace.intermediate.flatten()[: TOKENS * HIDDEN_SIZE].view(
-        TOKENS, HIDDEN_SIZE
-    )
+    internal_out_alias = workspace.intermediate.flatten()[: TOKENS * HIDDEN_SIZE].view(TOKENS, HIDDEN_SIZE)
     with pytest.raises((TypeError, ValueError)):
         op(x, router_logits, out=internal_out_alias)
     with pytest.raises((TypeError, ValueError)):
@@ -1237,6 +1287,39 @@ def test_sonic_moe_tensor_shape_and_dtype_validation():
         op.forward_topk(x, topk_ids[:, :1], topk_weights)
     with pytest.raises((TypeError, ValueError)):
         op.forward_topk(x, topk_ids, topk_weights[:, :1])
+
+
+def test_sonic_moe_fp16_preparation_and_dtype_validation():
+    bf16_config = _config()
+    fp16_config = _config(compute_dtype="fp16")
+    x, w1, w2, router_logits = _make_case(dtype=torch.float16)
+    b1 = torch.randn(
+        (NUM_EXPERTS, fp16_config.stage1_projection_size),
+        dtype=torch.float16,
+        device=x.device,
+    )
+    b2 = torch.randn((NUM_EXPERTS, HIDDEN_SIZE), dtype=torch.float16, device=x.device)
+
+    prepared = prepare_sonic_fp16_weights(w1.float(), w2.float(), fp16_config, b1=b1, b2=b2)
+    assert prepared.weight_dtype == "fp16"
+    assert prepared.compute_dtype == torch.float16
+    assert prepared.gate_up.dtype == torch.float16
+    assert prepared.down.dtype == torch.float16
+    assert prepared.stage1_bias is not None and prepared.stage1_bias.dtype == torch.float16
+    assert prepared.stage2_bias is not None and prepared.stage2_bias.dtype == torch.float16
+
+    op = SonicMoE(fp16_config, prepared)
+    workspace = op.reserve(TOKENS)
+    assert workspace.intermediate.dtype == torch.float16
+    assert workspace.output.dtype == torch.float16
+    with pytest.raises(TypeError, match="hidden_states must use"):
+        op(x.to(torch.bfloat16), router_logits)
+    with pytest.raises(ValueError, match="compute_dtype='bf16'"):
+        prepare_sonic_bf16_weights(w1, w2, fp16_config)
+    with pytest.raises(ValueError, match="compute_dtype='fp16'"):
+        prepare_sonic_fp16_weights(w1, w2, bf16_config)
+    with pytest.raises(ValueError, match="require config.compute_dtype='bf16'"):
+        prepare_sonic_mxfp4_weights(w1, w2, fp16_config)
 
 
 def test_sonic_moe_rejects_malformed_prepared_storage_and_mxfp4_tiles():
@@ -1284,7 +1367,7 @@ def test_sonic_moe_rejects_malformed_prepared_storage_and_mxfp4_tiles():
         dummy_scale=torch.zeros(1, dtype=torch.uint8, device=w1.device),
         config=format_specific_limit,
     )
-    with pytest.raises(ValueError, match="BF16 gate/up weights"):
+    with pytest.raises(ValueError, match="dense 16-bit gate/up weights"):
         SonicMoE(format_specific_limit, unsafe_bf16)
 
     huge_expert_config = _config(num_experts=2_097_153)

@@ -23,8 +23,7 @@ from kernels.moe.moe_2stage_a16wmix.gemm2 import compile_gemm2_a16w4_port
 from kernels.moe.moe_sorting_kernel import moe_softmax_sort_flydsl
 from kernels.moe.sonic import SonicMoE, SonicMoEConfig, SonicMoEWeights
 
-
-_CACHE_SCHEMA_VERSION = 4
+_CACHE_SCHEMA_VERSION = 5
 _TUNING_FIELDS = (
     "tile_m",
     "tile_n",
@@ -157,11 +156,7 @@ class SonicMoEAutotuner:
             raise ValueError(f"warmup must be >= 0 and rep > 0, got {warmup}/{rep}")
         self.base_config = base_config
         self.weights = weights
-        self.candidates = tuple(
-            default_sonic_moe_candidates(base_config)
-            if candidates is None
-            else candidates
-        )
+        self.candidates = tuple(default_sonic_moe_candidates(base_config) if candidates is None else candidates)
         if not self.candidates:
             raise ValueError("at least one SonicMoE autotune candidate is required")
         self._validate_candidate_semantics()
@@ -203,6 +198,7 @@ class SonicMoEAutotuner:
             "top_k",
             "renormalize",
             "activation",
+            "compute_dtype",
         )
         expected = tuple(getattr(self.base_config, name) for name in semantic_fields)
         SonicMoE(self.base_config, self.weights)
@@ -235,6 +231,7 @@ class SonicMoEAutotuner:
             "torch_hip": str(torch.version.hip),
             "source": self._source_hash,
             "weight_dtype": self.weights.weight_dtype,
+            "compute_dtype": self.base_config.compute_dtype,
             "has_bias": self.weights.has_bias,
             "hidden_dtype": str(hidden_states.dtype),
             "router_dtype": str(router_logits.dtype),
@@ -271,8 +268,7 @@ class SonicMoEAutotuner:
             if not isinstance(entries, dict):
                 return
             candidate_by_tuning = {
-                json.dumps(_config_tuning_dict(config), sort_keys=True): config
-                for config in self.candidates
+                json.dumps(_config_tuning_dict(config), sort_keys=True): config for config in self.candidates
             }
             for key, tuning in entries.items():
                 encoded = json.dumps(tuning, sort_keys=True)
@@ -297,27 +293,18 @@ class SonicMoEAutotuner:
                 if self.cache_file.is_file():
                     try:
                         old = json.loads(self.cache_file.read_text(encoding="utf-8"))
-                        if isinstance(old, dict) and old.get(
-                            "version"
-                        ) == _CACHE_SCHEMA_VERSION and isinstance(
-                            old.get("entries"), dict
+                        if (
+                            isinstance(old, dict)
+                            and old.get("version") == _CACHE_SCHEMA_VERSION
+                            and isinstance(old.get("entries"), dict)
                         ):
                             entries.update(old["entries"])
                     except (OSError, TypeError, ValueError, json.JSONDecodeError):
                         pass
-                entries.update(
-                    {
-                        key: _config_tuning_dict(config)
-                        for key, config in self._winner_cache.items()
-                    }
-                )
+                entries.update({key: _config_tuning_dict(config) for key, config in self._winner_cache.items()})
                 payload = {"version": _CACHE_SCHEMA_VERSION, "entries": entries}
-                temporary = self.cache_file.with_name(
-                    f".{self.cache_file.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
-                )
-                temporary.write_text(
-                    json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8"
-                )
+                temporary = self.cache_file.with_name(f".{self.cache_file.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
+                temporary.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
                 os.replace(temporary, self.cache_file)
                 temporary = None
         except OSError:
@@ -341,17 +328,11 @@ class SonicMoEAutotuner:
         candidate_norm = torch.linalg.vector_norm(candidate_f32)
         if ref_norm.item() == 0.0 or candidate_norm.item() == 0.0:
             return torch.equal(reference, candidate)
-        cosine = torch.nn.functional.cosine_similarity(
-            reference_f32.flatten(), candidate_f32.flatten(), dim=0
-        ).item()
+        cosine = torch.nn.functional.cosine_similarity(reference_f32.flatten(), candidate_f32.flatten(), dim=0).item()
         norm_ratio = (candidate_norm / ref_norm).item()
         max_reference = reference_f32.abs().max().item()
         max_error = (candidate_f32 - reference_f32).abs().max().item()
-        return (
-            cosine >= 0.999
-            and 0.98 <= norm_ratio <= 1.02
-            and max_error <= 0.15 * max(max_reference, 1.0e-2)
-        )
+        return cosine >= 0.999 and 0.98 <= norm_ratio <= 1.02 and max_error <= 0.15 * max(max_reference, 1.0e-2)
 
     def _search(
         self,
@@ -363,7 +344,7 @@ class SonicMoEAutotuner:
         stream = torch.cuda.current_stream(hidden_states.device)
         scratch = torch.empty(
             (hidden_states.shape[0], self.base_config.hidden_size),
-            dtype=torch.bfloat16,
+            dtype=hidden_states.dtype,
             device=hidden_states.device,
         )
         reference: torch.Tensor | None = None

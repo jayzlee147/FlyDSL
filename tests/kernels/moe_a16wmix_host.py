@@ -77,6 +77,7 @@ def _get_compiled_gemm1_a16w4(
         xcd_swizzle=xcd_swizzle,
         waves_per_eu=waves_per_eu,
         w_dtype=w_dtype,
+        a_dtype="fp16" if w_dtype == "fp16" else "bf16",
         w_layout=w_layout,
         k_wave=k_wave,
         has_bias=False,
@@ -108,6 +109,7 @@ def _get_compiled_gemm2_a16w4(
         xcd_swizzle=xcd_swizzle,
         waves_per_eu=waves_per_eu,
         w_dtype=w_dtype,
+        a_dtype="fp16" if w_dtype == "fp16" else "bf16",
         persist=persist,
         has_bias=False,
         round_projection_bf16=False,
@@ -362,14 +364,15 @@ def flydsl_a16w4_gemm1(
     ``w_dtype="mxfp4"`` (default): W1 mxfp4, ``w1_scale_u8`` = shuffled e8m0. ``"int4"``:
     W1 packed signed int4 (same preshuffle as mxfp4), ``w1_scale_u8`` groupwise bf16 in
     the ``(E, N_OUT, G//2, 2)`` layout (see :func:`a16wi4_scale_to_kernel_layout`).
-    ``"bf16"``: RAW bf16 W1 preshuffled ``shuffle_weight (16,16)``; ``w1_scale_u8`` unused.
+    ``"bf16"``/``"fp16"``: RAW matching A16 W1 preshuffled with
+    ``shuffle_weight (16,16)``; ``w1_scale_u8`` is unused.
 
     ``w_layout="standard"`` (default) consumes the N-major GGUU preshuffle. ``"guinterleave"``
     (mxfp4 only) consumes aiter's native GUGU stage1 W1+scale layout
     (``shuffle_weight_a16w4``/``shuffle_scale_a16w4``) directly, with no host relayout.
 
-    ``a_bf16`` is bf16 ``[n_tokens, D_HIDDEN]``. Writes the bf16 intermediate
-    ``[sorted_size, D_INTER]`` (by sorted position) into ``inter_sorted_bf16``.
+    ``a_bf16`` and ``inter_sorted_bf16`` use the dense weight dtype (BF16 for
+    quantized weights). The intermediate is indexed by sorted position.
 
     Tile config: ``tile_m/n/k`` -> BM/TILE_N/TILE_K, ``waves_per_eu`` ->
     rocdl.waves_per_eu, ``b_nt`` -> W-load cache modifier (0=cached, 2=nt),
@@ -523,8 +526,8 @@ def flydsl_a16w4_gemm2(
     persist=None,
     stream=None,
 ):
-    """a16w4/a16wi4/a16w16 fused stage2 (down-proj). Consumes the bf16 [sorted_size,
-    D_INTER] intermediate; scatters routing-weighted bf16 into ``flat_out``.
+    """a16w4/a16wi4/a16w16 fused stage2 (down-proj). Consumes the A16 [sorted_size,
+    D_INTER] intermediate; scatters routing-weighted A16 into ``flat_out``.
 
     Tile config: ``tile_m/n/k`` -> BM/TILE_N/TILE_K, ``waves_per_eu`` ->
     rocdl.waves_per_eu, ``b_nt`` -> W-load cache modifier, ``xcd_swizzle`` -> XCD/HBM
