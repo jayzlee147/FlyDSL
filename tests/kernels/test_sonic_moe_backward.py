@@ -23,6 +23,7 @@ _ACTIVATIONS = (
     "silu",
     "relu_sq",
 )
+_DTYPES = ((torch.bfloat16, "bf16"), (torch.float16, "fp16"))
 
 
 def _gfx950_device():
@@ -59,6 +60,7 @@ def _make_case(
     seed,
     *,
     activation="swiglu",
+    dtype=torch.bfloat16,
 ):
     device = _gfx950_device()
     generator = torch.Generator(device=device).manual_seed(seed)
@@ -68,7 +70,7 @@ def _make_case(
         dtype=torch.float32,
         device=device,
         generator=generator,
-    ).to(torch.bfloat16)
+    ).to(dtype)
     w1 = (
         torch.randn(
             (num_experts, projection_size, hidden_size),
@@ -77,7 +79,7 @@ def _make_case(
             generator=generator,
         )
         / math.sqrt(hidden_size)
-    ).to(torch.bfloat16)
+    ).to(dtype)
     w2 = (
         torch.randn(
             (num_experts, hidden_size, intermediate_size),
@@ -86,7 +88,7 @@ def _make_case(
             generator=generator,
         )
         / math.sqrt(intermediate_size)
-    ).to(torch.bfloat16)
+    ).to(dtype)
     # Leave the final expert empty while preserving distinct ids per token.
     active_experts = num_experts - 1
     ids_host = [[(token + slot) % active_experts for slot in range(topk)] for token in range(tokens)]
@@ -103,7 +105,7 @@ def _make_case(
         dtype=torch.float32,
         device=device,
         generator=generator,
-    ).to(torch.bfloat16)
+    ).to(dtype)
     return x, w1, w2, topk_ids, topk_weights, grad_output
 
 
@@ -117,7 +119,7 @@ def _make_biases(w1, w2, seed):
             generator=generator,
         )
         / math.sqrt(w1.shape[-1])
-    ).to(torch.bfloat16)
+    ).to(w1.dtype)
     b2 = (
         torch.randn(
             (w2.shape[0], w2.shape[1]),
@@ -126,7 +128,7 @@ def _make_biases(w1, w2, seed):
             generator=generator,
         )
         / math.sqrt(w2.shape[-1])
-    ).to(torch.bfloat16)
+    ).to(w1.dtype)
     return b1, b2
 
 
@@ -178,7 +180,7 @@ def _activation_reference(preactivation, da, intermediate_size, activation_name)
         else:
             raise AssertionError(f"unexpected activation {activation_name!r}")
         dz = da * derivative
-    return activated.to(torch.bfloat16), dz.to(torch.bfloat16)
+    return activated.to(preactivation.dtype), dz.to(preactivation.dtype)
 
 
 @torch.no_grad()
@@ -204,7 +206,7 @@ def _backward_reference(
     assert projection_size == expected_projection_size
     dx_routes = torch.empty(
         (tokens, topk, hidden_size),
-        dtype=torch.bfloat16,
+        dtype=x.dtype,
         device=x.device,
     )
     dw1 = torch.zeros_like(w1)
@@ -227,7 +229,7 @@ def _backward_reference(
         preactivation = x_e.float() @ w1[expert].float().transpose(0, 1)
         if b1 is not None:
             preactivation = preactivation + b1[expert].float()
-        preactivation = preactivation.to(torch.bfloat16)
+        preactivation = preactivation.to(x.dtype)
         # da is computed before dz, while activation is needed by projection
         # and dW2.  Passing a zero placeholder here avoids duplicating the
         # activation formulas; dz is recomputed after da is available.
@@ -244,10 +246,10 @@ def _backward_reference(
         projection = activation.float() @ w2[expert].float().transpose(0, 1)
         if b2 is not None:
             projection = projection + b2[expert].float()
-        projection = projection.to(torch.bfloat16)
+        projection = projection.to(x.dtype)
         dtopk_weights[token_indices, slots] = (dout_e.float() * projection.float()).sum(dim=1)
-        dy = (dout_e.float() * scores_e[:, None]).to(torch.bfloat16)
-        da = (dy.float() @ w2[expert].float()).to(torch.bfloat16).float()
+        dy = (dout_e.float() * scores_e[:, None]).to(x.dtype)
+        da = (dy.float() @ w2[expert].float()).to(x.dtype).float()
         _, dz = _activation_reference(
             preactivation,
             da,
@@ -255,14 +257,14 @@ def _backward_reference(
             activation_name,
         )
 
-        dw2[expert] = (dy.float().transpose(0, 1) @ activation.float()).to(torch.bfloat16)
-        dw1[expert] = (dz.float().transpose(0, 1) @ x_e.float()).to(torch.bfloat16)
-        dx_routes[token_indices, slots] = (dz.float() @ w1[expert].float()).to(torch.bfloat16)
+        dw2[expert] = (dy.float().transpose(0, 1) @ activation.float()).to(x.dtype)
+        dw1[expert] = (dz.float().transpose(0, 1) @ x_e.float()).to(x.dtype)
+        dx_routes[token_indices, slots] = (dz.float() @ w1[expert].float()).to(x.dtype)
         if db1 is not None:
-            db1[expert] = dz.float().sum(dim=0).to(torch.bfloat16)
-            db2[expert] = dy.float().sum(dim=0).to(torch.bfloat16)
+            db1[expert] = dz.float().sum(dim=0).to(x.dtype)
+            db2[expert] = dy.float().sum(dim=0).to(x.dtype)
 
-    dx = dx_routes.float().sum(dim=1).to(torch.bfloat16)
+    dx = dx_routes.float().sum(dim=1).to(x.dtype)
     result = (dx, dw1, dw2, dtopk_weights)
     return (*result, db1, db2) if has_bias else result
 
@@ -276,15 +278,26 @@ def _backward_reference(
         (11, 512, 256, 8, 4),
     ),
 )
+@pytest.mark.parametrize("dtype,compute_dtype", _DTYPES, ids=("bf16", "fp16"))
 def test_sonic_moe_backward_matches_a16_reference(
     tokens,
     hidden_size,
     intermediate_size,
     num_experts,
     topk,
+    dtype,
+    compute_dtype,
 ):
-    config = _config(hidden_size, intermediate_size, num_experts, topk)
-    args = _make_case(tokens, hidden_size, intermediate_size, num_experts, topk, seed=211 + topk)
+    config = _config(hidden_size, intermediate_size, num_experts, topk, compute_dtype=compute_dtype)
+    args = _make_case(
+        tokens,
+        hidden_size,
+        intermediate_size,
+        num_experts,
+        topk,
+        seed=211 + topk,
+        dtype=dtype,
+    )
 
     actual = sonic_moe_backward(*args, config)
     expected = _backward_reference(*args)
@@ -308,7 +321,12 @@ def test_sonic_moe_backward_matches_a16_reference(
 
 
 @pytest.mark.parametrize("activation_name", _ACTIVATIONS)
-def test_sonic_moe_backward_bias_gradients_match_a16_reference(activation_name):
+@pytest.mark.parametrize("dtype,compute_dtype", _DTYPES, ids=("bf16", "fp16"))
+def test_sonic_moe_backward_bias_gradients_match_a16_reference(
+    activation_name,
+    dtype,
+    compute_dtype,
+):
     hidden_size, intermediate_size, num_experts, topk = 128, 64, 4, 2
     config = _config(
         hidden_size,
@@ -316,6 +334,7 @@ def test_sonic_moe_backward_bias_gradients_match_a16_reference(activation_name):
         num_experts,
         topk,
         activation=activation_name,
+        compute_dtype=compute_dtype,
     )
     args = _make_case(
         7,
@@ -325,6 +344,7 @@ def test_sonic_moe_backward_bias_gradients_match_a16_reference(activation_name):
         topk,
         seed=307,
         activation=activation_name,
+        dtype=dtype,
     )
     b1, b2 = _make_biases(args[1], args[2], seed=311)
 
@@ -350,7 +370,7 @@ def test_sonic_moe_backward_bias_gradients_match_a16_reference(activation_name):
     torch.testing.assert_close(actual[3], expected[3], rtol=5e-4, atol=5e-4)
     for actual_bias_gradient, expected_bias_gradient in zip(actual[4:], expected[4:]):
         assert actual_bias_gradient.shape == expected_bias_gradient.shape
-        assert actual_bias_gradient.dtype == torch.bfloat16
+        assert actual_bias_gradient.dtype == dtype
         torch.testing.assert_close(
             actual_bias_gradient.float(),
             expected_bias_gradient.float(),
@@ -366,7 +386,12 @@ def test_sonic_moe_backward_bias_gradients_match_a16_reference(activation_name):
 
 
 @pytest.mark.parametrize("activation_name", ("swiglu", "relu_sq"))
-def test_sonic_moe_backward_bias_reduction_spans_route_tiles(activation_name):
+@pytest.mark.parametrize("dtype,compute_dtype", _DTYPES, ids=("bf16", "fp16"))
+def test_sonic_moe_backward_bias_reduction_spans_route_tiles(
+    activation_name,
+    dtype,
+    compute_dtype,
+):
     tokens, hidden_size, intermediate_size, num_experts, topk = 65, 128, 64, 3, 2
     config = _config(
         hidden_size,
@@ -374,6 +399,7 @@ def test_sonic_moe_backward_bias_reduction_spans_route_tiles(activation_name):
         num_experts,
         topk,
         activation=activation_name,
+        compute_dtype=compute_dtype,
     )
     args = _make_case(
         tokens,
@@ -383,6 +409,7 @@ def test_sonic_moe_backward_bias_reduction_spans_route_tiles(activation_name):
         topk,
         seed=331,
         activation=activation_name,
+        dtype=dtype,
     )
     b1, b2 = _make_biases(args[1], args[2], seed=337)
 
@@ -411,7 +438,12 @@ def test_sonic_moe_backward_bias_reduction_spans_route_tiles(activation_name):
 
 
 @pytest.mark.parametrize("activation_name", _ACTIVATIONS)
-def test_sonic_moe_backward_activation_variants_match_a16_reference(activation_name):
+@pytest.mark.parametrize("dtype,compute_dtype", _DTYPES, ids=("bf16", "fp16"))
+def test_sonic_moe_backward_activation_variants_match_a16_reference(
+    activation_name,
+    dtype,
+    compute_dtype,
+):
     hidden_size, intermediate_size, num_experts, topk = 128, 64, 4, 2
     config = _config(
         hidden_size,
@@ -419,6 +451,7 @@ def test_sonic_moe_backward_activation_variants_match_a16_reference(activation_n
         num_experts,
         topk,
         activation=activation_name,
+        compute_dtype=compute_dtype,
     )
     args = _make_case(
         7,
@@ -428,6 +461,7 @@ def test_sonic_moe_backward_activation_variants_match_a16_reference(activation_n
         topk,
         seed=271,
         activation=activation_name,
+        dtype=dtype,
     )
 
     actual = sonic_moe_backward(*args, config)
@@ -446,10 +480,11 @@ def test_sonic_moe_backward_activation_variants_match_a16_reference(activation_n
     torch.testing.assert_close(actual[3], expected[3], rtol=5e-4, atol=5e-4)
 
 
-def test_sonic_moe_backward_repeated_calls_do_not_alias_workspace():
-    config = _config(128, 64, 4, 2)
-    first = _make_case(7, 128, 64, 4, 2, seed=251)
-    second = _make_case(7, 128, 64, 4, 2, seed=257)
+@pytest.mark.parametrize("dtype,compute_dtype", _DTYPES, ids=("bf16", "fp16"))
+def test_sonic_moe_backward_repeated_calls_do_not_alias_workspace(dtype, compute_dtype):
+    config = _config(128, 64, 4, 2, compute_dtype=compute_dtype)
+    first = _make_case(7, 128, 64, 4, 2, seed=251, dtype=dtype)
+    second = _make_case(7, 128, 64, 4, 2, seed=257, dtype=dtype)
 
     first_actual = tuple(t.clone() for t in sonic_moe_backward(*first, config))
     sonic_moe_backward(*second, config)
@@ -464,8 +499,10 @@ def test_sonic_moe_backward_rejects_unsupported_contracts():
     args = _make_case(7, 128, 64, 4, 2, seed=263)
     b1, b2 = _make_biases(args[1], args[2], seed=317)
 
-    with pytest.raises(ValueError, match="compute_dtype='bf16'"):
+    with pytest.raises(TypeError, match="must be torch.float16"):
         sonic_moe_backward(*args, _config(128, 64, 4, 2, compute_dtype="fp16"))
+    with pytest.raises(ValueError, match="unsupported compute_dtype"):
+        sonic_moe_backward(*args, _config(128, 64, 4, 2, compute_dtype="fp32"))
     with pytest.raises(ValueError, match="w1 must have shape"):
         sonic_moe_backward(*args, _config(128, 64, 4, 2, activation="relu"))
     with pytest.raises(ValueError, match="both be None or both be tensors"):
@@ -477,7 +514,7 @@ def test_sonic_moe_backward_rejects_unsupported_contracts():
             b1=b1[:, :-1],
             b2=b2,
         )
-    with pytest.raises(TypeError, match="b2 must be bfloat16"):
+    with pytest.raises(TypeError, match="b2 must be torch.bfloat16"):
         sonic_moe_backward(
             *args,
             _config(128, 64, 4, 2),

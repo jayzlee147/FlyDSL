@@ -3,8 +3,8 @@
 
 """First-stage training backward for the gfx950 SonicMoE operator.
 
-This module implements the dense BF16, fixed-K training contract needed by the
-SonicMoE ROCm adapter.  All seven forward activations and optional expert bias
+This module implements the dense BF16/FP16, fixed-K training contract needed by
+the SonicMoE ROCm adapter.  All seven forward activations and optional expert bias
 are supported.  It does not reuse the inference workspace.  Re-sorting and
 recomputing the two forward intermediates makes retained graphs and overlapping
 forward calls safe.
@@ -200,10 +200,11 @@ def _compile_expert_histogram(num_experts: int, device_index: int):
 
 
 @functools.lru_cache(maxsize=128)
-def _compile_gather(hidden_size: int, device_index: int):
+def _compile_gather(hidden_size: int, compute_dtype: str, device_index: int):
     """Compile sorted-row gathers for hidden states and output gradients."""
 
     del device_index
+    elem_dtype = fx.Float16 if compute_dtype == "fp16" else fx.BFloat16
     vector_width = 4
     vectors_per_row = hidden_size // vector_width
 
@@ -238,15 +239,15 @@ def _compile_gather(hidden_size: int, device_index: int):
                 x_rsrc,
                 source,
                 vec_width=vector_width,
-                dtype=fx.BFloat16,
+                dtype=elem_dtype,
             )
             dout_value = buffer_ops.buffer_load(
                 dout_rsrc,
                 source,
                 vec_width=vector_width,
-                dtype=fx.BFloat16,
+                dtype=elem_dtype,
             )
-            zero = fx.Vector.filled(vector_width, 0.0, fx.BFloat16)
+            zero = fx.Vector.filled(vector_width, 0.0, elem_dtype)
             buffer_ops.buffer_store(valid.select(fx.Vector(x_value), zero), x_sorted_rsrc, destination)
             buffer_ops.buffer_store(valid.select(fx.Vector(dout_value), zero), dout_sorted_rsrc, destination)
 
@@ -284,11 +285,13 @@ def _compile_activation_prepare(
     hidden_size: int,
     intermediate_size: int,
     activation_name: str,
+    compute_dtype: str,
     device_index: int,
 ):
     """Compile activation recomputation and routed-dout scaling."""
 
     del device_index
+    elem_dtype = fx.Float16 if compute_dtype == "fp16" else fx.BFloat16
     is_glu = activation_name in _GLU_ACTIVATIONS
     projection_size = intermediate_size * (2 if is_glu else 1)
     up_column_offset = intermediate_size if is_glu else 0
@@ -315,17 +318,17 @@ def _compile_activation_prepare(
             if column < fx.Int32(intermediate_size):
                 gate_offset = row * fx.Int32(projection_size) + column
                 act_offset = row * fx.Int32(intermediate_size) + column
-                gate = buffer_ops.buffer_load(preact_rsrc, gate_offset, vec_width=1, dtype=fx.BFloat16).extf(T.f32)
+                gate = buffer_ops.buffer_load(preact_rsrc, gate_offset, vec_width=1, dtype=elem_dtype).extf(T.f32)
                 up_offset = gate_offset + fx.Int32(up_column_offset)
                 up = buffer_ops.buffer_load(
                     preact_rsrc,
                     up_offset,
                     vec_width=1,
-                    dtype=fx.BFloat16,
+                    dtype=elem_dtype,
                 ).extf(T.f32)
                 activation_f32 = _activation_f32(gate, up, activation_name)
                 buffer_ops.buffer_store(
-                    fx.Float32(activation_f32).to(fx.BFloat16),
+                    fx.Float32(activation_f32).to(elem_dtype),
                     activation_rsrc,
                     act_offset,
                 )
@@ -337,9 +340,9 @@ def _compile_activation_prepare(
             column = tid + fx.Int32(base)
             if column < fx.Int32(hidden_size):
                 offset = row * fx.Int32(hidden_size) + column
-                dout_value = buffer_ops.buffer_load(dout_rsrc, offset, vec_width=1, dtype=fx.BFloat16).extf(T.f32)
+                dout_value = buffer_ops.buffer_load(dout_rsrc, offset, vec_width=1, dtype=elem_dtype).extf(T.f32)
                 buffer_ops.buffer_store(
-                    fx.Float32(dout_value * route_weight).to(fx.BFloat16),
+                    fx.Float32(dout_value * route_weight).to(elem_dtype),
                     dy_rsrc,
                     offset,
                 )
@@ -373,11 +376,13 @@ def _compile_activation_prepare(
 def _compile_activation_derivative(
     intermediate_size: int,
     activation_name: str,
+    compute_dtype: str,
     device_index: int,
 ):
     """Compile the selected activation's Jacobian-vector product."""
 
     del device_index
+    elem_dtype = fx.Float16 if compute_dtype == "fp16" else fx.BFloat16
     is_glu = activation_name in _GLU_ACTIVATIONS
     projection_size = intermediate_size * (2 if is_glu else 1)
     up_column_offset = intermediate_size if is_glu else 0
@@ -400,23 +405,23 @@ def _compile_activation_derivative(
                 gate_offset = row * fx.Int32(projection_size) + column
                 up_offset = gate_offset + fx.Int32(up_column_offset)
                 act_offset = row * fx.Int32(intermediate_size) + column
-                gate = buffer_ops.buffer_load(preact_rsrc, gate_offset, vec_width=1, dtype=fx.BFloat16).extf(T.f32)
+                gate = buffer_ops.buffer_load(preact_rsrc, gate_offset, vec_width=1, dtype=elem_dtype).extf(T.f32)
                 up = buffer_ops.buffer_load(
                     preact_rsrc,
                     up_offset,
                     vec_width=1,
-                    dtype=fx.BFloat16,
+                    dtype=elem_dtype,
                 ).extf(T.f32)
-                da_value = buffer_ops.buffer_load(da_rsrc, act_offset, vec_width=1, dtype=fx.BFloat16).extf(T.f32)
+                da_value = buffer_ops.buffer_load(da_rsrc, act_offset, vec_width=1, dtype=elem_dtype).extf(T.f32)
                 dz_gate, dz_up = _activation_backward_f32(
                     gate,
                     up,
                     da_value,
                     activation_name,
                 )
-                buffer_ops.buffer_store(fx.Float32(dz_gate).to(fx.BFloat16), dz_rsrc, gate_offset)
+                buffer_ops.buffer_store(fx.Float32(dz_gate).to(elem_dtype), dz_rsrc, gate_offset)
                 if const_expr(is_glu):
-                    buffer_ops.buffer_store(fx.Float32(dz_up).to(fx.BFloat16), dz_rsrc, up_offset)
+                    buffer_ops.buffer_store(fx.Float32(dz_up).to(elem_dtype), dz_rsrc, up_offset)
 
     @flyc.jit
     def launch(
@@ -440,11 +445,13 @@ def _compile_bias_gradient_clear(
     projection_size: int,
     hidden_size: int,
     num_experts: int,
+    compute_dtype: str,
     device_index: int,
 ):
     """Compile the exact-zero initialization for all expert bias gradients."""
 
     del device_index
+    elem_dtype = fx.Float16 if compute_dtype == "fp16" else fx.BFloat16
     db1_elements = num_experts * projection_size
     db2_elements = num_experts * hidden_size
     grid_size = (max(db1_elements, db2_elements) + _BLOCK_THREADS - 1) // _BLOCK_THREADS
@@ -455,9 +462,9 @@ def _compile_bias_gradient_clear(
         db1_rsrc = buffer_ops.create_buffer_resource(db1, max_size=True)
         db2_rsrc = buffer_ops.create_buffer_resource(db2, max_size=True)
         if index < fx.Int32(db1_elements):
-            buffer_ops.buffer_store(fx.BFloat16(0.0), db1_rsrc, index)
+            buffer_ops.buffer_store(elem_dtype(0.0), db1_rsrc, index)
         if index < fx.Int32(db2_elements):
-            buffer_ops.buffer_store(fx.BFloat16(0.0), db2_rsrc, index)
+            buffer_ops.buffer_store(elem_dtype(0.0), db2_rsrc, index)
 
     @flyc.jit
     def launch(
@@ -478,11 +485,13 @@ def _compile_bias_gradient_clear(
 def _compile_bias_gradient_reduction(
     projection_size: int,
     hidden_size: int,
+    compute_dtype: str,
     device_index: int,
 ):
     """Compile one expert segment's FP32-accumulating bias reductions."""
 
     del device_index
+    elem_dtype = fx.Float16 if compute_dtype == "fp16" else fx.BFloat16
     grid_size = (max(projection_size, hidden_size) + _BLOCK_THREADS - 1) // _BLOCK_THREADS
 
     @flyc.kernel(known_block_size=[_BLOCK_THREADS, 1, 1])
@@ -503,17 +512,17 @@ def _compile_bias_gradient_reduction(
             db1_acc = fx.Float32(0.0)
             for row in range(fx.Int32(0), i32_rows, fx.Int32(1)):
                 offset = row * fx.Int32(projection_size) + column
-                value = buffer_ops.buffer_load(dz_rsrc, offset, vec_width=1, dtype=fx.BFloat16).extf(T.f32)
+                value = buffer_ops.buffer_load(dz_rsrc, offset, vec_width=1, dtype=elem_dtype).extf(T.f32)
                 db1_acc = db1_acc + value
-            buffer_ops.buffer_store(db1_acc.to(fx.BFloat16), db1_rsrc, column)
+            buffer_ops.buffer_store(db1_acc.to(elem_dtype), db1_rsrc, column)
 
         if column < fx.Int32(hidden_size):
             db2_acc = fx.Float32(0.0)
             for row in range(fx.Int32(0), i32_rows, fx.Int32(1)):
                 offset = row * fx.Int32(hidden_size) + column
-                value = buffer_ops.buffer_load(dy_rsrc, offset, vec_width=1, dtype=fx.BFloat16).extf(T.f32)
+                value = buffer_ops.buffer_load(dy_rsrc, offset, vec_width=1, dtype=elem_dtype).extf(T.f32)
                 db2_acc = db2_acc + value
-            buffer_ops.buffer_store(db2_acc.to(fx.BFloat16), db2_rsrc, column)
+            buffer_ops.buffer_store(db2_acc.to(elem_dtype), db2_rsrc, column)
 
     @flyc.jit
     def launch(
@@ -534,10 +543,11 @@ def _compile_bias_gradient_reduction(
 
 
 @functools.lru_cache(maxsize=128)
-def _compile_score_backward(hidden_size: int, topk: int, device_index: int):
+def _compile_score_backward(hidden_size: int, topk: int, compute_dtype: str, device_index: int):
     """Compile ``ds = dot(dout, materialized_down_projection)``."""
 
     del device_index
+    elem_dtype = fx.Float16 if compute_dtype == "fp16" else fx.BFloat16
 
     @flyc.kernel(known_block_size=[_BLOCK_THREADS, 1, 1])
     def score_backward_kernel(
@@ -570,13 +580,13 @@ def _compile_score_backward(hidden_size: int, topk: int, device_index: int):
                     dout_rsrc,
                     offset,
                     vec_width=1,
-                    dtype=fx.BFloat16,
+                    dtype=elem_dtype,
                 ).extf(T.f32)
                 projected = buffer_ops.buffer_load(
                     projection_rsrc,
                     offset,
                     vec_width=1,
-                    dtype=fx.BFloat16,
+                    dtype=elem_dtype,
                 ).extf(T.f32)
                 thread_dot = thread_dot + dout_value * projected
 
@@ -639,10 +649,11 @@ def _compile_score_backward(hidden_size: int, topk: int, device_index: int):
 
 
 @functools.lru_cache(maxsize=128)
-def _compile_unsort(hidden_size: int, topk: int, device_index: int):
+def _compile_unsort(hidden_size: int, topk: int, compute_dtype: str, device_index: int):
     """Compile sorted expert-row to dense ``[tokens, topk, H]`` scatter."""
 
     del device_index
+    elem_dtype = fx.Float16 if compute_dtype == "fp16" else fx.BFloat16
     vector_width = 4
     vectors_per_row = hidden_size // vector_width
 
@@ -673,7 +684,7 @@ def _compile_unsort(hidden_size: int, topk: int, device_index: int):
                     source_rsrc,
                     source,
                     vec_width=vector_width,
-                    dtype=fx.BFloat16,
+                    dtype=elem_dtype,
                 )
                 buffer_ops.buffer_store(value, destination_rsrc, destination)
 
@@ -713,8 +724,13 @@ def _validate_backward_inputs(
     b1: torch.Tensor | None,
     b2: torch.Tensor | None,
 ) -> tuple[int, int, int, int]:
-    if config.compute_dtype != "bf16":
-        raise ValueError("sonic_moe_backward currently supports compute_dtype='bf16' only")
+    dtype_by_name = {"bf16": torch.bfloat16, "fp16": torch.float16}
+    if config.compute_dtype not in dtype_by_name:
+        raise ValueError(
+            "sonic_moe_backward supports compute_dtype='bf16' or 'fp16', "
+            f"got {config.compute_dtype!r}"
+        )
+    expected_dtype = dtype_by_name[config.compute_dtype]
     if config.activation not in _SUPPORTED_ACTIVATIONS:
         raise ValueError(
             f"sonic_moe_backward does not support activation={config.activation!r}; "
@@ -765,8 +781,8 @@ def _validate_backward_inputs(
     if b1 is not None:
         floating_names.extend(("b1", "b2"))
     for name in floating_names:
-        if tensors[name].dtype != torch.bfloat16:
-            raise TypeError(f"{name} must be bfloat16, got {tensors[name].dtype}")
+        if tensors[name].dtype != expected_dtype:
+            raise TypeError(f"{name} must be {expected_dtype}, got {tensors[name].dtype}")
     if topk_ids.dtype != torch.int32:
         raise TypeError(f"topk_ids must be int32, got {topk_ids.dtype}")
     if topk_weights.dtype != torch.float32:
@@ -792,15 +808,15 @@ def sonic_moe_backward(
     b1: torch.Tensor | None = None,
     b2: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, ...]:
-    """Differentiate dense BF16 fixed-K SonicMoE, optionally with bias.
+    """Differentiate dense BF16/FP16 fixed-K SonicMoE, optionally with bias.
 
     Parameters use logical, expert-major weights: ``w1[E, 2I, H]`` for GLU
     activations, ``w1[E, I, H]`` for pointwise activations, and
     ``w2[E, H, I]``.  Routing tensors are ``topk_ids[int32, T, K]`` and
     ``topk_weights[float32, T, K]``.  Without bias, the returned tuple remains
     ``(dx, dw1, dw2, dtopk_weights)``.  When ``b1`` and ``b2`` are supplied,
-    ``(db1, db2)`` are appended.  Tensor and bias gradients use BF16;
-    routing-score gradients use FP32.
+    ``(db1, db2)`` are appended. Tensor and bias gradients preserve the A16
+    input dtype; routing-score gradients use FP32.
 
     Expert ids must be in range and distinct within each token.  As in the
     inference fixed-K path, value validation is an unchecked hot-path
@@ -820,6 +836,7 @@ def sonic_moe_backward(
         b2,
     )
     topk = int(config.top_k)
+    compute_dtype = str(config.compute_dtype)
     activation_name = str(config.activation)
     projection_size = intermediate_size * (2 if activation_name in _GLU_ACTIVATIONS else 1)
     has_bias = b1 is not None
@@ -848,16 +865,16 @@ def sonic_moe_backward(
     sorter_dummy = torch.empty(4, dtype=torch.int32, device=device)
     expert_frequency = torch.empty(num_experts, dtype=torch.int32, device=device)
 
-    x_sorted = torch.empty((max_padded, hidden_size), dtype=torch.bfloat16, device=device)
+    x_sorted = torch.empty((max_padded, hidden_size), dtype=hidden_states.dtype, device=device)
     dout_sorted = torch.empty_like(x_sorted)
     dy = torch.empty_like(x_sorted)
     projection = torch.empty_like(x_sorted)
-    preactivation = torch.empty((max_padded, projection_size), dtype=torch.bfloat16, device=device)
-    activation = torch.empty((max_padded, intermediate_size), dtype=torch.bfloat16, device=device)
+    preactivation = torch.empty((max_padded, projection_size), dtype=hidden_states.dtype, device=device)
+    activation = torch.empty((max_padded, intermediate_size), dtype=hidden_states.dtype, device=device)
     da = torch.empty_like(activation)
     dz = torch.empty_like(preactivation)
     dx_sorted = torch.empty_like(x_sorted)
-    dx_routes = torch.empty((tokens, topk, hidden_size), dtype=torch.bfloat16, device=device)
+    dx_routes = torch.empty((tokens, topk, hidden_size), dtype=hidden_states.dtype, device=device)
 
     dx = torch.empty_like(hidden_states, memory_format=torch.contiguous_format)
     dw1 = torch.zeros_like(w1, memory_format=torch.contiguous_format)
@@ -889,6 +906,7 @@ def sonic_moe_backward(
                 projection_size,
                 hidden_size,
                 num_experts,
+                compute_dtype,
                 device_index,
             )
             _run_compiled(clear_bias_gradients, db1, db2, stream)
@@ -919,7 +937,7 @@ def sonic_moe_backward(
                 offset += padded
         padded_rows = offset
 
-        gather = _compile_gather(hidden_size, device_index)
+        gather = _compile_gather(hidden_size, compute_dtype, device_index)
         gather_work = padded_rows * (hidden_size // 4)
         gather_grid = max(1, (gather_work + _BLOCK_THREADS - 1) // _BLOCK_THREADS)
         _run_compiled(
@@ -952,6 +970,7 @@ def sonic_moe_backward(
             hidden_size,
             intermediate_size,
             activation_name,
+            compute_dtype,
             device_index,
         )
         _run_compiled(
@@ -999,6 +1018,7 @@ def sonic_moe_backward(
         activation_derivative = _compile_activation_derivative(
             intermediate_size,
             activation_name,
+            compute_dtype,
             device_index,
         )
         _run_compiled(
@@ -1016,6 +1036,7 @@ def sonic_moe_backward(
             _compile_bias_gradient_reduction(
                 projection_size,
                 hidden_size,
+                compute_dtype,
                 device_index,
             )
             if has_bias
@@ -1050,7 +1071,7 @@ def sonic_moe_backward(
                     stream,
                 )
 
-        score_backward = _compile_score_backward(hidden_size, topk, device_index)
+        score_backward = _compile_score_backward(hidden_size, topk, compute_dtype, device_index)
         _run_compiled(
             score_backward,
             dout_sorted,
@@ -1062,7 +1083,7 @@ def sonic_moe_backward(
             stream,
         )
 
-        unsort = _compile_unsort(hidden_size, topk, device_index)
+        unsort = _compile_unsort(hidden_size, topk, compute_dtype, device_index)
         unsort_work = padded_rows * (hidden_size // 4)
         unsort_grid = max(1, (unsort_work + _BLOCK_THREADS - 1) // _BLOCK_THREADS)
         _run_compiled(
@@ -1076,7 +1097,8 @@ def sonic_moe_backward(
             stream,
         )
 
-        reduce = compile_moe_reduction(topk=topk, model_dim=hidden_size, dtype_str="bf16")
+        reduction_dtype = "f16" if compute_dtype == "fp16" else "bf16"
+        reduce = compile_moe_reduction(topk=topk, model_dim=hidden_size, dtype_str=reduction_dtype)
         _run_compiled(
             reduce,
             _ptr(dx_routes),
