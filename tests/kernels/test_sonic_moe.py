@@ -59,15 +59,18 @@ def _gfx950_device():
     return torch.device("cuda")
 
 
-def _make_case(tokens=TOKENS, seed=17):
+def _make_case(tokens=TOKENS, seed=17, activation="swiglu"):
     device = _gfx950_device()
     generator = torch.Generator(device=device).manual_seed(seed)
     x = torch.randn(
         (tokens, HIDDEN_SIZE), device=device, dtype=torch.float32, generator=generator
     ).to(torch.bfloat16)
+    stage1_size = INTERMEDIATE_SIZE * (
+        2 if activation in ("swiglu", "geglu", "reglu") else 1
+    )
     w1 = (
         torch.randn(
-            (NUM_EXPERTS, 2 * INTERMEDIATE_SIZE, HIDDEN_SIZE),
+            (NUM_EXPERTS, stage1_size, HIDDEN_SIZE),
             device=device,
             dtype=torch.float32,
             generator=generator,
@@ -127,6 +130,79 @@ def test_sonic_moe_bf16_forward_matches_reference():
     _assert_close(out, expected)
 
 
+@pytest.mark.parametrize(
+    "activation",
+    ("swiglu", "geglu", "reglu", "gelu_tanh_approx", "relu", "silu", "relu_sq"),
+)
+def test_sonic_moe_bf16_activation_variants_fixed_and_flat_routes(activation):
+    config = _config(activation=activation)
+    x, w1, w2, router_logits = _make_case(seed=83, activation=activation)
+    op = SonicMoE(config, prepare_sonic_bf16_weights(w1, w2, config))
+    expected = sonic_moe_reference(x, w1, w2, router_logits, config)
+    topk_ids, topk_weights = _topk_from_logits(router_logits, config)
+
+    actual_fixed = op.forward_topk(x, topk_ids, topk_weights)
+    token_indices = torch.arange(TOKENS, dtype=torch.int32, device=x.device).repeat_interleave(
+        config.top_k
+    )
+    actual_flat = op.forward_routes(
+        x,
+        token_indices,
+        topk_ids.reshape(-1).contiguous(),
+        topk_weights.reshape(-1).contiguous(),
+    )
+    torch.cuda.synchronize()
+
+    _assert_close(actual_fixed, expected)
+    _assert_close(actual_flat, expected)
+
+
+@pytest.mark.parametrize("activation", ("geglu", "relu_sq"))
+def test_sonic_moe_mxfp4_activation_variants(activation):
+    config = _config(activation=activation)
+    x, w1, w2, router_logits = _make_case(seed=89, activation=activation)
+    prepared = prepare_sonic_mxfp4_weights(w1, w2, config)
+    expected = sonic_moe_mxfp4_reference(x, w1, w2, router_logits, config)
+    actual = SonicMoE(config, prepared)(x, router_logits)
+    torch.cuda.synchronize()
+    _assert_close(actual, expected)
+
+
+def test_sonic_moe_activation_preserves_legacy_bf16_preactivation_rounding():
+    device = _gfx950_device()
+    config = _config(num_experts=1, top_k=1, activation="relu_sq")
+    value = 1.5078125
+    x = torch.zeros((1, HIDDEN_SIZE), dtype=torch.bfloat16, device=device)
+    x[0, 0] = value
+    w1 = torch.zeros(
+        (1, INTERMEDIATE_SIZE, HIDDEN_SIZE), dtype=torch.bfloat16, device=device
+    )
+    w1[0, :, 0] = value
+    w2 = torch.zeros(
+        (1, HIDDEN_SIZE, INTERMEDIATE_SIZE), dtype=torch.bfloat16, device=device
+    )
+    op = SonicMoE(config, prepare_sonic_bf16_weights(w1, w2, config))
+
+    op.forward_topk(
+        x,
+        torch.zeros((1, 1), dtype=torch.int32, device=device),
+        torch.ones((1, 1), dtype=torch.float32, device=device),
+    )
+    torch.cuda.synchronize()
+
+    assert op.workspace is not None
+    preactivation = (torch.tensor(value) * torch.tensor(value)).to(torch.bfloat16).float()
+    expected = preactivation.square().to(torch.bfloat16)
+    without_preactivation_rounding = torch.tensor(value * value).square().to(torch.bfloat16)
+    assert expected.item() != without_preactivation_rounding.item()
+    assert torch.equal(
+        op.workspace.intermediate[0],
+        torch.full(
+            (INTERMEDIATE_SIZE,), expected.item(), dtype=torch.bfloat16, device=device
+        ),
+    )
+
+
 def test_sonic_moe_ragged_routes_match_reference_and_frequency():
     """Flat routes allow missing tokens, duplicate edges, and arbitrary weights."""
 
@@ -156,7 +232,7 @@ def test_sonic_moe_ragged_routes_match_reference_and_frequency():
     for route in range(route_weights.numel()):
         token = int(token_indices[route])
         expert = int(expert_indices[route])
-        gate_up = w1_f32[expert] @ x_f32[token]
+        gate_up = (w1_f32[expert] @ x_f32[token]).to(torch.bfloat16).float()
         gate, up = gate_up.split(INTERMEDIATE_SIZE)
         activated = (torch.nn.functional.silu(gate) * up).to(torch.bfloat16).float()
         projected = w2_f32[expert] @ activated
@@ -271,7 +347,7 @@ def test_sonic_moe_ragged_high_fan_in_matches_fp32_reference():
 
     expected_row = torch.zeros(HIDDEN_SIZE, dtype=torch.float32, device=device)
     for expert in range(experts):
-        gate_up = w1[expert].float() @ x[0].float()
+        gate_up = (w1[expert].float() @ x[0].float()).to(torch.bfloat16).float()
         gate, up = gate_up.split(INTERMEDIATE_SIZE)
         activated = (torch.nn.functional.silu(gate) * up).to(torch.bfloat16).float()
         expected_row.add_((w2[expert].float() @ activated) * route_weights[expert])
@@ -725,7 +801,7 @@ def test_sonic_moe_autotuner_search_and_disk_cache(tmp_path):
     recovered(x, router_logits)
     torch.cuda.synchronize()
     assert recovered.search_count == 1
-    assert '"version": 2' in non_object_cache_file.read_text(encoding="utf-8")
+    assert '"version": 3' in non_object_cache_file.read_text(encoding="utf-8")
 
 
 def test_sonic_moe_router_and_multiphase_sort_fallback():
@@ -923,6 +999,10 @@ def test_sonic_moe_config_validation():
     for override in invalid_configs:
         with pytest.raises((TypeError, ValueError)):
             _config(**override)
+    with pytest.raises(ValueError, match="unsupported activation"):
+        _config(activation="not-an-activation")
+    with pytest.raises(TypeError, match="activation must be a string"):
+        _config(activation=None)
 
     large_mesh_config = _config(num_experts=300, top_k=1)
     with pytest.raises(ValueError, match="signed 32-bit byte-index"):

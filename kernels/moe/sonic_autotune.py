@@ -24,7 +24,7 @@ from kernels.moe.moe_sorting_kernel import moe_softmax_sort_flydsl
 from kernels.moe.sonic import SonicMoE, SonicMoEConfig, SonicMoEWeights
 
 
-_CACHE_SCHEMA_VERSION = 2
+_CACHE_SCHEMA_VERSION = 3
 _TUNING_FIELDS = (
     "tile_m",
     "tile_n",
@@ -202,6 +202,7 @@ class SonicMoEAutotuner:
             "num_experts",
             "top_k",
             "renormalize",
+            "activation",
         )
         expected = tuple(getattr(self.base_config, name) for name in semantic_fields)
         SonicMoE(self.base_config, self.weights)
@@ -242,6 +243,7 @@ class SonicMoEAutotuner:
             "num_experts": self.base_config.num_experts,
             "top_k": self.base_config.top_k,
             "renormalize": self.base_config.renormalize,
+            "activation": self.base_config.activation,
             "profile_key": self.profile_key,
             "validated": self.validate_candidates,
             "candidates": self._candidate_fingerprint(),

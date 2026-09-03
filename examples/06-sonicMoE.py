@@ -43,6 +43,11 @@ def _parse_args():
     parser.add_argument("--down-tile-n", type=int, default=None)
     parser.add_argument("--down-tile-k", type=int, default=None)
     parser.add_argument("--weight-dtype", choices=("bf16", "mxfp4"), default="bf16")
+    parser.add_argument(
+        "--activation",
+        choices=("swiglu", "geglu", "reglu", "gelu_tanh_approx", "relu", "silu", "relu_sq"),
+        default="swiglu",
+    )
     parser.add_argument("--autotune", action="store_true", help="search and cache a shape-bucket tile")
     parser.add_argument("--autotune-warmup", type=int, default=3)
     parser.add_argument("--autotune-iters", type=int, default=10)
@@ -76,6 +81,7 @@ def main():
         tile_k=args.tile_k,
         down_tile_n=args.down_tile_n,
         down_tile_k=args.down_tile_k,
+        activation=args.activation,
     )
     device = torch.device("cuda")
     torch.manual_seed(args.seed)
@@ -83,7 +89,8 @@ def main():
     w1 = (
         torch.randn(
             args.experts,
-            2 * args.intermediate_size,
+            args.intermediate_size
+            * (2 if args.activation in ("swiglu", "geglu", "reglu") else 1),
             args.hidden_size,
             device=device,
             dtype=torch.bfloat16,
@@ -198,8 +205,16 @@ def main():
     end.synchronize()
 
     latency_us = start.elapsed_time(end) * 1000.0 / args.iters
-    # Gate+up: 4*T*K*H*I, down: 2*T*K*H*I.
-    useful_flops = 6.0 * args.tokens * args.top_k * args.hidden_size * args.intermediate_size
+    # GLU stage 1 has two projections; pointwise activations have one. Stage 2 has one.
+    projection_count = 3 if args.activation in ("swiglu", "geglu", "reglu") else 2
+    useful_flops = (
+        2.0
+        * projection_count
+        * args.tokens
+        * args.top_k
+        * args.hidden_size
+        * args.intermediate_size
+    )
     useful_tflops = useful_flops / (latency_us * 1e-6) / 1e12
     if op.workspace is None:
         raise RuntimeError("SonicMoE workspace was not initialized")
@@ -212,7 +227,7 @@ def main():
     print(
         f"device={props.name}, arch={get_rocm_arch()}, "
         f"shape=T{args.tokens} H{args.hidden_size} I{args.intermediate_size} "
-        f"E{args.experts} K{args.top_k} W={args.weight_dtype}"
+        f"E{args.experts} K{args.top_k} W={args.weight_dtype} A={args.activation}"
     )
     print(
         f"tiles=({run_config.tile_m},{run_config.tile_n},{run_config.tile_k})/"

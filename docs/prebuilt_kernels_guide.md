@@ -303,9 +303,10 @@ python3 tests/kernels/test_flash_attn_fwd.py --dtype fp8 --compare --warmup 10 -
 The gfx950 inference path composes the existing FlyDSL routing and
 `moe_2stage_a16wmix` MFMA kernels. The routing stage rounds each expert's rows to
 `tile_m` and records packed token/slot indices. Stage 1 gathers the original BF16
-rows while loading A and fuses `silu(gate) * up`; stage 2 consumes the sorted BF16
-intermediate and performs routing-weighted BF16 atomic scatter. No explicit
-gathered activation tensor is materialized.
+rows while loading A and fuses the selected activation; stage 2 consumes the
+sorted BF16 intermediate and performs routing-weighted BF16 atomic scatter. No
+explicit gathered activation tensor is materialized. Supported activations are
+SwiGLU, GEGLU, ReGLU, GELU-tanh, ReLU, SiLU, and ReLU squared.
 
 ```python
 from kernels.moe.sonic import (
@@ -319,8 +320,10 @@ cfg = SonicMoEConfig(
     hidden_size=4096, intermediate_size=14336,
     num_experts=256, top_k=8,
     tile_m=32, tile_n=128, tile_k=128,
+    activation="swiglu",
 )
-# w1: [E, 2*I, H] in [gate | up] order; w2: [E, H, I].
+# GLU w1: [E, 2*I, H] in [gate | up] order.
+# Non-GLU w1: [E, I, H]. w2 is always [E, H, I].
 # Choose one prepared format. Weight preparation is outside the hot path.
 weights = prepare_sonic_bf16_weights(w1, w2, cfg)
 # weights = prepare_sonic_mxfp4_weights(w1, w2, cfg)

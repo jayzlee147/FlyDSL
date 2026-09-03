@@ -6,7 +6,7 @@
 The hot path is three logical stages:
 
 1. router softmax + top-k + expert sort/token rounding (and output zeroing),
-2. grouped gate/up GEMM with indexed row-gather and fused SwiGLU, and
+2. grouped stage-1 GEMM with indexed row-gather and fused activation, and
 3. grouped down-projection with routing-weighted atomic scatter.
 
 No gathered activation tensor is materialized.  Expert rows are represented by
@@ -17,7 +17,8 @@ stage 2 consumes the sorted BF16 intermediate and scatters directly to tokens.
 Weights may be dense BF16 (A16W16) or per-1x32 E8M0-scaled MXFP4
 (A16W4); activations and the stage-1 intermediate remain BF16 in both modes.
 This module is intentionally an inference-forward API.  The SonicMoE training
-backward (varlen-K dW, dSwiGLU, and bias reductions) is not implemented here.
+backward (varlen-K dW, activation derivatives, and bias reductions) is not
+implemented here.
 """
 
 from __future__ import annotations
@@ -56,13 +57,27 @@ _SUPPORTED_ROUTER_DTYPES = {
     torch.float16: "f16",
     torch.bfloat16: "bf16",
 }
+_SUPPORTED_ACTIVATIONS = frozenset(
+    {"swiglu", "geglu", "reglu", "gelu_tanh_approx", "relu", "silu", "relu_sq"}
+)
+_GLU_ACTIVATIONS = frozenset({"swiglu", "geglu", "reglu"})
+_GEMM1_ACTIVATIONS = {
+    # gemm1's historical ``silu`` spelling means the fused SwiGLU epilogue.
+    "swiglu": "silu",
+    "geglu": "geglu",
+    "reglu": "reglu",
+    "gelu_tanh_approx": "gelu_tanh_approx",
+    "relu": "relu",
+    "silu": "silu_pointwise",
+    "relu_sq": "relu_sq",
+}
 
 
 @dataclass(frozen=True)
 class SonicMoEConfig:
     """Static shape and tile configuration for :class:`SonicMoE`.
 
-    ``tile_n``/``tile_k`` configure the gate/up GEMM.  The down-projection
+    ``tile_n``/``tile_k`` configure the stage-1 GEMM.  The down-projection
     defaults to the same values and can be tuned independently with
     ``down_tile_n``/``down_tile_k``.  All tiles are compile-time constants.
     """
@@ -83,8 +98,16 @@ class SonicMoEConfig:
     stage2_xcd_swizzle: int = 1
     waves_per_eu: int | None = None
     persistent_stage2: bool = False
+    activation: str = "swiglu"
 
     def __post_init__(self) -> None:
+        if not isinstance(self.activation, str):
+            raise TypeError(f"activation must be a string, got {type(self.activation).__name__}")
+        if self.activation not in _SUPPORTED_ACTIVATIONS:
+            raise ValueError(
+                f"unsupported activation {self.activation!r}; expected one of "
+                f"{sorted(_SUPPORTED_ACTIVATIONS)}"
+            )
         positive = {
             "hidden_size": self.hidden_size,
             "intermediate_size": self.intermediate_size,
@@ -158,9 +181,8 @@ class SonicMoEConfig:
                 f"hidden_size ({self.hidden_size}) must be divisible by "
                 f"down_tile_n ({self.stage2_tile_n})"
             )
-        # The gate/up body emits two 128-channel halves.
-        if (2 * self.intermediate_size) % 256 != 0:
-            raise ValueError("2 * intermediate_size must be divisible by 256")
+        if self.intermediate_size % 128 != 0:
+            raise ValueError("intermediate_size must be divisible by 128")
         if self.stage1_b_cache_mod not in (None, 0, 2):
             raise ValueError("stage1_b_cache_mod must be None, 0 (cached), or 2 (non-temporal)")
         if self.stage2_b_cache_mod not in (None, 0, 2):
@@ -198,6 +220,14 @@ class SonicMoEConfig:
         return self.num_experts <= 1024 and not (
             self.num_experts & (self.num_experts - 1)
         )
+
+    @property
+    def is_glu(self) -> bool:
+        return self.activation in _GLU_ACTIVATIONS
+
+    @property
+    def stage1_projection_size(self) -> int:
+        return self.intermediate_size * (2 if self.is_glu else 1)
 
 
 @dataclass(frozen=True)
@@ -410,7 +440,7 @@ def _validate_weight_inputs(
     w2: torch.Tensor,
     config: SonicMoEConfig,
 ) -> None:
-    expected_w1 = (config.num_experts, 2 * config.intermediate_size, config.hidden_size)
+    expected_w1 = (config.num_experts, config.stage1_projection_size, config.hidden_size)
     expected_w2 = (config.num_experts, config.hidden_size, config.intermediate_size)
     if tuple(w1.shape) != expected_w1:
         raise ValueError(f"w1 must have shape {expected_w1}, got {tuple(w1.shape)}")
@@ -436,7 +466,7 @@ def _mxfp4_scale_storage_numel(experts: int, rows: int, k: int) -> int:
 
 def _validate_bf16_resource_limits(config: SonicMoEConfig) -> None:
     # Each expert gets a 64-bit resource base, but offsets within it remain u32.
-    gate_up_bytes_per_expert = 4 * config.intermediate_size * config.hidden_size
+    gate_up_bytes_per_expert = config.stage1_projection_size * config.hidden_size * 2
     if gate_up_bytes_per_expert > _MAX_BUFFER_BYTE_OFFSET:
         raise ValueError(
             "BF16 gate/up weights for one expert exceed the 32-bit byte-offset limit: "
@@ -447,7 +477,7 @@ def _validate_bf16_resource_limits(config: SonicMoEConfig) -> None:
 def _validate_mxfp4_resource_limits(config: SonicMoEConfig) -> None:
     """Guard per-expert packed weights and whole-tensor E8M0 scale spans."""
 
-    packed_gate_up_bytes_per_expert = config.intermediate_size * config.hidden_size
+    packed_gate_up_bytes_per_expert = config.stage1_projection_size * config.hidden_size // 2
     if packed_gate_up_bytes_per_expert > _MAX_BUFFER_BYTE_OFFSET:
         raise ValueError(
             "MXFP4 gate/up weights for one expert exceed the 32-bit byte-offset limit: "
@@ -458,7 +488,7 @@ def _validate_mxfp4_resource_limits(config: SonicMoEConfig) -> None:
     down_scale_cols = _round_up(config.intermediate_size // 32, 8)
     spans = {
         "gate/up E8M0 scales": config.num_experts
-        * (2 * config.intermediate_size)
+        * config.stage1_projection_size
         * gate_scale_cols,
         "down E8M0 scales": config.num_experts
         * config.hidden_size
@@ -496,7 +526,7 @@ def _validate_prepared_weight_storage(
     if weights.weight_dtype == "bf16":
         expected_gate_up = (
             config.num_experts,
-            2 * config.intermediate_size,
+            config.stage1_projection_size,
             config.hidden_size,
         )
         expected_down = (
@@ -511,7 +541,7 @@ def _validate_prepared_weight_storage(
     else:
         expected_gate_up = (
             config.num_experts,
-            2 * config.intermediate_size,
+            config.stage1_projection_size,
             config.hidden_size // 2,
         )
         expected_down = (
@@ -527,7 +557,7 @@ def _validate_prepared_weight_storage(
             raise TypeError("MXFP4 E8M0 scales must use uint8 storage")
         expected_gate_scale = _mxfp4_scale_storage_numel(
             config.num_experts,
-            2 * config.intermediate_size,
+            config.stage1_projection_size,
             config.hidden_size,
         )
         expected_down_scale = _mxfp4_scale_storage_numel(
@@ -749,13 +779,15 @@ def prepare_sonic_bf16_weights(
     w2: torch.Tensor,
     config: SonicMoEConfig,
 ) -> SonicMoEWeights:
-    """Validate and preshuffle concatenated gate/up and down-projection weights.
+    """Validate and preshuffle stage-1 and down-projection weights.
 
     Parameters
     ----------
     w1:
         ``[num_experts, 2 * intermediate_size, hidden_size]`` in ``[gate | up]``
-        order.  Floating input is converted to BF16 once during preparation.
+        order for GLU activations, otherwise
+        ``[num_experts, intermediate_size, hidden_size]``. Floating input is
+        converted to BF16 once during preparation.
     w2:
         ``[num_experts, hidden_size, intermediate_size]``.
     """
@@ -833,13 +865,14 @@ def _get_stage1_launcher(
         TOPK=config.top_k,
         TILE_N=config.tile_n,
         TILE_K=config.tile_k,
-        act="silu",
+        act=_GEMM1_ACTIVATIONS[config.activation],
         b_cache_mod=b_cache_mod,
         xcd_swizzle=config.stage1_xcd_swizzle,
         waves_per_eu=config.waves_per_eu,
         w_dtype=weight_dtype,
         w_layout="standard",
         k_wave=1,
+        round_preact_bf16=True,
     )
 
 
@@ -894,15 +927,17 @@ class SonicMoE:
             weights.config.hidden_size,
             weights.config.intermediate_size,
             weights.config.num_experts,
+            weights.config.activation,
         )
         requested_shape = (
             config.hidden_size,
             config.intermediate_size,
             config.num_experts,
+            config.activation,
         )
         if prepared_shape != requested_shape:
             raise ValueError(
-                "prepared weights were created for different H/I/E dimensions: "
+                "prepared weights were created for different H/I/E/activation: "
                 f"{prepared_shape} != {requested_shape}"
             )
         if weights.weight_dtype not in ("bf16", "mxfp4"):
@@ -1113,7 +1148,7 @@ class SonicMoE:
         router_logits: torch.Tensor,
         out: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Run router + grouped SwiGLU MLP from router logits.
+        """Run router + grouped expert MLP from router logits.
 
         ``router_logits`` is ``[tokens, num_experts]`` in FP32/FP16/BF16.
         """
@@ -1449,7 +1484,7 @@ def sonic_moe_reference(
         raise ValueError("hidden_states shape does not match config/router_logits")
     if tuple(w1.shape) != (
         config.num_experts,
-        2 * config.intermediate_size,
+        config.stage1_projection_size,
         config.hidden_size,
     ):
         raise ValueError("w1 shape does not match config")
@@ -1474,10 +1509,32 @@ def sonic_moe_reference(
     )
     for slot in range(config.top_k):
         expert = route_ids[:, slot]
-        gate_up = torch.bmm(w1f[expert], x.unsqueeze(-1)).squeeze(-1)
-        gate, up = gate_up.split(config.intermediate_size, dim=-1)
+        stage1 = torch.bmm(w1f[expert], x.unsqueeze(-1)).squeeze(-1)
+        # The legacy grouped GEMM materializes BF16 preactivation before the
+        # activation kernel reloads it in FP32. The fused kernel preserves this
+        # observable rounding boundary.
+        stage1 = stage1.to(torch.bfloat16).float()
         # Stage 1 stores a BF16 sorted intermediate before stage 2 reloads it.
-        activated = (torch.nn.functional.silu(gate) * up).to(torch.bfloat16).float()
+        if config.activation == "swiglu":
+            gate, up = stage1.split(config.intermediate_size, dim=-1)
+            activated = torch.nn.functional.silu(gate) * up
+        elif config.activation == "geglu":
+            gate, up = stage1.split(config.intermediate_size, dim=-1)
+            activated = torch.nn.functional.gelu(gate, approximate="tanh") * up
+        elif config.activation == "reglu":
+            gate, up = stage1.split(config.intermediate_size, dim=-1)
+            activated = torch.nn.functional.relu(gate) * up
+        elif config.activation == "gelu_tanh_approx":
+            activated = torch.nn.functional.gelu(stage1, approximate="tanh")
+        elif config.activation == "relu":
+            activated = torch.nn.functional.relu(stage1)
+        elif config.activation == "silu":
+            activated = torch.nn.functional.silu(stage1)
+        elif config.activation == "relu_sq":
+            activated = torch.nn.functional.relu(stage1).square()
+        else:  # guarded by SonicMoEConfig validation
+            raise AssertionError(f"unexpected activation {config.activation!r}")
+        activated = activated.to(torch.bfloat16).float()
         projected = torch.bmm(w2f[expert], activated.unsqueeze(-1)).squeeze(-1)
         result.add_(projected * route_weights[:, slot, None])
     return result.to(torch.bfloat16)
