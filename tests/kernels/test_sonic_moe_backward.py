@@ -13,6 +13,17 @@ from kernels.moe.sonic import SonicMoEConfig, sonic_moe_backward
 
 pytestmark = [pytest.mark.l2_device, pytest.mark.rocm_lower]
 
+_GLU_ACTIVATIONS = frozenset({"swiglu", "geglu", "reglu"})
+_ACTIVATIONS = (
+    "swiglu",
+    "geglu",
+    "reglu",
+    "gelu_tanh_approx",
+    "relu",
+    "silu",
+    "relu_sq",
+)
+
 
 def _gfx950_device():
     if not torch.cuda.is_available():
@@ -39,9 +50,19 @@ def _config(hidden_size, intermediate_size, num_experts, topk, **overrides):
     return SonicMoEConfig(**values)
 
 
-def _make_case(tokens, hidden_size, intermediate_size, num_experts, topk, seed):
+def _make_case(
+    tokens,
+    hidden_size,
+    intermediate_size,
+    num_experts,
+    topk,
+    seed,
+    *,
+    activation="swiglu",
+):
     device = _gfx950_device()
     generator = torch.Generator(device=device).manual_seed(seed)
+    projection_size = intermediate_size * (2 if activation in _GLU_ACTIVATIONS else 1)
     x = torch.randn(
         (tokens, hidden_size),
         dtype=torch.float32,
@@ -50,7 +71,7 @@ def _make_case(tokens, hidden_size, intermediate_size, num_experts, topk, seed):
     ).to(torch.bfloat16)
     w1 = (
         torch.randn(
-            (num_experts, 2 * intermediate_size, hidden_size),
+            (num_experts, projection_size, hidden_size),
             dtype=torch.float32,
             device=device,
             generator=generator,
@@ -86,14 +107,76 @@ def _make_case(tokens, hidden_size, intermediate_size, num_experts, topk, seed):
     return x, w1, w2, topk_ids, topk_weights, grad_output
 
 
+def _tanh_reference(value):
+    exp_value = torch.exp2(value.abs() * (-2.0 * math.log2(math.e)))
+    tanh_abs = (1.0 - exp_value) / (1.0 + exp_value)
+    return torch.where(value > 0, tanh_abs, -tanh_abs)
+
+
+def _gelu_tanh_reference(value):
+    inner = math.sqrt(2.0 / math.pi) * (value + 0.044715 * value.square() * value)
+    tanh_inner = _tanh_reference(inner)
+    activated = 0.5 * value * (1.0 + tanh_inner)
+    derivative = 0.5 * (1.0 + tanh_inner) + (
+        0.5 * value * (1.0 - tanh_inner.square()) * math.sqrt(2.0 / math.pi) * (1.0 + 3.0 * 0.044715 * value.square())
+    )
+    return activated, derivative
+
+
+def _activation_reference(preactivation, da, intermediate_size, activation_name):
+    if activation_name in _GLU_ACTIVATIONS:
+        gate, up = preactivation.float().split(intermediate_size, dim=1)
+        if activation_name == "swiglu":
+            sigmoid = torch.sigmoid(gate)
+            activated_gate = gate * sigmoid
+            derivative = sigmoid * (1.0 + gate * (1.0 - sigmoid))
+        elif activation_name == "geglu":
+            activated_gate, derivative = _gelu_tanh_reference(gate)
+        else:
+            activated_gate = torch.relu(gate)
+            derivative = (gate > 0).float()
+        activated = activated_gate * up
+        dz = torch.cat((da * up * derivative, da * activated_gate), dim=1)
+    else:
+        value = preactivation.float()
+        if activation_name == "gelu_tanh_approx":
+            activated, derivative = _gelu_tanh_reference(value)
+        elif activation_name == "relu":
+            activated = torch.relu(value)
+            derivative = (value > 0).float()
+        elif activation_name == "silu":
+            sigmoid = torch.sigmoid(value)
+            activated = value * sigmoid
+            derivative = sigmoid * (1.0 + value * (1.0 - sigmoid))
+        elif activation_name == "relu_sq":
+            relu = torch.relu(value)
+            activated = relu.square()
+            derivative = 2.0 * relu
+        else:
+            raise AssertionError(f"unexpected activation {activation_name!r}")
+        dz = da * derivative
+    return activated.to(torch.bfloat16), dz.to(torch.bfloat16)
+
+
 @torch.no_grad()
-def _backward_reference(x, w1, w2, topk_ids, topk_weights, grad_output):
+def _backward_reference(
+    x,
+    w1,
+    w2,
+    topk_ids,
+    topk_weights,
+    grad_output,
+    *,
+    activation_name="swiglu",
+):
     """Match the standalone backward's explicit A16 materialization contract."""
 
     tokens, hidden_size = x.shape
     num_experts, projection_size, _ = w1.shape
     topk = topk_ids.shape[1]
-    intermediate_size = projection_size // 2
+    intermediate_size = w2.shape[-1]
+    expected_projection_size = intermediate_size * (2 if activation_name in _GLU_ACTIVATIONS else 1)
+    assert projection_size == expected_projection_size
     dx_routes = torch.empty(
         (tokens, topk, hidden_size),
         dtype=torch.bfloat16,
@@ -113,20 +196,29 @@ def _backward_reference(x, w1, w2, topk_ids, topk_weights, grad_output):
         scores_e = topk_weights[token_indices, slots]
 
         preactivation = (x_e.float() @ w1[expert].float().transpose(0, 1)).to(torch.bfloat16)
-        gate, up = preactivation.float().split(intermediate_size, dim=1)
-        activation = (torch.nn.functional.silu(gate) * up).to(torch.bfloat16)
+        # da is computed before dz, while activation is needed by projection
+        # and dW2.  Passing a zero placeholder here avoids duplicating the
+        # activation formulas; dz is recomputed after da is available.
+        activation, _ = _activation_reference(
+            preactivation,
+            torch.zeros(
+                (preactivation.shape[0], intermediate_size),
+                dtype=torch.float32,
+                device=preactivation.device,
+            ),
+            intermediate_size,
+            activation_name,
+        )
         projection = (activation.float() @ w2[expert].float().transpose(0, 1)).to(torch.bfloat16)
         dtopk_weights[token_indices, slots] = (dout_e.float() * projection.float()).sum(dim=1)
         dy = (dout_e.float() * scores_e[:, None]).to(torch.bfloat16)
         da = (dy.float() @ w2[expert].float()).to(torch.bfloat16).float()
-        sigmoid = torch.sigmoid(gate)
-        dz = torch.cat(
-            (
-                da * up * sigmoid * (1.0 + gate * (1.0 - sigmoid)),
-                da * gate * sigmoid,
-            ),
-            dim=1,
-        ).to(torch.bfloat16)
+        _, dz = _activation_reference(
+            preactivation,
+            da,
+            intermediate_size,
+            activation_name,
+        )
 
         dw2[expert] = (dy.float().transpose(0, 1) @ activation.float()).to(torch.bfloat16)
         dw1[expert] = (dz.float().transpose(0, 1) @ x_e.float()).to(torch.bfloat16)
@@ -175,6 +267,42 @@ def test_sonic_moe_backward_matches_a16_reference(
     assert torch.count_nonzero(actual[2][-1]) == 0
 
 
+@pytest.mark.parametrize("activation_name", _ACTIVATIONS)
+def test_sonic_moe_backward_activation_variants_match_a16_reference(activation_name):
+    hidden_size, intermediate_size, num_experts, topk = 128, 64, 4, 2
+    config = _config(
+        hidden_size,
+        intermediate_size,
+        num_experts,
+        topk,
+        activation=activation_name,
+    )
+    args = _make_case(
+        7,
+        hidden_size,
+        intermediate_size,
+        num_experts,
+        topk,
+        seed=271,
+        activation=activation_name,
+    )
+
+    actual = sonic_moe_backward(*args, config)
+    expected = _backward_reference(*args, activation_name=activation_name)
+    torch.cuda.synchronize()
+
+    for actual_gradient, expected_gradient in zip(actual[:3], expected[:3]):
+        assert actual_gradient.shape == expected_gradient.shape
+        assert actual_gradient.dtype == expected_gradient.dtype
+        torch.testing.assert_close(
+            actual_gradient.float(),
+            expected_gradient.float(),
+            rtol=3e-2,
+            atol=5e-2,
+        )
+    torch.testing.assert_close(actual[3], expected[3], rtol=5e-4, atol=5e-4)
+
+
 def test_sonic_moe_backward_repeated_calls_do_not_alias_workspace():
     config = _config(128, 64, 4, 2)
     first = _make_case(7, 128, 64, 4, 2, seed=251)
@@ -194,7 +322,7 @@ def test_sonic_moe_backward_rejects_unsupported_contracts():
 
     with pytest.raises(ValueError, match="compute_dtype='bf16'"):
         sonic_moe_backward(*args, _config(128, 64, 4, 2, compute_dtype="fp16"))
-    with pytest.raises(ValueError, match="activation='swiglu'"):
+    with pytest.raises(ValueError, match="w1 must have shape"):
         sonic_moe_backward(*args, _config(128, 64, 4, 2, activation="relu"))
 
     noncontiguous_dout = args[-1].transpose(0, 1).contiguous().transpose(0, 1)

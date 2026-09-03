@@ -3,15 +3,15 @@
 
 """First-stage training backward for the gfx950 SonicMoE operator.
 
-This module intentionally starts with the narrow training contract needed by
-the SonicMoE ROCm adapter: dense BF16 expert weights, fixed-K routing, SwiGLU,
-and no expert bias.  It does not reuse the inference workspace.  Re-sorting
-and recomputing the two forward intermediates makes retained graphs and
+This module implements the dense BF16, fixed-K, bias-free training contract
+needed by the SonicMoE ROCm adapter.  All seven forward activations are
+supported.  It does not reuse the inference workspace.  Re-sorting and
+recomputing the two forward intermediates makes retained graphs and
 overlapping forward calls safe.
 
 The implementation is entirely FlyDSL on device.  The general A16W16 GEMM is
 used for all expert matrix products; small FlyDSL kernels implement routing
-metadata, gather/scatter, SwiGLU's derivative, and the top-K reduction.  The
+metadata, gather/scatter, activation derivatives, and the top-K reduction.  The
 bring-up path performs one host synchronization to read expert frequencies and
 dispatches six GEMMs per active expert.  A future grouped-MFMA implementation
 can replace that dispatch without changing the public API.
@@ -34,6 +34,7 @@ from kernels.common.kernels_common import get_warp_size
 from kernels.common.mem_ops import atomic_add
 from kernels.common.tensor_shim import _run_compiled
 from kernels.gemm.gemm_a16w16_gfx950 import gemm_a16w16
+from kernels.moe.moe_2stage_a16wmix.gemm1 import _gelu_tanh_f32, _relu_f32, _sigmoid_f32, _tanh_f32
 from kernels.moe.moe_gemm_2stage.moe_reduce import compile_moe_reduction
 from kernels.moe.moe_sorting_kernel import moe_sorting_flydsl, moe_sorting_get_workspace_size
 
@@ -46,6 +47,8 @@ _SORT_UNIT = 64
 _TOKEN_MASK = 0x00FFFFFF
 _WARP_SIZE = get_warp_size()
 _RED_SLOTS = max(1, (_BLOCK_THREADS + _WARP_SIZE - 1) // _WARP_SIZE)
+_GLU_ACTIVATIONS = frozenset({"swiglu", "geglu", "reglu"})
+_SUPPORTED_ACTIVATIONS = frozenset({"swiglu", "geglu", "reglu", "gelu_tanh_approx", "relu", "silu", "relu_sq"})
 
 _GEMM_KWARGS = {
     "block_m": 64,
@@ -62,8 +65,77 @@ _GEMM_KWARGS = {
 
 
 @fx.struct
-class _SwiGLUBackwardSharedStorage:
+class _ScoreBackwardSharedStorage:
     reduction: fx.Array[fx.Float32, _RED_SLOTS, 16]
+
+
+def _gelu_tanh_derivative_f32(x):
+    """Derivative of the tanh-approximate GELU used by stage 1."""
+
+    one = fx.Float32(1.0)
+    half = fx.Float32(0.5)
+    sqrt_2_over_pi = fx.Float32(0.7978845608028654)
+    coeff = fx.Float32(0.044715)
+    inner = sqrt_2_over_pi * (x + coeff * x * x * x)
+    tanh_inner = _tanh_f32(inner)
+    dinner = sqrt_2_over_pi * (one + fx.Float32(3.0) * coeff * x * x)
+    return half * (one + tanh_inner) + half * x * (one - tanh_inner * tanh_inner) * dinner
+
+
+def _relu_derivative_f32(x):
+    zero = fx.Float32(0.0)
+    one = fx.Float32(1.0)
+    positive = arith.cmpf(arith.CmpFPredicate.OGT, _raw(x), _raw(zero))
+    return fx.Float32(arith.select(positive, _raw(one), _raw(zero)))
+
+
+def _activation_f32(gate, up, activation: str):
+    """Apply a compile-time selected public SonicMoE activation."""
+
+    if activation == "swiglu":
+        return gate * _sigmoid_f32(gate) * up
+    if activation == "geglu":
+        return _gelu_tanh_f32(gate) * up
+    if activation == "reglu":
+        return _relu_f32(gate) * up
+    if activation == "gelu_tanh_approx":
+        return _gelu_tanh_f32(gate)
+    if activation == "relu":
+        return _relu_f32(gate)
+    if activation == "silu":
+        return gate * _sigmoid_f32(gate)
+    if activation == "relu_sq":
+        relu = _relu_f32(gate)
+        return relu * relu
+    raise AssertionError(f"unexpected activation {activation!r}")
+
+
+def _activation_backward_f32(gate, up, da, activation: str):
+    """Apply a compile-time selected activation Jacobian-vector product."""
+
+    one = fx.Float32(1.0)
+    if activation == "swiglu":
+        sigmoid = _sigmoid_f32(gate)
+        activated_gate = gate * sigmoid
+        derivative = sigmoid * (one + gate * (one - sigmoid))
+        return da * up * derivative, da * activated_gate
+    if activation == "geglu":
+        return (
+            da * up * _gelu_tanh_derivative_f32(gate),
+            da * _gelu_tanh_f32(gate),
+        )
+    if activation == "reglu":
+        return da * up * _relu_derivative_f32(gate), da * _relu_f32(gate)
+    if activation == "gelu_tanh_approx":
+        return da * _gelu_tanh_derivative_f32(gate), fx.Float32(0.0)
+    if activation == "relu":
+        return da * _relu_derivative_f32(gate), fx.Float32(0.0)
+    if activation == "silu":
+        sigmoid = _sigmoid_f32(gate)
+        return da * sigmoid * (one + gate * (one - sigmoid)), fx.Float32(0.0)
+    if activation == "relu_sq":
+        return da * fx.Float32(2.0) * _relu_f32(gate), fx.Float32(0.0)
+    raise AssertionError(f"unexpected activation {activation!r}")
 
 
 def _max_padded_routes(tokens: int, num_experts: int, topk: int) -> tuple[int, int]:
@@ -208,13 +280,21 @@ def _compile_gather(hidden_size: int, device_index: int):
 
 
 @functools.lru_cache(maxsize=128)
-def _compile_swiglu_prepare(hidden_size: int, intermediate_size: int, device_index: int):
-    """Compile SwiGLU forward recomputation and routed-dout scaling."""
+def _compile_activation_prepare(
+    hidden_size: int,
+    intermediate_size: int,
+    activation_name: str,
+    device_index: int,
+):
+    """Compile activation recomputation and routed-dout scaling."""
 
     del device_index
+    is_glu = activation_name in _GLU_ACTIVATIONS
+    projection_size = intermediate_size * (2 if is_glu else 1)
+    up_column_offset = intermediate_size if is_glu else 0
 
     @flyc.kernel(known_block_size=[_BLOCK_THREADS, 1, 1])
-    def swiglu_prepare_kernel(
+    def activation_prepare_kernel(
         preactivation: fx.Tensor,
         activation: fx.Tensor,
         dout_sorted: fx.Tensor,
@@ -223,7 +303,6 @@ def _compile_swiglu_prepare(hidden_size: int, intermediate_size: int, device_ind
     ):
         row = gpu.block_idx.x
         tid = gpu.thread_idx.x
-        one_f32 = fx.Float32(1.0)
         weights_rsrc = buffer_ops.create_buffer_resource(sorted_weights, max_size=True)
         preact_rsrc = buffer_ops.create_buffer_resource(preactivation, max_size=True)
         activation_rsrc = buffer_ops.create_buffer_resource(activation, max_size=True)
@@ -234,14 +313,17 @@ def _compile_swiglu_prepare(hidden_size: int, intermediate_size: int, device_ind
         for base in range_constexpr(0, intermediate_size, _BLOCK_THREADS):
             column = tid + fx.Int32(base)
             if column < fx.Int32(intermediate_size):
-                gate_offset = row * fx.Int32(2 * intermediate_size) + column
-                up_offset = gate_offset + fx.Int32(intermediate_size)
+                gate_offset = row * fx.Int32(projection_size) + column
                 act_offset = row * fx.Int32(intermediate_size) + column
                 gate = buffer_ops.buffer_load(preact_rsrc, gate_offset, vec_width=1, dtype=fx.BFloat16).extf(T.f32)
-                up = buffer_ops.buffer_load(preact_rsrc, up_offset, vec_width=1, dtype=fx.BFloat16).extf(T.f32)
-                exp_neg = fx.rocdl.exp2(T.f32, _raw(gate * fx.Float32(-1.4426950408889634)))
-                sigmoid = fx.rocdl.rcp(T.f32, _raw(one_f32 + exp_neg))
-                activation_f32 = (gate * sigmoid) * up
+                up_offset = gate_offset + fx.Int32(up_column_offset)
+                up = buffer_ops.buffer_load(
+                    preact_rsrc,
+                    up_offset,
+                    vec_width=1,
+                    dtype=fx.BFloat16,
+                ).extf(T.f32)
+                activation_f32 = _activation_f32(gate, up, activation_name)
                 buffer_ops.buffer_store(
                     fx.Float32(activation_f32).to(fx.BFloat16),
                     activation_rsrc,
@@ -272,7 +354,7 @@ def _compile_swiglu_prepare(hidden_size: int, intermediate_size: int, device_ind
         i32_padded_rows: fx.Int32,
         stream: fx.Stream = fx.Stream(None),
     ):
-        swiglu_prepare_kernel(
+        activation_prepare_kernel(
             preactivation,
             activation,
             dout_sorted,
@@ -288,20 +370,26 @@ def _compile_swiglu_prepare(hidden_size: int, intermediate_size: int, device_ind
 
 
 @functools.lru_cache(maxsize=128)
-def _compile_swiglu_derivative(intermediate_size: int, device_index: int):
-    """Compile the SwiGLU Jacobian-vector product from routed ``da``."""
+def _compile_activation_derivative(
+    intermediate_size: int,
+    activation_name: str,
+    device_index: int,
+):
+    """Compile the selected activation's Jacobian-vector product."""
 
     del device_index
+    is_glu = activation_name in _GLU_ACTIVATIONS
+    projection_size = intermediate_size * (2 if is_glu else 1)
+    up_column_offset = intermediate_size if is_glu else 0
 
     @flyc.kernel(known_block_size=[_BLOCK_THREADS, 1, 1])
-    def swiglu_derivative_kernel(
+    def activation_derivative_kernel(
         preactivation: fx.Tensor,
         da: fx.Tensor,
         dz: fx.Tensor,
     ):
         row = gpu.block_idx.x
         tid = gpu.thread_idx.x
-        one_f32 = fx.Float32(1.0)
         preact_rsrc = buffer_ops.create_buffer_resource(preactivation, max_size=True)
         da_rsrc = buffer_ops.create_buffer_resource(da, max_size=True)
         dz_rsrc = buffer_ops.create_buffer_resource(dz, max_size=True)
@@ -309,18 +397,26 @@ def _compile_swiglu_derivative(intermediate_size: int, device_index: int):
         for base in range_constexpr(0, intermediate_size, _BLOCK_THREADS):
             column = tid + fx.Int32(base)
             if column < fx.Int32(intermediate_size):
-                gate_offset = row * fx.Int32(2 * intermediate_size) + column
-                up_offset = gate_offset + fx.Int32(intermediate_size)
+                gate_offset = row * fx.Int32(projection_size) + column
+                up_offset = gate_offset + fx.Int32(up_column_offset)
                 act_offset = row * fx.Int32(intermediate_size) + column
                 gate = buffer_ops.buffer_load(preact_rsrc, gate_offset, vec_width=1, dtype=fx.BFloat16).extf(T.f32)
-                up = buffer_ops.buffer_load(preact_rsrc, up_offset, vec_width=1, dtype=fx.BFloat16).extf(T.f32)
+                up = buffer_ops.buffer_load(
+                    preact_rsrc,
+                    up_offset,
+                    vec_width=1,
+                    dtype=fx.BFloat16,
+                ).extf(T.f32)
                 da_value = buffer_ops.buffer_load(da_rsrc, act_offset, vec_width=1, dtype=fx.BFloat16).extf(T.f32)
-                exp_neg = fx.rocdl.exp2(T.f32, _raw(gate * fx.Float32(-1.4426950408889634)))
-                sigmoid = fx.rocdl.rcp(T.f32, _raw(one_f32 + exp_neg))
-                dz_gate = da_value * up * sigmoid * (one_f32 + gate * (one_f32 - sigmoid))
-                dz_up = da_value * gate * sigmoid
+                dz_gate, dz_up = _activation_backward_f32(
+                    gate,
+                    up,
+                    da_value,
+                    activation_name,
+                )
                 buffer_ops.buffer_store(fx.Float32(dz_gate).to(fx.BFloat16), dz_rsrc, gate_offset)
-                buffer_ops.buffer_store(fx.Float32(dz_up).to(fx.BFloat16), dz_rsrc, up_offset)
+                if const_expr(is_glu):
+                    buffer_ops.buffer_store(fx.Float32(dz_up).to(fx.BFloat16), dz_rsrc, up_offset)
 
     @flyc.jit
     def launch(
@@ -330,7 +426,7 @@ def _compile_swiglu_derivative(intermediate_size: int, device_index: int):
         i32_padded_rows: fx.Int32,
         stream: fx.Stream = fx.Stream(None),
     ):
-        swiglu_derivative_kernel(preactivation, da, dz).launch(
+        activation_derivative_kernel(preactivation, da, dz).launch(
             grid=(i32_padded_rows, 1, 1),
             block=(_BLOCK_THREADS, 1, 1),
             stream=stream,
@@ -386,7 +482,7 @@ def _compile_score_backward(hidden_size: int, topk: int, device_index: int):
                 ).extf(T.f32)
                 thread_dot = thread_dot + dout_value * projected
 
-        lds = fx.SharedAllocator().allocate(_SwiGLUBackwardSharedStorage).peek()
+        lds = fx.SharedAllocator().allocate(_ScoreBackwardSharedStorage).peek()
         reduction = lds.reduction.view(fx.make_layout(_RED_SLOTS, 1))
 
         def wave_reduce_add(value):
@@ -519,17 +615,21 @@ def _validate_backward_inputs(
 ) -> tuple[int, int, int, int]:
     if config.compute_dtype != "bf16":
         raise ValueError("sonic_moe_backward currently supports compute_dtype='bf16' only")
-    if config.activation != "swiglu":
-        raise ValueError("sonic_moe_backward currently supports activation='swiglu' only")
+    if config.activation not in _SUPPORTED_ACTIVATIONS:
+        raise ValueError(
+            f"sonic_moe_backward does not support activation={config.activation!r}; "
+            f"expected one of {sorted(_SUPPORTED_ACTIVATIONS)}"
+        )
 
     tokens = int(hidden_states.shape[0]) if hidden_states.ndim == 2 else -1
     hidden_size = int(config.hidden_size)
     intermediate_size = int(config.intermediate_size)
     num_experts = int(config.num_experts)
     topk = int(config.top_k)
+    projection_size = intermediate_size * (2 if config.activation in _GLU_ACTIVATIONS else 1)
     expected = {
         "hidden_states": (tokens, hidden_size),
-        "w1": (num_experts, 2 * intermediate_size, hidden_size),
+        "w1": (num_experts, projection_size, hidden_size),
         "w2": (num_experts, hidden_size, intermediate_size),
         "topk_ids": (tokens, topk),
         "topk_weights": (tokens, topk),
@@ -579,9 +679,10 @@ def sonic_moe_backward(
     grad_output: torch.Tensor,
     config: "SonicMoEConfig",
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Differentiate dense BF16 fixed-K, bias-free SwiGLU SonicMoE.
+    """Differentiate dense BF16 fixed-K, bias-free SonicMoE.
 
-    Parameters use logical, expert-major weights: ``w1[E, 2I, H]`` and
+    Parameters use logical, expert-major weights: ``w1[E, 2I, H]`` for GLU
+    activations, ``w1[E, I, H]`` for pointwise activations, and
     ``w2[E, H, I]``.  Routing tensors are ``topk_ids[int32, T, K]`` and
     ``topk_weights[float32, T, K]``.  The returned tuple is
     ``(dx, dw1, dw2, dtopk_weights)`` with BF16 tensor gradients and FP32
@@ -603,6 +704,8 @@ def sonic_moe_backward(
         config,
     )
     topk = int(config.top_k)
+    activation_name = str(config.activation)
+    projection_size = intermediate_size * (2 if activation_name in _GLU_ACTIVATIONS else 1)
     device = hidden_states.device
     device_index = device.index or 0
     with torch.cuda.device(device):
@@ -632,7 +735,7 @@ def sonic_moe_backward(
     dout_sorted = torch.empty_like(x_sorted)
     dy = torch.empty_like(x_sorted)
     projection = torch.empty_like(x_sorted)
-    preactivation = torch.empty((max_padded, 2 * intermediate_size), dtype=torch.bfloat16, device=device)
+    preactivation = torch.empty((max_padded, projection_size), dtype=torch.bfloat16, device=device)
     activation = torch.empty((max_padded, intermediate_size), dtype=torch.bfloat16, device=device)
     da = torch.empty_like(activation)
     dz = torch.empty_like(preactivation)
@@ -714,13 +817,14 @@ def sonic_moe_backward(
                 layout="nt",
             )
 
-        swiglu_prepare = _compile_swiglu_prepare(
+        activation_prepare = _compile_activation_prepare(
             hidden_size,
             intermediate_size,
+            activation_name,
             device_index,
         )
         _run_compiled(
-            swiglu_prepare,
+            activation_prepare,
             preactivation,
             activation,
             dout_sorted,
@@ -760,9 +864,13 @@ def sonic_moe_backward(
                 layout="tn",
             )
 
-        swiglu_derivative = _compile_swiglu_derivative(intermediate_size, device_index)
+        activation_derivative = _compile_activation_derivative(
+            intermediate_size,
+            activation_name,
+            device_index,
+        )
         _run_compiled(
-            swiglu_derivative,
+            activation_derivative,
             preactivation,
             da,
             dz,

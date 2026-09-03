@@ -18,9 +18,9 @@ Weights may be dense BF16/FP16 (A16W16) or per-1x32 E8M0-scaled MXFP4
 (A16W4). MXFP4 currently uses BF16 activations; dense weights use the compute
 dtype selected by :class:`SonicMoEConfig`.
 The reusable :class:`SonicMoE` object remains an inference-forward API.  This
-module also exports the initial standalone ``sonic_moe_backward`` entry point
-for dense BF16, fixed-K, bias-free SwiGLU training.  Other activations, expert
-bias gradients, FP16, and flat ragged routes are staged follow-up work.
+module also exports the standalone ``sonic_moe_backward`` entry point for
+dense BF16, fixed-K, bias-free training across all supported activations.
+Expert bias gradients, FP16, and flat ragged routes are staged follow-up work.
 """
 
 from __future__ import annotations
