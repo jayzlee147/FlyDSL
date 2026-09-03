@@ -292,7 +292,14 @@ def _gemm2_body_a16w4(
                 )
 
     row_a_lds = lane_mod_16
-    col_base_bytes_L = lane_div_16 * fx.Int32(64)
+    # The original mapping assigns each of the four 16-lane groups a 32-element
+    # slice inside a 128-wide K chunk.  A dense TILE_K=64 tile instead has only
+    # 16 elements per lane group; keep the A and B fragment maps in lockstep so
+    # all four groups cover the two K32 instructions without reading past LDS.
+    if const_expr(TILE_K < 128):
+        col_base_bytes_L = lane_div_16 * fx.Int32(KH_TILE_BYTES // 4)
+    else:
+        col_base_bytes_L = lane_div_16 * fx.Int32(64)
 
     def _a_col_bytes_for_ku(ku):
         _k0_blk = ku // 4
@@ -331,9 +338,17 @@ def _gemm2_body_a16w4(
         raw = []
         base_k0 = base_k // fx.Int32(32)
         for ku in range_constexpr(k_unroll):
-            _k0_blk = ku // 4
-            bf_k0 = base_k0 + fx.Int32(_k0_blk * 4) + lane_div_16
-            bf_klane = fx.Int32(ku % 4)
+            if const_expr(TILE_K < 128):
+                # Flatten the TILE_K/8 fragments across four lane groups.  For
+                # TILE_K=64 this maps (lane_group, ku) to logical fragments
+                # 0..7 and therefore to exactly two K32 preshuffle blocks.
+                frag = lane_div_16 * fx.Int32(k_unroll) + fx.Int32(ku)
+                bf_k0 = base_k0 + frag // fx.Int32(4)
+                bf_klane = frag % fx.Int32(4)
+            else:
+                _k0_blk = ku // 4
+                bf_k0 = base_k0 + fx.Int32(_k0_blk * 4) + lane_div_16
+                bf_klane = fx.Int32(ku % 4)
             elem_idx = fx.Int32(
                 crd2idx(
                     [fx.Int64(n_blk), fx.Int64(bf_k0), fx.Int64(bf_klane), fx.Int64(n_intra), fx.Int64(0)],

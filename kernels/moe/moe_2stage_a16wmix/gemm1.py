@@ -880,7 +880,6 @@ def compile_gemm1_a16w4_port(
     _N_OUT = (2 if _is_glu else 1) * _INTER
     assert _K % TILE_K == 0, f"D_HIDDEN (K) must be a multiple of {TILE_K}, got {_K}"
     assert _K % (k_wave * TILE_K) == 0, f"D_HIDDEN (K) must be a multiple of k_wave*TILE_K, got {_K}, k_wave={k_wave}"
-    assert _INTER % 128 == 0, f"D_INTER must be a multiple of 128, got {_INTER}"
     assert _INTER % TILE_N == 0, f"D_INTER must be a multiple of TILE_N={TILE_N}, got {_INTER}"
     assert BM % 16 == 0, f"BM must be a multiple of 16, got {BM}"
     NUM_N_BLOCKS = _INTER // TILE_N

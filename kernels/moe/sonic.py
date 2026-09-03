@@ -174,8 +174,6 @@ class SonicMoEConfig:
             raise ValueError(
                 f"hidden_size ({self.hidden_size}) must be divisible by " f"down_tile_n ({self.stage2_tile_n})"
             )
-        if self.intermediate_size % 128 != 0:
-            raise ValueError("intermediate_size must be divisible by 128")
         if self.stage1_b_cache_mod not in (None, 0, 2):
             raise ValueError("stage1_b_cache_mod must be None, 0 (cached), or 2 (non-temporal)")
         if self.stage2_b_cache_mod not in (None, 0, 2):

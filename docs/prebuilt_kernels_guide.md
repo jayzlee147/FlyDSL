@@ -340,6 +340,11 @@ weights_fp16 = prepare_sonic_fp16_weights(w1_fp16, w2_fp16, cfg_fp16)
 out_fp16 = SonicMoE(cfg_fp16, weights_fp16)(hidden_states_fp16, router_logits_fp16)
 ```
 
+Dense BF16/FP16 shapes may use a 64-wide intermediate dimension. For example,
+`H=128, I=64` uses `tile_n=64`, `tile_k=128`, `down_tile_n=128`, and
+`down_tile_k=64`. MXFP4 retains its packed-load requirement that both K tiles
+are at least 128, so this `I=64` configuration is dense-only.
+
 Weights are preshuffled once during preparation. Workspaces and compiled launchers
 are reused. Power-of-two expert counts up to 1024 use the FlyDSL router; other
 counts (for example E=896) use a PyTorch softmax/top-k fallback followed by the
