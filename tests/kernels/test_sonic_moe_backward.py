@@ -107,6 +107,29 @@ def _make_case(
     return x, w1, w2, topk_ids, topk_weights, grad_output
 
 
+def _make_biases(w1, w2, seed):
+    generator = torch.Generator(device=w1.device).manual_seed(seed)
+    b1 = (
+        torch.randn(
+            w1.shape[:2],
+            dtype=torch.float32,
+            device=w1.device,
+            generator=generator,
+        )
+        / math.sqrt(w1.shape[-1])
+    ).to(torch.bfloat16)
+    b2 = (
+        torch.randn(
+            (w2.shape[0], w2.shape[1]),
+            dtype=torch.float32,
+            device=w2.device,
+            generator=generator,
+        )
+        / math.sqrt(w2.shape[-1])
+    ).to(torch.bfloat16)
+    return b1, b2
+
+
 def _tanh_reference(value):
     exp_value = torch.exp2(value.abs() * (-2.0 * math.log2(math.e)))
     tanh_abs = (1.0 - exp_value) / (1.0 + exp_value)
@@ -168,6 +191,8 @@ def _backward_reference(
     grad_output,
     *,
     activation_name="swiglu",
+    b1=None,
+    b2=None,
 ):
     """Match the standalone backward's explicit A16 materialization contract."""
 
@@ -185,6 +210,10 @@ def _backward_reference(
     dw1 = torch.zeros_like(w1)
     dw2 = torch.zeros_like(w2)
     dtopk_weights = torch.empty_like(topk_weights)
+    has_bias = b1 is not None
+    assert has_bias == (b2 is not None)
+    db1 = torch.zeros_like(b1) if b1 is not None else None
+    db2 = torch.zeros_like(b2) if b2 is not None else None
 
     for expert in range(num_experts):
         pairs = (topk_ids == expert).nonzero(as_tuple=False)
@@ -195,7 +224,10 @@ def _backward_reference(
         dout_e = grad_output[token_indices]
         scores_e = topk_weights[token_indices, slots]
 
-        preactivation = (x_e.float() @ w1[expert].float().transpose(0, 1)).to(torch.bfloat16)
+        preactivation = x_e.float() @ w1[expert].float().transpose(0, 1)
+        if b1 is not None:
+            preactivation = preactivation + b1[expert].float()
+        preactivation = preactivation.to(torch.bfloat16)
         # da is computed before dz, while activation is needed by projection
         # and dW2.  Passing a zero placeholder here avoids duplicating the
         # activation formulas; dz is recomputed after da is available.
@@ -209,7 +241,10 @@ def _backward_reference(
             intermediate_size,
             activation_name,
         )
-        projection = (activation.float() @ w2[expert].float().transpose(0, 1)).to(torch.bfloat16)
+        projection = activation.float() @ w2[expert].float().transpose(0, 1)
+        if b2 is not None:
+            projection = projection + b2[expert].float()
+        projection = projection.to(torch.bfloat16)
         dtopk_weights[token_indices, slots] = (dout_e.float() * projection.float()).sum(dim=1)
         dy = (dout_e.float() * scores_e[:, None]).to(torch.bfloat16)
         da = (dy.float() @ w2[expert].float()).to(torch.bfloat16).float()
@@ -223,9 +258,13 @@ def _backward_reference(
         dw2[expert] = (dy.float().transpose(0, 1) @ activation.float()).to(torch.bfloat16)
         dw1[expert] = (dz.float().transpose(0, 1) @ x_e.float()).to(torch.bfloat16)
         dx_routes[token_indices, slots] = (dz.float() @ w1[expert].float()).to(torch.bfloat16)
+        if db1 is not None:
+            db1[expert] = dz.float().sum(dim=0).to(torch.bfloat16)
+            db2[expert] = dy.float().sum(dim=0).to(torch.bfloat16)
 
     dx = dx_routes.float().sum(dim=1).to(torch.bfloat16)
-    return dx, dw1, dw2, dtopk_weights
+    result = (dx, dw1, dw2, dtopk_weights)
+    return (*result, db1, db2) if has_bias else result
 
 
 @pytest.mark.parametrize(
@@ -251,6 +290,7 @@ def test_sonic_moe_backward_matches_a16_reference(
     expected = _backward_reference(*args)
     torch.cuda.synchronize()
 
+    assert len(actual) == 4
     for actual_gradient, expected_gradient in zip(actual[:3], expected[:3]):
         assert actual_gradient.shape == expected_gradient.shape
         assert actual_gradient.dtype == expected_gradient.dtype
@@ -265,6 +305,109 @@ def test_sonic_moe_backward_matches_a16_reference(
     # The intentionally unused expert must receive exact zero weight grads.
     assert torch.count_nonzero(actual[1][-1]) == 0
     assert torch.count_nonzero(actual[2][-1]) == 0
+
+
+@pytest.mark.parametrize("activation_name", _ACTIVATIONS)
+def test_sonic_moe_backward_bias_gradients_match_a16_reference(activation_name):
+    hidden_size, intermediate_size, num_experts, topk = 128, 64, 4, 2
+    config = _config(
+        hidden_size,
+        intermediate_size,
+        num_experts,
+        topk,
+        activation=activation_name,
+    )
+    args = _make_case(
+        7,
+        hidden_size,
+        intermediate_size,
+        num_experts,
+        topk,
+        seed=307,
+        activation=activation_name,
+    )
+    b1, b2 = _make_biases(args[1], args[2], seed=311)
+
+    actual = sonic_moe_backward(*args, config, b1=b1, b2=b2)
+    expected = _backward_reference(
+        *args,
+        activation_name=activation_name,
+        b1=b1,
+        b2=b2,
+    )
+    torch.cuda.synchronize()
+
+    assert len(actual) == 6
+    for actual_gradient, expected_gradient in zip(actual[:3], expected[:3]):
+        assert actual_gradient.shape == expected_gradient.shape
+        assert actual_gradient.dtype == expected_gradient.dtype
+        torch.testing.assert_close(
+            actual_gradient.float(),
+            expected_gradient.float(),
+            rtol=3e-2,
+            atol=5e-2,
+        )
+    torch.testing.assert_close(actual[3], expected[3], rtol=5e-4, atol=5e-4)
+    for actual_bias_gradient, expected_bias_gradient in zip(actual[4:], expected[4:]):
+        assert actual_bias_gradient.shape == expected_bias_gradient.shape
+        assert actual_bias_gradient.dtype == torch.bfloat16
+        torch.testing.assert_close(
+            actual_bias_gradient.float(),
+            expected_bias_gradient.float(),
+            rtol=3e-2,
+            atol=5e-2,
+        )
+
+    # The final expert is intentionally unused and must remain exactly zero.
+    assert torch.count_nonzero(actual[1][-1]) == 0
+    assert torch.count_nonzero(actual[2][-1]) == 0
+    assert torch.count_nonzero(actual[4][-1]) == 0
+    assert torch.count_nonzero(actual[5][-1]) == 0
+
+
+@pytest.mark.parametrize("activation_name", ("swiglu", "relu_sq"))
+def test_sonic_moe_backward_bias_reduction_spans_route_tiles(activation_name):
+    tokens, hidden_size, intermediate_size, num_experts, topk = 65, 128, 64, 3, 2
+    config = _config(
+        hidden_size,
+        intermediate_size,
+        num_experts,
+        topk,
+        activation=activation_name,
+    )
+    args = _make_case(
+        tokens,
+        hidden_size,
+        intermediate_size,
+        num_experts,
+        topk,
+        seed=331,
+        activation=activation_name,
+    )
+    b1, b2 = _make_biases(args[1], args[2], seed=337)
+
+    actual = sonic_moe_backward(*args, config, b1=b1, b2=b2)
+    expected = _backward_reference(
+        *args,
+        activation_name=activation_name,
+        b1=b1,
+        b2=b2,
+    )
+    torch.cuda.synchronize()
+
+    for actual_gradient, expected_gradient in zip(actual, expected):
+        if actual_gradient.dtype == torch.float32:
+            rtol, atol = 5e-4, 5e-4
+        else:
+            rtol, atol = 3e-2, 5e-2
+        torch.testing.assert_close(
+            actual_gradient.float(),
+            expected_gradient.float(),
+            rtol=rtol,
+            atol=atol,
+        )
+    assert torch.count_nonzero(actual[4][-1]) == 0
+    assert torch.count_nonzero(actual[5][-1]) == 0
 
 
 @pytest.mark.parametrize("activation_name", _ACTIVATIONS)
@@ -319,11 +462,28 @@ def test_sonic_moe_backward_repeated_calls_do_not_alias_workspace():
 
 def test_sonic_moe_backward_rejects_unsupported_contracts():
     args = _make_case(7, 128, 64, 4, 2, seed=263)
+    b1, b2 = _make_biases(args[1], args[2], seed=317)
 
     with pytest.raises(ValueError, match="compute_dtype='bf16'"):
         sonic_moe_backward(*args, _config(128, 64, 4, 2, compute_dtype="fp16"))
     with pytest.raises(ValueError, match="w1 must have shape"):
         sonic_moe_backward(*args, _config(128, 64, 4, 2, activation="relu"))
+    with pytest.raises(ValueError, match="both be None or both be tensors"):
+        sonic_moe_backward(*args, _config(128, 64, 4, 2), b1=b1)
+    with pytest.raises(ValueError, match="b1 must have shape"):
+        sonic_moe_backward(
+            *args,
+            _config(128, 64, 4, 2),
+            b1=b1[:, :-1],
+            b2=b2,
+        )
+    with pytest.raises(TypeError, match="b2 must be bfloat16"):
+        sonic_moe_backward(
+            *args,
+            _config(128, 64, 4, 2),
+            b1=b1,
+            b2=b2.float(),
+        )
 
     noncontiguous_dout = args[-1].transpose(0, 1).contiguous().transpose(0, 1)
     assert not noncontiguous_dout.is_contiguous()

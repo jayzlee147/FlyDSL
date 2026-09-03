@@ -3,11 +3,11 @@
 
 """First-stage training backward for the gfx950 SonicMoE operator.
 
-This module implements the dense BF16, fixed-K, bias-free training contract
-needed by the SonicMoE ROCm adapter.  All seven forward activations are
-supported.  It does not reuse the inference workspace.  Re-sorting and
-recomputing the two forward intermediates makes retained graphs and
-overlapping forward calls safe.
+This module implements the dense BF16, fixed-K training contract needed by the
+SonicMoE ROCm adapter.  All seven forward activations and optional expert bias
+are supported.  It does not reuse the inference workspace.  Re-sorting and
+recomputing the two forward intermediates makes retained graphs and overlapping
+forward calls safe.
 
 The implementation is entirely FlyDSL on device.  The general A16W16 GEMM is
 used for all expert matrix products; small FlyDSL kernels implement routing
@@ -436,6 +436,104 @@ def _compile_activation_derivative(
 
 
 @functools.lru_cache(maxsize=128)
+def _compile_bias_gradient_clear(
+    projection_size: int,
+    hidden_size: int,
+    num_experts: int,
+    device_index: int,
+):
+    """Compile the exact-zero initialization for all expert bias gradients."""
+
+    del device_index
+    db1_elements = num_experts * projection_size
+    db2_elements = num_experts * hidden_size
+    grid_size = (max(db1_elements, db2_elements) + _BLOCK_THREADS - 1) // _BLOCK_THREADS
+
+    @flyc.kernel(known_block_size=[_BLOCK_THREADS, 1, 1])
+    def clear_kernel(db1: fx.Tensor, db2: fx.Tensor):
+        index = gpu.block_idx.x * fx.Int32(_BLOCK_THREADS) + gpu.thread_idx.x
+        db1_rsrc = buffer_ops.create_buffer_resource(db1, max_size=True)
+        db2_rsrc = buffer_ops.create_buffer_resource(db2, max_size=True)
+        if index < fx.Int32(db1_elements):
+            buffer_ops.buffer_store(fx.BFloat16(0.0), db1_rsrc, index)
+        if index < fx.Int32(db2_elements):
+            buffer_ops.buffer_store(fx.BFloat16(0.0), db2_rsrc, index)
+
+    @flyc.jit
+    def launch(
+        db1: fx.Tensor,
+        db2: fx.Tensor,
+        stream: fx.Stream = fx.Stream(None),
+    ):
+        clear_kernel(db1, db2).launch(
+            grid=(grid_size, 1, 1),
+            block=(_BLOCK_THREADS, 1, 1),
+            stream=stream,
+        )
+
+    return launch
+
+
+@functools.lru_cache(maxsize=128)
+def _compile_bias_gradient_reduction(
+    projection_size: int,
+    hidden_size: int,
+    device_index: int,
+):
+    """Compile one expert segment's FP32-accumulating bias reductions."""
+
+    del device_index
+    grid_size = (max(projection_size, hidden_size) + _BLOCK_THREADS - 1) // _BLOCK_THREADS
+
+    @flyc.kernel(known_block_size=[_BLOCK_THREADS, 1, 1])
+    def reduction_kernel(
+        dz: fx.Tensor,
+        dy: fx.Tensor,
+        db1: fx.Tensor,
+        db2: fx.Tensor,
+        i32_rows: fx.Int32,
+    ):
+        column = gpu.block_idx.x * fx.Int32(_BLOCK_THREADS) + gpu.thread_idx.x
+        dz_rsrc = buffer_ops.create_buffer_resource(dz, max_size=True)
+        dy_rsrc = buffer_ops.create_buffer_resource(dy, max_size=True)
+        db1_rsrc = buffer_ops.create_buffer_resource(db1, max_size=True)
+        db2_rsrc = buffer_ops.create_buffer_resource(db2, max_size=True)
+
+        if column < fx.Int32(projection_size):
+            db1_acc = fx.Float32(0.0)
+            for row in range(fx.Int32(0), i32_rows, fx.Int32(1)):
+                offset = row * fx.Int32(projection_size) + column
+                value = buffer_ops.buffer_load(dz_rsrc, offset, vec_width=1, dtype=fx.BFloat16).extf(T.f32)
+                db1_acc = db1_acc + value
+            buffer_ops.buffer_store(db1_acc.to(fx.BFloat16), db1_rsrc, column)
+
+        if column < fx.Int32(hidden_size):
+            db2_acc = fx.Float32(0.0)
+            for row in range(fx.Int32(0), i32_rows, fx.Int32(1)):
+                offset = row * fx.Int32(hidden_size) + column
+                value = buffer_ops.buffer_load(dy_rsrc, offset, vec_width=1, dtype=fx.BFloat16).extf(T.f32)
+                db2_acc = db2_acc + value
+            buffer_ops.buffer_store(db2_acc.to(fx.BFloat16), db2_rsrc, column)
+
+    @flyc.jit
+    def launch(
+        dz: fx.Tensor,
+        dy: fx.Tensor,
+        db1: fx.Tensor,
+        db2: fx.Tensor,
+        i32_rows: fx.Int32,
+        stream: fx.Stream = fx.Stream(None),
+    ):
+        reduction_kernel(dz, dy, db1, db2, i32_rows).launch(
+            grid=(grid_size, 1, 1),
+            block=(_BLOCK_THREADS, 1, 1),
+            stream=stream,
+        )
+
+    return launch
+
+
+@functools.lru_cache(maxsize=128)
 def _compile_score_backward(hidden_size: int, topk: int, device_index: int):
     """Compile ``ds = dot(dout, materialized_down_projection)``."""
 
@@ -612,6 +710,8 @@ def _validate_backward_inputs(
     topk_weights: torch.Tensor,
     grad_output: torch.Tensor,
     config: "SonicMoEConfig",
+    b1: torch.Tensor | None,
+    b2: torch.Tensor | None,
 ) -> tuple[int, int, int, int]:
     if config.compute_dtype != "bf16":
         raise ValueError("sonic_moe_backward currently supports compute_dtype='bf16' only")
@@ -627,6 +727,8 @@ def _validate_backward_inputs(
     num_experts = int(config.num_experts)
     topk = int(config.top_k)
     projection_size = intermediate_size * (2 if config.activation in _GLU_ACTIVATIONS else 1)
+    if (b1 is None) != (b2 is None):
+        raise ValueError("b1 and b2 must both be None or both be tensors")
     expected = {
         "hidden_states": (tokens, hidden_size),
         "w1": (num_experts, projection_size, hidden_size),
@@ -643,6 +745,11 @@ def _validate_backward_inputs(
         "topk_weights": topk_weights,
         "grad_output": grad_output,
     }
+    if b1 is not None:
+        expected["b1"] = (num_experts, projection_size)
+        expected["b2"] = (num_experts, hidden_size)
+        tensors["b1"] = b1
+        tensors["b2"] = b2
     if tokens <= 0:
         raise ValueError(f"hidden_states must be non-empty 2D, got shape {tuple(hidden_states.shape)}")
     if tokens > _TOKEN_MASK:
@@ -654,7 +761,10 @@ def _validate_backward_inputs(
             raise ValueError(f"{name} must be on the same ROCm device as hidden_states")
         if not tensor.is_contiguous():
             raise ValueError(f"{name} must be contiguous")
-    for name in ("hidden_states", "w1", "w2", "grad_output"):
+    floating_names = ["hidden_states", "w1", "w2", "grad_output"]
+    if b1 is not None:
+        floating_names.extend(("b1", "b2"))
+    for name in floating_names:
         if tensors[name].dtype != torch.bfloat16:
             raise TypeError(f"{name} must be bfloat16, got {tensors[name].dtype}")
     if topk_ids.dtype != torch.int32:
@@ -678,15 +788,19 @@ def sonic_moe_backward(
     topk_weights: torch.Tensor,
     grad_output: torch.Tensor,
     config: "SonicMoEConfig",
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Differentiate dense BF16 fixed-K, bias-free SonicMoE.
+    *,
+    b1: torch.Tensor | None = None,
+    b2: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, ...]:
+    """Differentiate dense BF16 fixed-K SonicMoE, optionally with bias.
 
     Parameters use logical, expert-major weights: ``w1[E, 2I, H]`` for GLU
     activations, ``w1[E, I, H]`` for pointwise activations, and
     ``w2[E, H, I]``.  Routing tensors are ``topk_ids[int32, T, K]`` and
-    ``topk_weights[float32, T, K]``.  The returned tuple is
-    ``(dx, dw1, dw2, dtopk_weights)`` with BF16 tensor gradients and FP32
-    routing-score gradients.
+    ``topk_weights[float32, T, K]``.  Without bias, the returned tuple remains
+    ``(dx, dw1, dw2, dtopk_weights)``.  When ``b1`` and ``b2`` are supplied,
+    ``(db1, db2)`` are appended.  Tensor and bias gradients use BF16;
+    routing-score gradients use FP32.
 
     Expert ids must be in range and distinct within each token.  As in the
     inference fixed-K path, value validation is an unchecked hot-path
@@ -702,10 +816,13 @@ def sonic_moe_backward(
         topk_weights,
         grad_output,
         config,
+        b1,
+        b2,
     )
     topk = int(config.top_k)
     activation_name = str(config.activation)
     projection_size = intermediate_size * (2 if activation_name in _GLU_ACTIVATIONS else 1)
+    has_bias = b1 is not None
     device = hidden_states.device
     device_index = device.index or 0
     with torch.cuda.device(device):
@@ -746,6 +863,8 @@ def sonic_moe_backward(
     dw1 = torch.zeros_like(w1, memory_format=torch.contiguous_format)
     dw2 = torch.zeros_like(w2, memory_format=torch.contiguous_format)
     dtopk_weights = torch.empty_like(topk_weights, memory_format=torch.contiguous_format)
+    db1 = torch.empty_like(b1, memory_format=torch.contiguous_format) if b1 is not None else None
+    db2 = torch.empty_like(b2, memory_format=torch.contiguous_format) if b2 is not None else None
 
     # Custom kernels consume raw storage only; detach keeps DLPack conversion
     # valid when this function is called from a torch.autograd.Function.
@@ -755,6 +874,8 @@ def sonic_moe_backward(
     ids_arg = topk_ids.detach()
     weights_arg = topk_weights.detach()
     dout_arg = grad_output.detach()
+    b1_arg = b1.detach() if b1 is not None else None
+    b2_arg = b2.detach() if b2 is not None else None
 
     with torch.cuda.device(device):
         stream = torch.cuda.current_stream(device)
@@ -762,6 +883,15 @@ def sonic_moe_backward(
         route_grid = max(1, (routes + _BLOCK_THREADS - 1) // _BLOCK_THREADS)
         histogram = _compile_expert_histogram(num_experts, device_index)
         _run_compiled(histogram, ids_arg, expert_frequency, routes, route_grid, stream)
+
+        if has_bias:
+            clear_bias_gradients = _compile_bias_gradient_clear(
+                projection_size,
+                hidden_size,
+                num_experts,
+                device_index,
+            )
+            _run_compiled(clear_bias_gradients, db1, db2, stream)
 
         moe_sorting_flydsl(
             ids_arg,
@@ -812,6 +942,7 @@ def sonic_moe_backward(
                 x_sorted[start:end],
                 w1_arg[expert].transpose(0, 1),
                 out=preactivation[start:end],
+                bias=None if b1_arg is None else b1_arg[expert],
                 user_kwargs=_GEMM_KWARGS,
                 stream=stream,
                 layout="nt",
@@ -843,6 +974,7 @@ def sonic_moe_backward(
                 activation[start:end],
                 w2_arg[expert].transpose(0, 1),
                 out=projection[start:end],
+                bias=None if b2_arg is None else b2_arg[expert],
                 user_kwargs=_GEMM_KWARGS,
                 stream=stream,
                 layout="nt",
@@ -880,6 +1012,15 @@ def sonic_moe_backward(
 
         # Each expert owns a disjoint output slice, so no atomics or
         # cross-expert reductions are needed for dW1 or routed dX.
+        bias_gradient_reduction = (
+            _compile_bias_gradient_reduction(
+                projection_size,
+                hidden_size,
+                device_index,
+            )
+            if has_bias
+            else None
+        )
         for expert, start, rows in segments:
             end = start + rows
             gemm_a16w16(
@@ -898,6 +1039,16 @@ def sonic_moe_backward(
                 stream=stream,
                 layout="nn",
             )
+            if bias_gradient_reduction is not None:
+                _run_compiled(
+                    bias_gradient_reduction,
+                    dz[start:end],
+                    dy[start:end],
+                    db1[expert],
+                    db2[expert],
+                    rows,
+                    stream,
+                )
 
         score_backward = _compile_score_backward(hidden_size, topk, device_index)
         _run_compiled(
@@ -936,7 +1087,10 @@ def sonic_moe_backward(
             stream,
         )
 
-    return dx, dw1, dw2, dtopk_weights
+    result = (dx, dw1, dw2, dtopk_weights)
+    if has_bias:
+        return (*result, db1, db2)
+    return result
 
 
 __all__ = ["sonic_moe_backward"]
