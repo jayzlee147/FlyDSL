@@ -12,7 +12,7 @@ This guide covers the available FlyDSL kernels — normalization, softmax, GEMM,
 | **Softmax backward** | `build_softmax_bwd_module(N, dtype)` | Layout API (`@flyc.kernel`) | f32, f16, bf16 | fp32 dot reduction, native-dtype register buffering |
 | **GEMM** | `compile_preshuffle_gemm(...)` | `@flyc.kernel` | fp8, int8, fp16, bf16 | Preshuffle B, ping-pong LDS, MFMA 16x16 |
 | **FlashAttention** | `build_flash_attn_func_module(...)` | `@flyc.kernel` | bf16, f16 (any arch); fp8 e4m3fn (gfx950, D=128, dense) | Dual-wave SWP fwd, GQA/MQA, causal, descale ABI |
-| **SonicMoE forward** | `SonicMoE(config, weights)` | Host-composed FlyDSL | BF16 activation; BF16 or MXFP4 weight | Routing/top-k + sort, gather+SwiGLU GEMM, weighted down scatter |
+| **SonicMoE forward** | `SonicMoE(config, weights)` | Host-composed FlyDSL | BF16 activation/bias; BF16 or MXFP4 weight | Routing/top-k + sort, fused activation, weighted down scatter |
 
 All kernels use the `@flyc.kernel`/`@flyc.jit` API from `flydsl.compiler` and `flydsl.expr` (`python/flydsl/`).
 
@@ -324,9 +324,10 @@ cfg = SonicMoEConfig(
 )
 # GLU w1: [E, 2*I, H] in [gate | up] order.
 # Non-GLU w1: [E, I, H]. w2 is always [E, H, I].
+# Optional b1/b2 are [E, 2*I or I] and [E, H], respectively.
 # Choose one prepared format. Weight preparation is outside the hot path.
-weights = prepare_sonic_bf16_weights(w1, w2, cfg)
-# weights = prepare_sonic_mxfp4_weights(w1, w2, cfg)
+weights = prepare_sonic_bf16_weights(w1, w2, cfg, b1=b1, b2=b2)
+# weights = prepare_sonic_mxfp4_weights(w1, w2, cfg, b1=b1, b2=b2)
 op = SonicMoE(cfg, weights)
 out = op(hidden_states_bf16, router_logits_bf16)
 ```
@@ -385,8 +386,10 @@ traffic profiles, construct separate tuners with `profile_key="uniform"`,
 `profile_key="decode-skew"`, or another stable application label so their disk
 cache entries do not collide.
 
-This API is inference-forward only: no bias, saved pre-activation, backward,
-varlen-K dW, or dSwiGLU is provided. The BF16 atomic output is non-deterministic at
+This API is inference-forward only. Optional expert-major BF16 `b1`/`b2` are
+prepared with the weights and fused before the activation and route weighting,
+respectively. Saved pre-activation, backward, varlen-K dW, and activation
+derivatives are not yet provided. The BF16 atomic output is non-deterministic at
 the last few bits. See `examples/06-sonicMoE.py` for correctness and warm-cache
 benchmarking.
 

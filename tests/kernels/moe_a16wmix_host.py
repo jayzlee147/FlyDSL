@@ -79,6 +79,7 @@ def _get_compiled_gemm1_a16w4(
         w_dtype=w_dtype,
         w_layout=w_layout,
         k_wave=k_wave,
+        has_bias=False,
     )
 
 
@@ -108,6 +109,8 @@ def _get_compiled_gemm2_a16w4(
         waves_per_eu=waves_per_eu,
         w_dtype=w_dtype,
         persist=persist,
+        has_bias=False,
+        round_projection_bf16=False,
     )
 
 
@@ -474,6 +477,7 @@ def flydsl_a16w4_gemm1(
         a_bf16.data_ptr(),
         w1_u8.data_ptr(),
         w1_scale_u8.data_ptr(),
+        w1_scale_u8.data_ptr(),  # ignored dummy bias pointer
         sorted_expert_ids.data_ptr(),
         cumsum_tensor.data_ptr(),
         m_indices.data_ptr(),
@@ -599,6 +603,7 @@ def flydsl_a16w4_gemm2(
         inter_sorted_bf16.data_ptr(),
         w2_u8.data_ptr(),
         w2_scale_u8.data_ptr(),
+        w2_scale_u8.data_ptr(),  # ignored dummy bias pointer
         sorted_expert_ids.data_ptr(),
         cumsum_tensor.data_ptr(),
         sorted_token_ids.data_ptr(),

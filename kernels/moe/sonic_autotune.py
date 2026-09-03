@@ -24,7 +24,7 @@ from kernels.moe.moe_sorting_kernel import moe_softmax_sort_flydsl
 from kernels.moe.sonic import SonicMoE, SonicMoEConfig, SonicMoEWeights
 
 
-_CACHE_SCHEMA_VERSION = 3
+_CACHE_SCHEMA_VERSION = 4
 _TUNING_FIELDS = (
     "tile_m",
     "tile_n",
@@ -235,6 +235,7 @@ class SonicMoEAutotuner:
             "torch_hip": str(torch.version.hip),
             "source": self._source_hash,
             "weight_dtype": self.weights.weight_dtype,
+            "has_bias": self.weights.has_bias,
             "hidden_dtype": str(hidden_states.dtype),
             "router_dtype": str(router_logits.dtype),
             "tokens_bucket": _token_bucket(int(hidden_states.shape[0])),

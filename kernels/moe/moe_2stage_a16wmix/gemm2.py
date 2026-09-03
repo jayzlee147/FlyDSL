@@ -117,6 +117,7 @@ def _gemm2_body_a16w4(
     arg_a,
     arg_bq,
     arg_bscale,
+    arg_bias,
     arg_eids,
     arg_stids,
     arg_sweights,
@@ -135,6 +136,8 @@ def _gemm2_body_a16w4(
     b_cache_mod=2,
     w_dtype="mxfp4",
     use_k16=False,
+    has_bias=False,
+    round_projection_bf16=False,
 ):
     """a16w4/a16wi4/a16w16 stage2 body. K=inter_dim (contraction), N=model_dim (N_OUT).
 
@@ -471,7 +474,37 @@ def _gemm2_body_a16w4(
     # region (offset 0) is reused for the epilog's f32 acc staging.
     gpu.barrier()
     lds_acc_base_i32 = fx.Int32(fx.ptrtoint(lds_raw_ptr))
-    accm_v = [[accm[i][J].load().ir_value() for J in range(num_acc_n)] for i in range(m_repeat)]
+    if const_expr(has_bias):
+        bias_base = _global_base_ptr1(
+            fx.Int64(arg_bias) + fx.Int64(e) * fx.Int64(N_OUT * 2)
+        )
+        bias_values = []
+        for J in range_constexpr(num_acc_n):
+            col = wave * fx.Int32(_n_per_wave) + fx.Int32(J * 16) + lane_mod_16
+            bias_idx = by_n + col
+            bias_raw = llvm.load(
+                T.bf16,
+                _gep1(bias_base, bias_idx * fx.Int32(2)),
+                invariant=True,
+            )
+            bias_values.append(fx.Float32(fx.BFloat16(bias_raw)))
+
+    accm_v = []
+    for i in range_constexpr(m_repeat):
+        row = []
+        for J in range_constexpr(num_acc_n):
+            vec = Vec(accm[i][J].load().ir_value())
+            if const_expr(has_bias):
+                vec = Vec.from_elements(
+                    [vec[v] + bias_values[J] for v in range_constexpr(4)],
+                    fx.Float32,
+                )
+            if const_expr(round_projection_bf16):
+                # Legacy Sonic stores grouped-GEMM output in BF16 before the
+                # FP32 route-score reduction reloads it.
+                vec = vec.to(fx.BFloat16).to(fx.Float32)
+            row.append(vec.ir_value())
+        accm_v.append(row)
     _atomic_bf16_epilog(
         lds_acc_base_i32,
         accm_v,
@@ -515,6 +548,8 @@ def compile_gemm2_a16w4_port(
     waves_per_eu=None,
     w_dtype="mxfp4",
     persist=False,
+    has_bias=False,
+    round_projection_bf16=False,
 ):
     """a16w4/a16wi4/a16w16 (bf16 intermediate A x mxfp4/int4/bf16 W2) stage2 builder.
 
@@ -526,6 +561,8 @@ def compile_gemm2_a16w4_port(
     per-XCD L2 locality (group = xcd_swizzle m-blocks).
     """
     assert w_dtype in ("mxfp4", "int4", "bf16"), f"w_dtype must be 'mxfp4', 'int4' or 'bf16', got {w_dtype!r}"
+    assert isinstance(has_bias, bool), "has_bias must be bool"
+    assert isinstance(round_projection_bf16, bool), "round_projection_bf16 must be bool"
     # Arch-gate K=16 (gfx942) vs K=32 (gfx950); see a16wmix_use_k16.
     _use_k16 = a16wmix_use_k16()
     _K = D_INTER
@@ -550,6 +587,10 @@ def compile_gemm2_a16w4_port(
         _name += f"_w{waves_per_eu}"
     if persist:
         _name += "_persist"
+    if has_bias:
+        _name += "_biasv1"
+    if round_projection_bf16:
+        _name += "_projbf16v1"
 
     @fx.struct
     class SharedStorage:
@@ -560,6 +601,7 @@ def compile_gemm2_a16w4_port(
         arg_a: fx.Int64,
         arg_bq: fx.Int64,
         arg_bscale: fx.Int64,
+        arg_bias: fx.Int64,
         arg_eids: fx.Int64,
         arg_cumsum: fx.Int64,
         arg_stids: fx.Int64,
@@ -605,6 +647,7 @@ def compile_gemm2_a16w4_port(
                 arg_a,
                 arg_bq,
                 arg_bscale,
+                arg_bias,
                 arg_eids,
                 arg_stids,
                 arg_sweights,
@@ -622,6 +665,8 @@ def compile_gemm2_a16w4_port(
                 b_cache_mod=b_cache_mod,
                 w_dtype=w_dtype,
                 use_k16=_use_k16,
+                has_bias=has_bias,
+                round_projection_bf16=round_projection_bf16,
             )
 
         if const_expr(persist):
@@ -644,6 +689,7 @@ def compile_gemm2_a16w4_port(
         arg_a: fx.Int64,
         arg_bq: fx.Int64,
         arg_bscale: fx.Int64,
+        arg_bias: fx.Int64,
         arg_eids: fx.Int64,
         arg_cumsum: fx.Int64,
         arg_stids: fx.Int64,
@@ -659,6 +705,7 @@ def compile_gemm2_a16w4_port(
             arg_a,
             arg_bq,
             arg_bscale,
+            arg_bias,
             arg_eids,
             arg_cumsum,
             arg_stids,

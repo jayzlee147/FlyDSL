@@ -247,6 +247,8 @@ class SonicMoEWeights:
     gate_up_scale: torch.Tensor | None = None
     down_scale: torch.Tensor | None = None
     weight_dtype: str = "bf16"
+    stage1_bias: torch.Tensor | None = None
+    stage2_bias: torch.Tensor | None = None
 
     @property
     def device(self) -> torch.device:
@@ -255,11 +257,19 @@ class SonicMoEWeights:
     @property
     def tensors(self) -> tuple[torch.Tensor, ...]:
         tensors = [self.gate_up, self.down, self.dummy_scale]
+        if self.stage1_bias is not None:
+            tensors.append(self.stage1_bias)
+        if self.stage2_bias is not None:
+            tensors.append(self.stage2_bias)
         if self.gate_up_scale is not None:
             tensors.append(self.gate_up_scale)
         if self.down_scale is not None:
             tensors.append(self.down_scale)
         return tuple(tensors)
+
+    @property
+    def has_bias(self) -> bool:
+        return self.stage1_bias is not None
 
 
 @dataclass
@@ -454,6 +464,38 @@ def _validate_weight_inputs(
         raise TypeError(f"w1/w2 must be floating point, got {w1.dtype}/{w2.dtype}")
 
 
+def _prepare_biases(
+    b1: torch.Tensor | None,
+    b2: torch.Tensor | None,
+    w1: torch.Tensor,
+    config: SonicMoEConfig,
+) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+    """Validate optional logical expert biases and materialize the BF16 ABI."""
+
+    if (b1 is None) != (b2 is None):
+        raise ValueError("b1 and b2 must either both be provided or both be None")
+    if b1 is None:
+        return None, None
+    assert b2 is not None
+
+    expected_b1 = (config.num_experts, config.stage1_projection_size)
+    expected_b2 = (config.num_experts, config.hidden_size)
+    if tuple(b1.shape) != expected_b1:
+        raise ValueError(f"b1 must have shape {expected_b1}, got {tuple(b1.shape)}")
+    if tuple(b2.shape) != expected_b2:
+        raise ValueError(f"b2 must have shape {expected_b2}, got {tuple(b2.shape)}")
+    if not b1.is_cuda or not b2.is_cuda:
+        raise ValueError("SonicMoE biases must be on a ROCm device")
+    if b1.device != w1.device or b2.device != w1.device:
+        raise ValueError("b1/b2 and expert weights must share a device")
+    if not (b1.dtype.is_floating_point and b2.dtype.is_floating_point):
+        raise TypeError(f"b1/b2 must be floating point, got {b1.dtype}/{b2.dtype}")
+    return (
+        b1.detach().to(dtype=torch.bfloat16, copy=True).contiguous(),
+        b2.detach().to(dtype=torch.bfloat16, copy=True).contiguous(),
+    )
+
+
 def _round_up(value: int, multiple: int) -> int:
     return ((int(value) + multiple - 1) // multiple) * multiple
 
@@ -522,6 +564,25 @@ def _validate_prepared_weight_storage(
         raise TypeError("dummy_scale must be a non-empty contiguous uint8 tensor")
     if weights.gate_up.data_ptr() % 16 or weights.down.data_ptr() % 16:
         raise ValueError("prepared gate/up and down weights must be 16-byte aligned")
+    if (weights.stage1_bias is None) != (weights.stage2_bias is None):
+        raise ValueError("prepared stage1_bias and stage2_bias must either both be present or absent")
+    if weights.stage1_bias is not None:
+        expected_b1 = (config.num_experts, config.stage1_projection_size)
+        expected_b2 = (config.num_experts, config.hidden_size)
+        if tuple(weights.stage1_bias.shape) != expected_b1:
+            raise ValueError(
+                f"prepared stage1_bias must have shape {expected_b1}, "
+                f"got {tuple(weights.stage1_bias.shape)}"
+            )
+        if tuple(weights.stage2_bias.shape) != expected_b2:
+            raise ValueError(
+                f"prepared stage2_bias must have shape {expected_b2}, "
+                f"got {tuple(weights.stage2_bias.shape)}"
+            )
+        if weights.stage1_bias.dtype != torch.bfloat16 or weights.stage2_bias.dtype != torch.bfloat16:
+            raise TypeError("prepared SonicMoE biases must use torch.bfloat16 storage")
+        if weights.stage1_bias.data_ptr() % 2 or weights.stage2_bias.data_ptr() % 2:
+            raise ValueError("prepared SonicMoE biases must be 2-byte aligned")
 
     if weights.weight_dtype == "bf16":
         expected_gate_up = (
@@ -778,6 +839,9 @@ def prepare_sonic_bf16_weights(
     w1: torch.Tensor,
     w2: torch.Tensor,
     config: SonicMoEConfig,
+    *,
+    b1: torch.Tensor | None = None,
+    b2: torch.Tensor | None = None,
 ) -> SonicMoEWeights:
     """Validate and preshuffle stage-1 and down-projection weights.
 
@@ -790,16 +854,24 @@ def prepare_sonic_bf16_weights(
         converted to BF16 once during preparation.
     w2:
         ``[num_experts, hidden_size, intermediate_size]``.
+    b1, b2:
+        Optional expert-major biases with shapes
+        ``[num_experts, stage1_projection_size]`` and
+        ``[num_experts, hidden_size]``. They must be provided together and are
+        copied to contiguous BF16 storage during preparation.
     """
 
     _validate_weight_inputs(w1, w2, config)
     _validate_bf16_resource_limits(config)
+    stage1_bias, stage2_bias = _prepare_biases(b1, b2, w1, config)
 
     return SonicMoEWeights(
         gate_up=_preshuffle_bf16_weight(w1),
         down=_preshuffle_bf16_weight(w2),
         dummy_scale=torch.zeros(1, dtype=torch.uint8, device=w1.device),
         config=config,
+        stage1_bias=stage1_bias,
+        stage2_bias=stage2_bias,
     )
 
 
@@ -807,15 +879,21 @@ def prepare_sonic_mxfp4_weights(
     w1: torch.Tensor,
     w2: torch.Tensor,
     config: SonicMoEConfig,
+    *,
+    b1: torch.Tensor | None = None,
+    b2: torch.Tensor | None = None,
 ) -> SonicMoEWeights:
     """Quantize and preshuffle weight-only MXFP4 gate/up and down weights.
 
     Activations and the sorted stage-1 intermediate remain BF16 (A16W4). Each
     32-value weight block receives one E8M0 scale. This is the numerically
     validated low-memory path; it does not quantize activations to MXFP8.
+    Optional ``b1``/``b2`` follow the same expert-major BF16 contract as
+    :func:`prepare_sonic_bf16_weights`.
     """
 
     _validate_weight_inputs(w1, w2, config)
+    stage1_bias, stage2_bias = _prepare_biases(b1, b2, w1, config)
     if config.hidden_size % 64 != 0 or config.intermediate_size % 64 != 0:
         raise ValueError(
             "MXFP4 weight preshuffle requires hidden/intermediate sizes divisible by 64"
@@ -828,6 +906,8 @@ def prepare_sonic_mxfp4_weights(
         down=_preshuffle_mxfp4_weight(w2_quant),
         dummy_scale=torch.zeros(1, dtype=torch.uint8, device=w1.device),
         config=config,
+        stage1_bias=stage1_bias,
+        stage2_bias=stage2_bias,
         gate_up_scale=_preshuffle_e8m0_scale(w1_scale),
         down_scale=_preshuffle_e8m0_scale(w2_scale),
         weight_dtype="mxfp4",
@@ -851,6 +931,7 @@ def _get_stage1_launcher(
     config: SonicMoEConfig,
     b_cache_mod: int,
     weight_dtype: str,
+    has_bias: bool,
     device_index: int,
 ):
     # ``device_index`` is intentionally part of the LRU key.  Compiled
@@ -873,6 +954,7 @@ def _get_stage1_launcher(
         w_layout="standard",
         k_wave=1,
         round_preact_bf16=True,
+        has_bias=has_bias,
     )
 
 
@@ -881,6 +963,7 @@ def _get_stage2_launcher(
     config: SonicMoEConfig,
     b_cache_mod: int,
     weight_dtype: str,
+    has_bias: bool,
     device_index: int,
 ):
     # See _get_stage1_launcher: keep a distinct loaded function per device.
@@ -897,6 +980,8 @@ def _get_stage2_launcher(
         waves_per_eu=config.waves_per_eu,
         w_dtype=weight_dtype,
         persist=config.persistent_stage2,
+        has_bias=has_bias,
+        round_projection_bf16=True,
     )
 
 
@@ -1077,6 +1162,7 @@ class SonicMoE:
             cfg,
             _stage1_cache_mod(cfg, tokens),
             self.weights.weight_dtype,
+            self.weights.has_bias,
             hidden_states.device.index or 0,
         )
         grid1 = gemm1_a16w4_grid(
@@ -1093,6 +1179,11 @@ class SonicMoE:
                 self.weights.dummy_scale
                 if self.weights.gate_up_scale is None
                 else self.weights.gate_up_scale
+            ).data_ptr(),
+            (
+                self.weights.dummy_scale
+                if self.weights.stage1_bias is None
+                else self.weights.stage1_bias
             ).data_ptr(),
             workspace.sorted_expert_ids.data_ptr(),
             workspace.num_valid_ids.data_ptr(),
@@ -1112,6 +1203,7 @@ class SonicMoE:
             cfg,
             _stage2_cache_mod(cfg, tokens),
             self.weights.weight_dtype,
+            self.weights.has_bias,
             hidden_states.device.index or 0,
         )
         grid2 = gemm2_a16w4_grid(
@@ -1129,6 +1221,11 @@ class SonicMoE:
                 self.weights.dummy_scale
                 if self.weights.down_scale is None
                 else self.weights.down_scale
+            ).data_ptr(),
+            (
+                self.weights.dummy_scale
+                if self.weights.stage2_bias is None
+                else self.weights.stage2_bias
             ).data_ptr(),
             workspace.sorted_expert_ids.data_ptr(),
             workspace.num_valid_ids.data_ptr(),
@@ -1472,6 +1569,9 @@ def sonic_moe_reference(
     w2: torch.Tensor,
     router_logits: torch.Tensor,
     config: SonicMoEConfig,
+    *,
+    b1: torch.Tensor | None = None,
+    b2: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Approximate oracle with FP32 GEMMs and a BF16 stage-1 intermediate.
 
@@ -1494,6 +1594,7 @@ def sonic_moe_reference(
         config.intermediate_size,
     ):
         raise ValueError("w2 shape does not match config")
+    prepared_b1, prepared_b2 = _prepare_biases(b1, b2, w1, config)
 
     probs = torch.softmax(router_logits.float(), dim=-1)
     route_weights, route_ids = torch.topk(probs, config.top_k, dim=-1)
@@ -1502,6 +1603,8 @@ def sonic_moe_reference(
 
     x = hidden_states.float()
     w1f, w2f = w1.float(), w2.float()
+    b1f = None if prepared_b1 is None else prepared_b1.float()
+    b2f = None if prepared_b2 is None else prepared_b2.float()
     result = torch.zeros(
         (hidden_states.shape[0], config.hidden_size),
         dtype=torch.float32,
@@ -1510,6 +1613,8 @@ def sonic_moe_reference(
     for slot in range(config.top_k):
         expert = route_ids[:, slot]
         stage1 = torch.bmm(w1f[expert], x.unsqueeze(-1)).squeeze(-1)
+        if b1f is not None:
+            stage1 = stage1 + b1f[expert]
         # The legacy grouped GEMM materializes BF16 preactivation before the
         # activation kernel reloads it in FP32. The fused kernel preserves this
         # observable rounding boundary.
@@ -1536,6 +1641,9 @@ def sonic_moe_reference(
             raise AssertionError(f"unexpected activation {config.activation!r}")
         activated = activated.to(torch.bfloat16).float()
         projected = torch.bmm(w2f[expert], activated.unsqueeze(-1)).squeeze(-1)
+        if b2f is not None:
+            projected = projected + b2f[expert]
+        projected = projected.to(torch.bfloat16).float()
         result.add_(projected * route_weights[:, slot, None])
     return result.to(torch.bfloat16)
 
@@ -1547,6 +1655,9 @@ def sonic_moe_mxfp4_reference(
     w2: torch.Tensor,
     router_logits: torch.Tensor,
     config: SonicMoEConfig,
+    *,
+    b1: torch.Tensor | None = None,
+    b2: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Reference the A16W4 path after canonical per-1x32 weight quantization.
 
@@ -1566,6 +1677,8 @@ def sonic_moe_mxfp4_reference(
         w2_dequant,
         router_logits,
         config,
+        b1=b1,
+        b2=b2,
     )
 
 

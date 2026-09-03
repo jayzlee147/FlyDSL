@@ -17,7 +17,9 @@ from .utils import (
     _a16w4_swizzle_xor16,
     _buffer_i32_scalar_read,
     _e8m0_byte_to_f32,
+    _gep1,
     _gep3,
+    _global_base_ptr1,
     _global_i32_at,
     _global_i32_buffer_tiles,
     _global_i32_buffer_view,
@@ -127,6 +129,7 @@ def _gemm1_body_a16w4(
     arg_x,
     arg_bq,
     arg_bscale,
+    arg_bias,
     arg_eids,
     arg_mind,
     arg_cumsum,
@@ -155,6 +158,7 @@ def _gemm1_body_a16w4(
     k_wave=1,
     use_k16=False,
     round_preact_bf16=False,
+    has_bias=False,
 ):
     """a16w4/a16wi4/a16w16 (bf16 A x mxfp4/int4/bf16 W) fused stage1 gemm1 body.
 
@@ -737,7 +741,32 @@ def _gemm1_body_a16w4(
         if _is_glu:
             _reduce_round(acc_up)
 
-    # ---- epilogue: SiLU(gate)*up -> bf16 intermediate [sorted_size, inter] -----
+    # Load each expert/channel bias once per lane and reuse it for every row this
+    # lane owns. Bias uses the logical row-major [E, N_OUT] layout (no preshuffle).
+    if const_expr(has_bias):
+        bias_base = _global_base_ptr1(
+            fx.Int64(arg_bias) + fx.Int64(e) * fx.Int64(N_OUT * 2)
+        )
+        gate_bias = []
+        up_bias = []
+        for ni in range_constexpr(num_acc_n):
+            gate_idx = col_g_list[ni]
+            gate_raw = llvm.load(
+                T.bf16,
+                _gep1(bias_base, gate_idx * fx.Int32(2)),
+                invariant=True,
+            )
+            gate_bias.append(fx.Float32(fx.BFloat16(gate_raw)))
+            if _is_glu:
+                up_idx = gate_idx + inter_i32
+                up_raw = llvm.load(
+                    T.bf16,
+                    _gep1(bias_base, up_idx * fx.Int32(2)),
+                    invariant=True,
+                )
+                up_bias.append(fx.Float32(fx.BFloat16(up_raw)))
+
+    # ---- epilogue: activation -> bf16 intermediate [sorted_size, inter] --------
     # Stored by SORTED POSITION (row = bx_m + row_in_tile). Padding rows (token >=
     # tokens) masked out; for k_wave>1 only the primary k-group (wave_k_id==0) writes.
     if const_expr(k_wave > 1):
@@ -753,12 +782,16 @@ def _gemm1_body_a16w4(
                 valid = valid & _is_primary
             for ni in range_constexpr(num_acc_n):
                 g = fx.Float32(fx.Vector(fx.memref_load_vec(acc_gate[mi][ni]))[ii])
+                if const_expr(has_bias):
+                    g = g + gate_bias[ni]
                 if const_expr(round_preact_bf16):
                     # SonicMoE's legacy grouped GEMM materializes BF16 before
                     # its separate activation kernel reloads the value in FP32.
                     g = fx.Float32(g.to(fx.BFloat16))
                 if const_expr(act == "situv2"):
                     u = fx.Float32(fx.Vector(fx.memref_load_vec(acc_up[mi][ni]))[ii])
+                    if const_expr(has_bias):
+                        u = u + up_bias[ni]
                     if const_expr(round_preact_bf16):
                         u = fx.Float32(u.to(fx.BFloat16))
                     y = _situ_mul_batch(
@@ -776,6 +809,8 @@ def _gemm1_body_a16w4(
                         if _is_glu
                         else None
                     )
+                    if const_expr(_is_glu and has_bias):
+                        u = u + up_bias[ni]
                     if const_expr(_is_glu and round_preact_bf16):
                         u = fx.Float32(u.to(fx.BFloat16))
                     y = _stage1_activation_f32(g, u, act)
@@ -807,6 +842,7 @@ def compile_gemm1_a16w4_port(
     w_layout="standard",
     k_wave=1,
     round_preact_bf16=False,
+    has_bias=False,
 ):
     """a16w4/a16wi4/a16w16 (bf16 A x mxfp4/int4/bf16 W1) fused stage1 builder.
 
@@ -835,6 +871,7 @@ def compile_gemm1_a16w4_port(
     assert k_wave in (1, 2, 4), f"k_wave must be 1, 2, or 4, got {k_wave}"
     assert 4 % k_wave == 0, f"4 must be divisible by k_wave, got {k_wave}"
     assert isinstance(round_preact_bf16, bool), "round_preact_bf16 must be bool"
+    assert isinstance(has_bias, bool), "has_bias must be bool"
     _K = D_HIDDEN
     _INTER = D_INTER
     _is_glu = act in ("silu", "swiglu", "geglu", "reglu", "situv2")
@@ -887,9 +924,10 @@ def compile_gemm1_a16w4_port(
     _wl_tag = "" if w_layout == "standard" else f"_{w_layout}"
     _kw_tag = f"_kw{k_wave}" if k_wave > 1 else ""
     _round_tag = "_prebf16" if round_preact_bf16 else ""
+    _bias_tag = "_bias" if has_bias else ""
     name_suffix = (
         f"a16w4{_wd_tag}{_wl_tag}_h{_K}_i{_INTER}_ne{NE}_bm{BM}"
-        f"_tn{TILE_N}{_act_tag}{_bcm_tag}{_xcd_tag}{_wpe_tag}{_kw_tag}{_round_tag}"
+        f"_tn{TILE_N}{_act_tag}{_bcm_tag}{_xcd_tag}{_wpe_tag}{_kw_tag}{_round_tag}{_bias_tag}"
     )
 
     @fx.struct
@@ -901,6 +939,7 @@ def compile_gemm1_a16w4_port(
         arg_x: fx.Int64,
         arg_bq: fx.Int64,
         arg_bscale: fx.Int64,
+        arg_bias: fx.Int64,
         arg_eids: fx.Int64,
         arg_cumsum: fx.Int64,
         arg_mind: fx.Int64,
@@ -952,6 +991,7 @@ def compile_gemm1_a16w4_port(
                 arg_x,
                 arg_bq,
                 arg_bscale,
+                arg_bias,
                 arg_eids,
                 arg_mind,
                 arg_cumsum,
@@ -979,6 +1019,7 @@ def compile_gemm1_a16w4_port(
                 k_wave=k_wave,
                 use_k16=_use_k16,
                 round_preact_bf16=round_preact_bf16,
+                has_bias=has_bias,
             )
 
     @flyc.jit
@@ -986,6 +1027,7 @@ def compile_gemm1_a16w4_port(
         arg_x: fx.Int64,
         arg_bq: fx.Int64,
         arg_bscale: fx.Int64,
+        arg_bias: fx.Int64,
         arg_eids: fx.Int64,
         arg_cumsum: fx.Int64,
         arg_mind: fx.Int64,
@@ -1004,6 +1046,7 @@ def compile_gemm1_a16w4_port(
             arg_x,
             arg_bq,
             arg_bscale,
+            arg_bias,
             arg_eids,
             arg_cumsum,
             arg_mind,

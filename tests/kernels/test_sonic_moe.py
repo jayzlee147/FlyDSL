@@ -168,6 +168,125 @@ def test_sonic_moe_mxfp4_activation_variants(activation):
     _assert_close(actual, expected)
 
 
+@pytest.mark.parametrize("activation", ("swiglu", "relu"))
+def test_sonic_moe_bf16_bias_matches_reference_fixed_and_flat_routes(activation):
+    config = _config(activation=activation)
+    x, w1, w2, router_logits = _make_case(seed=97, activation=activation)
+    generator = torch.Generator(device=x.device).manual_seed(101)
+    b1 = (
+        torch.randn(
+            (NUM_EXPERTS, config.stage1_projection_size),
+            device=x.device,
+            dtype=torch.float32,
+            generator=generator,
+        )
+        / 8
+    ).to(torch.bfloat16)
+    b2 = (
+        torch.randn(
+            (NUM_EXPERTS, HIDDEN_SIZE),
+            device=x.device,
+            dtype=torch.float32,
+            generator=generator,
+        )
+        / 8
+    ).to(torch.bfloat16)
+    prepared = prepare_sonic_bf16_weights(w1, w2, config, b1=b1, b2=b2)
+    assert prepared.has_bias
+    expected = sonic_moe_reference(
+        x, w1, w2, router_logits, config, b1=b1, b2=b2
+    )
+    op = SonicMoE(config, prepared)
+
+    actual_fixed = op(x, router_logits)
+    topk_ids, topk_weights = _topk_from_logits(router_logits, config)
+    token_indices = torch.arange(
+        TOKENS, dtype=torch.int32, device=x.device
+    ).repeat_interleave(config.top_k)
+    actual_flat = op.forward_routes(
+        x,
+        token_indices,
+        topk_ids.reshape(-1).contiguous(),
+        topk_weights.reshape(-1).contiguous(),
+    )
+    torch.cuda.synchronize()
+
+    _assert_close(actual_fixed, expected)
+    _assert_close(actual_flat, expected)
+
+
+def test_sonic_moe_mxfp4_bias_matches_reference():
+    config = _config(activation="geglu")
+    x, w1, w2, router_logits = _make_case(seed=103, activation="geglu")
+    b1 = torch.linspace(
+        -0.25,
+        0.25,
+        NUM_EXPERTS * config.stage1_projection_size,
+        device=x.device,
+        dtype=torch.bfloat16,
+    ).view(NUM_EXPERTS, config.stage1_projection_size)
+    b2 = torch.linspace(
+        0.125,
+        -0.125,
+        NUM_EXPERTS * HIDDEN_SIZE,
+        device=x.device,
+        dtype=torch.bfloat16,
+    ).view(NUM_EXPERTS, HIDDEN_SIZE)
+    prepared = prepare_sonic_mxfp4_weights(w1, w2, config, b1=b1, b2=b2)
+    expected = sonic_moe_mxfp4_reference(
+        x, w1, w2, router_logits, config, b1=b1, b2=b2
+    )
+    actual = SonicMoE(config, prepared)(x, router_logits)
+    torch.cuda.synchronize()
+    _assert_close(actual, expected)
+
+
+def test_sonic_moe_bias_ragged_duplicate_zero_score_and_empty_routes():
+    device = _gfx950_device()
+    config = _config(activation="relu")
+    x = torch.zeros((3, HIDDEN_SIZE), dtype=torch.bfloat16, device=device)
+    w1 = torch.zeros(
+        (NUM_EXPERTS, INTERMEDIATE_SIZE, HIDDEN_SIZE),
+        dtype=torch.bfloat16,
+        device=device,
+    )
+    w2 = torch.zeros(
+        (NUM_EXPERTS, HIDDEN_SIZE, INTERMEDIATE_SIZE),
+        dtype=torch.bfloat16,
+        device=device,
+    )
+    b1 = torch.ones(
+        (NUM_EXPERTS, INTERMEDIATE_SIZE), dtype=torch.bfloat16, device=device
+    )
+    b2 = torch.stack(
+        [
+            torch.full((HIDDEN_SIZE,), expert + 1, dtype=torch.bfloat16, device=device)
+            for expert in range(NUM_EXPERTS)
+        ]
+    )
+    op = SonicMoE(
+        config,
+        prepare_sonic_bf16_weights(w1, w2, config, b1=b1, b2=b2),
+    )
+    token_indices = torch.tensor([0, 0, 2, 2], dtype=torch.int32, device=device)
+    expert_indices = torch.tensor([1, 1, 0, 2], dtype=torch.int32, device=device)
+    route_weights = torch.tensor([0.25, -0.5, 0.0, 1.5], device=device)
+
+    actual = op.forward_routes(x, token_indices, expert_indices, route_weights)
+    torch.cuda.synchronize()
+    expected = torch.zeros_like(x)
+    expected[0].fill_(-0.5)
+    expected[2].fill_(4.5)
+    assert torch.equal(actual, expected)
+    assert torch.count_nonzero(actual[1]) == 0
+
+    empty_i32 = torch.empty(0, dtype=torch.int32, device=device)
+    empty_f32 = torch.empty(0, dtype=torch.float32, device=device)
+    empty = op.forward_routes(x, empty_i32, empty_i32, empty_f32)
+    torch.cuda.synchronize()
+    assert torch.count_nonzero(empty) == 0
+
+
 def test_sonic_moe_activation_preserves_legacy_bf16_preactivation_rounding():
     device = _gfx950_device()
     config = _config(num_experts=1, top_k=1, activation="relu_sq")
@@ -728,6 +847,23 @@ def test_sonic_moe_autotuner_search_and_disk_cache(tmp_path):
         rep=1,
         cache_dir=tmp_path,
     )
+    b1 = torch.zeros(
+        (NUM_EXPERTS, config.stage1_projection_size),
+        dtype=torch.bfloat16,
+        device=x.device,
+    )
+    b2 = torch.zeros(
+        (NUM_EXPERTS, HIDDEN_SIZE), dtype=torch.bfloat16, device=x.device
+    )
+    biased_tuner = SonicMoEAutotuner(
+        config,
+        prepare_sonic_bf16_weights(w1, w2, config, b1=b1, b2=b2),
+        candidates=candidates,
+        warmup=0,
+        rep=1,
+        cache_dir=tmp_path / "biased",
+    )
+    assert tuner._cache_key(x, router_logits) != biased_tuner._cache_key(x, router_logits)
 
     expected = sonic_moe_reference(x, w1, w2, router_logits, config)
     actual = tuner(x, router_logits)
@@ -801,7 +937,7 @@ def test_sonic_moe_autotuner_search_and_disk_cache(tmp_path):
     recovered(x, router_logits)
     torch.cuda.synchronize()
     assert recovered.search_count == 1
-    assert '"version": 3' in non_object_cache_file.read_text(encoding="utf-8")
+    assert '"version": 4' in non_object_cache_file.read_text(encoding="utf-8")
 
 
 def test_sonic_moe_router_and_multiphase_sort_fallback():
@@ -1022,6 +1158,31 @@ def test_sonic_moe_tensor_shape_and_dtype_validation():
     assert prepared_fp32.down.dtype == torch.bfloat16
     with pytest.raises((TypeError, ValueError)):
         prepare_sonic_bf16_weights(w1.to(torch.int16), w2, config)
+
+    b1 = torch.randn(
+        (NUM_EXPERTS, config.stage1_projection_size),
+        dtype=torch.bfloat16,
+        device=x.device,
+    )
+    b2 = torch.randn(
+        (NUM_EXPERTS, HIDDEN_SIZE), dtype=torch.bfloat16, device=x.device
+    )
+    with pytest.raises(ValueError, match="both be provided"):
+        prepare_sonic_bf16_weights(w1, w2, config, b1=b1)
+    with pytest.raises(ValueError, match="b1 must have shape"):
+        prepare_sonic_bf16_weights(w1, w2, config, b1=b1[:, :-1], b2=b2)
+    with pytest.raises(ValueError, match="b2 must have shape"):
+        prepare_sonic_bf16_weights(w1, w2, config, b1=b1, b2=b2[:, :-1])
+    with pytest.raises(TypeError, match="b1/b2 must be floating point"):
+        prepare_sonic_bf16_weights(w1, w2, config, b1=b1.to(torch.int16), b2=b2)
+
+    prepared_bias = prepare_sonic_bf16_weights(w1, w2, config, b1=b1, b2=b2)
+    prepared_b1 = prepared_bias.stage1_bias.clone()
+    prepared_b2 = prepared_bias.stage2_bias.clone()
+    b1.zero_()
+    b2.zero_()
+    assert torch.equal(prepared_bias.stage1_bias, prepared_b1)
+    assert torch.equal(prepared_bias.stage2_bias, prepared_b2)
 
     op = SonicMoE(config, prepare_sonic_bf16_weights(w1, w2, config))
     with pytest.raises((TypeError, ValueError)):
