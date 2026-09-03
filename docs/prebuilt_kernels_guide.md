@@ -298,7 +298,7 @@ python3 tests/kernels/test_flash_attn_fwd.py --dtype fp8 --compare --warmup 10 -
 
 ---
 
-## 3c. SonicMoE A16W16/A16W4 forward (`kernels/moe/sonic.py`)
+## 3c. SonicMoE A16W16/A16W4 (`kernels/moe/sonic.py`)
 
 The gfx950 inference path composes the existing FlyDSL routing and
 `moe_2stage_a16wmix` MFMA kernels. The routing stage rounds each expert's rows to
@@ -317,6 +317,7 @@ from kernels.moe.sonic import (
     prepare_sonic_bf16_weights,
     prepare_sonic_fp16_weights,
     prepare_sonic_mxfp4_weights,
+    sonic_moe_backward,
 )
 
 cfg = SonicMoEConfig(
@@ -338,6 +339,18 @@ out = op(hidden_states_bf16, router_logits_bf16)
 cfg_fp16 = replace(cfg, compute_dtype="fp16")
 weights_fp16 = prepare_sonic_fp16_weights(w1_fp16, w2_fp16, cfg_fp16)
 out_fp16 = SonicMoE(cfg_fp16, weights_fp16)(hidden_states_fp16, router_logits_fp16)
+
+# Initial training API: logical dense expert-major weights, explicit fixed-K
+# routes, BF16, SwiGLU, and no expert bias.
+dx, dw1, dw2, droute_scores = sonic_moe_backward(
+    hidden_states_bf16,
+    w1,
+    w2,
+    topk_ids_i32,
+    topk_scores_f32,
+    grad_output_bf16,
+    cfg,
+)
 ```
 
 Dense BF16/FP16 shapes may use a 64-wide intermediate dimension. For example,
@@ -399,19 +412,22 @@ traffic profiles, construct separate tuners with `profile_key="uniform"`,
 `profile_key="decode-skew"`, or another stable application label so their disk
 cache entries do not collide.
 
-This API is inference-forward only. Optional expert-major BF16/FP16 `b1`/`b2` are
-prepared with the weights and fused before the activation and route weighting,
-respectively. Saved pre-activation, backward, varlen-K dW, and activation
-derivatives are not yet provided. The packed A16 atomic output is non-deterministic at
-the last few bits. See `examples/06-sonicMoE.py` for correctness and warm-cache
-benchmarking.
+Optional expert-major BF16/FP16 `b1`/`b2` are prepared with the weights and fused
+before the activation and route weighting, respectively. The initial
+`sonic_moe_backward` path supports dense BF16 weights, fixed-K routing, SwiGLU,
+and no bias. It independently re-sorts routes and recomputes the materialized
+pre-activation and projection, so it does not retain or alias an inference
+workspace across calls. The bring-up implementation uses per-expert A16W16 GEMMs
+and one host synchronization to read expert frequencies; activation, routing,
+reduction, and every tensor calculation remain FlyDSL device kernels. The
+`dout * route_score` input is rounded to BF16 before the backward GEMMs, so it is
+an A16 training contract rather than bitwise parity with a legacy FP32-scaled
+Triton grouped GEMM.
 
-An optimized training path needs more than a generic GEMM fallback: it must retain
-or recompute gate/up pre-activations, add dSwiGLU, provide transposed grouped dX
-GEMMs, expose actual and padded expert offsets, implement expert-ragged-K dW, and
-perform segmented bias reductions. The current sorter and forward workspace do
-not expose or lifetime-manage that state, so the inference API deliberately
-rejects tensors requiring gradients.
+Backward for the other activation variants, expert bias, FP16, and flat ragged
+routes is not yet provided by this initial entry point. The packed A16 atomic
+forward output is non-deterministic at the last few bits. See
+`examples/06-sonicMoE.py` for correctness and warm-cache benchmarking.
 
 ### Scaled-MFMA status
 
