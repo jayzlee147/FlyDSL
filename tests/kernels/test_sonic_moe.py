@@ -127,6 +127,172 @@ def test_sonic_moe_bf16_forward_matches_reference():
     _assert_close(out, expected)
 
 
+def test_sonic_moe_ragged_routes_match_reference_and_frequency():
+    """Flat routes allow missing tokens, duplicate edges, and arbitrary weights."""
+
+    config = _config()
+    x, w1, w2, _ = _make_case(seed=19)
+    prepared = prepare_sonic_bf16_weights(w1, w2, config)
+    op = SonicMoE(config, prepared)
+    token_indices = torch.tensor(
+        [0, 0, 1, 3, 3, 3, 5, 6, 6, 6, 6],
+        dtype=torch.int32,
+        device=x.device,
+    )
+    expert_indices = torch.tensor(
+        [1, 3, 0, 2, 2, 1, 3, 0, 1, 2, 3],
+        dtype=torch.int32,
+        device=x.device,
+    )
+    route_weights = torch.tensor(
+        [0.7, 0.3, 1.2, -0.4, 0.6, 0.0, 0.9, 0.1, 0.2, 0.3, 0.4],
+        dtype=torch.float32,
+        device=x.device,
+    )
+    frequency = torch.empty(NUM_EXPERTS, dtype=torch.int32, device=x.device)
+
+    expected = torch.zeros_like(x, dtype=torch.float32)
+    x_f32, w1_f32, w2_f32 = x.float(), w1.float(), w2.float()
+    for route in range(route_weights.numel()):
+        token = int(token_indices[route])
+        expert = int(expert_indices[route])
+        gate_up = w1_f32[expert] @ x_f32[token]
+        gate, up = gate_up.split(INTERMEDIATE_SIZE)
+        activated = (torch.nn.functional.silu(gate) * up).to(torch.bfloat16).float()
+        projected = w2_f32[expert] @ activated
+        expected[token].add_(projected * route_weights[route])
+    expected = expected.to(torch.bfloat16)
+
+    actual = op.forward_routes(
+        x,
+        token_indices,
+        expert_indices,
+        route_weights,
+        expert_frequency_out=frequency,
+    )
+    torch.cuda.synchronize()
+
+    expected_frequency = torch.bincount(
+        expert_indices.to(torch.int64), minlength=NUM_EXPERTS
+    ).to(torch.int32)
+    assert torch.equal(frequency, expected_frequency)
+    assert op.workspace is not None
+    assert op.workspace.routes == route_weights.numel()
+    expected_blocks = sum(
+        (int(count) + config.tile_m - 1) // config.tile_m
+        for count in expected_frequency
+        if int(count) > 0
+    )
+    assert int(op.workspace.num_valid_ids[0]) == expected_blocks * config.tile_m
+    assert int(op.workspace.num_valid_ids[1]) == TOKENS
+    _assert_close(actual, expected)
+
+    # Kernel/JIT cache specialization must include tile_m.  Running 16 then 32
+    # in one process catches accidental reuse of captured DSL constants.
+    config_tile32 = replace(config, tile_m=32)
+    op_tile32 = SonicMoE(config_tile32, prepared)
+    frequency_tile32 = torch.empty_like(frequency)
+    actual_tile32 = op_tile32.forward_routes(
+        x,
+        token_indices,
+        expert_indices,
+        route_weights,
+        expert_frequency_out=frequency_tile32,
+    )
+    torch.cuda.synchronize()
+    assert op_tile32.workspace is not None
+    assert int(op_tile32.workspace.num_valid_ids[0]) == expected_blocks * 32
+    assert torch.equal(frequency_tile32, expected_frequency)
+    _assert_close(actual_tile32, expected)
+
+    actual_tile16_again = op.forward_routes(
+        x,
+        token_indices,
+        expert_indices,
+        route_weights,
+    )
+    torch.cuda.synchronize()
+    assert op.workspace is not None
+    assert int(op.workspace.num_valid_ids[0]) == expected_blocks * config.tile_m
+    assert torch.equal(op.workspace.expert_frequency, expected_frequency)
+    _assert_close(actual_tile16_again, expected)
+
+    empty_indices = torch.empty(0, dtype=torch.int32, device=x.device)
+    empty_weights = torch.empty(0, dtype=torch.float32, device=x.device)
+    empty_frequency = torch.empty(NUM_EXPERTS, dtype=torch.int32, device=x.device)
+    empty_actual = op.forward_routes(
+        x,
+        empty_indices,
+        empty_indices,
+        empty_weights,
+        expert_frequency_out=empty_frequency,
+    )
+    torch.cuda.synchronize()
+    assert torch.count_nonzero(empty_actual) == 0
+    assert torch.count_nonzero(empty_frequency) == 0
+    assert op.workspace is not None and op.workspace.max_m_blocks == 0
+
+
+def test_sonic_moe_ragged_high_fan_in_matches_fp32_reference():
+    """An up-rounded token may receive many experts and BF16 atomic contributions."""
+
+    device = _gfx950_device()
+    tokens, experts = 3, 64
+    config = _config(num_experts=experts, top_k=1)
+    generator = torch.Generator(device=device).manual_seed(59)
+    x = torch.randn(
+        (tokens, HIDDEN_SIZE), dtype=torch.float32, device=device, generator=generator
+    ).to(torch.bfloat16)
+    w1 = (
+        torch.randn(
+            (experts, 2 * INTERMEDIATE_SIZE, HIDDEN_SIZE),
+            dtype=torch.float32,
+            device=device,
+            generator=generator,
+        )
+        / math.sqrt(HIDDEN_SIZE)
+    ).to(torch.bfloat16)
+    w2 = (
+        torch.randn(
+            (experts, HIDDEN_SIZE, INTERMEDIATE_SIZE),
+            dtype=torch.float32,
+            device=device,
+            generator=generator,
+        )
+        / math.sqrt(INTERMEDIATE_SIZE)
+    ).to(torch.bfloat16)
+    token_indices = torch.zeros(experts, dtype=torch.int32, device=device)
+    expert_indices = torch.arange(experts, dtype=torch.int32, device=device)
+    route_weights = torch.softmax(
+        torch.randn(experts, dtype=torch.float32, device=device, generator=generator),
+        dim=0,
+    )
+    frequency = torch.empty(experts, dtype=torch.int32, device=device)
+
+    expected_row = torch.zeros(HIDDEN_SIZE, dtype=torch.float32, device=device)
+    for expert in range(experts):
+        gate_up = w1[expert].float() @ x[0].float()
+        gate, up = gate_up.split(INTERMEDIATE_SIZE)
+        activated = (torch.nn.functional.silu(gate) * up).to(torch.bfloat16).float()
+        expected_row.add_((w2[expert].float() @ activated) * route_weights[expert])
+    expected = torch.zeros_like(x)
+    expected[0] = expected_row.to(torch.bfloat16)
+
+    op = SonicMoE(config, prepare_sonic_bf16_weights(w1, w2, config))
+    actual = op.forward_routes(
+        x,
+        token_indices,
+        expert_indices,
+        route_weights,
+        expert_frequency_out=frequency,
+    )
+    torch.cuda.synchronize()
+
+    assert torch.equal(frequency, torch.ones_like(frequency))
+    assert torch.count_nonzero(actual[1:]) == 0
+    _assert_close(actual, expected)
+
+
 def test_sonic_moe_mxfp4_weight_only_forward():
     """A16W4 keeps BF16 activations while consuming per-1x32 MXFP4 weights."""
 
@@ -444,6 +610,22 @@ def test_sonic_moe_workspace_bound_scales_with_active_experts():
     assert workspace.max_m_blocks == 2
     assert workspace.intermediate.shape == (64, INTERMEDIATE_SIZE)
     _assert_close(actual, expected)
+
+    topk_ids, topk_weights = _topk_from_logits(logits, config)
+    ragged_frequency = torch.empty(896, dtype=torch.int32, device=device)
+    ragged_actual = op.forward_routes(
+        x,
+        torch.zeros(config.top_k, dtype=torch.int32, device=device),
+        topk_ids.reshape(-1),
+        topk_weights.reshape(-1),
+        expert_frequency_out=ragged_frequency,
+    )
+    torch.cuda.synchronize()
+    assert op.workspace is not None
+    assert op.workspace.routes == config.top_k
+    assert op.workspace.max_padded_tokens == 64
+    assert int(ragged_frequency.sum()) == config.top_k
+    _assert_close(ragged_actual, expected)
 
     mxfp4_weights = prepare_sonic_mxfp4_weights(w1, w2, config)
     mxfp4_expected = sonic_moe_mxfp4_reference(x, w1, w2, logits, config)

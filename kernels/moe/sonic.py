@@ -39,6 +39,7 @@ from kernels.moe.moe_2stage_a16wmix.gemm2 import (
     compile_gemm2_a16w4_port,
     gemm2_a16w4_grid,
 )
+from kernels.moe.moe_ragged_sorting_kernel import moe_ragged_sorting_flydsl
 from kernels.moe.moe_sorting_kernel import (
     moe_softmax_sort_flydsl,
     moe_sorting_flydsl,
@@ -233,9 +234,10 @@ class SonicMoEWeights:
 
 @dataclass
 class SonicMoEWorkspace:
-    """Reusable routing, intermediate, and output buffers for one token count."""
+    """Reusable routing, intermediate, and output buffers for one route shape."""
 
     tokens: int
+    routes: int | None
     max_padded_tokens: int
     max_m_blocks: int
     sorted_token_ids: torch.Tensor
@@ -243,6 +245,7 @@ class SonicMoEWorkspace:
     sorted_expert_ids: torch.Tensor
     num_valid_ids: torch.Tensor
     sorting_workspace: torch.Tensor | None
+    expert_frequency: torch.Tensor
     router_topk_weights: torch.Tensor
     router_topk_ids: torch.Tensor
     router_topk_expert_indices: torch.Tensor
@@ -264,6 +267,7 @@ class SonicMoEWorkspace:
             self.sorted_weights,
             self.sorted_expert_ids,
             self.num_valid_ids,
+            self.expert_frequency,
             self.router_topk_weights,
             self.router_topk_ids,
             self.router_topk_expert_indices,
@@ -280,40 +284,64 @@ class SonicMoEWorkspace:
         config: SonicMoEConfig,
         tokens: int,
         device: torch.device,
+        *,
+        routes: int | None = None,
     ) -> "SonicMoEWorkspace":
         if tokens <= 0:
             raise ValueError(f"tokens must be positive, got {tokens}")
-        # At most min(E, routes) experts can be non-empty. If A experts are active,
-        # Q padded tiles need at least Q*tile_m - A*(tile_m-1) real routes. Also,
-        # top-k IDs are distinct per token, so one expert receives at most `tokens`
-        # routes. The minimum of those bounds avoids launching empty expert tiles.
-        routes = tokens * config.top_k
-        active_experts = min(config.num_experts, routes)
+        if routes is not None and routes < 0:
+            raise ValueError(f"routes must be non-negative, got {routes}")
+
+        # If A experts are active, Q padded tiles need at least
+        # Q*tile_m - A*(tile_m-1) real routes.  Dense top-k routing additionally
+        # has at most one edge per (token, expert); flat routing deliberately
+        # supports duplicates, so it cannot use that tighter bound.
+        route_count = tokens * config.top_k if routes is None else int(routes)
+        active_experts = min(config.num_experts, route_count)
         padding_bound = (
-            routes + active_experts * (config.tile_m - 1)
+            route_count + active_experts * (config.tile_m - 1)
         ) // config.tile_m
-        per_expert_bound = active_experts * (
-            (tokens + config.tile_m - 1) // config.tile_m
-        )
-        max_blocks = min(padding_bound, per_expert_bound)
+        if routes is None:
+            per_expert_bound = active_experts * (
+                (tokens + config.tile_m - 1) // config.tile_m
+            )
+            max_blocks = min(padding_bound, per_expert_bound)
+        else:
+            max_blocks = padding_bound
         max_padded = max_blocks * config.tile_m
+        if max_padded > _MAX_SIGNED_I32:
+            raise ValueError(
+                "padded route count exceeds the sorting kernel's signed 32-bit "
+                f"index limit: {max_padded}"
+            )
+        if max_padded * 4 > _MAX_BUFFER_BYTE_OFFSET:
+            raise ValueError(
+                "sorted route metadata exceeds the kernel's 32-bit byte-offset "
+                f"limit: max_padded={max_padded}"
+            )
         if max_padded * config.intermediate_size * 2 > _MAX_BUFFER_BYTE_OFFSET:
             raise ValueError(
                 "sorted BF16 intermediate exceeds the kernel's 32-bit byte-offset limit: "
                 f"max_padded={max_padded}, intermediate_size={config.intermediate_size}"
             )
-        sorting_workspace_size = moe_sorting_get_workspace_size(
-            tokens,
-            config.num_experts,
-            config.top_k,
-            unit_size=config.tile_m,
-        )
-        mesh_stride = ((tokens + config.tile_m - 1) // config.tile_m) * config.tile_m
-        if config.num_experts * mesh_stride > _MAX_SIGNED_I32:
-            raise ValueError(
-                "sorting mesh exceeds the kernel's signed 32-bit byte-index limit: "
-                f"experts={config.num_experts}, mesh_stride={mesh_stride}"
+        if routes is None:
+            sorting_workspace_size = moe_sorting_get_workspace_size(
+                tokens,
+                config.num_experts,
+                config.top_k,
+                unit_size=config.tile_m,
             )
+            mesh_stride = ((tokens + config.tile_m - 1) // config.tile_m) * config.tile_m
+            if config.num_experts * mesh_stride > _MAX_SIGNED_I32:
+                raise ValueError(
+                    "sorting mesh exceeds the kernel's signed 32-bit byte-index limit: "
+                    f"experts={config.num_experts}, mesh_stride={mesh_stride}"
+                )
+        else:
+            # Flat sorting only needs one atomic cursor per expert.  The exact
+            # frequency is kept separately because the prefix phase must not
+            # destroy the public frequency result.
+            sorting_workspace_size = config.num_experts
         if sorting_workspace_size * 4 > _MAX_BUFFER_BYTE_OFFSET:
             raise ValueError(
                 "sorting workspace exceeds the kernel's 32-bit byte-offset limit: "
@@ -321,16 +349,22 @@ class SonicMoEWorkspace:
             )
         return cls(
             tokens=tokens,
+            routes=routes,
             max_padded_tokens=max_padded,
             max_m_blocks=max_blocks,
-            sorted_token_ids=torch.empty(max_padded, dtype=torch.int32, device=device),
-            sorted_weights=torch.empty(max_padded, dtype=torch.float32, device=device),
-            sorted_expert_ids=torch.empty(max_blocks, dtype=torch.int32, device=device),
+            # Keep a one-element backing allocation for the all-empty ragged
+            # case so raw buffer descriptors never receive a null data pointer.
+            sorted_token_ids=torch.empty(max(1, max_padded), dtype=torch.int32, device=device),
+            sorted_weights=torch.empty(max(1, max_padded), dtype=torch.float32, device=device),
+            sorted_expert_ids=torch.empty(max(1, max_blocks), dtype=torch.int32, device=device),
             num_valid_ids=torch.empty(2, dtype=torch.int32, device=device),
             sorting_workspace=(
                 torch.empty(sorting_workspace_size, dtype=torch.int32, device=device)
                 if sorting_workspace_size
                 else None
+            ),
+            expert_frequency=torch.empty(
+                config.num_experts, dtype=torch.int32, device=device
             ),
             router_topk_weights=torch.empty(
                 (tokens, config.top_k), dtype=torch.float32, device=device
@@ -342,7 +376,7 @@ class SonicMoEWorkspace:
                 (tokens, config.top_k), dtype=torch.int32, device=device
             ),
             intermediate=torch.empty(
-                (max_padded, config.intermediate_size),
+                (max(1, max_padded), config.intermediate_size),
                 dtype=torch.bfloat16,
                 device=device,
             ),
@@ -837,14 +871,16 @@ class SonicMoE:
     """Reusable gfx950 SonicMoE A16 forward operator.
 
     Up to ``max_cached_workspaces`` workspaces are retained in LRU order, keyed by
-    ``(device, stream, token_count)``. The returned default output aliases that
-    workspace and is overwritten by the next call with the same key; pass ``out=``
-    when the caller owns output storage. Independent streams receive independent
-    workspaces, while calls sharing a cache key serialize their complete kernel
-    enqueue sequence. Eviction only drops the operator's reference: an in-progress
-    call retains its workspace locally, and its buffers are allocated and used on
-    the keyed stream so PyTorch's stream-aware allocator defers unsafe reuse. Call
-    :meth:`clear_workspace` to release all cached entries eagerly.
+    ``(device, stream, token_count, route_count)``; dense top-k calls use a
+    dedicated route-count sentinel. The returned default output aliases that
+    workspace and is overwritten by the next call with the same key; pass
+    ``out=`` when the caller owns output storage. Independent streams receive
+    independent workspaces, while calls sharing a cache key serialize their
+    complete kernel enqueue sequence. Eviction only drops the operator's
+    reference: an in-progress call retains its workspace locally, and its
+    buffers are allocated and used on the keyed stream so PyTorch's stream-aware
+    allocator defers unsafe reuse. Call :meth:`clear_workspace` to release all
+    cached entries eagerly.
     """
 
     def __init__(
@@ -890,7 +926,7 @@ class SonicMoE:
         self.weights = weights
         self._max_cached_workspaces = max_cached_workspaces
         self._workspaces: OrderedDict[
-            tuple[int, int, int], SonicMoEWorkspace
+            tuple[int, int, int, int], SonicMoEWorkspace
         ] = OrderedDict()
         self._workspace_lock = threading.RLock()
         self.workspace: SonicMoEWorkspace | None = None
@@ -900,9 +936,12 @@ class SonicMoE:
             self._workspaces.clear()
             self.workspace = None
 
-    def reserve(self, tokens: int) -> SonicMoEWorkspace:
+    def reserve(self, tokens: int, *, routes: int | None = None) -> SonicMoEWorkspace:
+        if routes is not None and routes < 0:
+            raise ValueError(f"routes must be non-negative, got {routes}")
         stream_id = int(torch.cuda.current_stream(self.weights.device).cuda_stream)
-        key = (self.weights.device.index or 0, stream_id, int(tokens))
+        route_key = -1 if routes is None else int(routes)
+        key = (self.weights.device.index or 0, stream_id, int(tokens), route_key)
         with self._workspace_lock:
             workspace = self._workspaces.get(key)
             if workspace is None:
@@ -910,6 +949,7 @@ class SonicMoE:
                     self.config,
                     int(tokens),
                     self.weights.device,
+                    routes=routes,
                 )
                 self._workspaces[key] = workspace
                 while len(self._workspaces) > self._max_cached_workspaces:
@@ -1156,6 +1196,156 @@ class SonicMoE:
                     workspace.router_topk_expert_indices,
                 ),
             )
+            return self._run_grouped_gemms(hidden_states, workspace, output)
+
+    def forward_routes(
+        self,
+        hidden_states: torch.Tensor,
+        token_indices: torch.Tensor,
+        expert_indices: torch.Tensor,
+        route_weights: torch.Tensor,
+        out: torch.Tensor | None = None,
+        expert_frequency_out: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Run the grouped MLP from a flat variable-K route list.
+
+        ``token_indices`` and ``expert_indices`` must be contiguous int32 and
+        ``route_weights`` contiguous float32, all with shape ``[routes]``.
+        Every edge is consumed independently, including duplicate
+        ``(token, expert)`` pairs; weights are used verbatim.  IDs must be in
+        range.  This hot path intentionally leaves value validation to the
+        caller to avoid a device synchronization.
+
+        When supplied, ``expert_frequency_out`` must be contiguous int32 with
+        shape ``[num_experts]`` and receives the number of route occurrences
+        for each expert.
+        """
+
+        if not hidden_states.is_cuda:
+            raise ValueError("hidden_states must be on a ROCm device")
+        with torch.cuda.device(hidden_states.device):
+            return self._forward_routes_on_current_device(
+                hidden_states,
+                token_indices,
+                expert_indices,
+                route_weights,
+                out,
+                expert_frequency_out,
+            )
+
+    def _forward_routes_on_current_device(
+        self,
+        hidden_states: torch.Tensor,
+        token_indices: torch.Tensor,
+        expert_indices: torch.Tensor,
+        route_weights: torch.Tensor,
+        out: torch.Tensor | None,
+        expert_frequency_out: torch.Tensor | None,
+    ) -> torch.Tensor:
+        tokens = self._validate_hidden(hidden_states)
+        if token_indices.ndim != 1 or expert_indices.ndim != 1 or route_weights.ndim != 1:
+            raise ValueError(
+                "token_indices, expert_indices, and route_weights must be one-dimensional"
+            )
+        routes = int(route_weights.numel())
+        if int(token_indices.numel()) != routes or int(expert_indices.numel()) != routes:
+            raise ValueError(
+                "token_indices, expert_indices, and route_weights must have equal length"
+            )
+        if routes > _MAX_SIGNED_I32:
+            raise ValueError(
+                f"route count exceeds the sorting kernel's signed 32-bit limit: {routes}"
+            )
+        if (
+            not token_indices.is_cuda
+            or not expert_indices.is_cuda
+            or not route_weights.is_cuda
+            or token_indices.device != hidden_states.device
+            or expert_indices.device != hidden_states.device
+            or route_weights.device != hidden_states.device
+        ):
+            raise ValueError("route tensors must be on the same ROCm device as hidden_states")
+        if token_indices.dtype != torch.int32 or expert_indices.dtype != torch.int32:
+            raise TypeError(
+                "token_indices/expert_indices must be int32, got "
+                f"{token_indices.dtype}/{expert_indices.dtype}"
+            )
+        if route_weights.dtype != torch.float32:
+            raise TypeError(f"route_weights must be float32, got {route_weights.dtype}")
+        if (
+            not token_indices.is_contiguous()
+            or not expert_indices.is_contiguous()
+            or not route_weights.is_contiguous()
+        ):
+            raise ValueError("route tensors must be contiguous")
+        if route_weights.requires_grad:
+            raise ValueError("SonicMoE is inference-only; route_weights must not require gradients")
+
+        workspace = self.reserve(tokens, routes=routes)
+        output = self._validate_out(
+            out,
+            workspace,
+            hidden_states,
+            token_indices,
+            expert_indices,
+            route_weights,
+            *self.weights.tensors,
+        )
+
+        frequency = workspace.expert_frequency
+        if expert_frequency_out is not None:
+            frequency = expert_frequency_out
+            expected_frequency = (self.config.num_experts,)
+            if tuple(frequency.shape) != expected_frequency:
+                raise ValueError(
+                    f"expert_frequency_out must have shape {expected_frequency}, "
+                    f"got {tuple(frequency.shape)}"
+                )
+            if (
+                not frequency.is_cuda
+                or frequency.device != hidden_states.device
+                or frequency.dtype != torch.int32
+                or not frequency.is_contiguous()
+            ):
+                raise ValueError(
+                    "expert_frequency_out must be contiguous int32 on the same ROCm device"
+                )
+            frequency_storage = frequency.untyped_storage().data_ptr()
+            read_tensors = (
+                hidden_states,
+                token_indices,
+                expert_indices,
+                route_weights,
+                *self.weights.tensors,
+            )
+            if frequency_storage == output.untyped_storage().data_ptr() or any(
+                frequency_storage == tensor.untyped_storage().data_ptr()
+                for tensor in read_tensors
+            ):
+                raise ValueError("expert_frequency_out must not alias an input or output")
+            if frequency_storage in workspace.storage_ptrs:
+                raise ValueError("expert_frequency_out must not alias internal workspace storage")
+
+        assert workspace.sorting_workspace is not None
+        with workspace._launch_lock:
+            moe_ragged_sorting_flydsl(
+                token_indices,
+                expert_indices,
+                route_weights,
+                frequency,
+                workspace.sorting_workspace,
+                workspace.sorted_token_ids,
+                workspace.sorted_weights,
+                workspace.sorted_expert_ids,
+                workspace.num_valid_ids,
+                output,
+                self.config.num_experts,
+                tokens=tokens,
+                max_padded_routes=workspace.max_padded_tokens,
+                unit_size=self.config.tile_m,
+            )
+            if routes == 0:
+                return output
             return self._run_grouped_gemms(hidden_states, workspace, output)
 
     def forward_topk(
