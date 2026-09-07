@@ -56,6 +56,7 @@ from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 TOKENS = 4096
@@ -68,6 +69,42 @@ APIS = ("inference", "training")
 GFX950_PERSISTENT_GRID_CAP = 256
 GFX950_LDS_BYTES = 160 * 1024
 CHUNK_ELEMENTS = 8 * 1024 * 1024
+WORKSPACE_TENSOR_FIELDS = (
+    "sorted_token_ids",
+    "sorted_weights",
+    "sorted_expert_ids",
+    "num_valid_ids",
+    "sorting_workspace",
+    "expert_frequency",
+    "router_topk_weights",
+    "router_topk_ids",
+    "router_topk_expert_indices",
+    "intermediate",
+    "route_output",
+    "output",
+)
+RESOURCE_METADATA_FIELDS = (
+    "agpr_count",
+    "group_segment_fixed_size",
+    "private_segment_fixed_size",
+    "sgpr_count",
+    "sgpr_spill_count",
+    "vgpr_count",
+    "vgpr_spill_count",
+    "wavefront_size",
+)
+RESOURCE_GATE_FIELDS = (
+    "group_segment_fixed_size",
+    "private_segment_fixed_size",
+    "sgpr_spill_count",
+    "vgpr_spill_count",
+)
+STATIC_TO_TORCH_DTYPE = {
+    "bf16": "torch.bfloat16",
+    "fp16": "torch.float16",
+    "float32": "torch.float32",
+    "int32": "torch.int32",
+}
 
 OUTPUT_LIMITS = {
     "relative_l2": 3.0e-2,
@@ -173,6 +210,27 @@ PROFILES = (
         {"down_tile_m": 128},
     ),
     Profile(
+        "m80-equal",
+        "1-route-m",
+        "baseline",
+        "Distribution-aware BM80: one balanced expert tile with only 1.09375x padding.",
+        {"tile_m": 80, "down_tile_m": 80},
+    ),
+    Profile(
+        "m96-equal",
+        "1-route-m",
+        "baseline",
+        "Distribution-aware BM96 alternative for balanced and hot-16 routing.",
+        {"tile_m": 96, "down_tile_m": 96},
+    ),
+    Profile(
+        "m112-equal",
+        "1-route-m",
+        "baseline",
+        "Distribution-aware BM112 alternative between BM96 and BM128.",
+        {"tile_m": 112, "down_tile_m": 112},
+    ),
+    Profile(
         "m128-equal",
         "1-route-m",
         "baseline",
@@ -255,6 +313,9 @@ SUITES = {
         "m16-equal",
         "m32-down128",
         "m64-down128",
+        "m80-equal",
+        "m96-equal",
+        "m112-equal",
         "m128-equal",
         "bn256-bk64",
         "pipeline2",
@@ -324,6 +385,40 @@ def _effective_stage2_stages(config: dict[str, Any]) -> int:
     return int(requested)
 
 
+def _static_lds_usage(config: dict[str, Any]) -> dict[str, int]:
+    bm1 = int(config["tile_m"])
+    bn1 = int(config["tile_n"])
+    bk1 = int(config["tile_k"])
+    bm2 = int(config["down_tile_m"])
+    bn2 = int(config["down_tile_n"])
+    bk2 = int(config["down_tile_k"])
+    k_wave = int(config["stage1_k_wave"])
+    k_tiles_per_wave = HIDDEN // (k_wave * bk1)
+    stage1_stages = 2 if k_tiles_per_wave > 1 else 1
+    stage1_a_lds = k_wave * stage1_stages * bm1 * bk1 * 2
+    stage1_reduce_lds = 0
+    if k_wave > 1:
+        n_waves = 4 // k_wave
+        acc_n = (bn1 // n_waves) // 16
+        m_repeat = bm1 // 16
+        stage1_reduce_lds = 4 * (acc_n * m_repeat) * 64 * 4 * 4
+    stage1_lds = max(stage1_a_lds, stage1_reduce_lds)
+    stage2_stages = _effective_stage2_stages(config)
+    stage2_a_lds = stage2_stages * bm2 * bk2 * 2
+    stage2_epilogue_lds = bm2 * bn2 * 4
+    return {
+        "stage1_pipeline_stages": stage1_stages,
+        "stage1_a_bytes": stage1_a_lds,
+        "stage1_reduction_bytes": stage1_reduce_lds,
+        "stage1_total_bytes": stage1_lds,
+        "stage2_pipeline_stages": stage2_stages,
+        "stage2_a_bytes": stage2_a_lds,
+        "stage2_epilogue_bytes": stage2_epilogue_lds,
+        "stage2_total_bytes": max(stage2_a_lds, stage2_epilogue_lds),
+        "gfx950_limit_bytes": GFX950_LDS_BYTES,
+    }
+
+
 def _validate_static_config(name: str, config: dict[str, Any]) -> None:
     bm1 = int(config["tile_m"])
     bn1 = int(config["tile_n"])
@@ -349,23 +444,11 @@ def _validate_static_config(name: str, config: dict[str, Any]) -> None:
     if route_m % bm1 or route_m % bm2:
         errors.append("route M must be divisible by both GEMM M tiles")
 
-    k_tiles_per_wave = HIDDEN // (k_wave * bk1)
-    stage1_stages = 2 if k_tiles_per_wave > 1 else 1
-    stage1_a_lds = k_wave * stage1_stages * bm1 * bk1 * 2
-    if k_wave > 1:
-        n_waves = 4 // k_wave
-        acc_n = (bn1 // n_waves) // 16
-        m_repeat = bm1 // 16
-        stage1_reduce_lds = 4 * (acc_n * m_repeat) * 64 * 4 * 4
-        stage1_lds = max(stage1_a_lds, stage1_reduce_lds)
-    else:
-        stage1_lds = stage1_a_lds
-    stage2_stages = _effective_stage2_stages(config)
-    stage2_lds = max(stage2_stages * bm2 * bk2 * 2, bm2 * bn2 * 4)
-    if stage1_lds > GFX950_LDS_BYTES:
-        errors.append(f"Stage 1 LDS {stage1_lds} exceeds {GFX950_LDS_BYTES}")
-    if stage2_lds > GFX950_LDS_BYTES:
-        errors.append(f"Stage 2 LDS {stage2_lds} exceeds {GFX950_LDS_BYTES}")
+    lds = _static_lds_usage(config)
+    if lds["stage1_total_bytes"] > GFX950_LDS_BYTES:
+        errors.append(f"Stage 1 LDS {lds['stage1_total_bytes']} exceeds {GFX950_LDS_BYTES}")
+    if lds["stage2_total_bytes"] > GFX950_LDS_BYTES:
+        errors.append(f"Stage 2 LDS {lds['stage2_total_bytes']} exceeds {GFX950_LDS_BYTES}")
     if errors:
         raise ValueError(f"invalid static profile {name}: " + "; ".join(errors))
 
@@ -438,7 +521,78 @@ def _static_topology(config: dict[str, Any], case: str) -> dict[str, Any]:
     }
 
 
-def _static_footprint(config: dict[str, Any]) -> dict[str, int]:
+def _static_tensor_record(shape: tuple[int, ...] | None, dtype: str, element_size: int) -> dict[str, Any]:
+    if shape is None:
+        return {
+            "allocated": False,
+            "shape": None,
+            "dtype": dtype,
+            "element_size": element_size,
+            "numel": 0,
+            "bytes": 0,
+        }
+    numel = math.prod(shape)
+    return {
+        "allocated": True,
+        "shape": list(shape),
+        "dtype": dtype,
+        "element_size": element_size,
+        "numel": numel,
+        "bytes": numel * element_size,
+    }
+
+
+def _gfx950_sorting_workspace_i32(route_tile_m: int) -> int:
+    """Mirror the multiphase sorter allocation for this fixed T4096/E896 shape."""
+
+    mesh_stride = ((TOKENS + route_tile_m - 1) // route_tile_m) * route_tile_m
+    workspace_mesh_bytes = EXPERTS * mesh_stride
+    return (workspace_mesh_bytes + 3) // 4 + (EXPERTS + 1)
+
+
+def _static_workspace_footprint(config: dict[str, Any]) -> dict[str, Any]:
+    """Exact tensors allocated by SonicMoEWorkspace.allocate for fixed top-k."""
+
+    topology = _static_topology(config, "balanced")
+    capacity_rows = topology["workspace_capacity_padded_rows"]
+    capacity_route_blocks = capacity_rows // topology["route_tile_m"]
+    sorting_workspace_i32 = _gfx950_sorting_workspace_i32(topology["route_tile_m"])
+    route_output_shape = (TOKENS, TOPK, HIDDEN) if config["stage2_output_mode"] == "reduce" else None
+    tensors = {
+        "sorted_token_ids": _static_tensor_record((max(1, capacity_rows),), "int32", 4),
+        "sorted_weights": _static_tensor_record((max(1, capacity_rows),), "float32", 4),
+        "sorted_expert_ids": _static_tensor_record((max(1, capacity_route_blocks),), "int32", 4),
+        "num_valid_ids": _static_tensor_record((2,), "int32", 4),
+        "sorting_workspace": _static_tensor_record((sorting_workspace_i32,), "int32", 4),
+        "expert_frequency": _static_tensor_record((EXPERTS,), "int32", 4),
+        "router_topk_weights": _static_tensor_record((TOKENS, TOPK), "float32", 4),
+        "router_topk_ids": _static_tensor_record((TOKENS, TOPK), "int32", 4),
+        "router_topk_expert_indices": _static_tensor_record((TOKENS, TOPK), "int32", 4),
+        "intermediate": _static_tensor_record(
+            (max(1, capacity_rows), INTERMEDIATE),
+            config["compute_dtype"],
+            2,
+        ),
+        "route_output": _static_tensor_record(route_output_shape, config["compute_dtype"], 2),
+        "output": _static_tensor_record((TOKENS, HIDDEN), config["compute_dtype"], 2),
+    }
+    if tuple(tensors) != WORKSPACE_TENSOR_FIELDS:
+        raise AssertionError("static workspace inventory drifted from SonicMoEWorkspace")
+    return {
+        "storage_accounting": "sum of one owning allocation per listed tensor; absent optional tensors are zero",
+        "sorter": {
+            "path": "multiphase",
+            "mesh_stride_bytes": ((TOKENS + topology["route_tile_m"] - 1) // topology["route_tile_m"])
+            * topology["route_tile_m"],
+            "workspace_i32_elements": sorting_workspace_i32,
+        },
+        "tensor_count": sum(entry["allocated"] for entry in tensors.values()),
+        "total_owned_bytes": sum(entry["bytes"] for entry in tensors.values()),
+        "tensors": tensors,
+    }
+
+
+def _static_footprint(config: dict[str, Any]) -> dict[str, Any]:
     dense_weights = EXPERTS * (2 * INTERMEDIATE * HIDDEN + HIDDEN * INTERMEDIATE) * 2
     input_bytes = TOKENS * HIDDEN * 2
     output_bytes = input_bytes
@@ -450,6 +604,7 @@ def _static_footprint(config: dict[str, Any]) -> dict[str, int]:
         "output_bytes": output_bytes,
         "training_retained_state_bytes_per_call": retained_state,
         "reduce_route_output_workspace_bytes": route_output,
+        "sonic_moe_workspace": _static_workspace_footprint(config),
     }
 
 
@@ -485,6 +640,7 @@ def _profile_record(profile: Profile) -> dict[str, Any]:
             "stage1_b_cache_mod": _effective_cache_mod(config, 1),
             "stage2_b_cache_mod": _effective_cache_mod(config, 2),
             "stage2_pipeline_stages": _effective_stage2_stages(config),
+            "static_lds": _static_lds_usage(config),
         },
         "topology": {case: _static_topology(config, case) for case in ROUTING_CASES},
         "static_footprint": _static_footprint(config),
@@ -571,6 +727,11 @@ def _parse_args() -> argparse.Namespace:
         help="emit the complete static plan and exit without importing torch or allocating GPU tensors",
     )
     parser.add_argument(
+        "--self-test",
+        action="store_true",
+        help="run pure-CPU profile, workspace-accounting, and resource-gate invariants",
+    )
+    parser.add_argument(
         "--correctness-only",
         action="store_true",
         help="run numerical/repeatability checks but skip event timing",
@@ -620,9 +781,11 @@ def _parse_args() -> argparse.Namespace:
         parser.error("--min-speedup must be positive")
     if not 0.0 <= args.min_paired_win_rate <= 1.0:
         parser.error("--min-paired-win-rate must be in [0, 1]")
+    if args.list_profiles and args.self_test:
+        parser.error("--list-profiles and --self-test are mutually exclusive")
     if args.require_performance and args.correctness_only:
         parser.error("--require-performance cannot be combined with --correctness-only")
-    if not args.list_profiles and not args.correctness_only and not args.exclusive_gpu:
+    if not args.list_profiles and not args.self_test and not args.correctness_only and not args.exclusive_gpu:
         parser.error("timing requires --exclusive-gpu after independently reserving the selected GPU")
     return args
 
@@ -723,6 +886,75 @@ def _run_api(op, api: str, x, ids, scores, out):
     raise ValueError(f"unknown API {api!r}")
 
 
+def _workspace_owned_memory(workspace, config) -> dict[str, Any]:
+    """Count workspace-owned allocations once by untyped-storage base pointer."""
+
+    static = _static_workspace_footprint(_config_dict(config))
+    tensors: dict[str, Any] = {}
+    storages_by_ptr: dict[int, dict[str, Any]] = {}
+    observed_ptrs = set()
+    for name in WORKSPACE_TENSOR_FIELDS:
+        tensor = getattr(workspace, name)
+        expected = static["tensors"][name]
+        if tensor is None:
+            tensors[name] = {
+                "allocated": False,
+                "shape": None,
+                "dtype": None,
+                "logical_bytes": 0,
+                "storage_id": None,
+                "matches_static": not expected["allocated"],
+            }
+            continue
+        storage = tensor.untyped_storage()
+        pointer = int(storage.data_ptr())
+        observed_ptrs.add(pointer)
+        storage_entry = storages_by_ptr.get(pointer)
+        if storage_entry is None:
+            storage_entry = {
+                "storage_id": f"storage-{len(storages_by_ptr)}",
+                "bytes": int(storage.nbytes()),
+                "tensor_fields": [],
+            }
+            storages_by_ptr[pointer] = storage_entry
+        storage_entry["tensor_fields"].append(name)
+        logical_bytes = int(tensor.numel() * tensor.element_size())
+        tensors[name] = {
+            "allocated": True,
+            "shape": list(tensor.shape),
+            "dtype": str(tensor.dtype),
+            "logical_bytes": logical_bytes,
+            "storage_bytes": storage_entry["bytes"],
+            "storage_id": storage_entry["storage_id"],
+            "matches_static": bool(
+                expected["allocated"]
+                and list(tensor.shape) == expected["shape"]
+                and str(tensor.dtype) == STATIC_TO_TORCH_DTYPE[expected["dtype"]]
+                and logical_bytes == expected["bytes"]
+            ),
+        }
+    declared_ptrs = set(workspace.storage_ptrs)
+    storage_records = list(storages_by_ptr.values())
+    total_owned = sum(entry["bytes"] for entry in storage_records)
+    gates = {
+        "all_fields_accounted": tuple(tensors) == WORKSPACE_TENSOR_FIELDS,
+        "storage_ptr_inventory_matches_workspace": observed_ptrs == declared_ptrs,
+        "tensor_shapes_and_logical_bytes_match_static": all(entry["matches_static"] for entry in tensors.values()),
+        "deduplicated_total_matches_static": total_owned == static["total_owned_bytes"],
+    }
+    return {
+        "accounting": "untyped storage bytes, deduplicated by storage base pointer",
+        "total_owned_storage_bytes": total_owned,
+        "static_expected_owned_bytes": static["total_owned_bytes"],
+        "delta_from_static_bytes": total_owned - static["total_owned_bytes"],
+        "unique_storage_count": len(storage_records),
+        "storages": storage_records,
+        "tensors": tensors,
+        "gates": gates,
+        "passed": all(gates.values()),
+    }
+
+
 def _runtime_topology(sonic, config, workspace, case: str, api: str) -> dict[str, Any]:
     if workspace is None:
         raise RuntimeError("SonicMoE did not publish the workspace used by the completed forward")
@@ -750,12 +982,15 @@ def _runtime_topology(sonic, config, workspace, case: str, api: str) -> dict[str
         "stage2_capacity_m_blocks": workspace.stage2_max_m_blocks == expected["stage2"]["capacity_m_blocks"],
         "route_output_contract": (workspace.route_output is not None) == (config.stage2_output_mode == "reduce"),
     }
+    owned_memory = _workspace_owned_memory(workspace, config)
+    workspace_gates["owned_storage_accounting"] = owned_memory["passed"]
     return {
         "actual_padded_rows": actual_padded,
         "predicted_padded_rows": expected["actual_padded_rows"],
         "padded_rows_match_prediction": actual_padded == expected["actual_padded_rows"],
         "workspace_gates": workspace_gates,
         "workspace_gates_passed": all(workspace_gates.values()),
+        "owned_workspace_memory": owned_memory,
         "workspace_capacity_padded_rows": workspace.max_padded_tokens,
         "route_metadata_blocks": actual_padded // config.route_tile_m,
         "stage1": {
@@ -805,28 +1040,78 @@ def _config_dict(config) -> dict[str, Any]:
 def _artifact_resources(launcher) -> dict[str, Any]:
     artifacts = list(getattr(launcher, "_mem_cache", {}).values())
     if not artifacts:
-        return {}
-    ir_text = artifacts[-1].ir
+        return {
+            "metadata_found": False,
+            "missing_reason": "compiled launcher has no in-memory artifacts",
+            "kernel": None,
+            "raw_metadata": None,
+            "fields": {},
+        }
+    ir_text = getattr(artifacts[-1], "ir", None)
+    if not isinstance(ir_text, str):
+        return {
+            "metadata_found": False,
+            "missing_reason": "latest launcher artifact has no textual IR",
+            "kernel": None,
+            "raw_metadata": None,
+            "fields": {},
+        }
     matches = list(re.finditer(r'gpu\.kernel_metadata<"([^"]+)"', ir_text))
     if not matches:
-        return {}
+        return {
+            "metadata_found": False,
+            "missing_reason": "latest launcher artifact has no gpu.kernel_metadata record",
+            "kernel": None,
+            "raw_metadata": None,
+            "fields": {},
+        }
     start = matches[-1].start()
-    metadata = ir_text[start : start + 2500]
-    result: dict[str, Any] = {"kernel": matches[-1].group(1)}
-    for key in (
-        "agpr_count",
-        "group_segment_fixed_size",
-        "private_segment_fixed_size",
-        "sgpr_count",
-        "sgpr_spill_count",
-        "vgpr_count",
-        "vgpr_spill_count",
-        "wavefront_size",
-    ):
-        match = re.search(rf"{key} = (\d+) : i64", metadata)
+    end = ir_text.find("}>", start)
+    if end < 0:
+        return {
+            "metadata_found": False,
+            "missing_reason": "gpu.kernel_metadata record is unterminated",
+            "kernel": matches[-1].group(1),
+            "raw_metadata": ir_text[start : start + 2500],
+            "fields": {},
+        }
+    raw_metadata = ir_text[start : end + 2]
+    fields = {}
+    for key in RESOURCE_METADATA_FIELDS:
+        match = re.search(rf"{key} = (\d+) : i64", raw_metadata)
         if match:
-            result[key] = int(match.group(1))
-    return result
+            fields[key] = int(match.group(1))
+    return {
+        "metadata_found": True,
+        "missing_reason": None,
+        "kernel": matches[-1].group(1),
+        "raw_metadata": raw_metadata,
+        "raw_metadata_sha256": hashlib.sha256(raw_metadata.encode()).hexdigest(),
+        "fields": fields,
+    }
+
+
+def _resource_gate(metadata: dict[str, Any]) -> dict[str, Any]:
+    fields = metadata.get("fields", {})
+    missing_fields = [name for name in RESOURCE_GATE_FIELDS if name not in fields]
+    checks = {
+        "metadata_found": metadata.get("metadata_found") is True,
+        "required_fields_present": not missing_fields,
+        "private_segment_zero": fields.get("private_segment_fixed_size") == 0,
+        "sgpr_spills_zero": fields.get("sgpr_spill_count") == 0,
+        "vgpr_spills_zero": fields.get("vgpr_spill_count") == 0,
+        "lds_within_gfx950_limit": (
+            fields.get("group_segment_fixed_size") is not None
+            and fields["group_segment_fixed_size"] <= GFX950_LDS_BYTES
+        ),
+    }
+    return {
+        "required_fields": list(RESOURCE_GATE_FIELDS),
+        "missing_fields": missing_fields,
+        "gfx950_lds_limit_bytes": GFX950_LDS_BYTES,
+        "checks": checks,
+        "passed": all(checks.values()),
+    }
 
 
 def _isa_resources(dump_dir: Path | None, kernel_name: str | None) -> dict[str, Any]:
@@ -888,10 +1173,16 @@ def _launcher_resources(sonic, config, api: str, dump_dir: Path | None, device_i
     )
     resources = {}
     for name, launcher in (("stage1", stage1), ("stage2", stage2)):
-        entry = _artifact_resources(launcher)
-        entry.update(_isa_resources(dump_dir, entry.get("kernel")))
-        resources[name] = entry
-    return resources
+        metadata = _artifact_resources(launcher)
+        resources[name] = {
+            "metadata": metadata,
+            "isa": _isa_resources(dump_dir, metadata.get("kernel")),
+            "gate": _resource_gate(metadata),
+        }
+    return {
+        "kernels": resources,
+        "passed": all(entry["gate"]["passed"] for entry in resources.values()),
+    }
 
 
 def _run_correctness(
@@ -950,6 +1241,14 @@ def _run_correctness(
         "baseline": _runtime_topology(sonic, baseline_op.config, baseline_op.workspace, case, api),
         "candidate": _runtime_topology(sonic, candidate_op.config, candidate_op.workspace, case, api),
     }
+    baseline_workspace_bytes = runtime_topology["baseline"]["owned_workspace_memory"]["total_owned_storage_bytes"]
+    candidate_workspace_bytes = runtime_topology["candidate"]["owned_workspace_memory"]["total_owned_storage_bytes"]
+    owned_workspace_comparison = {
+        "accounting": "per-operator owned storage; independent of simultaneous process residency",
+        "baseline_bytes": baseline_workspace_bytes,
+        "candidate_bytes": candidate_workspace_bytes,
+        "candidate_minus_baseline_bytes": candidate_workspace_bytes - baseline_workspace_bytes,
+    }
     topology_passed = bool(
         all(
             topology["padded_rows_match_prediction"] and topology["workspace_gates_passed"]
@@ -972,12 +1271,14 @@ def _run_correctness(
             x.device.index or 0,
         ),
     }
-    passed = bool(
+    resource_gate_passed = all(resource["passed"] for resource in resources.values())
+    functional_passed = bool(
         output_metrics["passed"]
         and (state_metrics is None or state_metrics["passed"])
         and repeatability_passed
         and topology_passed
     )
+    passed = functional_passed and resource_gate_passed
     result = {
         "candidate_vs_baseline": {
             "output": output_metrics,
@@ -992,7 +1293,10 @@ def _run_correctness(
             "passed": repeatability_passed,
         },
         "runtime_topology": runtime_topology,
+        "owned_workspace_comparison": owned_workspace_comparison,
         "resources": resources,
+        "functional_passed": functional_passed,
+        "resource_gate_passed": resource_gate_passed,
         "passed": passed,
     }
     del first_output, first_state, baseline_state, candidate_state
@@ -1165,6 +1469,187 @@ def _device_identity(torch, device_index: int, arch: str) -> dict[str, Any]:
     }
 
 
+class _MockStorage:
+    def __init__(self, pointer: int, size: int):
+        self._pointer = pointer
+        self._size = size
+
+    def data_ptr(self) -> int:
+        return self._pointer
+
+    def nbytes(self) -> int:
+        return self._size
+
+
+class _MockTensor:
+    def __init__(self, shape: list[int], dtype: str, element_size: int, pointer: int):
+        self.shape = tuple(shape)
+        self.dtype = STATIC_TO_TORCH_DTYPE[dtype]
+        self._element_size = element_size
+        self._storage = _MockStorage(pointer, math.prod(shape) * element_size)
+
+    def numel(self) -> int:
+        return math.prod(self.shape)
+
+    def element_size(self) -> int:
+        return self._element_size
+
+    def untyped_storage(self) -> _MockStorage:
+        return self._storage
+
+
+def _mock_config(config: dict[str, Any]) -> SimpleNamespace:
+    result = SimpleNamespace(**config)
+    result.stage2_tile_m = config["down_tile_m"]
+    result.stage2_tile_n = config["down_tile_n"]
+    result.stage2_tile_k = config["down_tile_k"]
+    result.route_tile_m = math.lcm(config["tile_m"], config["down_tile_m"])
+    return result
+
+
+def _mock_workspace(config: dict[str, Any]) -> SimpleNamespace:
+    static = _static_workspace_footprint(config)
+    fields = {}
+    pointers = set()
+    pointer = 0x1000
+    for name, record in static["tensors"].items():
+        if not record["allocated"]:
+            fields[name] = None
+            continue
+        tensor = _MockTensor(record["shape"], record["dtype"], record["element_size"], pointer)
+        fields[name] = tensor
+        pointers.add(pointer)
+        pointer += max(0x1000, record["bytes"] + 0x1000)
+    fields["storage_ptrs"] = frozenset(pointers)
+    return SimpleNamespace(**fields)
+
+
+def _self_test_payload(repo: Path) -> dict[str, Any]:
+    """Pure-CPU invariants for profile legality, storage accounting, and gates."""
+
+    records = {profile.name: _profile_record(profile) for profile in PROFILES}
+    baseline_config = _resolved_profile_config("baseline")
+    baseline_workspace = _static_workspace_footprint(baseline_config)
+    mock_accounting = _workspace_owned_memory(
+        _mock_workspace(baseline_config),
+        _mock_config(baseline_config),
+    )
+    alias_workspace = _mock_workspace(baseline_config)
+    alias_workspace.sorted_weights._storage = alias_workspace.sorted_token_ids._storage
+    alias_workspace.storage_ptrs = frozenset(
+        tensor.untyped_storage().data_ptr()
+        for name in WORKSPACE_TENSOR_FIELDS
+        if (tensor := getattr(alias_workspace, name)) is not None
+    )
+    alias_accounting = _workspace_owned_memory(
+        alias_workspace,
+        _mock_config(baseline_config),
+    )
+    reduce_workspace = records["reduce-output"]["static_footprint"]["sonic_moe_workspace"]
+    reduce_parent_workspace = records["xcd8-cached"]["static_footprint"]["sonic_moe_workspace"]
+    reduce_route_bytes = records["reduce-output"]["static_footprint"]["reduce_route_output_workspace_bytes"]
+
+    raw_metadata = (
+        'gpu.kernel_metadata<"mock", !llvm.func<void ()>, metadata = {'
+        "agpr_count = 0 : i64, group_segment_fixed_size = 65536 : i64, "
+        "private_segment_fixed_size = 0 : i64, sgpr_count = 32 : i64, "
+        "sgpr_spill_count = 0 : i64, vgpr_count = 128 : i64, "
+        "vgpr_spill_count = 0 : i64, wavefront_size = 64 : i64}>"
+    )
+    launcher = SimpleNamespace(_mem_cache={"mock": SimpleNamespace(ir=raw_metadata)})
+    parsed_metadata = _artifact_resources(launcher)
+    passing_resource_gate = _resource_gate(parsed_metadata)
+    absent_metadata = _artifact_resources(SimpleNamespace(_mem_cache={}))
+    absent_resource_gate = _resource_gate(absent_metadata)
+    missing_resource_gate = _resource_gate(
+        {
+            "metadata_found": True,
+            "fields": {"group_segment_fixed_size": 0},
+        }
+    )
+    spilling_fields = dict(parsed_metadata["fields"])
+    spilling_fields["vgpr_spill_count"] = 1
+    spilling_resource_gate = _resource_gate(
+        {
+            "metadata_found": True,
+            "fields": spilling_fields,
+        }
+    )
+    private_fields = dict(parsed_metadata["fields"])
+    private_fields["private_segment_fixed_size"] = 16
+    private_resource_gate = _resource_gate(
+        {
+            "metadata_found": True,
+            "fields": private_fields,
+        }
+    )
+    oversized_lds_fields = dict(parsed_metadata["fields"])
+    oversized_lds_fields["group_segment_fixed_size"] = GFX950_LDS_BYTES + 1
+    oversized_lds_resource_gate = _resource_gate(
+        {
+            "metadata_found": True,
+            "fields": oversized_lds_fields,
+        }
+    )
+
+    checks = {
+        "all_profiles_static_valid": len(records) == len(PROFILES),
+        "all_profiles_reuse_prepared_weights": all(
+            record["prepared_weight_compatibility"]["matches_baseline"] for record in records.values()
+        ),
+        "workspace_inventory_complete": tuple(baseline_workspace["tensors"]) == WORKSPACE_TENSOR_FIELDS,
+        "mock_workspace_deduplicated_total_matches_static": mock_accounting["passed"],
+        "mock_alias_is_counted_once": (
+            alias_accounting["total_owned_storage_bytes"]
+            == baseline_workspace["total_owned_bytes"] - baseline_workspace["tensors"]["sorted_weights"]["bytes"]
+            and alias_accounting["unique_storage_count"] == mock_accounting["unique_storage_count"] - 1
+        ),
+        "reduce_workspace_delta_is_route_output": (
+            reduce_workspace["total_owned_bytes"] - reduce_parent_workspace["total_owned_bytes"] == reduce_route_bytes
+        ),
+        "m80_balanced_padding": (records["m80-equal"]["topology"]["balanced"]["actual_padded_rows"] == 71680),
+        "m80_hot16_padding": (records["m80-equal"]["topology"]["hot16"]["actual_padded_rows"] == 66560),
+        "distribution_aware_m_tiles_direct_to_lds": all(
+            (records[name]["config"]["tile_m"] * records[name]["config"]["tile_k"]) % 2048 == 0
+            and (records[name]["config"]["down_tile_m"] * records[name]["config"]["down_tile_k"]) % 2048 == 0
+            for name in ("m80-equal", "m96-equal", "m112-equal")
+        ),
+        "distribution_aware_m_tiles_fit_lds": all(
+            records[name]["effective"]["static_lds"][stage] <= GFX950_LDS_BYTES
+            for name in ("m80-equal", "m96-equal", "m112-equal")
+            for stage in ("stage1_total_bytes", "stage2_total_bytes")
+        ),
+        "complete_zero_spill_metadata_passes": passing_resource_gate["passed"],
+        "absent_metadata_fails": not absent_resource_gate["passed"],
+        "missing_metadata_field_fails": not missing_resource_gate["passed"],
+        "nonzero_spill_fails": not spilling_resource_gate["passed"],
+        "nonzero_private_segment_fails": not private_resource_gate["passed"],
+        "oversized_lds_fails": not oversized_lds_resource_gate["passed"],
+        "raw_metadata_preserved": parsed_metadata["raw_metadata"] == raw_metadata,
+    }
+    return {
+        "schema": "flydsl.sonic_e896_forward_self_test.v1",
+        "cpu_only": True,
+        "checks": checks,
+        "workspace": {
+            "baseline_static": baseline_workspace,
+            "baseline_mock_actual": mock_accounting,
+            "aliased_mock_actual": alias_accounting,
+            "reduce_static": reduce_workspace,
+        },
+        "resource_gate_examples": {
+            "passing": passing_resource_gate,
+            "absent": absent_resource_gate,
+            "missing_field": missing_resource_gate,
+            "spilling": spilling_resource_gate,
+            "private_segment": private_resource_gate,
+            "oversized_lds": oversized_lds_resource_gate,
+        },
+        "source_identity": _collect_source_identity(repo),
+        "passed": all(checks.values()),
+    }
+
+
 def _execute(args: argparse.Namespace, repo: Path) -> dict[str, Any]:
     if args.dump_dir is not None:
         args.dump_dir = args.dump_dir.resolve()
@@ -1256,6 +1741,7 @@ def _execute(args: argparse.Namespace, repo: Path) -> dict[str, Any]:
     }
 
     correctness_all = True
+    resource_all = True
     performance_all = True
     for profile_name in selected:
         print(f"[sonic-e896-forward] profile={profile_name}", file=sys.stderr, flush=True)
@@ -1316,7 +1802,13 @@ def _execute(args: argparse.Namespace, repo: Path) -> dict[str, Any]:
                 if args.skip_peak_memory:
                     api_result["peak_memory_status"] = "skipped (--skip-peak-memory)"
                 else:
-                    api_result["peak_memory"] = _measure_peaks(torch, calls, args.peak_samples)
+                    peak_memory = _measure_peaks(torch, calls, args.peak_samples)
+                    peak_memory["owned_workspace_comparison"] = correctness["owned_workspace_comparison"]
+                    peak_memory["interpretation"] = (
+                        "process peak samples include both live operators; use the separately "
+                        "deduplicated owned-workspace comparison for config-attributable bytes"
+                    )
+                    api_result["peak_memory"] = peak_memory
 
                 if args.correctness_only:
                     api_result["timing_status"] = "skipped (--correctness-only)"
@@ -1340,11 +1832,17 @@ def _execute(args: argparse.Namespace, repo: Path) -> dict[str, Any]:
                     performance_passed = bool(performance_gate["passed"])
                 api_result["acceptance_passed"] = correctness["passed"] and performance_passed
                 case_result["apis"][api] = api_result
-                correctness_all &= correctness["passed"]
+                correctness_all &= correctness["functional_passed"]
+                resource_all &= correctness["resource_gate_passed"]
                 performance_all &= performance_passed
             profile_result["cases"][case] = case_result
         profile_result["correctness_passed"] = all(
-            api_result["correctness"]["passed"]
+            api_result["correctness"]["functional_passed"]
+            for case_result in profile_result["cases"].values()
+            for api_result in case_result["apis"].values()
+        )
+        profile_result["resource_gate_passed"] = all(
+            api_result["correctness"]["resource_gate_passed"]
             for case_result in profile_result["cases"].values()
             for api_result in case_result["apis"].values()
         )
@@ -1361,9 +1859,10 @@ def _execute(args: argparse.Namespace, repo: Path) -> dict[str, Any]:
 
     baseline_op.clear_workspace()
     report["correctness_passed"] = bool(correctness_all)
+    report["resource_gate_passed"] = bool(resource_all)
     report["performance_passed"] = None if args.correctness_only else bool(performance_all)
     report["performance_required"] = args.require_performance
-    report["passed"] = bool(correctness_all and (not args.require_performance or performance_all))
+    report["passed"] = bool(correctness_all and resource_all and (not args.require_performance or performance_all))
     return report
 
 
@@ -1372,6 +1871,12 @@ def main() -> None:
     repo = Path(__file__).resolve().parents[1]
     if args.list_profiles:
         _emit(_plan_payload(args, repo), args.output)
+        return
+    if args.self_test:
+        report = _self_test_payload(repo)
+        _emit(report, args.output)
+        if not report["passed"]:
+            raise SystemExit(2)
         return
     report = _execute(args, repo)
     _emit(report, args.output)
