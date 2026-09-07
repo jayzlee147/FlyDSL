@@ -59,6 +59,14 @@ _DTYPES = ((torch.bfloat16, "bf16"), (torch.float16, "fp16"))
         ({"reuse_forward_preactivation": False}, False),
         ({"use_hostless_grouped": False}, False),
         ({"use_compact_w1": False}, False),
+        (
+            {
+                "use_hostless_grouped": False,
+                "use_compact_w1": False,
+                "use_large_grouped_dx": True,
+            },
+            True,
+        ),
         ({"flat_routes": True}, False),
         ({"has_bias": True}, False),
         ({"compute_dtype": "fp16"}, False),
@@ -70,6 +78,7 @@ def test_fused_da_dscore_policy_is_narrow(overrides, expected):
         "reuse_forward_preactivation": True,
         "use_hostless_grouped": True,
         "use_compact_w1": True,
+        "use_large_grouped_dx": False,
         "flat_routes": False,
         "has_bias": False,
         "compute_dtype": "bf16",
@@ -1916,11 +1925,18 @@ def test_sonic_moe_backward_routes_spans_multiple_expert_tiles(dtype, compute_dt
     ),
     (
         (1, 128, 64, 4, 2, None, True, True),
+        (64, 256, 128, 16, 3, None, True, False),
         (128, 256, 128, 64, 4, None, False, False),
         (128, 256, 128, 64, 4, 16, False, False),
         (4096, 128, 64, 4, 2, None, False, False),
     ),
-    ids=("t1-interleaved-bias", "t128-balanced", "t128-hot16", "t4096-legacy"),
+    ids=(
+        "t1-interleaved-bias",
+        "t64-interleaved-fused",
+        "t128-balanced",
+        "t128-hot16",
+        "t4096-legacy",
+    ),
 )
 def test_sonic_moe_backward_reuses_route_order_forward_preactivation(
     tokens,
@@ -1988,7 +2004,7 @@ def test_sonic_moe_backward_reuses_route_order_forward_preactivation(
         b1=b1,
         b2=b2,
         interleaved_w1=interleaved_w1,
-        reassociate_da_dscore=tokens == 128 and not has_bias,
+        reassociate_da_dscore=tokens in (64, 128) and not has_bias,
     )
     torch.cuda.synchronize()
 
@@ -2294,22 +2310,35 @@ def test_sonic_moe_backward_forward_state_skips_generic_w1_and_keeps_large_dx_qu
     )
     state = _make_forward_state(args[0], args[1], args[3], config)
     original_builder = sonic_backward_module.build_compact_m_tile_descriptors
+    original_fused_prepare = sonic_backward_module._compile_fused_forward_state_prepare
+    original_fused_derivative = sonic_backward_module._compile_fused_activation_derivative_dscore_scale_dy
     original_gemm = sonic_backward_module.gemm_a16w16
     builder_blocks = []
+    prepare_blocks = []
+    derivative_blocks = []
+
+    def _schedule_block_m(call_args, call_kwargs):
+        return call_kwargs.get("schedule_block_m", call_args[5] if len(call_args) > 5 else 16)
 
     def _tracked_builder(*builder_args, **builder_kwargs):
         builder_blocks.append(builder_kwargs["block_m"])
         return original_builder(*builder_args, **builder_kwargs)
 
+    def _tracked_fused_prepare(*compile_args, **compile_kwargs):
+        prepare_blocks.append(_schedule_block_m(compile_args, compile_kwargs))
+        return original_fused_prepare(*compile_args, **compile_kwargs)
+
+    def _tracked_fused_derivative(*compile_args, **compile_kwargs):
+        derivative_blocks.append(_schedule_block_m(compile_args, compile_kwargs))
+        return original_fused_derivative(*compile_args, **compile_kwargs)
+
     def _guarded_gemm(a, b, *gemm_args, **gemm_kwargs):
-        is_w1_recompute = (
-            gemm_kwargs.get("layout") == "nt"
-            and tuple(a.shape)[1:] == (hidden_size,)
-            and tuple(b.shape) == (hidden_size, 2 * intermediate_size)
-        )
-        if is_w1_recompute:
-            raise AssertionError("forward state must skip generic W1 recomputation")
+        if gemm_kwargs.get("layout") == "nt":
+            raise AssertionError("fused state path must skip generic W1/W2 projection recomputation")
         return original_gemm(a, b, *gemm_args, **gemm_kwargs)
+
+    def _unexpected_legacy_kernel(*_args, **_kwargs):
+        raise AssertionError("large retained-state path must use exact-row fused kernels")
 
     monkeypatch.setattr(
         sonic_backward_module,
@@ -2321,12 +2350,50 @@ def test_sonic_moe_backward_forward_state_skips_generic_w1_and_keeps_large_dx_qu
         "build_compact_m_tile_descriptors",
         _tracked_builder,
     )
+    monkeypatch.setattr(
+        sonic_backward_module,
+        "_compile_fused_forward_state_prepare",
+        _tracked_fused_prepare,
+    )
+    monkeypatch.setattr(
+        sonic_backward_module,
+        "_compile_fused_activation_derivative_dscore_scale_dy",
+        _tracked_fused_derivative,
+    )
+    monkeypatch.setattr(sonic_backward_module, "_compile_gather", _unexpected_legacy_kernel)
+    monkeypatch.setattr(
+        sonic_backward_module,
+        "_compile_activation_prepare_from_forward_state",
+        _unexpected_legacy_kernel,
+    )
+    monkeypatch.setattr(
+        sonic_backward_module,
+        "_compile_activation_derivative",
+        _unexpected_legacy_kernel,
+    )
+    monkeypatch.setattr(
+        sonic_backward_module,
+        "_compile_activation_derivative_from_forward_state",
+        _unexpected_legacy_kernel,
+    )
+    monkeypatch.setattr(
+        sonic_backward_module,
+        "_compile_grouped_w2_recompute",
+        _unexpected_legacy_kernel,
+    )
+    monkeypatch.setattr(
+        sonic_backward_module,
+        "_compile_score_backward",
+        _unexpected_legacy_kernel,
+    )
     monkeypatch.setattr(sonic_backward_module, "gemm_a16w16", _guarded_gemm)
     actual = sonic_moe_backward(*args, config, forward_state=state)
-    expected = _backward_reference(*args)
+    expected = _backward_reference(*args, reassociate_da_dscore=True)
     torch.cuda.synchronize()
 
     assert builder_blocks == [64]
+    assert prepare_blocks == [64]
+    assert derivative_blocks == [64]
     for actual_gradient, expected_gradient in zip(actual, expected):
         torch.testing.assert_close(
             actual_gradient.float(),
@@ -2336,15 +2403,120 @@ def test_sonic_moe_backward_forward_state_skips_generic_w1_and_keeps_large_dx_qu
         )
 
 
-def test_sonic_moe_backward_forward_state_waits_cross_stream_and_tracks_lifetime():
-    config = _config(128, 64, 4, 2, compute_dtype="bf16")
-    args = _make_case(7, 128, 64, 4, 2, seed=701, dtype=torch.bfloat16)
-    source_state = _make_forward_state(args[0], args[1], args[3], config)
+@pytest.mark.large_shape
+def test_sonic_moe_backward_t4096_fused_da_dscore_matches_q_reference():
+    """The production BM64 state path satisfies its reassociated A16 contract."""
+
+    tokens, hidden_size, intermediate_size, num_experts, topk = 4096, 4096, 2048, 64, 8
+    config = _config(
+        hidden_size,
+        intermediate_size,
+        num_experts,
+        topk,
+        compute_dtype="bf16",
+        down_tile_m=128,
+    )
+    args = _make_case(
+        tokens,
+        hidden_size,
+        intermediate_size,
+        num_experts,
+        topk,
+        seed=20260907,
+        dtype=torch.bfloat16,
+    )
+    state = _make_forward_state(args[0], args[1], args[3], config)
+    actual = sonic_moe_backward(*args, config, forward_state=state)
+    expected = _backward_reference(*args, reassociate_da_dscore=True)
+    torch.cuda.synchronize()
+
+    # A billion-element dW1 has a handful of near-zero elements outside the
+    # small-shape elementwise tolerance even though its global error is tiny.
+    # Keep this opt-in production gate sensitive to meaningful drift without
+    # weakening the default suite's elementwise assertions.
+    relative_l2_limits = (7.5e-4, 3.0e-4, 1.0e-4, 1.0e-4)
+    max_abs_limits = (0.0625, 0.5, 0.5, 0.25)
+    chunk_elements = 32 * 1024 * 1024
+    for actual_gradient, expected_gradient, relative_l2_limit, max_abs_limit in zip(
+        actual,
+        expected,
+        relative_l2_limits,
+        max_abs_limits,
+    ):
+        actual_flat = actual_gradient.reshape(-1)
+        expected_flat = expected_gradient.reshape(-1)
+        actual_sq = 0.0
+        reference_sq = 0.0
+        difference_sq = 0.0
+        max_abs = 0.0
+        for start in range(0, actual_flat.numel(), chunk_elements):
+            end = min(start + chunk_elements, actual_flat.numel())
+            actual_chunk = actual_flat[start:end].float()
+            expected_chunk = expected_flat[start:end].float()
+            difference = actual_chunk - expected_chunk
+            assert torch.isfinite(actual_chunk).all()
+            actual_sq += float(torch.sum(actual_chunk * actual_chunk))
+            reference_sq += float(torch.sum(expected_chunk * expected_chunk))
+            difference_sq += float(torch.sum(difference * difference))
+            max_abs = max(max_abs, float(difference.abs().max()))
+
+        actual_norm = math.sqrt(actual_sq)
+        reference_norm = math.sqrt(reference_sq)
+        relative_l2 = math.sqrt(difference_sq / reference_sq)
+        assert abs(actual_norm / reference_norm - 1.0) <= 1.0e-5
+        assert relative_l2 <= relative_l2_limit
+        assert max_abs <= max_abs_limit
+
+
+@pytest.mark.parametrize(
+    ("tokens", "hidden_size", "intermediate_size", "num_experts", "topk", "interleaved_w1", "fused"),
+    (
+        (7, 128, 64, 4, 2, False, False),
+        (64, 256, 128, 16, 3, True, True),
+    ),
+    ids=("legacy-row-path", "fused-interleaved"),
+)
+def test_sonic_moe_backward_forward_state_waits_cross_stream_and_tracks_lifetime(
+    tokens,
+    hidden_size,
+    intermediate_size,
+    num_experts,
+    topk,
+    interleaved_w1,
+    fused,
+):
+    config = _config(hidden_size, intermediate_size, num_experts, topk, compute_dtype="bf16")
+    args = list(
+        _make_case(
+            tokens,
+            hidden_size,
+            intermediate_size,
+            num_experts,
+            topk,
+            seed=701 + tokens,
+            dtype=torch.bfloat16,
+        )
+    )
+    if interleaved_w1:
+        args[1] = _interleave_glu_rows(args[1])
+    args = tuple(args)
+    source_state = _make_forward_state(
+        args[0],
+        args[1],
+        args[3],
+        config,
+        interleaved_w1=interleaved_w1,
+    )
     source = source_state.preactivation.clone()
     # Compile every backward launcher before constructing the delayed producer;
     # otherwise JIT time can outlast the device delay and turn the wait check
     # into another false positive.
-    sonic_moe_backward(*args, config, forward_state=source_state)
+    sonic_moe_backward(
+        *args,
+        config,
+        interleaved_w1=interleaved_w1,
+        forward_state=source_state,
+    )
     torch.cuda.current_stream(args[0].device).synchronize()
 
     producer = torch.cuda.Stream(device=args[0].device)
@@ -2357,7 +2529,7 @@ def test_sonic_moe_backward_forward_state_waits_cross_stream_and_tracks_lifetime
         # Record a real, incomplete dependency.  Waiting on an event before it
         # has ever been recorded is a no-op in CUDA/HIP and would make this
         # test pass without exercising backward's cross-stream wait.
-        torch.cuda._sleep(100_000_000)
+        torch.cuda._sleep(300_000_000)
         release_event.record(releaser)
     with torch.cuda.stream(producer):
         producer.wait_event(release_event)
@@ -2374,14 +2546,23 @@ def test_sonic_moe_backward_forward_state_waits_cross_stream_and_tracks_lifetime
     )
 
     with torch.cuda.stream(consumer):
-        actual = sonic_moe_backward(*args, config, forward_state=state)
+        actual = sonic_moe_backward(
+            *args,
+            config,
+            interleaved_w1=interleaved_w1,
+            forward_state=state,
+        )
     del state, route_preactivation
     with torch.cuda.stream(releaser):
         allocator_pressure = torch.full_like(source, -17.0)
     wait_start = time.perf_counter()
     consumer.synchronize()
     wait_seconds = time.perf_counter() - wait_start
-    expected = _backward_reference(*args)
+    expected = _backward_reference(
+        *args,
+        interleaved_w1=interleaved_w1,
+        reassociate_da_dscore=fused,
+    )
     torch.cuda.synchronize()
 
     assert wait_seconds >= 0.02

@@ -552,6 +552,7 @@ def _use_fused_da_dscore(
     reuse_forward_preactivation: bool,
     use_hostless_grouped: bool,
     use_compact_w1: bool,
+    use_large_grouped_dx: bool,
     flat_routes: bool,
     has_bias: bool,
     compute_dtype: str,
@@ -559,18 +560,19 @@ def _use_fused_da_dscore(
 ) -> bool:
     """Select the first gfx950 unscaled-dA/route-score fusion rollout.
 
-    The fused dataflow deliberately starts with the retained-forward-state,
-    compact-schedule path.  ``dy`` initially carries the exact gathered A16
-    output gradient, grouped dA computes ``q = dout @ W2``, and one row kernel
-    subsequently forms dA's score scaling, dscore, and the scaled dW2 input.
-    Bias, ragged routes, legacy host dispatch, and non-SwiGLU/dtype contracts
-    retain the projection-recompute implementation.
+    The fused dataflow uses retained forward state plus an exact-row descriptor
+    schedule.  Short shapes reuse the BM16 compact W1/dX queue; the production
+    T4096 shape reuses its independently tuned BM64 dX queue.  ``dy`` initially
+    carries the exact gathered A16 output gradient, grouped dA computes
+    ``q = dout @ W2``, and one row kernel subsequently forms dA's score
+    scaling, dscore, and the scaled dW2 input.  Bias, ragged routes, legacy
+    host dispatch, and non-SwiGLU/dtype contracts retain the projection-
+    recompute implementation.
     """
 
     return (
         reuse_forward_preactivation
-        and use_hostless_grouped
-        and use_compact_w1
+        and ((use_hostless_grouped and use_compact_w1) or use_large_grouped_dx)
         and not flat_routes
         and not has_bias
         and compute_dtype == "bf16"
@@ -1373,6 +1375,7 @@ def _compile_fused_forward_state_prepare(
     topk: int,
     interleaved_w1: bool,
     device_index: int,
+    schedule_block_m: int = _COMPACT_W1_BM,
     defer_dy_scaling: bool = False,
 ):
     """Gather the exact live rows and prepare retained-state backward inputs.
@@ -1382,10 +1385,10 @@ def _compile_fused_forward_state_prepare(
     materializes a sorted copy of ``grad_output``, and combines the remaining
     hidden-state gather with activation and routed-gradient preparation.
 
-    It consumes the existing counter-first BM16 W1/dX descriptor queue.  The
-    schedule touches real routes plus at most the final BM16 tail; the
-    independently zeroed ``dZ`` buffer continues to provide that tail's dX
-    contract.
+    It consumes an existing counter-first BM16 or BM64 dX descriptor queue.
+    The schedule touches real routes plus at most one tile tail per expert;
+    the independently zeroed ``dZ`` buffer continues to provide that tail's
+    dX contract.
     """
 
     del device_index
@@ -1393,7 +1396,8 @@ def _compile_fused_forward_state_prepare(
     projection_size = 2 * intermediate_size
     projection_column_stride = 2 if interleaved_w1 else 1
     up_column_offset = 1 if interleaved_w1 else intermediate_size
-    compact_block_m = _COMPACT_W1_BM
+    if schedule_block_m not in (_COMPACT_W1_BM, _LARGE_GROUPED_DX_BM):
+        raise ValueError("state-prepare schedule_block_m must be 16 or 64")
 
     @flyc.kernel(known_block_size=[_BLOCK_THREADS, 1, 1])
     def fused_prepare_kernel(
@@ -1484,11 +1488,11 @@ def _compile_fused_forward_state_prepare(
         total_tiles = fx.Int32(
             buffer_ops.buffer_load(schedule_rsrc, fx.Int32(0), vec_width=1, dtype=T.i32)
         )
-        total_rows = total_tiles * fx.Int32(compact_block_m)
+        total_rows = total_tiles * fx.Int32(schedule_block_m)
         for task_value in range(gpu.block_idx.x, total_rows, gpu.grid_dim.x):
             task = fx.Int32(task_value)
-            descriptor_index = task // fx.Int32(compact_block_m)
-            local_row = task % fx.Int32(compact_block_m)
+            descriptor_index = task // fx.Int32(schedule_block_m)
+            local_row = task % fx.Int32(schedule_block_m)
             descriptor = fx.Int32(
                 buffer_ops.buffer_load(
                     schedule_rsrc,
@@ -1497,7 +1501,7 @@ def _compile_fused_forward_state_prepare(
                     dtype=T.i32,
                 )
             )
-            prepare_real_row(descriptor * fx.Int32(compact_block_m) + local_row)
+            prepare_real_row(descriptor * fx.Int32(schedule_block_m) + local_row)
 
     @flyc.jit
     def launch(
@@ -1643,6 +1647,7 @@ def _compile_fused_activation_derivative_dscore_scale_dy(
     topk: int,
     interleaved_w1: bool,
     device_index: int,
+    schedule_block_m: int = _COMPACT_W1_BM,
 ):
     """Fuse the post-dA row work for the BF16 SwiGLU state fast path.
 
@@ -1666,7 +1671,8 @@ def _compile_fused_activation_derivative_dscore_scale_dy(
     projection_size = 2 * intermediate_size
     projection_column_stride = 2 if interleaved_w1 else 1
     up_column_offset = 1 if interleaved_w1 else intermediate_size
-    compact_block_m = _COMPACT_W1_BM
+    if schedule_block_m not in (_COMPACT_W1_BM, _LARGE_GROUPED_DX_BM):
+        raise ValueError("fused derivative schedule_block_m must be 16 or 64")
 
     @flyc.kernel(known_block_size=[_BLOCK_THREADS, 1, 1])
     def fused_kernel(
@@ -1786,11 +1792,11 @@ def _compile_fused_activation_derivative_dscore_scale_dy(
         total_tiles = fx.Int32(
             buffer_ops.buffer_load(schedule_rsrc, fx.Int32(0), vec_width=1, dtype=T.i32)
         )
-        total_rows = total_tiles * fx.Int32(compact_block_m)
+        total_rows = total_tiles * fx.Int32(schedule_block_m)
         for task_value in range(gpu.block_idx.x, total_rows, gpu.grid_dim.x):
             task = fx.Int32(task_value)
-            descriptor_index = task // fx.Int32(compact_block_m)
-            local_row = task % fx.Int32(compact_block_m)
+            descriptor_index = task // fx.Int32(schedule_block_m)
+            local_row = task % fx.Int32(schedule_block_m)
             descriptor = fx.Int32(
                 buffer_ops.buffer_load(
                     schedule_rsrc,
@@ -1799,7 +1805,7 @@ def _compile_fused_activation_derivative_dscore_scale_dy(
                     dtype=T.i32,
                 )
             )
-            row = descriptor * fx.Int32(compact_block_m) + local_row
+            row = descriptor * fx.Int32(schedule_block_m) + local_row
             packed = fx.Int32(buffer_ops.buffer_load(ids_rsrc, row, vec_width=1, dtype=T.i32))
             token = packed & fx.Int32(_TOKEN_MASK)
             slot = (packed >> fx.Int32(24)) & fx.Int32(0xFF)
@@ -2950,16 +2956,19 @@ def _sonic_moe_backward_impl(
         use_grouped_dw1=use_grouped_dw1,
         use_grouped_dx=use_grouped_dx,
     )
-    # The exact-row queue pays off once the BM16 compact schedule already
-    # exists.  Decode has only ~18 us of gather/prepare work and is faster on
-    # the original one-row kernels, so keep that latency path unchanged.
+    # Exact-row state preparation reuses either the short BM16 queue or the
+    # production T4096 BM64 dX queue.  Decode has only ~18 us of gather/prepare
+    # work and is faster on the original one-row kernels.
     use_fused_forward_state_prepare = (
-        reuse_forward_preactivation and use_hostless_grouped and use_compact_w1
+        reuse_forward_preactivation
+        and not has_bias
+        and ((use_hostless_grouped and use_compact_w1) or use_large_grouped_dx)
     )
     use_fused_da_dscore = _use_fused_da_dscore(
         reuse_forward_preactivation=reuse_forward_preactivation,
         use_hostless_grouped=use_hostless_grouped,
         use_compact_w1=use_compact_w1,
+        use_large_grouped_dx=use_large_grouped_dx,
         flat_routes=flat_routes,
         has_bias=has_bias,
         compute_dtype=compute_dtype,
@@ -3066,6 +3075,21 @@ def _sonic_moe_backward_impl(
         large_dx_storage = None
         large_dx_total = None
         large_dx_descriptors = None
+    if use_fused_forward_state_prepare:
+        if use_large_grouped_dx:
+            assert large_dx_storage is not None
+            state_row_schedule = large_dx_storage
+            state_schedule_block_m = _LARGE_GROUPED_DX_BM
+            state_schedule_bound = large_dx_bound
+        else:
+            assert compact_w1_storage is not None
+            state_row_schedule = compact_w1_storage
+            state_schedule_block_m = _COMPACT_W1_BM
+            state_schedule_bound = compact_w1_bound
+    else:
+        state_row_schedule = None
+        state_schedule_block_m = 0
+        state_schedule_bound = 0
     x_sorted = torch.empty((max_padded, hidden_size), dtype=hidden_states.dtype, device=device)
     # The retained-state hostless path reads token-major grad_output directly
     # in both dy preparation and dscore, avoiding a large padded sorted copy.
@@ -3102,15 +3126,17 @@ def _sonic_moe_backward_impl(
     ):
         preactivation.zero_()
     activation = torch.empty((max_padded, intermediate_size), dtype=hidden_states.dtype, device=device)
-    # Grouped dA writes real expert rows only.  The derivative and dW1/db1
-    # reductions consume full sorter-padded segments, so untouched rows must
-    # remain finite zero rather than uninitialized storage.
-    da = torch.empty_like(activation) if use_hostless_grouped or not use_grouped_da else torch.zeros_like(activation)
-    # Hostless compact dX skips sentinel rows in the derivative kernel, so
-    # zeroing dZ supplies its at-most-15-row BM16 tails.  The legacy long-token
-    # path differentiates every sorter-padded row; its zero dA therefore
-    # materializes the complete zero BM64 tail needed by large grouped dX.
-    dz_factory = torch.zeros if use_hostless_grouped else torch.empty
+    # Grouped dA writes real expert rows only.  Legacy derivatives consume full
+    # sorter-padded segments and therefore need zero tails; exact-row fused
+    # derivatives skip those rows and can leave dA uninitialized there.
+    da = (
+        torch.empty_like(activation)
+        if use_fused_da_dscore or use_hostless_grouped or not use_grouped_da
+        else torch.zeros_like(activation)
+    )
+    # Exact-row derivatives skip sentinel rows, so zeroing dZ supplies the
+    # at-most-(BM-1) tails consumed by compact BM16 or production BM64 dX.
+    dz_factory = torch.zeros if use_hostless_grouped or use_fused_da_dscore else torch.empty
     dz = dz_factory(
         (max_padded, projection_size),
         dtype=hidden_states.dtype,
@@ -3419,12 +3445,13 @@ def _sonic_moe_backward_impl(
                     topk,
                     interleaved_w1,
                     device_index,
+                    state_schedule_block_m,
                     use_fused_da_dscore,
                 )
-                assert compact_w1_storage is not None
+                assert state_row_schedule is not None
                 state_prepare_grid = min(
                     _HOSTLESS_ROW_GRID_CAP,
-                    max(1, compact_w1_bound * _COMPACT_W1_BM),
+                    max(1, state_schedule_bound * state_schedule_block_m),
                 )
                 _run_compiled(
                     fused_prepare,
@@ -3436,7 +3463,7 @@ def _sonic_moe_backward_impl(
                     dy,
                     sorted_weights,
                     sorted_token_ids,
-                    compact_w1_storage,
+                    state_row_schedule,
                     tokens,
                     state_prepare_grid,
                     stream,
@@ -3580,12 +3607,12 @@ def _sonic_moe_backward_impl(
                 stream,
             )
 
-        # Recompute the down projection for ds, and use the materialized A16
-        # dy for both da and dW2.  The A16 materialization is this backward
-        # implementation's explicit numerical contract.
+        # Fallbacks recompute the down projection for ds and use materialized
+        # A16 dy for both da and dW2.  The fused path instead gets dscore from
+        # q=dout@W2, so it deliberately skips these per-expert projections.
         for expert, start, rows in segments:
             end = start + rows
-            if not use_grouped_w2:
+            if not use_grouped_w2 and not use_fused_da_dscore:
                 assert projection is not None
                 gemm_a16w16(
                     activation[start:end],
@@ -3625,11 +3652,12 @@ def _sonic_moe_backward_impl(
                 topk,
                 interleaved_w1,
                 device_index,
+                state_schedule_block_m,
             )
-            assert compact_w1_storage is not None
+            assert state_row_schedule is not None
             derivative_grid = min(
                 _HOSTLESS_ROW_GRID_CAP,
-                max(1, compact_w1_bound * _COMPACT_W1_BM),
+                max(1, state_schedule_bound * state_schedule_block_m),
             )
             _run_compiled(
                 fused_derivative,
@@ -3641,7 +3669,7 @@ def _sonic_moe_backward_impl(
                 sorted_weights,
                 sorted_token_ids,
                 droute_weights,
-                compact_w1_storage,
+                state_row_schedule,
                 tokens,
                 derivative_grid,
                 stream,
