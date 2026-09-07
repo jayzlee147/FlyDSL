@@ -185,6 +185,108 @@ def _grouped_dw2_stages(max_expert_rows: int) -> int:
     return 3 if max_expert_rows >= _GROUPED_DW2_PIPELINE_THRESHOLD else 2
 
 
+def _launch_grouped_dw2(
+    dy: torch.Tensor,
+    activation: torch.Tensor,
+    expert_frequency: torch.Tensor,
+    sorted_expert_ids: torch.Tensor,
+    num_valid_ids: torch.Tensor,
+    dw2: torch.Tensor,
+    active_expert_storage: torch.Tensor | None,
+    *,
+    use_hostless_grouped: bool,
+    use_tn_metadata_direct: bool,
+    max_expert_rows: int,
+    hidden_size: int,
+    intermediate_size: int,
+    active_experts: int,
+    stream: torch.cuda.Stream,
+) -> None:
+    """Launch the tuned grouped dW2 profiles after dy becomes available."""
+
+    if use_hostless_grouped and not use_tn_metadata_direct:
+        # The queue count is already produced by compact W1.  Launch disjoint
+        # sparse/dense profiles without a host-side active-count readback.
+        sparse_dw2 = _grouped_dw2_tuning(
+            max_expert_rows,
+            hidden_size,
+            intermediate_size,
+            active_experts=_GROUPED_DW2_SPARSE_EXPERTS,
+        )
+        balanced_dw2 = _grouped_dw2_tuning(
+            min(max_expert_rows, 4),
+            hidden_size,
+            intermediate_size,
+        )
+        grouped_dw2_profiles = (
+            (*sparse_dw2, _grouped_dw2_stages(max_expert_rows), 0, _GROUPED_DW2_SPARSE_EXPERTS),
+            (
+                *balanced_dw2,
+                _grouped_dw2_stages(min(max_expert_rows, 4)),
+                _GROUPED_DW2_SPARSE_EXPERTS + 1,
+                None,
+            ),
+        )
+    else:
+        grouped_dw2_profiles = (
+            (
+                *_grouped_dw2_tuning(
+                    max_expert_rows,
+                    hidden_size,
+                    intermediate_size,
+                    active_experts=active_experts,
+                ),
+                _grouped_dw2_stages(max_expert_rows),
+                0,
+                None,
+            ),
+        )
+
+    for (
+        dw2_bm,
+        dw2_bn,
+        dw2_bk,
+        dw2_k_padding,
+        dw2_mw,
+        dw2_nw,
+        dw2_stages,
+        min_active_experts,
+        max_active_experts,
+    ) in grouped_dw2_profiles:
+        grouped_dw2_kwargs = {
+            "block_m": dw2_bm,
+            "block_n": dw2_bn,
+            "block_k": dw2_bk,
+            "k_padding": dw2_k_padding,
+            "m_waves": dw2_mw,
+            "n_waves": dw2_nw,
+            "stages": dw2_stages,
+            "stream": stream,
+        }
+        if use_tn_metadata_direct:
+            grouped_tn_from_metadata_flydsl(
+                dy,
+                activation,
+                expert_frequency,
+                sorted_expert_ids,
+                num_valid_ids,
+                dw2,
+                **grouped_dw2_kwargs,
+            )
+        else:
+            assert active_expert_storage is not None
+            grouped_tn_from_queue_flydsl(
+                dy,
+                activation,
+                expert_frequency,
+                active_expert_storage,
+                dw2,
+                min_active_experts=min_active_experts,
+                max_active_experts=max_active_experts,
+                **grouped_dw2_kwargs,
+            )
+
+
 def _grouped_da_tuning(max_expert_rows: int, hidden_size: int) -> tuple[int, int, int, int, int]:
     """Return ``(BM, BN, BK, m_waves, n_waves)`` for grouped dA."""
 
@@ -442,6 +544,37 @@ def _use_hostless_grouped_backward(
         and use_grouped_da
         and use_grouped_dw1
         and use_grouped_dx
+    )
+
+
+def _use_fused_da_dscore(
+    *,
+    reuse_forward_preactivation: bool,
+    use_hostless_grouped: bool,
+    use_compact_w1: bool,
+    flat_routes: bool,
+    has_bias: bool,
+    compute_dtype: str,
+    activation: str,
+) -> bool:
+    """Select the first gfx950 unscaled-dA/route-score fusion rollout.
+
+    The fused dataflow deliberately starts with the retained-forward-state,
+    compact-schedule path.  ``dy`` initially carries the exact gathered A16
+    output gradient, grouped dA computes ``q = dout @ W2``, and one row kernel
+    subsequently forms dA's score scaling, dscore, and the scaled dW2 input.
+    Bias, ragged routes, legacy host dispatch, and non-SwiGLU/dtype contracts
+    retain the projection-recompute implementation.
+    """
+
+    return (
+        reuse_forward_preactivation
+        and use_hostless_grouped
+        and use_compact_w1
+        and not flat_routes
+        and not has_bias
+        and compute_dtype == "bf16"
+        and activation == "swiglu"
     )
 
 
@@ -1059,6 +1192,7 @@ def _compile_activation_prepare_from_forward_state(
     interleaved_w1: bool,
     device_index: int,
     device_padded_rows: bool = False,
+    defer_dy_scaling: bool = False,
 ):
     """Gather route-order BF16 preactivation and prepare backward rows.
 
@@ -1132,7 +1266,9 @@ def _compile_activation_prepare_from_forward_state(
                         row * fx.Int32(intermediate_size) + column,
                     )
 
-            route_weight = fx.Float32(buffer_ops.buffer_load(weights_rsrc, row, vec_width=1, dtype=T.f32))
+            route_weight = fx.Float32(1.0)
+            if const_expr(not defer_dy_scaling):
+                route_weight = fx.Float32(buffer_ops.buffer_load(weights_rsrc, row, vec_width=1, dtype=T.f32))
             for base in range_constexpr(0, hidden_size, _BLOCK_THREADS):
                 column = tid + fx.Int32(base)
                 if column < fx.Int32(hidden_size):
@@ -1240,6 +1376,7 @@ def _compile_fused_forward_state_prepare(
     topk: int,
     interleaved_w1: bool,
     device_index: int,
+    defer_dy_scaling: bool = False,
 ):
     """Gather the exact live rows and prepare retained-state backward inputs.
 
@@ -1289,9 +1426,11 @@ def _compile_fused_forward_state_prepare(
             token = packed & fx.Int32(_TOKEN_MASK)
             slot = (packed >> fx.Int32(24)) & fx.Int32(0xFF)
             if (token < i32_tokens) & (slot < fx.Int32(topk)):
-                route_weight = fx.Float32(
-                    buffer_ops.buffer_load(weights_rsrc, row, vec_width=1, dtype=T.f32)
-                )
+                route_weight = fx.Float32(1.0)
+                if const_expr(not defer_dy_scaling):
+                    route_weight = fx.Float32(
+                        buffer_ops.buffer_load(weights_rsrc, row, vec_width=1, dtype=T.f32)
+                    )
                 source_base = token * fx.Int32(hidden_size)
                 destination_base = row * fx.Int32(hidden_size)
                 for base in range_constexpr(0, hidden_size, _BLOCK_THREADS):
@@ -1493,6 +1632,211 @@ def _compile_activation_derivative(
             i32_padded_rows,
         ).launch(
             grid=(i32_padded_rows, 1, 1),
+            block=(_BLOCK_THREADS, 1, 1),
+            stream=stream,
+        )
+
+    return launch
+
+
+@functools.lru_cache(maxsize=64)
+def _compile_fused_activation_derivative_dscore_scale_dy(
+    hidden_size: int,
+    intermediate_size: int,
+    topk: int,
+    interleaved_w1: bool,
+    device_index: int,
+):
+    """Fuse the post-dA row work for the BF16 SwiGLU state fast path.
+
+    On entry ``da`` contains the unscaled, A16-materialized contraction
+    ``q = dout @ W2`` and ``dy`` contains the gathered, unscaled ``dout``.
+    Each workgroup owns a sorted route and performs three operations while the
+    same row is resident:
+
+    * multiply q by the FP32 route weight before applying the SwiGLU Jacobian;
+    * reduce ``dot(q, activation)`` directly into route-order FP32 dscore;
+    * scale dy in place to restore the established A16 dW2 input contract.
+
+    A route is owned by exactly one workgroup, so dscore needs neither an
+    initialization launch nor atomics.  This is intentionally separate from
+    the general derivative kernel until bias and ragged-route epilogues are
+    implemented.
+    """
+
+    del device_index
+    elem_dtype = fx.BFloat16
+    projection_size = 2 * intermediate_size
+    projection_column_stride = 2 if interleaved_w1 else 1
+    up_column_offset = 1 if interleaved_w1 else intermediate_size
+    compact_block_m = _COMPACT_W1_BM
+
+    @flyc.kernel(known_block_size=[_BLOCK_THREADS, 1, 1])
+    def fused_kernel(
+        route_preactivation: fx.Tensor,
+        activation: fx.Tensor,
+        da: fx.Tensor,
+        dy: fx.Tensor,
+        dz: fx.Tensor,
+        sorted_weights: fx.Tensor,
+        sorted_token_ids: fx.Tensor,
+        dtopk_weights: fx.Tensor,
+        schedule: fx.Tensor,
+        i32_tokens: fx.Int32,
+    ):
+        tid = gpu.thread_idx.x
+        zero_f32 = fx.Float32(0.0)
+        fm_fast = arith.FastMathFlags.fast
+        route_preact_rsrc = buffer_ops.create_buffer_resource(route_preactivation, max_size=True)
+        activation_rsrc = buffer_ops.create_buffer_resource(activation, max_size=True)
+        da_rsrc = buffer_ops.create_buffer_resource(da, max_size=True)
+        dy_rsrc = buffer_ops.create_buffer_resource(dy, max_size=True)
+        dz_rsrc = buffer_ops.create_buffer_resource(dz, max_size=True)
+        weights_rsrc = buffer_ops.create_buffer_resource(sorted_weights, max_size=True)
+        ids_rsrc = buffer_ops.create_buffer_resource(sorted_token_ids, max_size=True)
+        ds_rsrc = buffer_ops.create_buffer_resource(dtopk_weights, max_size=True)
+        schedule_rsrc = buffer_ops.create_buffer_resource(schedule, max_size=True)
+        lds = fx.SharedAllocator().allocate(_ScoreBackwardSharedStorage).peek()
+        reduction = lds.reduction.view(fx.make_layout(_RED_SLOTS, 1))
+
+        def wave_reduce_add(value):
+            result = value
+            with fx.fastmath(fm_fast):
+                for shift_index in range_constexpr(int(math.log2(_WARP_SIZE))):
+                    offset = _WARP_SIZE // (2 << shift_index)
+                    result = result + gpu.shuffle_xor(result, offset, _WARP_SIZE)
+            return result
+
+        def process_row(row, token, slot):
+            route_weight = fx.Float32(buffer_ops.buffer_load(weights_rsrc, row, vec_width=1, dtype=T.f32))
+            thread_dot = zero_f32
+            route_row = token * fx.Int32(topk) + slot
+            route_base = route_row * fx.Int32(projection_size)
+            sorted_base = row * fx.Int32(projection_size)
+            for base in range_constexpr(0, intermediate_size, _BLOCK_THREADS):
+                column = tid + fx.Int32(base)
+                if column < fx.Int32(intermediate_size):
+                    relative_gate = column * fx.Int32(projection_column_stride)
+                    route_gate_offset = route_base + relative_gate
+                    sorted_gate_offset = sorted_base + relative_gate
+                    act_offset = row * fx.Int32(intermediate_size) + column
+                    gate = buffer_ops.buffer_load(
+                        route_preact_rsrc,
+                        route_gate_offset,
+                        vec_width=1,
+                        dtype=elem_dtype,
+                    ).extf(T.f32)
+                    up = buffer_ops.buffer_load(
+                        route_preact_rsrc,
+                        route_gate_offset + fx.Int32(up_column_offset),
+                        vec_width=1,
+                        dtype=elem_dtype,
+                    ).extf(T.f32)
+                    activation_value = buffer_ops.buffer_load(
+                        activation_rsrc,
+                        act_offset,
+                        vec_width=1,
+                        dtype=elem_dtype,
+                    ).extf(T.f32)
+                    q = buffer_ops.buffer_load(da_rsrc, act_offset, vec_width=1, dtype=elem_dtype).extf(T.f32)
+                    thread_dot = thread_dot + q * activation_value
+                    dz_gate, dz_up = _activation_backward_f32(
+                        gate,
+                        up,
+                        q * route_weight,
+                        "swiglu",
+                    )
+                    buffer_ops.buffer_store(fx.Float32(dz_gate).to(elem_dtype), dz_rsrc, sorted_gate_offset)
+                    buffer_ops.buffer_store(
+                        fx.Float32(dz_up).to(elem_dtype),
+                        dz_rsrc,
+                        sorted_gate_offset + fx.Int32(up_column_offset),
+                    )
+
+            # dW2 retains the existing multiply-before-GEMM A16 boundary.
+            for base in range_constexpr(0, hidden_size, _BLOCK_THREADS):
+                column = tid + fx.Int32(base)
+                if column < fx.Int32(hidden_size):
+                    offset = row * fx.Int32(hidden_size) + column
+                    dout_value = buffer_ops.buffer_load(dy_rsrc, offset, vec_width=1, dtype=elem_dtype).extf(T.f32)
+                    buffer_ops.buffer_store(
+                        fx.Float32(dout_value * route_weight).to(elem_dtype),
+                        dy_rsrc,
+                        offset,
+                    )
+
+            reduced = wave_reduce_add(thread_dot)
+            if const_expr(_RED_SLOTS > 1):
+                lane = tid % fx.Int32(_WARP_SIZE)
+                wave = tid // fx.Int32(_WARP_SIZE)
+                if lane == fx.Int32(0):
+                    fx.memref_store(reduced, reduction, wave)
+                gpu.barrier()
+                if wave == fx.Int32(0):
+                    in_range = lane < fx.Int32(_RED_SLOTS)
+                    safe_lane = in_range.select(lane, fx.Int32(0))
+                    partial = fx.memref_load(reduction, safe_lane)
+                    reduced = wave_reduce_add(in_range.select(partial, zero_f32))
+                    if lane == fx.Int32(0):
+                        fx.memref_store(reduced, reduction, fx.Int32(0))
+                gpu.barrier()
+                reduced = fx.memref_load(reduction, fx.Int32(0))
+
+            if tid == fx.Int32(0):
+                destination = token * fx.Int32(topk) + slot
+                buffer_ops.buffer_store(reduced, ds_rsrc, destination)
+
+        total_tiles = fx.Int32(
+            buffer_ops.buffer_load(schedule_rsrc, fx.Int32(0), vec_width=1, dtype=T.i32)
+        )
+        total_rows = total_tiles * fx.Int32(compact_block_m)
+        for task_value in range(gpu.block_idx.x, total_rows, gpu.grid_dim.x):
+            task = fx.Int32(task_value)
+            descriptor_index = task // fx.Int32(compact_block_m)
+            local_row = task % fx.Int32(compact_block_m)
+            descriptor = fx.Int32(
+                buffer_ops.buffer_load(
+                    schedule_rsrc,
+                    descriptor_index + fx.Int32(1),
+                    vec_width=1,
+                    dtype=T.i32,
+                )
+            )
+            row = descriptor * fx.Int32(compact_block_m) + local_row
+            packed = fx.Int32(buffer_ops.buffer_load(ids_rsrc, row, vec_width=1, dtype=T.i32))
+            token = packed & fx.Int32(_TOKEN_MASK)
+            slot = (packed >> fx.Int32(24)) & fx.Int32(0xFF)
+            if (token < i32_tokens) & (slot < fx.Int32(topk)):
+                process_row(row, token, slot)
+
+    @flyc.jit
+    def launch(
+        route_preactivation: fx.Tensor,
+        activation: fx.Tensor,
+        da: fx.Tensor,
+        dy: fx.Tensor,
+        dz: fx.Tensor,
+        sorted_weights: fx.Tensor,
+        sorted_token_ids: fx.Tensor,
+        dtopk_weights: fx.Tensor,
+        schedule: fx.Tensor,
+        i32_tokens: fx.Int32,
+        i32_grid: fx.Int32,
+        stream: fx.Stream = fx.Stream(None),
+    ):
+        fused_kernel(
+            route_preactivation,
+            activation,
+            da,
+            dy,
+            dz,
+            sorted_weights,
+            sorted_token_ids,
+            dtopk_weights,
+            schedule,
+            i32_tokens,
+        ).launch(
+            grid=(i32_grid, 1, 1),
             block=(_BLOCK_THREADS, 1, 1),
             stream=stream,
         )
@@ -2615,6 +2959,15 @@ def _sonic_moe_backward_impl(
     use_fused_forward_state_prepare = (
         reuse_forward_preactivation and use_hostless_grouped and use_compact_w1
     )
+    use_fused_da_dscore = _use_fused_da_dscore(
+        reuse_forward_preactivation=reuse_forward_preactivation,
+        use_hostless_grouped=use_hostless_grouped,
+        use_compact_w1=use_compact_w1,
+        flat_routes=flat_routes,
+        has_bias=has_bias,
+        compute_dtype=compute_dtype,
+        activation=activation_name,
+    )
     # If even the maximum possible active set falls below the measured
     # selective-clear crossover, a normal dense memset is unconditionally the
     # best choice.  This route-count test is host-known and distribution
@@ -2721,11 +3074,13 @@ def _sonic_moe_backward_impl(
     # in both dy preparation and dscore, avoiding a large padded sorted copy.
     dout_sorted = None if use_fused_forward_state_prepare else torch.empty_like(x_sorted)
     dy = torch.empty_like(x_sorted)
-    # The expert-grid W2 kernel intentionally skips most sorter padding.  Score
-    # reduction reads projection before checking the route sentinel, so keep
-    # every untouched padded row finite.
+    # The fused state path derives route-score gradients from q=dout@W2 and
+    # therefore does not materialize the forward down projection.  Fallbacks
+    # retain their original padding initialization contract.
     projection = (
-        torch.empty_like(x_sorted) if use_hostless_grouped or not use_grouped_w2 else torch.zeros_like(x_sorted)
+        None
+        if use_fused_da_dscore
+        else (torch.empty_like(x_sorted) if use_hostless_grouped or not use_grouped_w2 else torch.zeros_like(x_sorted))
     )
     # Grouped W1 writes ceil(real_rows/BM)*BM rows instead of every
     # SORTED_BM-padded row.  Zero-initialize the untouched suffix: gather makes
@@ -3067,6 +3422,7 @@ def _sonic_moe_backward_impl(
                     topk,
                     interleaved_w1,
                     device_index,
+                    use_fused_da_dscore,
                 )
                 assert compact_w1_storage is not None
                 state_prepare_grid = min(
@@ -3114,90 +3470,23 @@ def _sonic_moe_backward_impl(
                     stream,
                 )
 
-        if use_grouped_dw2:
-            if use_hostless_grouped and not use_tn_metadata_direct:
-                # The queue count is already produced by compact W1.  Launch
-                # disjoint sparse/dense profiles so hot routing retains the
-                # BM128/BN128 triple-buffered kernel while balanced routing
-                # keeps the BM128/BN256 two-stage profile, without a D2H read.
-                sparse_dw2 = _grouped_dw2_tuning(
-                    max_expert_rows,
-                    hidden_size,
-                    intermediate_size,
-                    active_experts=_GROUPED_DW2_SPARSE_EXPERTS,
-                )
-                balanced_dw2 = _grouped_dw2_tuning(
-                    min(max_expert_rows, 4),
-                    hidden_size,
-                    intermediate_size,
-                )
-                grouped_dw2_profiles = (
-                    (*sparse_dw2, _grouped_dw2_stages(max_expert_rows), 0, _GROUPED_DW2_SPARSE_EXPERTS),
-                    (
-                        *balanced_dw2,
-                        _grouped_dw2_stages(min(max_expert_rows, 4)),
-                        _GROUPED_DW2_SPARSE_EXPERTS + 1,
-                        None,
-                    ),
-                )
-            else:
-                grouped_dw2_profiles = (
-                    (
-                        *_grouped_dw2_tuning(
-                            max_expert_rows,
-                            hidden_size,
-                            intermediate_size,
-                            active_experts=len(segments),
-                        ),
-                        _grouped_dw2_stages(max_expert_rows),
-                        0,
-                        None,
-                    ),
-                )
-
-            for (
-                dw2_bm,
-                dw2_bn,
-                dw2_bk,
-                dw2_k_padding,
-                dw2_mw,
-                dw2_nw,
-                dw2_stages,
-                min_active_experts,
-                max_active_experts,
-            ) in grouped_dw2_profiles:
-                grouped_dw2_kwargs = {
-                    "block_m": dw2_bm,
-                    "block_n": dw2_bn,
-                    "block_k": dw2_bk,
-                    "k_padding": dw2_k_padding,
-                    "m_waves": dw2_mw,
-                    "n_waves": dw2_nw,
-                    "stages": dw2_stages,
-                    "stream": stream,
-                }
-                if use_tn_metadata_direct:
-                    grouped_tn_from_metadata_flydsl(
-                        dy,
-                        activation,
-                        expert_frequency,
-                        sorted_expert_ids,
-                        num_valid_ids,
-                        dw2,
-                        **grouped_dw2_kwargs,
-                    )
-                else:
-                    assert active_expert_storage is not None
-                    grouped_tn_from_queue_flydsl(
-                        dy,
-                        activation,
-                        expert_frequency,
-                        active_expert_storage,
-                        dw2,
-                        min_active_experts=min_active_experts,
-                        max_active_experts=max_active_experts,
-                        **grouped_dw2_kwargs,
-                    )
+        if use_grouped_dw2 and not use_fused_da_dscore:
+            _launch_grouped_dw2(
+                dy,
+                activation,
+                expert_frequency,
+                sorted_expert_ids,
+                num_valid_ids,
+                dw2,
+                active_expert_storage,
+                use_hostless_grouped=use_hostless_grouped,
+                use_tn_metadata_direct=use_tn_metadata_direct,
+                max_expert_rows=max_expert_rows,
+                hidden_size=hidden_size,
+                intermediate_size=intermediate_size,
+                active_experts=len(segments),
+                stream=stream,
+            )
 
         if use_grouped_da:
             if use_hostless_grouped and active_expert_storage is not None:
@@ -3265,7 +3554,8 @@ def _sonic_moe_backward_impl(
                     stream,
                 )
 
-        if use_grouped_w2:
+        if use_grouped_w2 and not use_fused_da_dscore:
+            assert projection is not None
             grouped_w2 = _compile_grouped_w2_recompute(
                 hidden_size,
                 intermediate_size,
@@ -3299,6 +3589,7 @@ def _sonic_moe_backward_impl(
         for expert, start, rows in segments:
             end = start + rows
             if not use_grouped_w2:
+                assert projection is not None
                 gemm_a16w16(
                     activation[start:end],
                     w2_arg[expert].transpose(0, 1),
@@ -3327,7 +3618,56 @@ def _sonic_moe_backward_impl(
                     layout="tn",
                 )
 
-        if use_fused_forward_state_prepare:
+        derivative_grid = min(_HOSTLESS_ROW_GRID_CAP, max_padded) if use_hostless_grouped else padded_rows
+        if use_fused_da_dscore:
+            assert forward_state_data is not None
+            route_preactivation = forward_state_data[0]
+            fused_derivative = _compile_fused_activation_derivative_dscore_scale_dy(
+                hidden_size,
+                intermediate_size,
+                topk,
+                interleaved_w1,
+                device_index,
+            )
+            assert compact_w1_storage is not None
+            derivative_grid = min(
+                _HOSTLESS_ROW_GRID_CAP,
+                max(1, compact_w1_bound * _COMPACT_W1_BM),
+            )
+            _run_compiled(
+                fused_derivative,
+                route_preactivation,
+                activation,
+                da,
+                dy,
+                dz,
+                sorted_weights,
+                sorted_token_ids,
+                droute_weights,
+                compact_w1_storage,
+                tokens,
+                derivative_grid,
+                stream,
+            )
+            # dy was intentionally left unscaled until the fused row kernel so
+            # grouped dA could compute q=dout@W2.  dW2 can start only now.
+            _launch_grouped_dw2(
+                dy,
+                activation,
+                expert_frequency,
+                sorted_expert_ids,
+                num_valid_ids,
+                dw2,
+                active_expert_storage,
+                use_hostless_grouped=use_hostless_grouped,
+                use_tn_metadata_direct=use_tn_metadata_direct,
+                max_expert_rows=max_expert_rows,
+                hidden_size=hidden_size,
+                intermediate_size=intermediate_size,
+                active_experts=len(segments),
+                stream=stream,
+            )
+        elif use_fused_forward_state_prepare:
             assert forward_state_data is not None
             route_preactivation = forward_state_data[0]
             derivative_from_state = _compile_activation_derivative_from_forward_state(
@@ -3370,7 +3710,7 @@ def _sonic_moe_backward_impl(
                 sorted_token_ids,
                 num_valid_ids,
                 tokens,
-                (min(_HOSTLESS_ROW_GRID_CAP, max_padded) if use_hostless_grouped else padded_rows),
+                derivative_grid,
                 stream,
             )
 
@@ -3545,6 +3885,7 @@ def _sonic_moe_backward_impl(
             assert sorted_route_ids is not None
             assert dx_accum is not None
             assert dout_sorted is not None
+            assert projection is not None
             route_score_backward = _compile_route_score_backward(
                 hidden_size,
                 compute_dtype,
@@ -3585,25 +3926,27 @@ def _sonic_moe_backward_impl(
                 stream,
             )
         else:
-            score_backward = _compile_score_backward(
-                hidden_size,
-                topk,
-                compute_dtype,
-                device_index,
-                use_hostless_grouped,
-                use_fused_forward_state_prepare,
-            )
-            _run_compiled(
-                score_backward,
-                dout_arg if use_fused_forward_state_prepare else dout_sorted,
-                projection,
-                sorted_token_ids,
-                droute_weights,
-                num_valid_ids,
-                tokens,
-                (min(_HOSTLESS_ROW_GRID_CAP, max_padded) if use_hostless_grouped else padded_rows),
-                stream,
-            )
+            if not use_fused_da_dscore:
+                assert projection is not None
+                score_backward = _compile_score_backward(
+                    hidden_size,
+                    topk,
+                    compute_dtype,
+                    device_index,
+                    use_hostless_grouped,
+                    use_fused_forward_state_prepare,
+                )
+                _run_compiled(
+                    score_backward,
+                    dout_arg if use_fused_forward_state_prepare else dout_sorted,
+                    projection,
+                    sorted_token_ids,
+                    droute_weights,
+                    num_valid_ids,
+                    tokens,
+                    (min(_HOSTLESS_ROW_GRID_CAP, max_padded) if use_hostless_grouped else padded_rows),
+                    stream,
+                )
 
             assert dx_routes is not None
             unsort = _compile_unsort(
