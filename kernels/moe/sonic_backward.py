@@ -9,12 +9,13 @@ activations and optional expert bias are supported. It does not reuse the
 inference workspace. Re-sorting and recomputing the two forward intermediates
 makes retained graphs and overlapping forward calls safe.
 
-The implementation is entirely FlyDSL on device.  The general A16W16 GEMM is
-used for all expert matrix products; small FlyDSL kernels implement routing
-metadata, gather/scatter, activation derivatives, and the top-K reduction.  The
-bring-up path performs one host synchronization to read expert frequencies and
-dispatches six GEMMs per active expert.  A future grouped-MFMA implementation
-can replace that dispatch without changing the public API.
+The implementation is entirely FlyDSL on device.  BF16 SwiGLU W1
+preactivation recompute uses a device-driven grouped gfx950 MFMA kernel; the
+remaining matrix products use the general A16W16 GEMM.  Small FlyDSL kernels
+implement routing metadata, gather/scatter, activation derivatives, and the
+top-K reduction.  The bring-up path still performs one host synchronization to
+dispatch the five remaining GEMMs per active expert; later grouped kernels can
+remove that synchronization without changing the public API.
 """
 
 import functools
@@ -34,7 +35,13 @@ from kernels.common.kernels_common import get_warp_size
 from kernels.common.mem_ops import atomic_add
 from kernels.common.tensor_shim import _run_compiled
 from kernels.gemm.gemm_a16w16_gfx950 import gemm_a16w16
-from kernels.moe.moe_2stage_a16wmix.gemm1 import _gelu_tanh_f32, _relu_f32, _sigmoid_f32, _tanh_f32
+from kernels.moe.moe_2stage_a16wmix.gemm1 import (
+    _gelu_tanh_f32,
+    _relu_f32,
+    _sigmoid_f32,
+    _tanh_f32,
+    compile_gemm1_a16w4_port,
+)
 from kernels.moe.moe_gemm_2stage.moe_reduce import compile_moe_reduction
 from kernels.moe.moe_ragged_sorting_kernel import moe_ragged_sorting_flydsl
 from kernels.moe.moe_sorting_kernel import moe_sorting_flydsl, moe_sorting_get_workspace_size
@@ -69,6 +76,54 @@ _GEMM_KWARGS = {
     "group_m": 0,
     "use_half_tile_interleaved": False,
 }
+
+# The first device-driven backward GEMM specialization targets the dominant
+# BF16 SwiGLU training shape.  A 16-row compute tile preserves the sorter's
+# 64-row expert metadata granularity while four K-waves cover gfx950's short-M
+# regime.  These are compile-time policy choices, not public ABI knobs.
+_GROUPED_W1_BM = 16
+_GROUPED_W1_BN = 64
+_GROUPED_W1_BK = 64
+_GROUPED_W1_K_WAVE = 4
+
+
+@functools.lru_cache(maxsize=64)
+def _compile_grouped_w1_recompute(
+    hidden_size: int,
+    intermediate_size: int,
+    num_experts: int,
+    topk: int,
+    has_bias: bool,
+    device_index: int,
+):
+    """Build grouped raw-W1 preactivation recompute for BF16 SwiGLU.
+
+    ``device_index`` intentionally participates in the cache key because a
+    loaded compiled function is tied to its ROCm device.
+    """
+
+    del device_index
+    return compile_gemm1_a16w4_port(
+        BM=_GROUPED_W1_BM,
+        SORTED_BM=_BACKWARD_SORT_UNIT,
+        D_HIDDEN=hidden_size,
+        D_INTER=intermediate_size,
+        NE=num_experts,
+        TOPK=topk,
+        TILE_N=_GROUPED_W1_BN,
+        TILE_K=_GROUPED_W1_BK,
+        act="swiglu",
+        b_cache_mod=0,
+        w_dtype="bf16",
+        a_dtype="bf16",
+        w_layout="standard",
+        k_wave=_GROUPED_W1_K_WAVE,
+        round_preact_bf16=False,
+        has_bias=has_bias,
+        logical_dense_weight=True,
+        store_preactivation=True,
+        expert_grid=True,
+    )
 
 
 @fx.struct
@@ -1149,6 +1204,12 @@ def _sonic_moe_backward_impl(
     sort_unit = _BACKWARD_SORT_UNIT
     projection_size = intermediate_size * (2 if activation_name in _GLU_ACTIVATIONS else 1)
     has_bias = b1 is not None
+    use_grouped_w1 = (
+        compute_dtype == "bf16"
+        and activation_name == "swiglu"
+        and hidden_size % (_GROUPED_W1_K_WAVE * _GROUPED_W1_BK) == 0
+        and intermediate_size % _GROUPED_W1_BN == 0
+    )
     device = hidden_states.device
     device_index = device.index or 0
     with torch.cuda.device(device):
@@ -1197,7 +1258,15 @@ def _sonic_moe_backward_impl(
     dout_sorted = torch.empty_like(x_sorted)
     dy = torch.empty_like(x_sorted)
     projection = torch.empty_like(x_sorted)
-    preactivation = torch.empty((max_padded, projection_size), dtype=hidden_states.dtype, device=device)
+    # Expert-grid W1 writes ceil(real_rows/BM)*BM rows instead of every
+    # SORTED_BM-padded row.  Zero-initialize the untouched suffix: gather makes
+    # padded x/dout zero, so its dy/da/dz and therefore dW/db contributions
+    # remain exactly zero while all activation inputs stay finite.
+    preactivation = (
+        torch.zeros((max_padded, projection_size), dtype=hidden_states.dtype, device=device)
+        if use_grouped_w1
+        else torch.empty((max_padded, projection_size), dtype=hidden_states.dtype, device=device)
+    )
     activation = torch.empty((max_padded, intermediate_size), dtype=hidden_states.dtype, device=device)
     da = torch.empty_like(activation)
     dz = torch.empty_like(preactivation)
@@ -1278,9 +1347,45 @@ def _sonic_moe_backward_impl(
                 workspace=sorting_workspace,
             )
 
+        # The grouped W1 kernel derives its live CTA bound and expert mapping
+        # exclusively from device-produced sorter metadata.  Its launch grid is
+        # only a safe allocation bound, so no expert-frequency readback is
+        # required to recompute preactivation.  Keep the generic fallback for
+        # non-SwiGLU/FP16 shapes until their epilogues are enabled here.
+        if use_grouped_w1:
+            grouped_w1 = _compile_grouped_w1_recompute(
+                hidden_size,
+                intermediate_size,
+                num_experts,
+                topk,
+                has_bias,
+                device_index,
+            )
+            grouped_w1_grid = num_experts * (intermediate_size // _GROUPED_W1_BN)
+            dummy_ptr = w1_arg.data_ptr()
+            _run_compiled(
+                grouped_w1,
+                x_arg.data_ptr(),
+                w1_arg.data_ptr(),
+                expert_frequency.data_ptr(),
+                dummy_ptr if b1_arg is None else b1_arg.data_ptr(),
+                sorted_expert_ids.data_ptr(),
+                num_valid_ids.data_ptr(),
+                sorted_token_ids.data_ptr(),
+                tokens,
+                int(grouped_w1_grid),
+                1.0,
+                1.0,
+                1.0,
+                1.0,
+                float("inf"),
+                preactivation.data_ptr(),
+                stream,
+            )
+
         # One explicit synchronization is accepted in this bring-up path.  It
-        # determines active expert slices; every tensor operation remains on
-        # device and is implemented by FlyDSL.
+        # determines active expert slices for the five remaining per-expert
+        # GEMMs; grouped W1 above does not consume this host data.
         frequencies = expert_frequency.cpu().tolist()
         segments: list[tuple[int, int, int]] = []
         offset = 0
@@ -1307,18 +1412,20 @@ def _sonic_moe_backward_impl(
             stream,
         )
 
-        # Recompute the materialized A16 preactivation.
-        for expert, start, rows in segments:
-            end = start + rows
-            gemm_a16w16(
-                x_sorted[start:end],
-                w1_arg[expert].transpose(0, 1),
-                out=preactivation[start:end],
-                bias=None if b1_arg is None else b1_arg[expert],
-                user_kwargs=_GEMM_KWARGS,
-                stream=stream,
-                layout="nt",
-            )
+        # Other activation/dtype combinations retain the original per-expert
+        # preactivation path.
+        if not use_grouped_w1:
+            for expert, start, rows in segments:
+                end = start + rows
+                gemm_a16w16(
+                    x_sorted[start:end],
+                    w1_arg[expert].transpose(0, 1),
+                    out=preactivation[start:end],
+                    bias=None if b1_arg is None else b1_arg[expert],
+                    user_kwargs=_GEMM_KWARGS,
+                    stream=stream,
+                    layout="nt",
+                )
 
         activation_prepare = _compile_activation_prepare(
             hidden_size,

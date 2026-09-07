@@ -411,6 +411,118 @@ def test_sonic_moe_backward_matches_a16_reference(
     assert torch.count_nonzero(actual[2][-1]) == 0
 
 
+def test_sonic_moe_backward_grouped_w1_spans_sort_blocks_with_bias():
+    """The device-driven W1 path handles a real M tail past one sort block."""
+
+    tokens, hidden_size, intermediate_size, num_experts, topk = 65, 512, 256, 4, 2
+    config = _config(
+        hidden_size,
+        intermediate_size,
+        num_experts,
+        topk,
+        compute_dtype="bf16",
+        down_tile_m=128,
+    )
+    args = list(
+        _make_case(
+            tokens,
+            hidden_size,
+            intermediate_size,
+            num_experts,
+            topk,
+            seed=367,
+            dtype=torch.bfloat16,
+        )
+    )
+    # Sixty-five routes per active expert cross a 64-row sorter boundary and
+    # require five BM16 compute tiles, with one live row in the final tile. The
+    # second route remains a distinct expert because the dense sorter contract
+    # assumes unique top-k expert ids within a token.
+    args[3][:, 0].fill_(2)
+    args[3][:, 1].fill_(0)
+    args = tuple(args)
+    b1, b2 = _make_biases(args[1], args[2], seed=373)
+
+    actual = sonic_moe_backward(*args, config, b1=b1, b2=b2)
+    expected = _backward_reference(*args, b1=b1, b2=b2)
+    torch.cuda.synchronize()
+
+    for actual_gradient, expected_gradient in zip(actual, expected):
+        if actual_gradient.dtype == torch.float32:
+            rtol, atol = 5e-4, 5e-4
+        else:
+            rtol, atol = 3e-2, 5e-2
+        torch.testing.assert_close(
+            actual_gradient.float(),
+            expected_gradient.float(),
+            rtol=rtol,
+            atol=atol,
+        )
+
+
+def test_sonic_moe_backward_grouped_w1_handles_e896_active_and_empty_experts():
+    """The expert-grid specialization skips empty experts at production E."""
+
+    tokens, hidden_size, intermediate_size, num_experts, topk = 7, 512, 256, 896, 2
+    config = _config(
+        hidden_size,
+        intermediate_size,
+        num_experts,
+        topk,
+        compute_dtype="bf16",
+        down_tile_m=128,
+    )
+    args = list(
+        _make_case(
+            tokens,
+            hidden_size,
+            intermediate_size,
+            num_experts,
+            topk,
+            seed=379,
+            dtype=torch.bfloat16,
+        )
+    )
+    args[3][:, 0].fill_(0)
+    args[3][:, 1].fill_(num_experts - 1)
+    args = tuple(args)
+
+    actual = sonic_moe_backward(*args, config)
+    reduced_ids = torch.stack(
+        (
+            torch.zeros(tokens, dtype=torch.int32, device=args[0].device),
+            torch.ones(tokens, dtype=torch.int32, device=args[0].device),
+        ),
+        dim=1,
+    )
+    expected = _backward_reference(
+        args[0],
+        args[1][[0, num_experts - 1]].contiguous(),
+        args[2][[0, num_experts - 1]].contiguous(),
+        reduced_ids,
+        args[4],
+        args[5],
+    )
+    torch.cuda.synchronize()
+
+    torch.testing.assert_close(actual[0].float(), expected[0].float(), rtol=3e-2, atol=5e-2)
+    torch.testing.assert_close(actual[3], expected[3], rtol=5e-4, atol=5e-4)
+    for actual_gradient, expected_gradient in (
+        (actual[1][0], expected[1][0]),
+        (actual[1][-1], expected[1][1]),
+        (actual[2][0], expected[2][0]),
+        (actual[2][-1], expected[2][1]),
+    ):
+        torch.testing.assert_close(
+            actual_gradient.float(),
+            expected_gradient.float(),
+            rtol=3e-2,
+            atol=5e-2,
+        )
+    assert torch.count_nonzero(actual[1][1:-1]) == 0
+    assert torch.count_nonzero(actual[2][1:-1]) == 0
+
+
 @pytest.mark.parametrize("tokens", (65, 129), ids=("oneshot", "multiphase"))
 def test_sonic_moe_forward_then_backward_separates_sorter_tensor_ranks(tokens):
     """Forward and backward use rank-2/rank-1 sorter scratch buffers."""

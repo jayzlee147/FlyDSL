@@ -161,13 +161,19 @@ def _gemm1_body_a16w4(
     use_k16=False,
     round_preact_bf16=False,
     has_bias=False,
+    logical_dense_weight=False,
+    store_preactivation=False,
 ):
     """A16W4/A16W16 fused stage1 GEMM body.
 
     A is native BF16/FP16 (no A-scale). W is mxfp4/int4 (BF16 activation only)
     or a matching raw 16-bit dense type. The selected activation produces an
     A16 intermediate
-    ``[sorted_size, inter_dim]`` stored by SORTED POSITION.
+    ``[sorted_size, inter_dim]`` stored by SORTED POSITION.  The backward
+    recompute specialization sets ``logical_dense_weight`` to consume the
+    public row-major ``[E, N_OUT, K]`` weight directly and
+    ``store_preactivation`` to materialize both gate/up accumulators without
+    applying the activation.
     """
     _is_int4 = w_dtype == "int4"
     _is_dense = w_dtype in ("bf16", "fp16")
@@ -292,14 +298,17 @@ def _gemm1_body_a16w4(
     # create_buffer_resource_from_addr + buffer_load.
     sw_tiles = None if _is_dense else _global_i32_buffer_tiles(arg_bscale, min(_sw_bytes, 0xFFFFFFFF), 1)
     sw_read_atom = fx.make_copy_atom(fx.rocdl.BufferCopy32b(0), fx.Int32)
-    # Intermediate [sorted_size, inter] bf16: num_records = cumsum0*inter*2, so masked
+    # Intermediate [sorted_size, inter] bf16, or backward's materialized
+    # [sorted_size, N_OUT] preactivation: num_records is derived from the
+    # device-produced padded-row count so over-provisioned launch CTAs stay OOB.
     # (clamped) stores land OOB. KEPT RAW: the output resource + masked buffer_store need a
     # dynamic (runtime cumsum0) num_records and per-store predication; the fx.copy layout
     # API does not express the masked scalar scatter this epilogue relies on.
     _cumsum0 = _global_i32_at(arg_cumsum, fx.Int32(0))
+    _OUT_COLS = N_OUT if store_preactivation else INTER
     out_rsrc = buffer_ops.create_buffer_resource_from_addr(
         _raw(fx.Int64(arg_out)),
-        num_records_bytes=_raw(fx.Int64(_cumsum0) * fx.Int64(INTER * 2)),
+        num_records_bytes=_raw(fx.Int64(_cumsum0) * fx.Int64(_OUT_COLS * 2)),
     )
 
     # ---- A gather rows (per-thread) -------------------------------------------
@@ -322,6 +331,7 @@ def _gemm1_body_a16w4(
     x_row_local = []
     x_col_dw = []
     x_row_base_div4 = []
+    x_row_valid = []
     for i in range_constexpr(num_x_loads):
         tile_idx = tx_base + fx.Int32(i * a_load_threads * chunk_i32)
         row_local = tile_idx // fx.Int32(tile_k_dwords)
@@ -331,7 +341,10 @@ def _gemm1_body_a16w4(
         sorted_row = bx_m + row_local
         fused = fx.Int32(_global_i32_at(arg_mind, sorted_row))
         t_i32 = fused & fx.Int32(0x00FFFFFF)
-        x_row_base_div4.append(t_i32 * fx.Int32(c_k_div4))
+        row_valid = t_i32 < i32_ntok
+        safe_t = row_valid.select(t_i32, fx.Int32(0)) if const_expr(store_preactivation) else t_i32
+        x_row_base_div4.append(safe_t * fx.Int32(c_k_div4))
+        x_row_valid.append(row_valid)
 
     # A global->LDS staging. gfx950 (K=32): one BufferCopyLDS128b direct-to-LDS async copy
     # (16 B / 8 bf16, VGPR-bypassing). gfx942 (use_k16): CDNA3 direct-to-LDS moves only
@@ -346,8 +359,11 @@ def _gemm1_body_a16w4(
     # token<i32_ntok guarded). A ~4GB resource would instead fault on unmapped memory.
     x_buf = _global_i32_buffer_view(arg_x, fx.Int64(i32_ntok) * fx.Int64(c_k_div4) * fx.Int64(4))
     x_dma_tiles4 = fx.logical_divide(x_buf, fx.make_layout(4, 1))
-    if const_expr(use_k16):
-        x_dma_atom = fx.make_copy_atom(fx.rocdl.BufferCopy128b(2), fx.Int32)  # gmem->regs
+    if const_expr(use_k16 or store_preactivation):
+        # Backward clamps padding rows to token zero, then explicitly zeros the
+        # loaded vector before LDS.  This avoids even a hardware-clamped OOB
+        # transaction at token==i32_ntok.
+        x_dma_atom = fx.make_copy_atom(fx.rocdl.BufferCopy128b(0), fx.Int32)  # gmem->regs
         x_lds_store_atom = fx.make_copy_atom(fx.UniversalCopy128b(), fx.Int32)  # regs->LDS
     else:
         x_dma_atom = fx.make_copy_atom(fx.rocdl.BufferCopyLDS128b(), fx.Int32)
@@ -367,10 +383,14 @@ def _gemm1_body_a16w4(
             row_k_dw = x_row_base_div4[i] + base_k_div4
             global_byte = row_k_dw * fx.Int32(4) + col_bytes
             lds_byte = slot_byte + x_row_local[i] * fx.Int32(KH_TILE_BYTES) + col_sw
-            if const_expr(use_k16):
-                # gfx942: buffer_load 16 B gmem->regs, then ds_write 16 B regs->LDS.
+            if const_expr(use_k16 or store_preactivation):
+                # gfx942 and backward's safe-padding path stage through VGPRs.
                 r = fx.make_rmem_tensor(fx.make_layout(4, 1), fx.Int32)
                 fx.copy(x_dma_atom, fx.slice(x_dma_tiles4, (None, global_byte // fx.Int32(16))), r)
+                if const_expr(store_preactivation):
+                    loaded = fx.Vector(fx.memref_load_vec(r))
+                    zero = fx.Vector.filled(4, 0, fx.Int32)
+                    r.store(x_row_valid[i].select(loaded, zero))
                 fx.copy(x_lds_store_atom, r, fx.slice(s_x_i32x4_tiles, (None, lds_byte // fx.Int32(16))))
             else:
                 fx.copy(
@@ -446,12 +466,26 @@ def _gemm1_body_a16w4(
                 _k0_blk = ku // 4
                 bf_k0 = base_k0 + fx.Int32(_k0_blk * 4) + lane_div_16
                 bf_klane = fx.Int32(ku % 4)
-            elem_idx = fx.Int32(
-                crd2idx(
-                    [fx.Int64(n_blk), fx.Int64(bf_k0), fx.Int64(bf_klane), fx.Int64(n_intra), fx.Int64(0)],
-                    layout_b_bf16,
+            if const_expr(logical_dense_weight):
+                # Public backward weights are contiguous [E, N_OUT, K].
+                # The preshuffle coordinate above maps back to one naturally
+                # aligned run of eight K values from a logical output row.
+                logical_n = n_blk * fx.Int32(16) + n_intra
+                logical_k = bf_k0 * fx.Int32(32) + bf_klane * fx.Int32(8)
+                elem_idx = logical_n * fx.Int32(K) + logical_k
+            else:
+                elem_idx = fx.Int32(
+                    crd2idx(
+                        [
+                            fx.Int64(n_blk),
+                            fx.Int64(bf_k0),
+                            fx.Int64(bf_klane),
+                            fx.Int64(n_intra),
+                            fx.Int64(0),
+                        ],
+                        layout_b_bf16,
+                    )
                 )
-            )
             # elem_idx is a bf16-elem offset; dword index = elem_idx*2/4, tile index = /4.
             r = fx.make_rmem_tensor(w_reg_lay, fx.Int32)
             fx.copy(w_copy_atom, fx.slice(w_tiles, (None, elem_idx // fx.Int32(8))), r)
@@ -800,6 +834,13 @@ def _gemm1_body_a16w4(
             valid = token < i32_ntok
             if const_expr(k_wave > 1):
                 valid = valid & _is_primary
+                preactivation_valid = _is_primary
+            else:
+                # Every row below cumsum0 belongs to a real expert tile.  Its
+                # route may be padding, but backward still needs a finite
+                # zero/bias preactivation there because later dense GEMMs
+                # contract across the complete padded segment.
+                preactivation_valid = sorted_row < _cumsum0
             for ni in range_constexpr(num_acc_n):
                 g = fx.Float32(fx.Vector(fx.memref_load_vec(acc_gate[mi][ni]))[ii])
                 if const_expr(has_bias):
@@ -808,7 +849,28 @@ def _gemm1_body_a16w4(
                     # SonicMoE's legacy grouped GEMM materializes BF16 before
                     # its separate activation kernel reloads the value in FP32.
                     g = fx.Float32(g.to(elem_dtype))
-                if const_expr(act == "situv2"):
+                if const_expr(store_preactivation):
+                    # Backward needs the exact A16 boundary produced by the
+                    # legacy per-expert GEMM.  Store gate/up separately and
+                    # defer activation to its existing derivative pipeline.
+                    out_base = sorted_row * fx.Int32(N_OUT)
+                    buffer_ops.buffer_store(
+                        g.to(elem_dtype),
+                        _raw(out_rsrc),
+                        _raw(out_base + col_g_list[ni]),
+                        mask=preactivation_valid,
+                    )
+                    if const_expr(_is_glu):
+                        u = fx.Float32(fx.Vector(fx.memref_load_vec(acc_up[mi][ni]))[ii])
+                        if const_expr(has_bias):
+                            u = u + up_bias[ni]
+                        buffer_ops.buffer_store(
+                            u.to(elem_dtype),
+                            _raw(out_rsrc),
+                            _raw(out_base + col_g_list[ni] + inter_i32),
+                            mask=preactivation_valid,
+                        )
+                elif const_expr(act == "situv2"):
                     u = fx.Float32(fx.Vector(fx.memref_load_vec(acc_up[mi][ni]))[ii])
                     if const_expr(has_bias):
                         u = u + up_bias[ni]
@@ -830,9 +892,10 @@ def _gemm1_body_a16w4(
                     if const_expr(_is_glu and round_preact_bf16):
                         u = fx.Float32(u.to(elem_dtype))
                     y = _stage1_activation_f32(g, u, act)
-                yb = y.to(elem_dtype)
-                out_idx = sorted_row * inter_i32 + col_g_list[ni]
-                buffer_ops.buffer_store(yb, _raw(out_rsrc), _raw(out_idx), mask=valid)
+                if const_expr(not store_preactivation):
+                    yb = y.to(elem_dtype)
+                    out_idx = sorted_row * inter_i32 + col_g_list[ni]
+                    buffer_ops.buffer_store(yb, _raw(out_rsrc), _raw(out_idx), mask=valid)
 
 
 def gemm1_a16w4_grid(BM, *, INTER, TILE_N, max_m_blocks):
@@ -861,6 +924,9 @@ def compile_gemm1_a16w4_port(
     k_wave=1,
     round_preact_bf16=False,
     has_bias=False,
+    logical_dense_weight=False,
+    store_preactivation=False,
+    expert_grid=False,
 ):
     """A16W4/A16W16 fused stage1 builder.
 
@@ -903,11 +969,20 @@ def compile_gemm1_a16w4_port(
     assert 4 % k_wave == 0, f"4 must be divisible by k_wave, got {k_wave}"
     assert isinstance(round_preact_bf16, bool), "round_preact_bf16 must be bool"
     assert isinstance(has_bias, bool), "has_bias must be bool"
+    assert isinstance(logical_dense_weight, bool), "logical_dense_weight must be bool"
+    assert isinstance(store_preactivation, bool), "store_preactivation must be bool"
+    assert isinstance(expert_grid, bool), "expert_grid must be bool"
     _K = D_HIDDEN
     _INTER = D_INTER
     _is_glu = act in ("silu", "swiglu", "geglu", "reglu", "situv2")
     assert not (w_layout == "guinterleave" and not _is_glu), "w_layout='guinterleave' is valid only for GLU activations"
     _N_OUT = (2 if _is_glu else 1) * _INTER
+    assert not logical_dense_weight or w_dtype in ("bf16", "fp16"), (
+        "logical_dense_weight is valid only for dense A16 weights"
+    )
+    assert not expert_grid or logical_dense_weight, (
+        "expert_grid requires logical dense weights because arg_bscale carries expert frequencies"
+    )
     assert _K % TILE_K == 0, f"D_HIDDEN (K) must be a multiple of {TILE_K}, got {_K}"
     assert _K % (k_wave * TILE_K) == 0, f"D_HIDDEN (K) must be a multiple of k_wave*TILE_K, got {_K}, k_wave={k_wave}"
     assert _INTER % TILE_N == 0, f"D_INTER must be a multiple of TILE_N={TILE_N}, got {_INTER}"
@@ -955,11 +1030,14 @@ def compile_gemm1_a16w4_port(
     _kw_tag = f"_kw{k_wave}" if k_wave > 1 else ""
     _round_tag = "_prebf16" if round_preact_bf16 else ""
     _bias_tag = "_bias" if has_bias else ""
+    _logical_w_tag = "_logicalw" if logical_dense_weight else ""
+    _preact_tag = "_storepreact" if store_preactivation else ""
+    _expert_grid_tag = "_egrid" if expert_grid else ""
     _sorted_tag = f"_sbm{SORTED_BM}" if SORTED_BM != BM else ""
     name_suffix = (
         f"a16w4{_wd_tag}{_ad_tag}{_wl_tag}_h{_K}_i{_INTER}_ne{NE}_bm{BM}"
         f"{_sorted_tag}_tn{TILE_N}_tk{TILE_K}{_act_tag}{_bcm_tag}{_xcd_tag}"
-        f"{_wpe_tag}{_kw_tag}{_round_tag}{_bias_tag}"
+        f"{_wpe_tag}{_kw_tag}{_round_tag}{_bias_tag}{_logical_w_tag}{_preact_tag}{_expert_grid_tag}"
     )
 
     @fx.struct
@@ -1013,11 +1091,7 @@ def compile_gemm1_a16w4_port(
             n_block = wig // group_size_m
             return m_block * fx.Int32(NUM_N_BLOCKS) + n_block
 
-        if bx_i32 < bound:
-            if const_expr(_SW > 0):
-                _tile = _xcd(bx_i32)
-            else:
-                _tile = bx_i32
+        def _run_body(tile):
             _gemm1_body_a16w4(
                 lds_raw_ptr,
                 arg_x,
@@ -1028,7 +1102,7 @@ def compile_gemm1_a16w4_port(
                 arg_mind,
                 arg_cumsum,
                 arg_out,
-                _tile,
+                tile,
                 lane,
                 wave,
                 i32_ntok,
@@ -1054,7 +1128,46 @@ def compile_gemm1_a16w4_port(
                 use_k16=_use_k16,
                 round_preact_bf16=round_preact_bf16,
                 has_bias=has_bias,
+                logical_dense_weight=logical_dense_weight,
+                store_preactivation=store_preactivation,
             )
+
+        if const_expr(expert_grid):
+            # Backward-only device-driven schedule.  One workgroup owns an
+            # (expert, N-tile) pair and loops over just ceil(real_rows/BM)
+            # compute tiles.  A fixed-iteration lower_bound finds the expert's
+            # first SORTED_BM metadata block without a host prefix-sum/readback.
+            expert_bound = fx.Int32(NE * NUM_N_BLOCKS)
+            if bx_i32 < expert_bound:
+                expert = bx_i32 // fx.Int32(NUM_N_BLOCKS)
+                n_block = bx_i32 % fx.Int32(NUM_N_BLOCKS)
+                frequency = rocdl.readfirstlane(T.i32, _raw(_global_i32_at(arg_bscale, expert)))
+                if frequency > fx.Int32(0):
+                    lo = fx.Int32(0)
+                    hi = cumsum0 // fx.Int32(SORTED_BM)
+                    # cumsum0 is signed-i32 bounded, hence at most 2^25
+                    # SORTED_BM=64 metadata blocks.  25 iterations suffice.
+                    for _ in range_constexpr(25):
+                        searching = lo < hi
+                        mid = (lo + hi) // fx.Int32(2)
+                        safe_mid = searching.select(mid, fx.Int32(0))
+                        mid_expert = fx.Int32(_global_i32_at(arg_eids, safe_mid))
+                        move_right = searching & (mid_expert < expert)
+                        lo = move_right.select(mid + fx.Int32(1), lo)
+                        move_left = searching & (mid_expert >= expert)
+                        hi = move_left.select(mid, hi)
+                    first_m_block = lo * fx.Int32(SORTED_BM // BM)
+                    num_m_blocks = (frequency + fx.Int32(BM - 1)) // fx.Int32(BM)
+                    for subtile in range(0, num_m_blocks, 1):
+                        tile = (first_m_block + fx.Int32(subtile)) * fx.Int32(NUM_N_BLOCKS) + n_block
+                        _run_body(tile)
+        else:
+            if bx_i32 < bound:
+                if const_expr(_SW > 0):
+                    _tile = _xcd(bx_i32)
+                else:
+                    _tile = bx_i32
+                _run_body(_tile)
 
     @flyc.jit
     def launch_gemm1(
