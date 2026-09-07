@@ -48,6 +48,7 @@ from kernels.moe.moe_2stage_a16wmix.gemm2 import compile_gemm2_a16w4_port
 from kernels.moe.moe_gemm_2stage.moe_reduce import compile_moe_reduction
 from kernels.moe.moe_ragged_sorting_kernel import moe_ragged_sorting_flydsl
 from kernels.moe.moe_sorting_kernel import moe_sorting_flydsl, moe_sorting_get_workspace_size
+from kernels.moe.sonic_grouped_a16w16 import compile_sonic_grouped_a16w16_nn
 from kernels.moe.sonic_grouped_scheduler import (
     build_compact_m_tile_descriptors,
     fixed_compact_m_tile_descriptor_upper_bound,
@@ -138,6 +139,29 @@ def _grouped_da_tuning(max_expert_rows: int, hidden_size: int) -> tuple[int, int
     return (64, _GROUPED_DA_BN, 64, 2, 2)
 
 
+# dX has the row-major NN shape ``[M, 2I] @ [2I, H]``.  BM16 avoids doing the
+# sorter's full 64-row padding.  BN128/2 waves wins for decode and hot routing;
+# BN256/4 waves reduces weight traffic when hundreds of experts are active.
+# The frequency readback already required by dW selects between them without a
+# new synchronization.  A persistent four-workgroup-per-CU launch bound (1024
+# on MI350/MI355X) keeps large descriptor grids resident without a long tail.
+_GROUPED_DX_BM = 16
+_GROUPED_DX_BK = 64
+_GROUPED_DX_STAGES = 2
+_GROUPED_DX_GRID_CAP = 1024
+_GROUPED_DX_DENSE_EXPERTS = 256
+
+
+def _grouped_dx_tuning(active_experts: int, hidden_size: int) -> tuple[int, int]:
+    """Return ``(BN, n_waves)`` for the observed expert distribution."""
+
+    if active_experts >= _GROUPED_DX_DENSE_EXPERTS and hidden_size % 256 == 0:
+        return (256, 4)
+    if hidden_size % 128 == 0:
+        return (128, 2)
+    return (64, 2)
+
+
 def _use_compact_w1_descriptor_queue(
     *,
     tokens: int,
@@ -208,6 +232,59 @@ def _use_grouped_w1_recompute(
         and intermediate_size % bn == 0
         and _BACKWARD_SORT_UNIT % bm == 0
         and max_expert_rows <= _GROUPED_W1_MAX_EXPERT_ROWS
+    )
+
+
+def _use_grouped_dx(
+    *,
+    compute_dtype: str,
+    activation: str,
+    hidden_size: int,
+    intermediate_size: int,
+    tokens: int,
+    flat_routes: bool,
+    compact_w1: bool,
+) -> bool:
+    """Select the device-scheduled BF16 SwiGLU dX contraction.
+
+    Compact mode deliberately reuses the already-built W1 descriptor queue.
+    The only queue-free mode is fixed-K T1: every active expert then owns one
+    real row and the sorter metadata itself is an exact BM16 work schedule.
+    """
+
+    return (
+        compute_dtype == "bf16"
+        and activation == "swiglu"
+        and (2 * intermediate_size) % _GROUPED_DX_BK == 0
+        and hidden_size % 64 == 0
+        and (compact_w1 or (tokens == 1 and not flat_routes))
+    )
+
+
+@functools.lru_cache(maxsize=64)
+def _compile_grouped_dx(
+    hidden_size: int,
+    intermediate_size: int,
+    num_experts: int,
+    block_n: int,
+    n_waves: int,
+    compact_grid: bool,
+    device_index: int,
+):
+    """Build the gfx950 grouped ``dZ @ W1`` specialization."""
+
+    return compile_sonic_grouped_a16w16_nn(
+        contraction_size=2 * intermediate_size,
+        output_size=hidden_size,
+        num_experts=num_experts,
+        block_m=_GROUPED_DX_BM,
+        block_n=block_n,
+        block_k=_GROUPED_DX_BK,
+        stages=_GROUPED_DX_STAGES,
+        n_waves=n_waves,
+        sorted_block_m=_BACKWARD_SORT_UNIT,
+        compact_grid=compact_grid,
+        device_index=device_index,
     )
 
 
@@ -1485,6 +1562,15 @@ def _sonic_moe_backward_impl(
         intermediate_size=intermediate_size,
     )
     use_compact_w1 = use_grouped_w1 and compact_w1_grid
+    use_grouped_dx = _use_grouped_dx(
+        compute_dtype=compute_dtype,
+        activation=activation_name,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+        tokens=tokens,
+        flat_routes=flat_routes,
+        compact_w1=use_compact_w1,
+    )
     device = hidden_states.device
     device_index = device.index or 0
     with torch.cuda.device(device):
@@ -1876,6 +1962,53 @@ def _sonic_moe_backward_impl(
             stream,
         )
 
+        if use_grouped_dx:
+            # The compact queue rounds real expert rows to BM16.  Gather makes
+            # padded dOut zero, so activation backward materializes zero dZ in
+            # the final partial tile; writing all 16 rows is therefore safe.
+            # Unsort/scatter subsequently reads only non-sentinel route rows.
+            active_experts = len(segments)
+            grouped_dx_bn, grouped_dx_n_waves = _grouped_dx_tuning(
+                active_experts,
+                hidden_size,
+            )
+            grouped_dx = _compile_grouped_dx(
+                hidden_size,
+                intermediate_size,
+                num_experts,
+                grouped_dx_bn,
+                grouped_dx_n_waves,
+                use_compact_w1,
+                device_index,
+            )
+            grouped_dx_m_tiles = (
+                sum((int(count) + _GROUPED_DX_BM - 1) // _GROUPED_DX_BM for count in frequencies)
+                if use_compact_w1
+                else active_experts
+            )
+            grouped_dx_grid = max(
+                1,
+                min(
+                    _GROUPED_DX_GRID_CAP,
+                    grouped_dx_m_tiles * (hidden_size // grouped_dx_bn),
+                ),
+            )
+            _run_compiled(
+                grouped_dx,
+                dz.data_ptr(),
+                w1_arg.data_ptr(),
+                (
+                    compact_w1_storage.data_ptr()
+                    if compact_w1_storage is not None
+                    else expert_frequency.data_ptr()
+                ),
+                sorted_expert_ids.data_ptr(),
+                num_valid_ids.data_ptr(),
+                dx_sorted.data_ptr(),
+                grouped_dx_grid,
+                stream,
+            )
+
         # Each expert owns a disjoint output slice, so no atomics or
         # cross-expert reductions are needed for dW1 or routed dX.
         bias_gradient_reduction = (
@@ -1898,14 +2031,15 @@ def _sonic_moe_backward_impl(
                 stream=stream,
                 layout="tn",
             )
-            gemm_a16w16(
-                dz[start:end],
-                w1_arg[expert],
-                out=dx_sorted[start:end],
-                user_kwargs=_GEMM_KWARGS,
-                stream=stream,
-                layout="nn",
-            )
+            if not use_grouped_dx:
+                gemm_a16w16(
+                    dz[start:end],
+                    w1_arg[expert],
+                    out=dx_sorted[start:end],
+                    user_kwargs=_GEMM_KWARGS,
+                    stream=stream,
+                    layout="nn",
+                )
             if bias_gradient_reduction is not None:
                 _run_compiled(
                     bias_gradient_reduction,

@@ -20,8 +20,10 @@ from kernels.moe.sonic import (
 )
 from kernels.moe.sonic_backward import (
     _grouped_da_tuning,
+    _grouped_dx_tuning,
     _grouped_w1_tuning,
     _use_grouped_da,
+    _use_grouped_dx,
     _use_grouped_w1_recompute,
     _use_grouped_w2_recompute,
 )
@@ -202,6 +204,69 @@ def test_grouped_w1_compact_queue_policy(tokens, expected_compact):
     assert (bm, bn, bk, k_wave) == (
         (16, 128, 64, 2) if expected_compact else (16, 64, 64, 4)
     )
+
+
+@pytest.mark.parametrize(
+    (
+        "compute_dtype",
+        "activation",
+        "hidden_size",
+        "intermediate_size",
+        "tokens",
+        "flat_routes",
+        "compact_w1",
+        "expected",
+    ),
+    (
+        ("bf16", "swiglu", 3584, 512, 1, False, False, True),
+        ("bf16", "swiglu", 3584, 512, 7, False, False, False),
+        ("bf16", "swiglu", 3584, 512, 64, False, True, True),
+        ("bf16", "swiglu", 3584, 512, 128, True, True, True),
+        ("bf16", "swiglu", 3584, 512, 1, True, False, False),
+        ("bf16", "swiglu", 3584, 512, 4096, False, False, False),
+        ("fp16", "swiglu", 3584, 512, 64, False, True, False),
+        ("bf16", "geglu", 3584, 512, 64, False, True, False),
+        ("bf16", "swiglu", 3552, 512, 64, False, True, False),
+        ("bf16", "swiglu", 3584, 500, 64, False, True, False),
+    ),
+)
+def test_grouped_dx_policy(
+    compute_dtype,
+    activation,
+    hidden_size,
+    intermediate_size,
+    tokens,
+    flat_routes,
+    compact_w1,
+    expected,
+):
+    assert (
+        _use_grouped_dx(
+            compute_dtype=compute_dtype,
+            activation=activation,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            tokens=tokens,
+            flat_routes=flat_routes,
+            compact_w1=compact_w1,
+        )
+        is expected
+    )
+
+
+@pytest.mark.parametrize(
+    ("active_experts", "hidden_size", "expected"),
+    (
+        (16, 3584, (128, 2)),
+        (255, 3584, (128, 2)),
+        (256, 3584, (256, 4)),
+        (896, 3584, (256, 4)),
+        (896, 128, (128, 2)),
+        (896, 192, (64, 2)),
+    ),
+)
+def test_grouped_dx_tuning(active_experts, hidden_size, expected):
+    assert _grouped_dx_tuning(active_experts, hidden_size) == expected
 
 
 def _gfx950_device():
@@ -555,8 +620,16 @@ def test_sonic_moe_backward_t1_keeps_expert_grid_without_descriptor_builder(monk
         _unexpected_builder,
     )
     actual = sonic_moe_backward(*args, config)
+    expected = _backward_reference(*args)
     torch.cuda.synchronize()
-    assert actual[0].shape == args[0].shape
+    for actual_gradient, expected_gradient in zip(actual[:3], expected[:3]):
+        torch.testing.assert_close(
+            actual_gradient.float(),
+            expected_gradient.float(),
+            rtol=3e-2,
+            atol=5e-2,
+        )
+    torch.testing.assert_close(actual[3], expected[3], rtol=5e-4, atol=5e-4)
 
 
 @pytest.mark.parametrize(
@@ -617,7 +690,7 @@ def test_sonic_moe_backward_matches_a16_reference(
     assert torch.count_nonzero(actual[2][-1]) == 0
 
 
-def test_sonic_moe_backward_grouped_w1_spans_sort_blocks_with_bias():
+def test_sonic_moe_backward_grouped_w1_spans_sort_blocks_with_bias(monkeypatch):
     """The device-driven W1 path handles a real M tail past one sort block."""
 
     tokens, hidden_size, intermediate_size, num_experts, topk = 65, 512, 256, 4, 2
@@ -649,9 +722,25 @@ def test_sonic_moe_backward_grouped_w1_spans_sort_blocks_with_bias():
     args = tuple(args)
     b1, b2 = _make_biases(args[1], args[2], seed=373)
 
+    original_builder = sonic_backward_module.build_compact_m_tile_descriptors
+    builder_calls = 0
+
+    def _tracked_builder(*builder_args, **builder_kwargs):
+        nonlocal builder_calls
+        builder_calls += 1
+        return original_builder(*builder_args, **builder_kwargs)
+
+    monkeypatch.setattr(
+        sonic_backward_module,
+        "build_compact_m_tile_descriptors",
+        _tracked_builder,
+    )
     actual = sonic_moe_backward(*args, config, b1=b1, b2=b2)
     expected = _backward_reference(*args, b1=b1, b2=b2)
     torch.cuda.synchronize()
+
+    # W1 recompute and dX share one counter-first BM16 queue.
+    assert builder_calls == 1
 
     for actual_gradient, expected_gradient in zip(actual, expected):
         if actual_gradient.dtype == torch.float32:
@@ -725,6 +814,49 @@ def test_sonic_moe_backward_grouped_w1_handles_e896_active_and_empty_experts():
             rtol=3e-2,
             atol=5e-2,
         )
+    assert torch.count_nonzero(actual[1][1:-1]) == 0
+    assert torch.count_nonzero(actual[2][1:-1]) == 0
+
+
+def test_sonic_moe_backward_grouped_dx_t1_handles_e896_metadata_grid():
+    """T1 dX maps sparse first/last experts through sorter metadata only."""
+
+    tokens, hidden_size, intermediate_size, num_experts, topk = 1, 128, 64, 896, 2
+    config = _config(
+        hidden_size,
+        intermediate_size,
+        num_experts,
+        topk,
+        compute_dtype="bf16",
+        down_tile_m=128,
+    )
+    args = list(
+        _make_case(
+            tokens,
+            hidden_size,
+            intermediate_size,
+            num_experts,
+            topk,
+            seed=431,
+            dtype=torch.bfloat16,
+        )
+    )
+    args[3][0, 0] = 0
+    args[3][0, 1] = num_experts - 1
+    args = tuple(args)
+
+    actual = sonic_moe_backward(*args, config)
+    expected = _backward_reference(*args)
+    torch.cuda.synchronize()
+
+    for actual_gradient, expected_gradient in zip(actual[:3], expected[:3]):
+        torch.testing.assert_close(
+            actual_gradient.float(),
+            expected_gradient.float(),
+            rtol=3e-2,
+            atol=5e-2,
+        )
+    torch.testing.assert_close(actual[3], expected[3], rtol=5e-4, atol=5e-4)
     assert torch.count_nonzero(actual[1][1:-1]) == 0
     assert torch.count_nonzero(actual[2][1:-1]) == 0
 
@@ -1012,6 +1144,90 @@ def test_sonic_moe_backward_routes_matches_a16_reference(
     assert torch.count_nonzero(actual[2][-1]) == 0
     assert torch.count_nonzero(actual[4][-1]) == 0
     assert torch.count_nonzero(actual[5][-1]) == 0
+
+
+def test_sonic_moe_backward_routes_grouped_dx_reuses_compact_queue(monkeypatch):
+    """Duplicate ragged routes use one BM16 queue for W1 recompute and dX."""
+
+    tokens, hidden_size, intermediate_size, num_experts = 64, 256, 128, 4
+    config = _config(
+        hidden_size,
+        intermediate_size,
+        num_experts,
+        1,
+        compute_dtype="bf16",
+        down_tile_m=128,
+    )
+    x, w1, w2, _, _, grad_output = _make_case(
+        tokens,
+        hidden_size,
+        intermediate_size,
+        num_experts,
+        1,
+        seed=419,
+        dtype=torch.bfloat16,
+    )
+    # Every token has the same (token, expert) edge twice.  This exercises the
+    # ragged atomic scatter and makes one expert span two sorter blocks.
+    token_indices = torch.arange(tokens, dtype=torch.int32, device=x.device).repeat_interleave(2)
+    expert_indices = torch.zeros(tokens * 2, dtype=torch.int32, device=x.device)
+    route_weights = torch.linspace(-0.5, 1.0, tokens * 2, dtype=torch.float32, device=x.device)
+    b1, b2 = _make_biases(w1, w2, seed=421)
+
+    original_builder = sonic_backward_module.build_compact_m_tile_descriptors
+    builder_calls = 0
+
+    def _tracked_builder(*builder_args, **builder_kwargs):
+        nonlocal builder_calls
+        builder_calls += 1
+        return original_builder(*builder_args, **builder_kwargs)
+
+    monkeypatch.setattr(
+        sonic_backward_module,
+        "build_compact_m_tile_descriptors",
+        _tracked_builder,
+    )
+    actual = sonic_moe_backward_routes(
+        x,
+        w1,
+        w2,
+        token_indices,
+        expert_indices,
+        route_weights,
+        grad_output,
+        config,
+        b1=b1,
+        b2=b2,
+    )
+    expected = _backward_routes_reference(
+        x,
+        w1,
+        w2,
+        token_indices,
+        expert_indices,
+        route_weights,
+        grad_output,
+        b1=b1,
+        b2=b2,
+    )
+    torch.cuda.synchronize()
+
+    assert builder_calls == 1
+    for actual_gradient, expected_gradient in zip(actual, expected):
+        if actual_gradient.dtype == torch.float32:
+            rtol, atol = 2e-3, 4e-3
+        else:
+            rtol, atol = 3e-2, 5e-2
+        torch.testing.assert_close(
+            actual_gradient.float(),
+            expected_gradient.float(),
+            rtol=rtol,
+            atol=atol,
+        )
+    assert torch.count_nonzero(actual[1][1:]) == 0
+    assert torch.count_nonzero(actual[2][1:]) == 0
+    assert torch.count_nonzero(actual[4][1:]) == 0
+    assert torch.count_nonzero(actual[5][1:]) == 0
 
 
 @pytest.mark.parametrize("with_bias", (False, True), ids=("no-bias", "bias"))
