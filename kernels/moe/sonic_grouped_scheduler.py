@@ -128,8 +128,15 @@ def compile_compact_m_tile_descriptor_builder(
     block_m: int,
     sorted_block_m: int,
     device_index: int,
+    emit_active_experts: bool = False,
 ):
-    """Compile the counter-clear plus descriptor-build launch sequence."""
+    """Compile the counter-clear plus descriptor-build launch sequence.
+
+    When ``emit_active_experts`` is true, the same expert scan also writes a
+    shared ``[count, (expert, first_sorted_row) * capacity]`` queue.  This lets
+    output-stationary grouped weight-gradient kernels reuse the W1/dX compact
+    scheduler without paying for a second active-expert builder.
+    """
 
     del device_index
     if num_experts <= 0:
@@ -148,10 +155,19 @@ def compile_compact_m_tile_descriptor_builder(
     lower_bound_steps = max(1, max_metadata_blocks.bit_length())
 
     @flyc.kernel(known_block_size=[_BLOCK_THREADS, 1, 1])
-    def clear_counter_kernel(total_tiles: fx.Tensor):
+    def clear_counter_kernel(
+        total_tiles: fx.Tensor,
+        active_expert_storage: fx.Tensor,
+    ):
         if gpu.thread_idx.x == fx.Int32(0):
             total_rsrc = buffer_ops.create_buffer_resource(total_tiles, max_size=True)
             buffer_ops.buffer_store(fx.Int32(0), total_rsrc, fx.Int32(0))
+            if emit_active_experts:
+                active_rsrc = buffer_ops.create_buffer_resource(
+                    active_expert_storage,
+                    max_size=True,
+                )
+                buffer_ops.buffer_store(fx.Int32(0), active_rsrc, fx.Int32(0))
 
     @flyc.kernel(known_block_size=[_BLOCK_THREADS, 1, 1])
     def build_descriptor_kernel(
@@ -161,6 +177,8 @@ def compile_compact_m_tile_descriptor_builder(
         descriptors: fx.Tensor,
         total_tiles: fx.Tensor,
         i32_descriptor_capacity: fx.Int32,
+        active_expert_storage: fx.Tensor,
+        i32_active_expert_capacity: fx.Int32,
     ):
         expert = gpu.block_idx.x * fx.Int32(_BLOCK_THREADS) + gpu.thread_idx.x
         if expert < fx.Int32(num_experts):
@@ -196,6 +214,26 @@ def compile_compact_m_tile_descriptor_builder(
                     buffer_ops.buffer_load(expert_ids_rsrc, safe_lo, vec_width=1, dtype=T.i32)
                 )
                 if in_metadata & (found_expert == expert):
+                    if emit_active_experts:
+                        active_slot = atomic_add(
+                            active_expert_storage,
+                            fx.Int32(0),
+                            fx.Int32(1),
+                            dtype_bytes=4,
+                        )
+                        active_index = fx.Int32(active_slot)
+                        if active_index < i32_active_expert_capacity:
+                            active_rsrc = buffer_ops.create_buffer_resource(
+                                active_expert_storage,
+                                max_size=True,
+                            )
+                            active_offset = fx.Int32(1) + active_index * fx.Int32(2)
+                            buffer_ops.buffer_store(expert, active_rsrc, active_offset)
+                            buffer_ops.buffer_store(
+                                lo * fx.Int32(sorted_block_m),
+                                active_rsrc,
+                                active_offset + fx.Int32(1),
+                            )
                     tile_count = (frequency + fx.Int32(block_m - 1)) // fx.Int32(block_m)
                     reservation = atomic_add(
                         total_tiles,
@@ -223,9 +261,11 @@ def compile_compact_m_tile_descriptor_builder(
         descriptors: fx.Tensor,
         total_tiles: fx.Tensor,
         i32_descriptor_capacity: fx.Int32,
+        active_expert_storage: fx.Tensor,
+        i32_active_expert_capacity: fx.Int32,
         stream: fx.Stream = fx.Stream(None),
     ):
-        clear_counter_kernel(total_tiles).launch(
+        clear_counter_kernel(total_tiles, active_expert_storage).launch(
             grid=(1, 1, 1),
             block=(_BLOCK_THREADS, 1, 1),
             stream=stream,
@@ -237,6 +277,8 @@ def compile_compact_m_tile_descriptor_builder(
             descriptors,
             total_tiles,
             i32_descriptor_capacity,
+            active_expert_storage,
+            i32_active_expert_capacity,
         ).launch(
             grid=((num_experts + _BLOCK_THREADS - 1) // _BLOCK_THREADS, 1, 1),
             block=(_BLOCK_THREADS, 1, 1),
@@ -256,9 +298,17 @@ def build_compact_m_tile_descriptors(
     block_m: int,
     sorted_block_m: int,
     descriptor_capacity: int | None = None,
+    active_expert_storage: torch.Tensor | None = None,
+    active_expert_capacity: int | None = None,
     stream: torch.cuda.Stream | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Clear ``total_tiles`` and asynchronously build compact M descriptors."""
+    """Clear counters and asynchronously build compact M descriptors.
+
+    Supplying ``active_expert_storage`` additionally emits the counter-first
+    active-expert queue used by grouped dW1/dW2, within the same clear/build
+    kernel pair.  The optional storage ABI is
+    ``[count, expert0, first_row0, expert1, first_row1, ...]``.
+    """
 
     tensors = {
         "expert_frequency": expert_frequency,
@@ -287,6 +337,29 @@ def build_compact_m_tile_descriptors(
         raise ValueError("descriptors must be rank 1")
     if total_tiles.ndim != 1 or total_tiles.numel() < 1:
         raise ValueError("total_tiles must contain at least one element")
+    if active_expert_storage is not None:
+        if active_expert_storage.device != device:
+            raise ValueError(
+                f"active_expert_storage must be on {device}, got {active_expert_storage.device}"
+            )
+        if active_expert_storage.dtype != torch.int32:
+            raise ValueError(
+                "active_expert_storage must have dtype torch.int32, "
+                f"got {active_expert_storage.dtype}"
+            )
+        if not active_expert_storage.is_contiguous():
+            raise ValueError("active_expert_storage must be contiguous")
+        if (
+            active_expert_storage.ndim != 1
+            or active_expert_storage.numel() < 1
+            or (active_expert_storage.numel() - 1) % 2
+        ):
+            raise ValueError(
+                "active_expert_storage must use the counter-first "
+                "[count, (expert, first_row) * capacity] ABI"
+            )
+    elif active_expert_capacity is not None:
+        raise ValueError("active_expert_capacity requires active_expert_storage")
     if block_m <= 0 or sorted_block_m <= 0 or sorted_block_m % block_m:
         raise ValueError(
             f"expected positive block_m dividing sorted_block_m, got block_m={block_m}, "
@@ -300,6 +373,31 @@ def build_compact_m_tile_descriptors(
         raise ValueError(
             f"descriptor_capacity must be in [0, {min(descriptors.numel(), _MAX_SIGNED_I32)}], got {capacity}"
         )
+    if active_expert_storage is None:
+        active_capacity = 0
+        active_storage_arg = total_tiles
+    else:
+        storage_capacity = (active_expert_storage.numel() - 1) // 2
+        active_capacity = (
+            storage_capacity
+            if active_expert_capacity is None
+            else active_expert_capacity
+        )
+        if not isinstance(active_capacity, int):
+            raise TypeError(
+                "active_expert_capacity must be an int or None, "
+                f"got {type(active_capacity).__name__}"
+            )
+        if (
+            active_capacity < 0
+            or active_capacity > storage_capacity
+            or active_capacity > _MAX_SIGNED_I32
+        ):
+            raise ValueError(
+                "active_expert_capacity must be in "
+                f"[0, {min(storage_capacity, _MAX_SIGNED_I32)}], got {active_capacity}"
+            )
+        active_storage_arg = active_expert_storage
     if stream is None:
         stream = torch.cuda.current_stream(device)
     device_index = device.index or 0
@@ -308,6 +406,7 @@ def build_compact_m_tile_descriptors(
         block_m,
         sorted_block_m,
         device_index,
+        active_expert_storage is not None,
     )
     _run_compiled(
         launcher,
@@ -317,6 +416,8 @@ def build_compact_m_tile_descriptors(
         descriptors,
         total_tiles,
         capacity,
+        active_storage_arg,
+        active_capacity,
         stream,
     )
     return descriptors, total_tiles

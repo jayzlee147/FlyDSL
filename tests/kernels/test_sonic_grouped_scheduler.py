@@ -59,6 +59,16 @@ def _expected_descriptors(frequencies, block_m):
     return result
 
 
+def _expected_active_experts(frequencies):
+    result = []
+    first_row = 0
+    for expert, count in enumerate(frequencies):
+        if count:
+            result.append((expert, first_row))
+        first_row += math.ceil(count / _SORTED_BLOCK_M) * _SORTED_BLOCK_M
+    return result
+
+
 def _run_and_check(frequencies, block_m, capacity, *, repeats=3):
     device = _gfx950_device()
     frequency, sorted_experts, num_valid = _metadata_from_frequencies(frequencies, device)
@@ -164,6 +174,53 @@ def test_compact_descriptor_builder_drops_stores_past_capacity():
     frequencies = [0, 1, 15, 16, 17, 63, 64, 65]
     expected = _expected_descriptors(frequencies, 16)
     _run_and_check(frequencies, 16, len(expected) - 1)
+
+
+@pytest.mark.parametrize(
+    "frequencies",
+    (
+        [0, 1, 15, 16, 17, 63, 64, 65],
+        [3] * 256 + [2] * 640,
+        [128] * 16 + [0] * 880,
+    ),
+)
+def test_compact_builder_also_emits_shared_active_expert_queue(frequencies):
+    device = _gfx950_device()
+    frequency, sorted_experts, num_valid = _metadata_from_frequencies(frequencies, device)
+    routes = sum(frequencies)
+    descriptor_bound = ragged_compact_m_tile_descriptor_upper_bound(
+        routes,
+        len(frequencies),
+        16,
+    )
+    active_capacity = min(routes, len(frequencies))
+    descriptors = torch.empty(descriptor_bound, dtype=torch.int32, device=device)
+    total = torch.full((1,), -1, dtype=torch.int32, device=device)
+    active_storage = torch.full(
+        (1 + 2 * active_capacity,),
+        -1,
+        dtype=torch.int32,
+        device=device,
+    )
+
+    build_compact_m_tile_descriptors(
+        frequency,
+        sorted_experts,
+        num_valid,
+        descriptors,
+        total,
+        block_m=16,
+        sorted_block_m=_SORTED_BLOCK_M,
+        descriptor_capacity=descriptor_bound,
+        active_expert_storage=active_storage,
+        active_expert_capacity=active_capacity,
+    )
+    torch.cuda.synchronize()
+
+    expected = _expected_active_experts(frequencies)
+    assert active_storage[0].item() == len(expected)
+    actual = active_storage[1 : 1 + 2 * len(expected)].reshape(-1, 2).cpu().tolist()
+    assert sorted(map(tuple, actual)) == expected
 
 
 @pytest.mark.parametrize(
