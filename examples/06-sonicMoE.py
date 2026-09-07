@@ -54,6 +54,13 @@ def _parse_args():
     parser.add_argument("--stage1-xcd-swizzle", type=int, default=0)
     parser.add_argument("--stage2-xcd-swizzle", type=int, default=1)
     parser.add_argument(
+        "--stage2-pipeline-stages",
+        type=int,
+        choices=(1, 2),
+        default=None,
+        help="override the auto-selected stage-2 A-LDS pipeline depth",
+    )
+    parser.add_argument(
         "--stage2-output-mode",
         choices=("atomic", "reduce"),
         default="atomic",
@@ -107,6 +114,7 @@ def main():
         down_tile_k=args.down_tile_k,
         stage1_xcd_swizzle=args.stage1_xcd_swizzle,
         stage2_xcd_swizzle=args.stage2_xcd_swizzle,
+        stage2_pipeline_stages=args.stage2_pipeline_stages,
         stage2_output_mode=args.stage2_output_mode,
         activation=args.activation,
         compute_dtype=compute_dtype,

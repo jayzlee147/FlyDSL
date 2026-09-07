@@ -141,6 +141,7 @@ class SonicMoEConfig:
     stage2_xcd_swizzle: int = 1
     waves_per_eu: int | None = None
     persistent_stage2: bool = False
+    stage2_pipeline_stages: int | None = None
     stage2_output_mode: str = "atomic"
     activation: str = "swiglu"
     compute_dtype: str = "bf16"
@@ -242,6 +243,15 @@ class SonicMoEConfig:
             raise ValueError("stage1_b_cache_mod must be None, 0 (cached), or 2 (non-temporal)")
         if self.stage2_b_cache_mod not in (None, 0, 2):
             raise ValueError("stage2_b_cache_mod must be None, 0 (cached), or 2 (non-temporal)")
+        if isinstance(self.stage2_pipeline_stages, bool) or self.stage2_pipeline_stages not in (
+            None,
+            1,
+            2,
+        ):
+            raise ValueError(
+                "stage2_pipeline_stages must be None (auto), 1, or 2, got "
+                f"{self.stage2_pipeline_stages!r}"
+            )
         if self.stage1_xcd_swizzle < 0 or self.stage2_xcd_swizzle < 0:
             raise ValueError("XCD swizzle values must be non-negative")
 
@@ -1063,13 +1073,18 @@ def _stage2_cache_mod(config: SonicMoEConfig, tokens: int) -> int:
 def _stage2_stages(config: SonicMoEConfig, tokens: int) -> int:
     """Select the measured gfx950 Stage-2 A-LDS pipeline depth.
 
-    The two-stage implementation is intentionally gated to the one production
+    An explicit ``stage2_pipeline_stages`` value is a tuning override used by
+    controlled gfx950 sweeps.  With the default ``None``, the two-stage
+    implementation is intentionally gated to the one production
     bucket where paired AB/BA measurements showed a repeatable gain.  All other
     shapes retain the established serial loop.  Route layout, weight-format,
     bias, and actual output-mode checks live at the call site because they are
     properties of the prepared invocation rather than
     :class:`SonicMoEConfig` alone.
     """
+
+    if config.stage2_pipeline_stages is not None:
+        return config.stage2_pipeline_stages
 
     return (
         2

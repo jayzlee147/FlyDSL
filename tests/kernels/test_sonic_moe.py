@@ -2678,6 +2678,15 @@ def test_sonic_moe_stage2_pipeline_gate_is_exact():
     ):
         assert _stage2_stages(fallback, 4096) == 1
 
+    assert _stage2_stages(replace(tuned, stage2_pipeline_stages=1), 4096) == 1
+    assert _stage2_stages(replace(tuned, stage2_pipeline_stages=2), 4095) == 2
+
+
+@pytest.mark.parametrize("value", (0, 3, True, "2"))
+def test_sonic_moe_rejects_invalid_stage2_pipeline_depth(value):
+    with pytest.raises(ValueError, match="stage2_pipeline_stages"):
+        _config(stage2_pipeline_stages=value)
+
 
 def test_sonic_moe_stage2_pipeline_gate_rejects_ragged_routes(monkeypatch):
     """Flat route lists must retain the measured serial Stage-2 path."""
