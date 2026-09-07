@@ -146,6 +146,13 @@ def compile_sonic_grouped_a16w16_nn(
     num_n_blocks = output_size // block_n
     cshuffle_vec_size = async_load_vec_size
     cshuffle_x_threads = block_n // cshuffle_vec_size
+    if store_route_slots and (
+        cshuffle_x_threads > GFX950_WAVE_SIZE
+        or GFX950_WAVE_SIZE % cshuffle_x_threads
+    ):
+        raise ValueError(
+            "route-slot output vectors for one row must form whole groups within a wave"
+        )
     cshuffle_vectors = block_m * block_n // cshuffle_vec_size
     cshuffle_iters = (cshuffle_vectors + block_threads - 1) // block_threads
     name = (
@@ -393,7 +400,24 @@ def compile_sonic_grouped_a16w16_nn(
                     )
                     sorted_row = m_row + local_row
                     if const_expr(store_route_slots):
-                        packed = fx.Int32(_global_i32_at(arg_sorted_token_ids, sorted_row))
+                        # Every row is written by ``block_n / 8`` adjacent
+                        # lanes.  Fetch its packed route once per lane group
+                        # and broadcast within the wave instead of issuing the
+                        # same VMEM load for every 16-byte output vector.
+                        lane = tid % fx.Int32(GFX950_WAVE_SIZE)
+                        packed_lane = fx.Int32(0)
+                        if lane % fx.Int32(cshuffle_x_threads) == fx.Int32(0):
+                            packed_lane = fx.Int32(
+                                _global_i32_at(arg_sorted_token_ids, sorted_row)
+                            )
+                        source_lane = lane - lane % fx.Int32(cshuffle_x_threads)
+                        packed = fx.Int32(
+                            rocdl.ds_bpermute(
+                                T.i32,
+                                source_lane * fx.Int32(4),
+                                packed_lane,
+                            )
+                        )
                         token = packed & fx.Int32(0x00FFFFFF)
                         slot = (packed >> fx.Int32(24)) & fx.Int32(0xFF)
                         valid = (token < i32_tokens) & (slot < fx.Int32(top_k))

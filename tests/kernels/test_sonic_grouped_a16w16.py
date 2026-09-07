@@ -29,6 +29,15 @@ def _gfx950_device():
         ({"store_route_slots": 1}, "store_route_slots"),
         ({"store_route_slots": True, "top_k": 0}, "top_k"),
         ({"store_route_slots": True, "top_k": 257}, "top_k"),
+        (
+            {
+                "store_route_slots": True,
+                "output_size": 96,
+                "block_n": 96,
+                "n_waves": 2,
+            },
+            "route-slot output vectors",
+        ),
     ),
 )
 def test_grouped_dx_route_slot_options_validate(overrides, message):

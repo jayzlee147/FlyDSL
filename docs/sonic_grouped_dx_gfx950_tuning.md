@@ -13,8 +13,12 @@ production kernel or include sorter/descriptor-builder latency.
 Production fixed-K backward now preserves the same GEMM body and BF16 rounding
 but decodes the packed token/slot ID in its epilogue and writes directly to
 `dX_routes[T,K,H]`.  This removes the padded `dX_sorted` allocation and the
-standalone unsort launch.  The isolated measurements below predate that
-epilogue fusion; ragged and generic fallback paths still use sorted output.
+standalone unsort launch.  One lane per output-row group loads the packed ID
+and broadcasts it with `ds_bpermute_b32`; the other 7, 15, or 31 lanes do not
+repeat the same metadata VMEM load.  The production T1, T128 sparse/dense, and
+T4096 code objects retain zero scratch and unchanged LDS allocation after this
+broadcast.  The isolated measurements below predate that epilogue fusion;
+ragged and generic fallback paths still use sorted output.
 
 ## Reproduction
 
