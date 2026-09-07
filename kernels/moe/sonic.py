@@ -19,8 +19,9 @@ directly to tokens or writes fixed top-k route rows for reduction.
 Weights may be dense BF16/FP16 (A16W16) or per-1x32 E8M0-scaled MXFP4
 (A16W4). MXFP4 currently uses BF16 activations; dense weights use the compute
 dtype selected by :class:`SonicMoEConfig`.
-The reusable :class:`SonicMoE` object remains an inference-forward API.  This
-module also exports standalone ``sonic_moe_backward`` and
+The reusable :class:`SonicMoE` object retains its inference-forward API and
+also exposes an explicitly training-oriented fixed-K state-producing entry
+point.  This module exports standalone ``sonic_moe_backward`` and
 ``sonic_moe_backward_routes`` entry points for dense BF16/FP16 fixed-K and flat
 ragged-route training across all supported activations, including optional
 expert bias gradients.
@@ -90,6 +91,24 @@ _GEMM1_ACTIVATIONS = {
     "silu": "silu_pointwise",
     "relu_sq": "relu_sq",
 }
+
+
+def _validate_training_preactivation_extent(tokens: int, top_k: int, intermediate_size: int) -> None:
+    """Keep masked route-state stores below their signed-i32 sentinel.
+
+    The training GEMM uses ``0x7fffffff`` as the byte offset for masked-off
+    lanes.  Consequently the state resource itself must end below that
+    sentinel, even though ordinary FlyDSL buffer addressing permits the full
+    unsigned 32-bit range.
+    """
+
+    state_bytes = tokens * top_k * 2 * intermediate_size * 2
+    if state_bytes > _MAX_SIGNED_I32:
+        raise ValueError(
+            "training preactivation exceeds the kernel's signed 32-bit "
+            "masked-store byte-offset limit: "
+            f"tokens={tokens}, top_k={top_k}, intermediate_size={intermediate_size}"
+        )
 
 
 @dataclass(frozen=True)
@@ -332,6 +351,35 @@ class SonicMoEWeights:
     @property
     def compute_dtype(self) -> torch.dtype:
         return _COMPUTE_DTYPES[self.config.compute_dtype]
+
+
+@dataclass(frozen=True)
+class SonicMoEForwardState:
+    """Immutable, invocation-owned state emitted by a training forward.
+
+    ``preactivation`` is compact fixed-K route-order storage with shape
+    ``[tokens, top_k, 2 * intermediate_size]``.  Its last dimension is either
+    separate gate/up halves or native ``[g0, u0, ...]`` interleaving according
+    to ``interleaved_w1``.  The tensor never aliases reusable
+    :class:`SonicMoEWorkspace` storage.
+
+    ``ready_event`` is recorded after the complete forward enqueue sequence.
+    A future standalone backward consumer can skip a wait on
+    ``producer_stream`` and otherwise wait on this event without a host
+    synchronization.
+    """
+
+    preactivation: torch.Tensor
+    tokens: int
+    hidden_size: int
+    intermediate_size: int
+    num_experts: int
+    top_k: int
+    activation: str
+    compute_dtype: str
+    interleaved_w1: bool
+    producer_stream: int
+    ready_event: torch.cuda.Event
 
 
 @dataclass
@@ -1080,6 +1128,41 @@ def _get_stage1_launcher(
 
 
 @functools.lru_cache(maxsize=256)
+def _get_stage1_training_launcher(
+    config: SonicMoEConfig,
+    b_cache_mod: int,
+    has_bias: bool,
+    interleaved_w1: bool,
+    device_index: int,
+):
+    """Compile the BF16 fixed-K dual-output Stage-1 specialization."""
+
+    del device_index
+    return compile_gemm1_a16w4_port(
+        BM=config.tile_m,
+        SORTED_BM=config.route_tile_m,
+        D_HIDDEN=config.hidden_size,
+        D_INTER=config.intermediate_size,
+        NE=config.num_experts,
+        TOPK=config.top_k,
+        TILE_N=config.tile_n,
+        TILE_K=config.tile_k,
+        act=_GEMM1_ACTIVATIONS[config.activation],
+        b_cache_mod=b_cache_mod,
+        xcd_swizzle=config.stage1_xcd_swizzle,
+        waves_per_eu=config.waves_per_eu,
+        w_dtype="bf16",
+        a_dtype="bf16",
+        w_layout="standard",
+        k_wave=config.stage1_k_wave,
+        round_preact_bf16=True,
+        has_bias=has_bias,
+        store_route_preactivation=True,
+        route_preactivation_interleaved=interleaved_w1,
+    )
+
+
+@functools.lru_cache(maxsize=256)
 def _get_stage2_launcher(
     config: SonicMoEConfig,
     b_cache_mod: int,
@@ -1236,6 +1319,11 @@ class SonicMoE:
         if not str(arch).startswith("gfx95"):
             raise RuntimeError(f"SonicMoE CDNA4 forward requires gfx95*, got {arch!r}")
         return tokens
+
+    def _validate_training_hidden(self, hidden_states: torch.Tensor) -> int:
+        """Apply the physical forward ABI while permitting autograd inputs."""
+
+        return self._validate_hidden(hidden_states.detach() if hidden_states.requires_grad else hidden_states)
 
     def _validate_out(
         self,
@@ -1399,6 +1487,114 @@ class SonicMoE:
                 topk=cfg.top_k,
                 model_dim=cfg.hidden_size,
                 dtype_str=reduction_dtype,
+            )
+            route_output_ptr = flyc.from_c_void_p(fx.Uint8, workspace.route_output.data_ptr())
+            out_ptr = flyc.from_c_void_p(fx.Uint8, out.data_ptr())
+            unused_ptr = flyc.from_c_void_p(fx.Uint8, self.weights.dummy_scale.data_ptr())
+            _run_compiled(
+                reduce,
+                route_output_ptr,
+                out_ptr,
+                unused_ptr,
+                unused_ptr,
+                tokens,
+                stream,
+            )
+        return out
+
+    def _run_grouped_gemms_training(
+        self,
+        hidden_states: torch.Tensor,
+        workspace: SonicMoEWorkspace,
+        out: torch.Tensor,
+        route_preactivation: torch.Tensor,
+        *,
+        interleaved_w1: bool,
+    ) -> torch.Tensor:
+        """Training-only grouped forward with the Stage-1 dual output."""
+
+        cfg = self.config
+        tokens = workspace.tokens
+        stream = torch.cuda.current_stream(hidden_states.device)
+        output_mode = cfg.stage2_output_mode
+        if output_mode == "reduce" and workspace.route_output is None:
+            raise RuntimeError("reduce stage2 output requires a fixed-top-k route workspace")
+
+        stage1 = _get_stage1_training_launcher(
+            cfg,
+            _stage1_cache_mod(cfg, tokens),
+            self.weights.has_bias,
+            interleaved_w1,
+            hidden_states.device.index or 0,
+        )
+        grid1 = gemm1_a16w4_grid(
+            cfg.tile_m,
+            INTER=cfg.intermediate_size,
+            TILE_N=cfg.tile_n,
+            max_m_blocks=workspace.stage1_max_m_blocks,
+        )
+        _run_compiled(
+            stage1,
+            hidden_states.data_ptr(),
+            self.weights.gate_up.data_ptr(),
+            self.weights.dummy_scale.data_ptr(),
+            (self.weights.dummy_scale if self.weights.stage1_bias is None else self.weights.stage1_bias).data_ptr(),
+            workspace.sorted_expert_ids.data_ptr(),
+            workspace.num_valid_ids.data_ptr(),
+            workspace.sorted_token_ids.data_ptr(),
+            tokens,
+            int(grid1),
+            1.0,
+            1.0,
+            1.0,
+            1.0,
+            float("inf"),
+            workspace.intermediate.data_ptr(),
+            route_preactivation.data_ptr(),
+            stream,
+        )
+
+        stage2_stages = _stage2_stages(cfg, tokens)
+        if self.weights.has_bias or output_mode != "atomic":
+            stage2_stages = 1
+        stage2 = _get_stage2_launcher(
+            cfg,
+            _stage2_cache_mod(cfg, tokens),
+            "bf16",
+            self.weights.has_bias,
+            output_mode,
+            stage2_stages,
+            hidden_states.device.index or 0,
+        )
+        grid2 = gemm2_a16w4_grid(
+            cfg.stage2_tile_m,
+            N_OUT=cfg.hidden_size,
+            TILE_N=cfg.stage2_tile_n,
+            max_m_blocks=workspace.stage2_max_m_blocks,
+            persist=cfg.persistent_stage2,
+        )
+        _run_compiled(
+            stage2,
+            workspace.intermediate.data_ptr(),
+            self.weights.down.data_ptr(),
+            self.weights.dummy_scale.data_ptr(),
+            (self.weights.dummy_scale if self.weights.stage2_bias is None else self.weights.stage2_bias).data_ptr(),
+            workspace.sorted_expert_ids.data_ptr(),
+            workspace.num_valid_ids.data_ptr(),
+            workspace.sorted_token_ids.data_ptr(),
+            workspace.sorted_weights.data_ptr(),
+            tokens,
+            workspace.stage2_max_m_blocks,
+            int(grid2),
+            (workspace.route_output if output_mode == "reduce" else out).data_ptr(),
+            stream,
+        )
+        if output_mode == "reduce":
+            assert workspace.route_output is not None
+            reduce = compile_moe_reduction(
+                topk=cfg.top_k,
+                model_dim=cfg.hidden_size,
+                dtype_str="bf16",
             )
             route_output_ptr = flyc.from_c_void_p(fx.Uint8, workspace.route_output.data_ptr())
             out_ptr = flyc.from_c_void_p(fx.Uint8, out.data_ptr())
@@ -1727,6 +1923,189 @@ class SonicMoE:
                 return output
             return self._run_grouped_gemms(hidden_states, workspace, output)
 
+    @staticmethod
+    def _record_training_forward_stream(
+        stream: torch.cuda.Stream,
+        *tensors: torch.Tensor | None,
+    ) -> None:
+        """Tie every raw-pointer tensor in a training launch to its stream."""
+
+        recorded_storages: set[int] = set()
+        for tensor in tensors:
+            if tensor is None:
+                continue
+            storage = tensor.untyped_storage().data_ptr()
+            if storage in recorded_storages:
+                continue
+            tensor.record_stream(stream)
+            recorded_storages.add(storage)
+
+    def forward_topk_training(
+        self,
+        hidden_states: torch.Tensor,
+        topk_ids: torch.Tensor,
+        topk_weights: torch.Tensor,
+        out: torch.Tensor | None = None,
+        *,
+        interleaved_w1: bool = False,
+    ) -> tuple[torch.Tensor, SonicMoEForwardState]:
+        """Run fixed-K forward and retain exact A16 W1 preactivation.
+
+        This first training-state specialization supports dense BF16 SwiGLU.
+        The saved tensor is allocated per invocation and is never backed by a
+        reusable workspace.  ``interleaved_w1=True`` changes only the saved
+        state's last-dimension layout to ``[g0, u0, ...]``; prepared forward
+        weights retain their established preshuffled representation.
+
+        As in :meth:`forward_topk`, each token's expert IDs must be distinct
+        and in range.  The hot path does not synchronize to validate values.
+
+        This is a low-level raw-pointer launch API, not a PyTorch autograd
+        Function: it permits gradient-bearing inputs so an adapter can save
+        them and provide the corresponding backward implementation.  Calling
+        it directly does not attach a ``grad_fn`` to ``output`` or state.
+
+        Forward-only graph capture is deliberately rejected in this phase.
+        Safe capture requires an explicit graph-private preallocated state slot
+        and a paired lifetime protocol, neither of which this API exposes yet.
+        """
+
+        if not isinstance(interleaved_w1, bool):
+            raise TypeError("interleaved_w1 must be bool")
+        if self.weights.weight_dtype != "bf16" or self.config.compute_dtype != "bf16":
+            raise NotImplementedError(
+                "forward_topk_training currently supports only dense BF16 weights and compute"
+            )
+        if self.config.activation != "swiglu":
+            raise NotImplementedError(
+                "forward_topk_training currently supports only activation='swiglu'"
+            )
+        if not hidden_states.is_cuda:
+            raise ValueError("hidden_states must be on a ROCm device")
+        with torch.cuda.device(hidden_states.device):
+            if torch.cuda.is_current_stream_capturing():
+                raise RuntimeError(
+                    "forward_topk_training does not support graph capture without a "
+                    "graph-private preallocated state slot; capture support is not enabled"
+                )
+            return self._forward_topk_training_on_current_device(
+                hidden_states,
+                topk_ids,
+                topk_weights,
+                out,
+                interleaved_w1=interleaved_w1,
+            )
+
+    def _forward_topk_training_on_current_device(
+        self,
+        hidden_states: torch.Tensor,
+        topk_ids: torch.Tensor,
+        topk_weights: torch.Tensor,
+        out: torch.Tensor | None,
+        *,
+        interleaved_w1: bool,
+    ) -> tuple[torch.Tensor, SonicMoEForwardState]:
+        tokens = self._validate_training_hidden(hidden_states)
+        expected = (tokens, self.config.top_k)
+        if tuple(topk_ids.shape) != expected or tuple(topk_weights.shape) != expected:
+            raise ValueError(
+                f"topk_ids/topk_weights must both have shape {expected}, got "
+                f"{tuple(topk_ids.shape)}/{tuple(topk_weights.shape)}"
+            )
+        if (
+            not topk_ids.is_cuda
+            or not topk_weights.is_cuda
+            or topk_ids.device != hidden_states.device
+            or topk_weights.device != hidden_states.device
+        ):
+            raise ValueError("topk ids/weights must be on the same ROCm device as hidden_states")
+        if topk_ids.dtype != torch.int32 or topk_weights.dtype != torch.float32:
+            raise TypeError(
+                f"topk_ids/topk_weights must be int32/float32, got "
+                f"{topk_ids.dtype}/{topk_weights.dtype}"
+            )
+        if not topk_ids.is_contiguous() or not topk_weights.is_contiguous():
+            raise ValueError("topk ids/weights must be contiguous")
+
+        _validate_training_preactivation_extent(
+            tokens,
+            self.config.top_k,
+            self.config.intermediate_size,
+        )
+
+        workspace = self.reserve(tokens)
+        output = self._validate_out(
+            out,
+            workspace,
+            hidden_states,
+            topk_ids,
+            topk_weights,
+            *self.weights.tensors,
+        )
+        preactivation = torch.empty(
+            (tokens, self.config.top_k, 2 * self.config.intermediate_size),
+            dtype=torch.bfloat16,
+            device=hidden_states.device,
+        )
+        if preactivation.untyped_storage().data_ptr() in workspace.storage_ptrs:
+            raise RuntimeError("training preactivation unexpectedly aliases reusable workspace storage")
+
+        stream = torch.cuda.current_stream(hidden_states.device)
+        ready_event = torch.cuda.Event()
+        with workspace._launch_lock:
+            moe_sorting_flydsl(
+                topk_ids,
+                topk_weights,
+                workspace.sorted_token_ids,
+                workspace.sorted_weights,
+                workspace.sorted_expert_ids,
+                workspace.num_valid_ids,
+                output,
+                self.config.num_experts,
+                unit_size=self.config.route_tile_m,
+                workspace=workspace.sorting_workspace,
+                direct_single_token=True,
+            )
+            result = self._run_grouped_gemms_training(
+                hidden_states,
+                workspace,
+                output,
+                preactivation,
+                interleaved_w1=interleaved_w1,
+            )
+            self._record_training_forward_stream(
+                stream,
+                hidden_states,
+                topk_ids,
+                topk_weights,
+                result,
+                preactivation,
+                *self.weights.tensors,
+                workspace.sorted_token_ids,
+                workspace.sorted_weights,
+                workspace.sorted_expert_ids,
+                workspace.num_valid_ids,
+                workspace.sorting_workspace,
+                workspace.intermediate,
+                workspace.route_output,
+            )
+            ready_event.record(stream)
+
+        state = SonicMoEForwardState(
+            preactivation=preactivation,
+            tokens=tokens,
+            hidden_size=self.config.hidden_size,
+            intermediate_size=self.config.intermediate_size,
+            num_experts=self.config.num_experts,
+            top_k=self.config.top_k,
+            activation=self.config.activation,
+            compute_dtype=self.config.compute_dtype,
+            interleaved_w1=interleaved_w1,
+            producer_stream=int(stream.cuda_stream),
+            ready_event=ready_event,
+        )
+        return result, state
+
     def forward_topk(
         self,
         hidden_states: torch.Tensor,
@@ -1939,6 +2318,7 @@ def sonic_moe_mxfp4_reference(
 __all__ = [
     "SonicMoE",
     "SonicMoEConfig",
+    "SonicMoEForwardState",
     "SonicMoEWeights",
     "SonicMoEWorkspace",
     "prepare_sonic_bf16_weights",

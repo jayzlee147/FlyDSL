@@ -7,21 +7,25 @@ import json
 import math
 import threading
 import weakref
-from dataclasses import replace
+from dataclasses import FrozenInstanceError, replace
 
 import pytest
 import torch
 
 from flydsl.runtime.device import get_rocm_arch
+from kernels.moe.moe_2stage_a16wmix.gemm1 import compile_gemm1_a16w4_port
 from kernels.moe.sonic import (
     SonicMoE,
     SonicMoEConfig,
+    SonicMoEForwardState,
     SonicMoEWeights,
     SonicMoEWorkspace,
     _get_stage1_launcher,
+    _get_stage1_training_launcher,
     _get_stage2_launcher,
     _quantize_mxfp4_weight,
     _stage2_stages,
+    _validate_training_preactivation_extent,
     prepare_sonic_bf16_weights,
     prepare_sonic_fp16_weights,
     prepare_sonic_mxfp4_weights,
@@ -111,6 +115,22 @@ def _prepare_dense_weights(w1, w2, config, *, b1=None, b2=None):
     return prepare(w1, w2, config, b1=b1, b2=b2)
 
 
+def _fixed_topk_preactivation_oracle(x, w1, topk_ids, *, b1=None, interleaved=False):
+    """Independent logical-weight GEMM oracle for compact route-order state."""
+
+    tokens, top_k = topk_ids.shape
+    selected_w1 = w1[topk_ids.long()].float().reshape(tokens * top_k, w1.shape[1], w1.shape[2])
+    route_x = x[:, None, :].expand(tokens, top_k, x.shape[1]).reshape(tokens * top_k, x.shape[1]).float()
+    preactivation = torch.bmm(selected_w1, route_x.unsqueeze(-1)).squeeze(-1)
+    if b1 is not None:
+        preactivation = preactivation + b1[topk_ids.long()].float().reshape(tokens * top_k, w1.shape[1])
+    preactivation = preactivation.to(torch.bfloat16).view(tokens, top_k, -1)
+    if interleaved:
+        gate, up = preactivation.chunk(2, dim=-1)
+        preactivation = torch.stack((gate, up), dim=-1).reshape(tokens, top_k, -1)
+    return preactivation
+
+
 def test_sonic_moe_bf16_forward_matches_reference():
     config = _config()
     x, w1, w2, router_logits = _make_case()
@@ -132,6 +152,221 @@ def test_sonic_moe_bf16_forward_matches_reference():
     torch.cuda.synchronize()
     assert returned is out
     _assert_close(out, expected)
+
+
+@pytest.mark.parametrize("interleaved_w1", (False, True), ids=("separate", "interleaved"))
+@pytest.mark.parametrize("has_bias", (False, True), ids=("no-bias", "bias"))
+def test_sonic_moe_training_forward_state_matches_route_order_gemm(interleaved_w1, has_bias):
+    config = _config()
+    x, w1, w2, router_logits = _make_case(seed=271)
+    generator = torch.Generator(device=x.device).manual_seed(273)
+    b1 = (
+        torch.randn(
+            (NUM_EXPERTS, 2 * INTERMEDIATE_SIZE),
+            dtype=torch.bfloat16,
+            device=x.device,
+            generator=generator,
+        )
+        / 8
+        if has_bias
+        else None
+    )
+    b2 = (
+        torch.randn(
+            (NUM_EXPERTS, HIDDEN_SIZE),
+            dtype=torch.bfloat16,
+            device=x.device,
+            generator=generator,
+        )
+        / 8
+        if has_bias
+        else None
+    )
+    topk_ids, topk_weights = _topk_from_logits(router_logits, config)
+    op = SonicMoE(config, prepare_sonic_bf16_weights(w1, w2, config, b1=b1, b2=b2))
+    out = torch.empty_like(x)
+
+    returned, state = op.forward_topk_training(
+        x,
+        topk_ids,
+        topk_weights,
+        out=out,
+        interleaved_w1=interleaved_w1,
+    )
+    expected_state = _fixed_topk_preactivation_oracle(
+        x,
+        w1,
+        topk_ids,
+        b1=b1,
+        interleaved=interleaved_w1,
+    )
+    expected_out = sonic_moe_reference(x, w1, w2, router_logits, config, b1=b1, b2=b2)
+    torch.cuda.synchronize()
+
+    assert returned is out
+    assert isinstance(state, SonicMoEForwardState)
+    assert state.preactivation.shape == (TOKENS, TOP_K, 2 * INTERMEDIATE_SIZE)
+    assert state.preactivation.dtype == torch.bfloat16
+    assert state.preactivation.is_contiguous()
+    assert state.tokens == TOKENS
+    assert state.hidden_size == HIDDEN_SIZE
+    assert state.intermediate_size == INTERMEDIATE_SIZE
+    assert state.num_experts == NUM_EXPERTS
+    assert state.top_k == TOP_K
+    assert state.activation == "swiglu"
+    assert state.compute_dtype == "bf16"
+    assert state.interleaved_w1 is interleaved_w1
+    assert state.producer_stream == int(torch.cuda.current_stream(x.device).cuda_stream)
+    assert state.ready_event.query()
+    assert op.workspace is not None
+    assert state.preactivation.untyped_storage().data_ptr() not in op.workspace.storage_ptrs
+    with pytest.raises(FrozenInstanceError):
+        state.tokens = 1
+    torch.testing.assert_close(state.preactivation.float(), expected_state.float(), rtol=3e-2, atol=5e-2)
+    _assert_close(out, expected_out)
+
+
+def test_sonic_moe_training_states_are_invocation_owned_and_not_overwritten():
+    config = _config()
+    x_a, w1, w2, logits_a = _make_case(seed=277)
+    x_b, _, _, logits_b = _make_case(seed=281)
+    ids_a, weights_a = _topk_from_logits(logits_a, config)
+    ids_b, weights_b = _topk_from_logits(logits_b, config)
+    op = SonicMoE(config, prepare_sonic_bf16_weights(w1, w2, config))
+
+    _, state_a = op.forward_topk_training(x_a, ids_a, weights_a)
+    state_a_snapshot = state_a.preactivation.clone()
+    _, state_b = op.forward_topk_training(x_b, ids_b, weights_b)
+    torch.cuda.synchronize()
+
+    assert state_a.preactivation.data_ptr() != state_b.preactivation.data_ptr()
+    assert state_a.ready_event is not state_b.ready_event
+    assert torch.equal(state_a.preactivation, state_a_snapshot)
+    expected_b = _fixed_topk_preactivation_oracle(x_b, w1, ids_b)
+    torch.testing.assert_close(state_b.preactivation.float(), expected_b.float(), rtol=3e-2, atol=5e-2)
+    assert op.workspace is not None
+    assert state_a.preactivation.untyped_storage().data_ptr() not in op.workspace.storage_ptrs
+    assert state_b.preactivation.untyped_storage().data_ptr() not in op.workspace.storage_ptrs
+
+
+@pytest.mark.parametrize("tokens", (1, 129), ids=("direct-t1", "multiphase-sort"))
+def test_sonic_moe_training_state_covers_fixed_topk_sort_paths(tokens):
+    config = _config(stage1_k_wave=2 if tokens == 1 else 1)
+    x, w1, w2, router_logits = _make_case(tokens=tokens, seed=279 + tokens)
+    topk_ids, topk_weights = _topk_from_logits(router_logits, config)
+    op = SonicMoE(config, prepare_sonic_bf16_weights(w1, w2, config))
+
+    _, state = op.forward_topk_training(x, topk_ids, topk_weights)
+    expected = _fixed_topk_preactivation_oracle(x, w1, topk_ids)
+    torch.cuda.synchronize()
+
+    assert state.preactivation.shape == (tokens, TOP_K, 2 * INTERMEDIATE_SIZE)
+    torch.testing.assert_close(state.preactivation.float(), expected.float(), rtol=3e-2, atol=5e-2)
+
+
+def test_sonic_moe_training_state_records_current_stream_and_ready_event():
+    config = _config()
+    x, w1, w2, router_logits = _make_case(seed=283)
+    topk_ids, topk_weights = _topk_from_logits(router_logits, config)
+    op = SonicMoE(config, prepare_sonic_bf16_weights(w1, w2, config))
+    producer = torch.cuda.Stream(device=x.device)
+    producer.wait_stream(torch.cuda.current_stream(x.device))
+
+    with torch.cuda.stream(producer):
+        out, state = op.forward_topk_training(x, topk_ids, topk_weights)
+    assert state.producer_stream == int(producer.cuda_stream)
+
+    consumer = torch.cuda.Stream(device=x.device)
+    consumer.wait_event(state.ready_event)
+    with torch.cuda.stream(consumer):
+        consumed = state.preactivation.float().sum() + out.float().sum()
+    torch.cuda.current_stream(x.device).wait_stream(consumer)
+    assert torch.isfinite(consumed)
+
+
+def test_sonic_moe_training_forward_rejects_capture_without_state_slot(monkeypatch):
+    config = _config()
+    x, w1, w2, router_logits = _make_case(seed=293)
+    topk_ids, topk_weights = _topk_from_logits(router_logits, config)
+    op = SonicMoE(config, prepare_sonic_bf16_weights(w1, w2, config))
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
+
+    with pytest.raises(RuntimeError, match="graph-private preallocated state slot"):
+        op.forward_topk_training(x, topk_ids, topk_weights)
+
+
+def test_sonic_moe_training_state_extent_stays_below_masked_store_sentinel():
+    max_tokens = 0x7FFFFFFF // 4
+    _validate_training_preactivation_extent(max_tokens, 1, 1)
+
+    with pytest.raises(ValueError, match="signed 32-bit masked-store byte-offset limit"):
+        _validate_training_preactivation_extent(max_tokens + 1, 1, 1)
+
+
+def test_sonic_moe_route_state_compile_rejects_situv2():
+    with pytest.raises(AssertionError, match="does not support act='situv2'"):
+        compile_gemm1_a16w4_port(
+            BM=16,
+            D_HIDDEN=128,
+            D_INTER=128,
+            NE=1,
+            TOPK=1,
+            TILE_N=128,
+            TILE_K=128,
+            act="situv2",
+            w_dtype="bf16",
+            a_dtype="bf16",
+            logical_dense_weight=True,
+            round_preact_bf16=True,
+            store_route_preactivation=True,
+        )
+
+
+def test_sonic_moe_inference_stage1_launcher_does_not_enable_dual_store(monkeypatch):
+    import kernels.moe.sonic as sonic_module
+
+    config = _config()
+    compile_kwargs = []
+
+    def fake_compile(**kwargs):
+        compile_kwargs.append(kwargs)
+        return object()
+
+    monkeypatch.setattr(sonic_module, "compile_gemm1_a16w4_port", fake_compile)
+    _get_stage1_launcher.cache_clear()
+    _get_stage1_training_launcher.cache_clear()
+    try:
+        inference = _get_stage1_launcher(config, 2, "bf16", False, 0)
+        assert inference is _get_stage1_launcher(config, 2, "bf16", False, 0)
+        assert compile_kwargs[-1].get("store_route_preactivation", False) is False
+        assert _get_stage1_launcher.cache_info().currsize == 1
+        assert _get_stage1_training_launcher.cache_info().currsize == 0
+
+        training = _get_stage1_training_launcher(config, 2, False, True, 0)
+        assert training is _get_stage1_training_launcher(config, 2, False, True, 0)
+        assert compile_kwargs[-1]["store_route_preactivation"] is True
+        assert compile_kwargs[-1]["route_preactivation_interleaved"] is True
+        assert _get_stage1_launcher.cache_info().currsize == 1
+        assert _get_stage1_training_launcher.cache_info().currsize == 1
+    finally:
+        _get_stage1_launcher.cache_clear()
+        _get_stage1_training_launcher.cache_clear()
+
+
+def test_sonic_moe_training_forward_rejects_unsupported_contracts():
+    fp16_config = _config(compute_dtype="fp16")
+    x, w1, w2, router_logits = _make_case(seed=307, dtype=torch.float16)
+    ids, weights = _topk_from_logits(router_logits, fp16_config)
+    fp16_op = SonicMoE(fp16_config, prepare_sonic_fp16_weights(w1, w2, fp16_config))
+    with pytest.raises(NotImplementedError, match="dense BF16"):
+        fp16_op.forward_topk_training(x, ids, weights)
+
+    relu_config = _config(activation="relu")
+    x, w1, w2, router_logits = _make_case(seed=311, activation="relu")
+    ids, weights = _topk_from_logits(router_logits, relu_config)
+    relu_op = SonicMoE(relu_config, prepare_sonic_bf16_weights(w1, w2, relu_config))
+    with pytest.raises(NotImplementedError, match="activation='swiglu'"):
+        relu_op.forward_topk_training(x, ids, weights)
 
 
 def test_sonic_moe_fp16_forward_matches_reference():

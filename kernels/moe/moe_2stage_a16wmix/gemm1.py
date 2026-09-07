@@ -134,6 +134,7 @@ def _gemm1_body_a16w4(
     arg_mind,
     arg_cumsum,
     arg_out,
+    arg_route_preactivation,
     bx_i32,
     lane,
     wave,
@@ -163,6 +164,8 @@ def _gemm1_body_a16w4(
     has_bias=False,
     logical_dense_weight=False,
     store_preactivation=False,
+    store_route_preactivation=False,
+    route_preactivation_interleaved=False,
 ):
     """A16W4/A16W16 fused stage1 GEMM body.
 
@@ -175,6 +178,12 @@ def _gemm1_body_a16w4(
     ``store_preactivation`` to materialize both gate/up accumulators without
     applying the activation.  For GLU, ``w_layout="interleaved"`` gives those
     logical rows the native ``[g0, u0, g1, u1, ...]`` order.
+
+    The independent ``store_route_preactivation`` specialization keeps the
+    ordinary activation output intact and additionally stores its exact A16
+    gate/up rounding boundary in compact fixed-K route order ``[T, K, 2I]``.
+    It is used only by the training-forward API; inference does not carry the
+    extra pointer or execute an extra store.
     """
     _is_int4 = w_dtype == "int4"
     _is_dense = w_dtype in ("bf16", "fp16")
@@ -312,6 +321,11 @@ def _gemm1_body_a16w4(
         _raw(fx.Int64(arg_out)),
         num_records_bytes=_raw(fx.Int64(_cumsum0) * fx.Int64(_OUT_COLS * 2)),
     )
+    if const_expr(store_route_preactivation):
+        route_preactivation_rsrc = buffer_ops.create_buffer_resource_from_addr(
+            _raw(fx.Int64(arg_route_preactivation)),
+            num_records_bytes=_raw(fx.Int64(i32_ntok) * fx.Int64(TOPK * N_OUT * 2)),
+        )
 
     # ---- A gather rows (per-thread) -------------------------------------------
     # a_load_threads (256 at k_wave=1) cooperatively load one k-group's BM x TILE_K
@@ -917,6 +931,30 @@ def _gemm1_body_a16w4(
                         u = u + up_bias[ni]
                     if const_expr(_is_glu and round_preact_bf16):
                         u = fx.Float32(u.to(elem_dtype))
+                    if const_expr(store_route_preactivation):
+                        # The sorter packs the original fixed-K slot in the
+                        # high byte.  Scatter directly to invocation-owned
+                        # compact route order, excluding expert padding rows.
+                        route_slot = (fused >> fx.Int32(24)) & fx.Int32(0xFF)
+                        route_base = (token * fx.Int32(TOPK) + route_slot) * fx.Int32(N_OUT)
+                        if const_expr(route_preactivation_interleaved):
+                            route_gate_col = col_g_list[ni] * fx.Int32(2)
+                            route_up_col = route_gate_col + fx.Int32(1)
+                        else:
+                            route_gate_col = col_g_list[ni]
+                            route_up_col = route_gate_col + inter_i32
+                        buffer_ops.buffer_store(
+                            g.to(elem_dtype),
+                            _raw(route_preactivation_rsrc),
+                            _raw(route_base + route_gate_col),
+                            mask=valid,
+                        )
+                        buffer_ops.buffer_store(
+                            u.to(elem_dtype),
+                            _raw(route_preactivation_rsrc),
+                            _raw(route_base + route_up_col),
+                            mask=valid,
+                        )
                     y = _stage1_activation_f32(g, u, act)
                 if const_expr(not store_preactivation):
                     yb = y.to(elem_dtype)
@@ -952,6 +990,8 @@ def compile_gemm1_a16w4_port(
     has_bias=False,
     logical_dense_weight=False,
     store_preactivation=False,
+    store_route_preactivation=False,
+    route_preactivation_interleaved=False,
     expert_grid=False,
     compact_grid=False,
 ):
@@ -987,6 +1027,12 @@ def compile_gemm1_a16w4_port(
     queue from ``arg_bscale``.  Entry zero is the live descriptor count and the
     remaining int32 entries are real-M-tile indices.  This is valid only for
     logical dense weights, where the scale argument is unused.
+
+    ``store_route_preactivation`` is a forward-training-only dual-output
+    specialization.  The regular activation output remains sorted for stage 2,
+    while an additional pointer receives rounded gate/up values in compact
+    fixed-K route order. ``route_preactivation_interleaved`` selects
+    ``[g0,u0,...]`` instead of the default ``[gate...,up...]`` last dimension.
     """
     SORTED_BM = BM if SORTED_BM is None else SORTED_BM
     assert w_dtype in ("mxfp4", "int4", "bf16", "fp16"), (
@@ -1014,14 +1060,26 @@ def compile_gemm1_a16w4_port(
     assert isinstance(has_bias, bool), "has_bias must be bool"
     assert isinstance(logical_dense_weight, bool), "logical_dense_weight must be bool"
     assert isinstance(store_preactivation, bool), "store_preactivation must be bool"
+    assert isinstance(store_route_preactivation, bool), "store_route_preactivation must be bool"
+    assert isinstance(route_preactivation_interleaved, bool), "route_preactivation_interleaved must be bool"
     assert isinstance(expert_grid, bool), "expert_grid must be bool"
     assert isinstance(compact_grid, bool), "compact_grid must be bool"
     assert not (expert_grid and compact_grid), "expert_grid and compact_grid are mutually exclusive"
+    assert not (
+        store_preactivation and store_route_preactivation
+    ), "exclusive stored-preactivation output cannot be combined with the forward dual output"
     _K = D_HIDDEN
     _INTER = D_INTER
     _is_glu = act in ("silu", "swiglu", "geglu", "reglu", "situv2")
     assert not (w_layout == "guinterleave" and not _is_glu), "w_layout='guinterleave' is valid only for GLU activations"
     assert not (w_layout == "interleaved" and not _is_glu), "w_layout='interleaved' is valid only for GLU activations"
+    assert not store_route_preactivation or _is_glu, "route-order preactivation requires a GLU activation"
+    assert not store_route_preactivation or act != "situv2", (
+        "route-order preactivation does not support act='situv2'"
+    )
+    assert not store_route_preactivation or round_preact_bf16, (
+        "route-order preactivation requires the observable A16 rounding boundary"
+    )
     _N_OUT = (2 if _is_glu else 1) * _INTER
     assert not logical_dense_weight or w_dtype in ("bf16", "fp16"), (
         "logical_dense_weight is valid only for dense A16 weights"
@@ -1081,13 +1139,18 @@ def compile_gemm1_a16w4_port(
     _bias_tag = "_bias" if has_bias else ""
     _logical_w_tag = "_logicalw" if logical_dense_weight else ""
     _preact_tag = "_storepreact" if store_preactivation else ""
+    _route_preact_tag = (
+        ("_routepreact_int" if route_preactivation_interleaved else "_routepreact_sep")
+        if store_route_preactivation
+        else ""
+    )
     _expert_grid_tag = "_egrid" if expert_grid else ""
     _compact_grid_tag = "_cgrid" if compact_grid else ""
     _sorted_tag = f"_sbm{SORTED_BM}" if SORTED_BM != BM else ""
     name_suffix = (
         f"a16w4{_wd_tag}{_ad_tag}{_wl_tag}_h{_K}_i{_INTER}_ne{NE}_bm{BM}"
         f"{_sorted_tag}_tn{TILE_N}_tk{TILE_K}{_act_tag}{_bcm_tag}{_xcd_tag}"
-        f"{_wpe_tag}{_kw_tag}{_round_tag}{_bias_tag}{_logical_w_tag}{_preact_tag}"
+        f"{_wpe_tag}{_kw_tag}{_round_tag}{_bias_tag}{_logical_w_tag}{_preact_tag}{_route_preact_tag}"
         f"{_expert_grid_tag}{_compact_grid_tag}"
     )
 
@@ -1095,8 +1158,8 @@ def compile_gemm1_a16w4_port(
     class SharedStorage:
         raw: fx.Array[fx.Uint8, lds_bytes, 16]
 
-    @flyc.kernel(name=f"gemm1_a16w4_port_{name_suffix}", known_block_size=[256, 1, 1])
-    def gemm1_kernel(
+    @flyc.jit
+    def _gemm1_kernel_body(
         arg_x: fx.Int64,
         arg_bq: fx.Int64,
         arg_bscale: fx.Int64,
@@ -1111,6 +1174,7 @@ def compile_gemm1_a16w4_port(
         f32_situ_linbeta_rcp: fx.Float32,
         f32_swiglu_limit: fx.Float32,
         arg_out: fx.Int64,
+        arg_route_preactivation: fx.Int64,
     ):
         lds_raw_ptr = fx.SharedAllocator().allocate(SharedStorage).peek().raw.ptr
         tx_i32 = fx.Int32(gpu.thread_id("x"))
@@ -1153,6 +1217,7 @@ def compile_gemm1_a16w4_port(
                 arg_mind,
                 arg_cumsum,
                 arg_out,
+                arg_route_preactivation,
                 tile,
                 lane,
                 wave,
@@ -1181,6 +1246,8 @@ def compile_gemm1_a16w4_port(
                 has_bias=has_bias,
                 logical_dense_weight=logical_dense_weight,
                 store_preactivation=store_preactivation,
+                store_route_preactivation=store_route_preactivation,
+                route_preactivation_interleaved=route_preactivation_interleaved,
             )
 
         if const_expr(compact_grid):
@@ -1235,6 +1302,121 @@ def compile_gemm1_a16w4_port(
                 else:
                     _tile = bx_i32
                 _run_body(_tile)
+
+    if store_route_preactivation:
+
+        @flyc.kernel(name=f"gemm1_a16w4_port_{name_suffix}", known_block_size=[256, 1, 1])
+        def gemm1_kernel_route_preactivation(
+            arg_x: fx.Int64,
+            arg_bq: fx.Int64,
+            arg_bscale: fx.Int64,
+            arg_bias: fx.Int64,
+            arg_eids: fx.Int64,
+            arg_cumsum: fx.Int64,
+            arg_mind: fx.Int64,
+            i32_ntok: fx.Int32,
+            f32_situ_beta: fx.Float32,
+            f32_situ_beta_rcp: fx.Float32,
+            f32_situ_linbeta: fx.Float32,
+            f32_situ_linbeta_rcp: fx.Float32,
+            f32_swiglu_limit: fx.Float32,
+            arg_out: fx.Int64,
+            arg_route_preactivation: fx.Int64,
+        ):
+            _gemm1_kernel_body(
+                arg_x,
+                arg_bq,
+                arg_bscale,
+                arg_bias,
+                arg_eids,
+                arg_cumsum,
+                arg_mind,
+                i32_ntok,
+                f32_situ_beta,
+                f32_situ_beta_rcp,
+                f32_situ_linbeta,
+                f32_situ_linbeta_rcp,
+                f32_swiglu_limit,
+                arg_out,
+                arg_route_preactivation,
+            )
+
+        @flyc.jit
+        def launch_gemm1_route_preactivation(
+            arg_x: fx.Int64,
+            arg_bq: fx.Int64,
+            arg_bscale: fx.Int64,
+            arg_bias: fx.Int64,
+            arg_eids: fx.Int64,
+            arg_cumsum: fx.Int64,
+            arg_mind: fx.Int64,
+            i32_ntok: fx.Int32,
+            i32_grid: fx.Int32,
+            f32_situ_beta: fx.Float32,
+            f32_situ_beta_rcp: fx.Float32,
+            f32_situ_linbeta: fx.Float32,
+            f32_situ_linbeta_rcp: fx.Float32,
+            f32_swiglu_limit: fx.Float32,
+            arg_out: fx.Int64,
+            arg_route_preactivation: fx.Int64,
+            stream: fx.Stream,
+        ):
+            grid_x = fx.Int64(i32_grid)
+            gemm1_kernel_route_preactivation(
+                arg_x,
+                arg_bq,
+                arg_bscale,
+                arg_bias,
+                arg_eids,
+                arg_cumsum,
+                arg_mind,
+                i32_ntok,
+                f32_situ_beta,
+                f32_situ_beta_rcp,
+                f32_situ_linbeta,
+                f32_situ_linbeta_rcp,
+                f32_swiglu_limit,
+                arg_out,
+                arg_route_preactivation,
+                value_attrs={"rocdl.waves_per_eu": waves_per_eu} if waves_per_eu else None,
+            ).launch(grid=(grid_x, 1, 1), block=(256, 1, 1), stream=stream)
+
+        return launch_gemm1_route_preactivation
+
+    @flyc.kernel(name=f"gemm1_a16w4_port_{name_suffix}", known_block_size=[256, 1, 1])
+    def gemm1_kernel(
+        arg_x: fx.Int64,
+        arg_bq: fx.Int64,
+        arg_bscale: fx.Int64,
+        arg_bias: fx.Int64,
+        arg_eids: fx.Int64,
+        arg_cumsum: fx.Int64,
+        arg_mind: fx.Int64,
+        i32_ntok: fx.Int32,
+        f32_situ_beta: fx.Float32,
+        f32_situ_beta_rcp: fx.Float32,
+        f32_situ_linbeta: fx.Float32,
+        f32_situ_linbeta_rcp: fx.Float32,
+        f32_swiglu_limit: fx.Float32,
+        arg_out: fx.Int64,
+    ):
+        _gemm1_kernel_body(
+            arg_x,
+            arg_bq,
+            arg_bscale,
+            arg_bias,
+            arg_eids,
+            arg_cumsum,
+            arg_mind,
+            i32_ntok,
+            f32_situ_beta,
+            f32_situ_beta_rcp,
+            f32_situ_linbeta,
+            f32_situ_linbeta_rcp,
+            f32_swiglu_limit,
+            arg_out,
+            fx.Int64(0),
+        )
 
     @flyc.jit
     def launch_gemm1(
