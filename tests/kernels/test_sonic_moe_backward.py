@@ -4,6 +4,8 @@
 """Correctness and contract tests for the first gfx950 SonicMoE backward."""
 
 import math
+import time
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -58,10 +60,7 @@ _DTYPES = ((torch.bfloat16, "bf16"), (torch.float16, "fp16"))
     ),
 )
 def test_grouped_dw1_tuning(max_expert_rows, hidden_size, intermediate_size, expected):
-    assert (
-        _grouped_dw1_tuning(max_expert_rows, hidden_size, intermediate_size)
-        == expected
-    )
+    assert _grouped_dw1_tuning(max_expert_rows, hidden_size, intermediate_size) == expected
 
 
 @pytest.mark.parametrize(
@@ -326,9 +325,7 @@ def test_grouped_w1_compact_queue_policy(tokens, expected_compact):
         intermediate_size=512,
     )
     assert compact is expected_compact
-    assert (bm, bn, bk, k_wave) == (
-        (16, 128, 64, 2) if expected_compact else (16, 64, 64, 4)
-    )
+    assert (bm, bn, bk, k_wave) == ((16, 128, 64, 2) if expected_compact else (16, 64, 64, 4))
 
 
 @pytest.mark.parametrize(
@@ -509,6 +506,54 @@ def _make_biases(w1, w2, seed):
     return b1, b2
 
 
+@torch.no_grad()
+def _make_forward_state(
+    x,
+    w1,
+    topk_ids,
+    config,
+    *,
+    b1=None,
+    interleaved_w1=False,
+):
+    """Build the route-order state contract without depending on forward API."""
+
+    tokens, topk = topk_ids.shape
+    projection_size = 2 * config.intermediate_size
+    preactivation = torch.empty(
+        (tokens, topk, projection_size),
+        dtype=torch.bfloat16,
+        device=x.device,
+    )
+    for expert in range(config.num_experts):
+        pairs = (topk_ids == expert).nonzero(as_tuple=False)
+        if pairs.numel() == 0:
+            continue
+        token_indices, slots = pairs[:, 0], pairs[:, 1]
+        values = x[token_indices].float() @ w1[expert].float().transpose(0, 1)
+        if b1 is not None:
+            values = values + b1[expert].float()
+        preactivation[token_indices, slots] = values.to(torch.bfloat16)
+
+    stream = torch.cuda.current_stream(x.device)
+    ready_event = torch.cuda.Event()
+    ready_event.record(stream)
+    return SimpleNamespace(
+        preactivation=preactivation,
+        tokens=tokens,
+        hidden_size=config.hidden_size,
+        intermediate_size=config.intermediate_size,
+        num_experts=config.num_experts,
+        top_k=config.top_k,
+        activation=config.activation,
+        compute_dtype=config.compute_dtype,
+        interleaved_w1=interleaved_w1,
+        has_bias=b1 is not None,
+        producer_stream=int(stream.cuda_stream),
+        ready_event=ready_event,
+    )
+
+
 def _tanh_reference(value):
     exp_value = torch.exp2(value.abs() * (-2.0 * math.log2(math.e)))
     tanh_abs = (1.0 - exp_value) / (1.0 + exp_value)
@@ -558,9 +603,7 @@ def _activation_reference(
         dz_gate = da * up * derivative
         dz_up = da * activated_gate
         dz = (
-            torch.stack((dz_gate, dz_up), dim=2).flatten(1, 2)
-            if interleaved_w1
-            else torch.cat((dz_gate, dz_up), dim=1)
+            torch.stack((dz_gate, dz_up), dim=2).flatten(1, 2) if interleaved_w1 else torch.cat((dz_gate, dz_up), dim=1)
         )
     else:
         value = preactivation.float()
@@ -1819,6 +1862,389 @@ def test_sonic_moe_backward_routes_spans_multiple_expert_tiles(dtype, compute_dt
     assert torch.count_nonzero(actual[2][2:]) == 0
     assert torch.count_nonzero(actual[4][2:]) == 0
     assert torch.count_nonzero(actual[5][2:]) == 0
+
+
+@pytest.mark.parametrize(
+    (
+        "tokens",
+        "hidden_size",
+        "intermediate_size",
+        "num_experts",
+        "topk",
+        "hot_experts",
+        "interleaved_w1",
+        "has_bias",
+    ),
+    (
+        (1, 128, 64, 4, 2, None, True, True),
+        (128, 256, 128, 64, 4, None, False, False),
+        (128, 256, 128, 64, 4, 16, False, False),
+        (4096, 128, 64, 4, 2, None, False, False),
+    ),
+    ids=("t1-interleaved-bias", "t128-balanced", "t128-hot16", "t4096-legacy"),
+)
+def test_sonic_moe_backward_reuses_route_order_forward_preactivation(
+    tokens,
+    hidden_size,
+    intermediate_size,
+    num_experts,
+    topk,
+    hot_experts,
+    interleaved_w1,
+    has_bias,
+):
+    """Forward state matches standalone numerics across tuned routing regimes."""
+
+    config = _config(
+        hidden_size,
+        intermediate_size,
+        num_experts,
+        topk,
+        compute_dtype="bf16",
+        down_tile_m=128,
+    )
+    args = list(
+        _make_case(
+            tokens,
+            hidden_size,
+            intermediate_size,
+            num_experts,
+            topk,
+            seed=607 + tokens + (hot_experts or 0),
+            dtype=torch.bfloat16,
+        )
+    )
+    if hot_experts is not None:
+        ids_host = [[(token + slot) % hot_experts for slot in range(topk)] for token in range(tokens)]
+        args[3] = torch.tensor(ids_host, dtype=torch.int32, device=args[0].device)
+    if interleaved_w1:
+        args[1] = _interleave_glu_rows(args[1])
+    args = tuple(args)
+    if has_bias:
+        b1, b2 = _make_biases(args[1], args[2], seed=659)
+        if interleaved_w1:
+            b1 = _interleave_glu_rows(b1)
+    else:
+        b1 = b2 = None
+
+    state = _make_forward_state(
+        args[0],
+        args[1],
+        args[3],
+        config,
+        b1=b1,
+        interleaved_w1=interleaved_w1,
+    )
+    state_snapshot = state.preactivation.clone()
+    actual = sonic_moe_backward(
+        *args,
+        config,
+        b1=b1,
+        b2=b2,
+        interleaved_w1=interleaved_w1,
+        forward_state=state,
+    )
+    expected = _backward_reference(
+        *args,
+        b1=b1,
+        b2=b2,
+        interleaved_w1=interleaved_w1,
+    )
+    torch.cuda.synchronize()
+
+    assert torch.equal(state.preactivation, state_snapshot)
+    for actual_gradient, expected_gradient in zip(actual, expected):
+        torch.testing.assert_close(
+            actual_gradient.float(),
+            expected_gradient.float(),
+            rtol=3e-2,
+            atol=5e-2,
+        )
+
+
+def test_sonic_moe_backward_forward_state_is_reusable_and_none_is_fallback():
+    config = _config(128, 64, 4, 2, compute_dtype="bf16")
+    args = _make_case(7, 128, 64, 4, 2, seed=677, dtype=torch.bfloat16)
+
+    implicit_fallback = tuple(t.clone() for t in sonic_moe_backward(*args, config))
+    explicit_fallback = sonic_moe_backward(*args, config, forward_state=None)
+    state = _make_forward_state(args[0], args[1], args[3], config)
+    state_snapshot = state.preactivation.clone()
+    first = tuple(t.clone() for t in sonic_moe_backward(*args, config, forward_state=state))
+    second = sonic_moe_backward(*args, config, forward_state=state)
+    torch.cuda.synchronize()
+
+    for implicit, explicit in zip(implicit_fallback, explicit_fallback):
+        assert torch.equal(implicit, explicit)
+    for first_gradient, second_gradient in zip(first, second):
+        assert torch.equal(first_gradient, second_gradient)
+    assert torch.equal(state.preactivation, state_snapshot)
+
+
+def test_sonic_moe_backward_forward_state_skips_grouped_w1_but_keeps_compact_queue(
+    monkeypatch,
+):
+    tokens, hidden_size, intermediate_size, num_experts, topk = 128, 256, 128, 64, 4
+    config = _config(
+        hidden_size,
+        intermediate_size,
+        num_experts,
+        topk,
+        compute_dtype="bf16",
+        down_tile_m=128,
+    )
+    args = _make_case(
+        tokens,
+        hidden_size,
+        intermediate_size,
+        num_experts,
+        topk,
+        seed=683,
+        dtype=torch.bfloat16,
+    )
+    state = _make_forward_state(args[0], args[1], args[3], config)
+    original_builder = sonic_backward_module.build_compact_m_tile_descriptors
+    builder_blocks = []
+
+    def _unexpected_grouped_w1(*_args, **_kwargs):
+        raise AssertionError("forward state must skip grouped W1 recomputation")
+
+    def _tracked_builder(*builder_args, **builder_kwargs):
+        builder_blocks.append(builder_kwargs["block_m"])
+        return original_builder(*builder_args, **builder_kwargs)
+
+    monkeypatch.setattr(
+        sonic_backward_module,
+        "_compile_grouped_w1_recompute",
+        _unexpected_grouped_w1,
+    )
+    monkeypatch.setattr(
+        sonic_backward_module,
+        "build_compact_m_tile_descriptors",
+        _tracked_builder,
+    )
+    sonic_moe_backward(*args, config, forward_state=state)
+    torch.cuda.synchronize()
+
+    assert builder_blocks == [16]
+
+
+def test_sonic_moe_backward_forward_state_skips_generic_w1_and_keeps_large_dx_queue(
+    monkeypatch,
+):
+    tokens, hidden_size, intermediate_size, num_experts, topk = 4096, 256, 128, 4, 2
+    config = _config(
+        hidden_size,
+        intermediate_size,
+        num_experts,
+        topk,
+        compute_dtype="bf16",
+        down_tile_m=128,
+    )
+    args = _make_case(
+        tokens,
+        hidden_size,
+        intermediate_size,
+        num_experts,
+        topk,
+        seed=691,
+        dtype=torch.bfloat16,
+    )
+    state = _make_forward_state(args[0], args[1], args[3], config)
+    original_builder = sonic_backward_module.build_compact_m_tile_descriptors
+    original_gemm = sonic_backward_module.gemm_a16w16
+    builder_blocks = []
+
+    def _tracked_builder(*builder_args, **builder_kwargs):
+        builder_blocks.append(builder_kwargs["block_m"])
+        return original_builder(*builder_args, **builder_kwargs)
+
+    def _guarded_gemm(a, b, *gemm_args, **gemm_kwargs):
+        is_w1_recompute = (
+            gemm_kwargs.get("layout") == "nt"
+            and tuple(a.shape)[1:] == (hidden_size,)
+            and tuple(b.shape) == (hidden_size, 2 * intermediate_size)
+        )
+        if is_w1_recompute:
+            raise AssertionError("forward state must skip generic W1 recomputation")
+        return original_gemm(a, b, *gemm_args, **gemm_kwargs)
+
+    monkeypatch.setattr(
+        sonic_backward_module,
+        "_use_large_grouped_dx_descriptor_queue",
+        lambda **_kwargs: True,
+    )
+    monkeypatch.setattr(
+        sonic_backward_module,
+        "build_compact_m_tile_descriptors",
+        _tracked_builder,
+    )
+    monkeypatch.setattr(sonic_backward_module, "gemm_a16w16", _guarded_gemm)
+    actual = sonic_moe_backward(*args, config, forward_state=state)
+    expected = _backward_reference(*args)
+    torch.cuda.synchronize()
+
+    assert builder_blocks == [64]
+    for actual_gradient, expected_gradient in zip(actual, expected):
+        torch.testing.assert_close(
+            actual_gradient.float(),
+            expected_gradient.float(),
+            rtol=3e-2,
+            atol=5e-2,
+        )
+
+
+def test_sonic_moe_backward_forward_state_waits_cross_stream_and_tracks_lifetime():
+    config = _config(128, 64, 4, 2, compute_dtype="bf16")
+    args = _make_case(7, 128, 64, 4, 2, seed=701, dtype=torch.bfloat16)
+    source_state = _make_forward_state(args[0], args[1], args[3], config)
+    source = source_state.preactivation.clone()
+    # Compile every backward launcher before constructing the delayed producer;
+    # otherwise JIT time can outlast the device delay and turn the wait check
+    # into another false positive.
+    sonic_moe_backward(*args, config, forward_state=source_state)
+    torch.cuda.current_stream(args[0].device).synchronize()
+
+    producer = torch.cuda.Stream(device=args[0].device)
+    consumer = torch.cuda.Stream(device=args[0].device)
+    releaser = torch.cuda.Stream(device=args[0].device)
+    release_event = torch.cuda.Event()
+    ready_event = torch.cuda.Event()
+    route_preactivation = torch.empty_like(source)
+    with torch.cuda.stream(releaser):
+        # Record a real, incomplete dependency.  Waiting on an event before it
+        # has ever been recorded is a no-op in CUDA/HIP and would make this
+        # test pass without exercising backward's cross-stream wait.
+        torch.cuda._sleep(100_000_000)
+        release_event.record(releaser)
+    with torch.cuda.stream(producer):
+        producer.wait_event(release_event)
+        route_preactivation.copy_(source)
+        ready_event.record(producer)
+    assert not ready_event.query()
+    state = SimpleNamespace(
+        **{
+            **vars(source_state),
+            "preactivation": route_preactivation,
+            "producer_stream": int(producer.cuda_stream),
+            "ready_event": ready_event,
+        }
+    )
+
+    with torch.cuda.stream(consumer):
+        actual = sonic_moe_backward(*args, config, forward_state=state)
+    del state, route_preactivation
+    with torch.cuda.stream(releaser):
+        allocator_pressure = torch.full_like(source, -17.0)
+    wait_start = time.perf_counter()
+    consumer.synchronize()
+    wait_seconds = time.perf_counter() - wait_start
+    expected = _backward_reference(*args)
+    torch.cuda.synchronize()
+
+    assert wait_seconds >= 0.02
+    assert torch.count_nonzero(allocator_pressure) == allocator_pressure.numel()
+    for actual_gradient, expected_gradient in zip(actual, expected):
+        torch.testing.assert_close(
+            actual_gradient.float(),
+            expected_gradient.float(),
+            rtol=3e-2,
+            atol=5e-2,
+        )
+
+
+def test_sonic_moe_backward_rejects_bad_forward_state():
+    config = _config(128, 64, 4, 2, compute_dtype="bf16")
+    args = _make_case(7, 128, 64, 4, 2, seed=709, dtype=torch.bfloat16)
+    state = _make_forward_state(args[0], args[1], args[3], config)
+    fields = vars(state).copy()
+
+    missing = fields.copy()
+    missing.pop("top_k")
+    with pytest.raises(ValueError, match="missing required field.*top_k"):
+        sonic_moe_backward(*args, config, forward_state=SimpleNamespace(**missing))
+    with pytest.raises(TypeError, match="tokens must be int"):
+        sonic_moe_backward(
+            *args,
+            config,
+            forward_state=SimpleNamespace(**{**fields, "tokens": True}),
+        )
+    with pytest.raises(ValueError, match="tokens must equal"):
+        sonic_moe_backward(
+            *args,
+            config,
+            forward_state=SimpleNamespace(**{**fields, "tokens": 8}),
+        )
+    with pytest.raises(TypeError, match="preactivation must be torch.bfloat16"):
+        sonic_moe_backward(
+            *args,
+            config,
+            forward_state=SimpleNamespace(**{**fields, "preactivation": state.preactivation.half()}),
+        )
+    with pytest.raises(ValueError, match="interleaved_w1 must match"):
+        sonic_moe_backward(
+            *args,
+            config,
+            forward_state=SimpleNamespace(**{**fields, "interleaved_w1": True}),
+        )
+    with pytest.raises(TypeError, match="has_bias must be bool"):
+        sonic_moe_backward(
+            *args,
+            config,
+            forward_state=SimpleNamespace(**{**fields, "has_bias": 0}),
+        )
+    with pytest.raises(ValueError, match="has_bias must match"):
+        sonic_moe_backward(
+            *args,
+            config,
+            b1=torch.zeros_like(args[1][:, :, 0]),
+            b2=torch.zeros_like(args[2][:, :, 0]),
+            forward_state=state,
+        )
+    with pytest.raises(TypeError, match="producer_stream must be int"):
+        sonic_moe_backward(
+            *args,
+            config,
+            forward_state=SimpleNamespace(**{**fields, "producer_stream": False}),
+        )
+    with pytest.raises(ValueError, match="ready_event must already be recorded"):
+        sonic_moe_backward(
+            *args,
+            config,
+            forward_state=SimpleNamespace(**{**fields, "ready_event": torch.cuda.Event()}),
+        )
+    with pytest.raises(ValueError, match="only dense BF16 SwiGLU"):
+        sonic_moe_backward(
+            *args,
+            _config(128, 64, 4, 2, compute_dtype="bf16", activation="geglu"),
+            forward_state=SimpleNamespace(**{**fields, "activation": "geglu"}),
+        )
+
+    oversized_intermediate = 40_000_000
+    oversized_config = _config(
+        128,
+        oversized_intermediate,
+        4,
+        2,
+        compute_dtype="bf16",
+    )
+    oversized_preactivation = torch.empty(1, dtype=torch.bfloat16, device=args[0].device).as_strided(
+        (7, 2, 2 * oversized_intermediate),
+        (0, 0, 0),
+    )
+    oversized_fields = {
+        **fields,
+        "preactivation": oversized_preactivation,
+        "intermediate_size": oversized_intermediate,
+    }
+    with pytest.raises(ValueError, match="byte span exceeds the signed 32-bit"):
+        sonic_backward_module._validate_forward_state(
+            SimpleNamespace(**oversized_fields),
+            args[0],
+            oversized_config,
+            False,
+            False,
+        )
 
 
 @pytest.mark.parametrize("dtype,compute_dtype", _DTYPES, ids=("bf16", "fp16"))
