@@ -447,6 +447,7 @@ def _compile_grouped_w1_recompute(
     num_experts: int,
     topk: int,
     has_bias: bool,
+    interleaved_w1: bool,
     compact_grid: bool,
     device_index: int,
 ):
@@ -484,7 +485,7 @@ def _compile_grouped_w1_recompute(
         b_cache_mod=0,
         w_dtype="bf16",
         a_dtype="bf16",
-        w_layout="standard",
+        w_layout="interleaved" if interleaved_w1 else "standard",
         k_wave=k_wave,
         round_preact_bf16=False,
         has_bias=has_bias,
@@ -908,6 +909,7 @@ def _compile_activation_prepare(
     intermediate_size: int,
     activation_name: str,
     compute_dtype: str,
+    interleaved_w1: bool,
     device_index: int,
     device_padded_rows: bool = False,
 ):
@@ -917,7 +919,8 @@ def _compile_activation_prepare(
     elem_dtype = fx.Float16 if compute_dtype == "fp16" else fx.BFloat16
     is_glu = activation_name in _GLU_ACTIVATIONS
     projection_size = intermediate_size * (2 if is_glu else 1)
-    up_column_offset = intermediate_size if is_glu else 0
+    projection_column_stride = 2 if is_glu and interleaved_w1 else 1
+    up_column_offset = 1 if is_glu and interleaved_w1 else intermediate_size if is_glu else 0
 
     @flyc.kernel(known_block_size=[_BLOCK_THREADS, 1, 1])
     def activation_prepare_kernel(
@@ -947,7 +950,10 @@ def _compile_activation_prepare(
             for base in range_constexpr(0, intermediate_size, _BLOCK_THREADS):
                 column = tid + fx.Int32(base)
                 if column < fx.Int32(intermediate_size):
-                    gate_offset = row * fx.Int32(projection_size) + column
+                    gate_offset = (
+                        row * fx.Int32(projection_size)
+                        + column * fx.Int32(projection_column_stride)
+                    )
                     act_offset = row * fx.Int32(intermediate_size) + column
                     gate = buffer_ops.buffer_load(
                         preact_rsrc, gate_offset, vec_width=1, dtype=elem_dtype
@@ -1038,6 +1044,7 @@ def _compile_activation_derivative(
     intermediate_size: int,
     activation_name: str,
     compute_dtype: str,
+    interleaved_w1: bool,
     device_index: int,
     device_padded_rows: bool = False,
 ):
@@ -1047,7 +1054,8 @@ def _compile_activation_derivative(
     elem_dtype = fx.Float16 if compute_dtype == "fp16" else fx.BFloat16
     is_glu = activation_name in _GLU_ACTIVATIONS
     projection_size = intermediate_size * (2 if is_glu else 1)
-    up_column_offset = intermediate_size if is_glu else 0
+    projection_column_stride = 2 if is_glu and interleaved_w1 else 1
+    up_column_offset = 1 if is_glu and interleaved_w1 else intermediate_size if is_glu else 0
 
     @flyc.kernel(known_block_size=[_BLOCK_THREADS, 1, 1])
     def activation_derivative_kernel(
@@ -1069,7 +1077,10 @@ def _compile_activation_derivative(
             for base in range_constexpr(0, intermediate_size, _BLOCK_THREADS):
                 column = tid + fx.Int32(base)
                 if column < fx.Int32(intermediate_size):
-                    gate_offset = row * fx.Int32(projection_size) + column
+                    gate_offset = (
+                        row * fx.Int32(projection_size)
+                        + column * fx.Int32(projection_column_stride)
+                    )
                     up_offset = gate_offset + fx.Int32(up_column_offset)
                     act_offset = row * fx.Int32(intermediate_size) + column
                     gate = buffer_ops.buffer_load(
@@ -1726,6 +1737,7 @@ def _validate_backward_inputs(
     config: "SonicMoEConfig",
     b1: torch.Tensor | None,
     b2: torch.Tensor | None,
+    interleaved_w1: bool,
 ) -> tuple[int, int, int, int]:
     dtype_by_name = {"bf16": torch.bfloat16, "fp16": torch.float16}
     if config.compute_dtype not in dtype_by_name:
@@ -1738,6 +1750,13 @@ def _validate_backward_inputs(
         raise ValueError(
             f"sonic_moe_backward does not support activation={config.activation!r}; "
             f"expected one of {sorted(_SUPPORTED_ACTIVATIONS)}"
+        )
+    if not isinstance(interleaved_w1, bool):
+        raise TypeError(f"interleaved_w1 must be bool, got {type(interleaved_w1).__name__}")
+    if interleaved_w1 and config.activation not in _GLU_ACTIVATIONS:
+        raise ValueError(
+            "interleaved_w1 is valid only for GLU activations "
+            f"{sorted(_GLU_ACTIVATIONS)}, got activation={config.activation!r}"
         )
 
     tokens = int(hidden_states.shape[0]) if hidden_states.ndim == 2 else -1
@@ -1816,6 +1835,7 @@ def _validate_backward_route_inputs(
     config: "SonicMoEConfig",
     b1: torch.Tensor | None,
     b2: torch.Tensor | None,
+    interleaved_w1: bool,
 ) -> tuple[int, int, int, int, int]:
     dtype_by_name = {"bf16": torch.bfloat16, "fp16": torch.float16}
     if config.compute_dtype not in dtype_by_name:
@@ -1828,6 +1848,13 @@ def _validate_backward_route_inputs(
         raise ValueError(
             f"sonic_moe_backward_routes does not support activation={config.activation!r}; "
             f"expected one of {sorted(_SUPPORTED_ACTIVATIONS)}"
+        )
+    if not isinstance(interleaved_w1, bool):
+        raise TypeError(f"interleaved_w1 must be bool, got {type(interleaved_w1).__name__}")
+    if interleaved_w1 and config.activation not in _GLU_ACTIVATIONS:
+        raise ValueError(
+            "interleaved_w1 is valid only for GLU activations "
+            f"{sorted(_GLU_ACTIVATIONS)}, got activation={config.activation!r}"
         )
     if token_indices.ndim != 1 or expert_indices.ndim != 1 or route_weights.ndim != 1:
         raise ValueError("token_indices, expert_indices, and route_weights must be one-dimensional")
@@ -1918,6 +1945,7 @@ def _sonic_moe_backward_impl(
     dimensions: tuple[int, int, int, int],
     b1: torch.Tensor | None = None,
     b2: torch.Tensor | None = None,
+    interleaved_w1: bool = False,
 ) -> tuple[torch.Tensor, ...]:
     """Shared sorted-expert implementation for fixed-K and flat routes."""
 
@@ -2238,6 +2266,7 @@ def _sonic_moe_backward_impl(
                 num_experts,
                 topk,
                 has_bias,
+                interleaved_w1,
                 use_compact_w1,
                 device_index,
             )
@@ -2399,6 +2428,7 @@ def _sonic_moe_backward_impl(
             intermediate_size,
             activation_name,
             compute_dtype,
+            interleaved_w1,
             device_index,
             use_hostless_grouped,
         )
@@ -2641,6 +2671,7 @@ def _sonic_moe_backward_impl(
             intermediate_size,
             activation_name,
             compute_dtype,
+            interleaved_w1,
             device_index,
             use_hostless_grouped,
         )
@@ -2945,12 +2976,16 @@ def sonic_moe_backward(
     *,
     b1: torch.Tensor | None = None,
     b2: torch.Tensor | None = None,
+    interleaved_w1: bool = False,
 ) -> tuple[torch.Tensor, ...]:
     """Differentiate dense BF16/FP16 fixed-K SonicMoE, optionally with bias.
 
     Parameters use logical, expert-major weights: ``w1[E, 2I, H]`` for GLU
     activations, ``w1[E, I, H]`` for pointwise activations, and
-    ``w2[E, H, I]``. Routing tensors are ``topk_ids[int32, T, K]`` and
+    ``w2[E, H, I]``. By default GLU W1 rows are ``[g0..gI, u0..uI]``. Setting
+    ``interleaved_w1=True`` instead consumes W1 (and optional B1) in native
+    ``[g0, u0, g1, u1, ...]`` row order and returns ``dw1``/``db1`` in that
+    same order. Routing tensors are ``topk_ids[int32, T, K]`` and
     ``topk_weights[float32, T, K]``. Without bias, the returned tuple is
     ``(dx, dw1, dw2, dtopk_weights)``. When ``b1`` and ``b2`` are supplied,
     ``(db1, db2)`` are appended. Tensor and bias gradients preserve the A16
@@ -2972,6 +3007,7 @@ def sonic_moe_backward(
         config,
         b1,
         b2,
+        interleaved_w1,
     )
     return _sonic_moe_backward_impl(
         hidden_states,
@@ -2985,6 +3021,7 @@ def sonic_moe_backward(
         dimensions=dimensions,
         b1=b1,
         b2=b2,
+        interleaved_w1=interleaved_w1,
     )
 
 
@@ -3000,6 +3037,7 @@ def sonic_moe_backward_routes(
     *,
     b1: torch.Tensor | None = None,
     b2: torch.Tensor | None = None,
+    interleaved_w1: bool = False,
 ) -> tuple[torch.Tensor, ...]:
     """Differentiate SonicMoE over a flat variable-count route list.
 
@@ -3009,6 +3047,8 @@ def sonic_moe_backward_routes(
     independent score gradients. Tokens may have zero routes and ``R`` may be
     zero. The result contract matches :func:`sonic_moe_backward`, with
     ``droute_weights`` replacing the fixed-K score gradient.
+    ``interleaved_w1`` has the same GLU W1/B1 input and gradient-layout
+    contract as :func:`sonic_moe_backward`.
 
     Token and expert ids must be in range. Value validation remains an unchecked
     hot-path precondition; the compatibility adapter validates it before launch.
@@ -3025,6 +3065,7 @@ def sonic_moe_backward_routes(
         config,
         b1,
         b2,
+        interleaved_w1,
     )
     return _sonic_moe_backward_impl(
         hidden_states,
@@ -3038,6 +3079,7 @@ def sonic_moe_backward_routes(
         dimensions=validated[:4],
         b1=b1,
         b2=b2,
+        interleaved_w1=interleaved_w1,
     )
 
 

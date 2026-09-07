@@ -375,6 +375,12 @@ dx, dw1, dw2, droute_scores, db1, db2 = sonic_moe_backward_routes(
 )
 ```
 
+For GLU backward, both entry points also accept ``interleaved_w1=True``. In
+that mode each expert's raw W1 rows, optional B1 entries, and returned
+W1/B1 gradients use ``[g0, u0, g1, u1, ...]`` order instead of the default
+``[gate | up]`` order. This is a logical dense layout and is distinct from the
+quantized ``guinterleave`` preshuffle; pointwise activations reject the option.
+
 Dense BF16/FP16 shapes may use a 64-wide intermediate dimension. For example,
 `H=128, I=64` uses `tile_n=64`, `tile_k=128`, `down_tile_n=128`, and
 `down_tile_k=64`. MXFP4 retains its packed-load requirement that both K tiles

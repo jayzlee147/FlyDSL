@@ -516,9 +516,26 @@ def _gelu_tanh_reference(value):
     return activated, derivative
 
 
-def _activation_reference(preactivation, da, intermediate_size, activation_name):
+def _interleave_glu_rows(tensor):
+    """Convert expert-major ``[gate..., up...]`` rows to ``[g0,u0,...]``."""
+
+    gate, up = tensor.chunk(2, dim=1)
+    return torch.stack((gate, up), dim=2).flatten(1, 2).contiguous()
+
+
+def _activation_reference(
+    preactivation,
+    da,
+    intermediate_size,
+    activation_name,
+    *,
+    interleaved_w1=False,
+):
     if activation_name in _GLU_ACTIVATIONS:
-        gate, up = preactivation.float().split(intermediate_size, dim=1)
+        if interleaved_w1:
+            gate, up = preactivation.float().reshape(-1, intermediate_size, 2).unbind(dim=2)
+        else:
+            gate, up = preactivation.float().split(intermediate_size, dim=1)
         if activation_name == "swiglu":
             sigmoid = torch.sigmoid(gate)
             activated_gate = gate * sigmoid
@@ -529,7 +546,13 @@ def _activation_reference(preactivation, da, intermediate_size, activation_name)
             activated_gate = torch.relu(gate)
             derivative = (gate > 0).float()
         activated = activated_gate * up
-        dz = torch.cat((da * up * derivative, da * activated_gate), dim=1)
+        dz_gate = da * up * derivative
+        dz_up = da * activated_gate
+        dz = (
+            torch.stack((dz_gate, dz_up), dim=2).flatten(1, 2)
+            if interleaved_w1
+            else torch.cat((dz_gate, dz_up), dim=1)
+        )
     else:
         value = preactivation.float()
         if activation_name == "gelu_tanh_approx":
@@ -563,6 +586,7 @@ def _backward_reference(
     activation_name="swiglu",
     b1=None,
     b2=None,
+    interleaved_w1=False,
 ):
     """Match the standalone backward's explicit A16 materialization contract."""
 
@@ -610,6 +634,7 @@ def _backward_reference(
             ),
             intermediate_size,
             activation_name,
+            interleaved_w1=interleaved_w1,
         )
         projection = activation.float() @ w2[expert].float().transpose(0, 1)
         if b2 is not None:
@@ -623,6 +648,7 @@ def _backward_reference(
             da,
             intermediate_size,
             activation_name,
+            interleaved_w1=interleaved_w1,
         )
 
         dw2[expert] = (dy.float().transpose(0, 1) @ activation.float()).to(x.dtype)
@@ -650,6 +676,7 @@ def _backward_routes_reference(
     activation_name="swiglu",
     b1=None,
     b2=None,
+    interleaved_w1=False,
 ):
     """Match the flat-route backward's explicit A16 boundaries."""
 
@@ -690,6 +717,7 @@ def _backward_routes_reference(
             ),
             intermediate_size,
             activation_name,
+            interleaved_w1=interleaved_w1,
         )
         projection = activation.float() @ w2[expert].float().transpose(0, 1)
         if b2 is not None:
@@ -698,7 +726,13 @@ def _backward_routes_reference(
         droute_weights[route_ids] = (dout_e.float() * projection.float()).sum(dim=1)
         dy = (dout_e.float() * scores_e[:, None]).to(x.dtype)
         da = (dy.float() @ w2[expert].float()).to(x.dtype).float()
-        _, dz = _activation_reference(preactivation, da, intermediate_size, activation_name)
+        _, dz = _activation_reference(
+            preactivation,
+            da,
+            intermediate_size,
+            activation_name,
+            interleaved_w1=interleaved_w1,
+        )
 
         dw2[expert] = (dy.float().transpose(0, 1) @ activation.float()).to(x.dtype)
         dw1[expert] = (dz.float().transpose(0, 1) @ x_e.float()).to(x.dtype)
@@ -887,6 +921,71 @@ def test_sonic_moe_backward_matches_a16_reference(
     # The intentionally unused expert must receive exact zero weight grads.
     assert torch.count_nonzero(actual[1][-1]) == 0
     assert torch.count_nonzero(actual[2][-1]) == 0
+
+
+@pytest.mark.parametrize("activation_name", tuple(sorted(_GLU_ACTIVATIONS)))
+@pytest.mark.parametrize("dtype,compute_dtype", _DTYPES, ids=("bf16", "fp16"))
+def test_sonic_moe_backward_native_interleaved_w1_matches_reference(
+    activation_name,
+    dtype,
+    compute_dtype,
+):
+    """Fixed-K preserves native GLU row order through W1, dW1, B1, and dB1."""
+
+    tokens, hidden_size, intermediate_size, num_experts, topk = 1, 256, 128, 4, 2
+    config = _config(
+        hidden_size,
+        intermediate_size,
+        num_experts,
+        topk,
+        activation=activation_name,
+        compute_dtype=compute_dtype,
+        down_tile_m=128,
+    )
+    args = list(
+        _make_case(
+            tokens,
+            hidden_size,
+            intermediate_size,
+            num_experts,
+            topk,
+            seed=443,
+            activation=activation_name,
+            dtype=dtype,
+        )
+    )
+    b1, b2 = _make_biases(args[1], args[2], seed=449)
+    args[1] = _interleave_glu_rows(args[1])
+    b1 = _interleave_glu_rows(b1)
+    args = tuple(args)
+
+    actual = sonic_moe_backward(
+        *args,
+        config,
+        b1=b1,
+        b2=b2,
+        interleaved_w1=True,
+    )
+    expected = _backward_reference(
+        *args,
+        activation_name=activation_name,
+        b1=b1,
+        b2=b2,
+        interleaved_w1=True,
+    )
+    torch.cuda.synchronize()
+
+    for actual_gradient, expected_gradient in zip(actual, expected):
+        if actual_gradient.dtype == torch.float32:
+            rtol, atol = 5e-4, 5e-4
+        else:
+            rtol, atol = 3e-2, 5e-2
+        torch.testing.assert_close(
+            actual_gradient.float(),
+            expected_gradient.float(),
+            rtol=rtol,
+            atol=atol,
+        )
 
 
 def test_sonic_moe_backward_grouped_w1_spans_sort_blocks_with_bias(monkeypatch):
@@ -1357,6 +1456,92 @@ def test_sonic_moe_backward_routes_matches_a16_reference(
     assert torch.count_nonzero(actual[5][-1]) == 0
 
 
+@pytest.mark.parametrize("dtype,compute_dtype", _DTYPES, ids=("bf16-grouped", "fp16-generic"))
+def test_sonic_moe_backward_routes_native_interleaved_w1_matches_reference(
+    dtype,
+    compute_dtype,
+):
+    """Ragged duplicate routes preserve native interleaved W1/B1 gradients."""
+
+    tokens, hidden_size, intermediate_size, num_experts = 64, 256, 128, 5
+    config = _config(
+        hidden_size,
+        intermediate_size,
+        num_experts,
+        1,
+        compute_dtype=compute_dtype,
+        down_tile_m=128,
+    )
+    x, w1, w2, _, _, grad_output = _make_case(
+        tokens,
+        hidden_size,
+        intermediate_size,
+        num_experts,
+        1,
+        seed=457,
+        dtype=dtype,
+    )
+    b1, b2 = _make_biases(w1, w2, seed=461)
+    w1 = _interleave_glu_rows(w1)
+    b1 = _interleave_glu_rows(b1)
+    token_indices = torch.tensor(
+        [0, 0, 3, 7, 7, 31, 63],
+        dtype=torch.int32,
+        device=x.device,
+    )
+    expert_indices = torch.tensor(
+        [1, 1, 3, 0, 2, 0, 2],
+        dtype=torch.int32,
+        device=x.device,
+    )
+    route_weights = torch.tensor(
+        [0.75, 0.25, -0.1, 0.0, 1.25, 0.4, 0.8],
+        dtype=torch.float32,
+        device=x.device,
+    )
+
+    actual = sonic_moe_backward_routes(
+        x,
+        w1,
+        w2,
+        token_indices,
+        expert_indices,
+        route_weights,
+        grad_output,
+        config,
+        b1=b1,
+        b2=b2,
+        interleaved_w1=True,
+    )
+    expected = _backward_routes_reference(
+        x,
+        w1,
+        w2,
+        token_indices,
+        expert_indices,
+        route_weights,
+        grad_output,
+        b1=b1,
+        b2=b2,
+        interleaved_w1=True,
+    )
+    torch.cuda.synchronize()
+
+    for actual_gradient, expected_gradient in zip(actual, expected):
+        if actual_gradient.dtype == torch.float32:
+            rtol, atol = 2e-3, 4e-3
+        else:
+            rtol, atol = 3e-2, 5e-2
+        torch.testing.assert_close(
+            actual_gradient.float(),
+            expected_gradient.float(),
+            rtol=rtol,
+            atol=atol,
+        )
+    assert torch.count_nonzero(actual[1][4]) == 0
+    assert torch.count_nonzero(actual[4][4]) == 0
+
+
 def test_sonic_moe_backward_routes_grouped_dx_reuses_compact_queue(monkeypatch):
     """Duplicate ragged routes use one BM16 queue for W1 recompute and dX."""
 
@@ -1569,6 +1754,14 @@ def test_sonic_moe_backward_rejects_unsupported_contracts():
         sonic_moe_backward(*args, _config(128, 64, 4, 2, compute_dtype="fp32"))
     with pytest.raises(ValueError, match="w1 must have shape"):
         sonic_moe_backward(*args, _config(128, 64, 4, 2, activation="relu"))
+    with pytest.raises(TypeError, match="interleaved_w1 must be bool"):
+        sonic_moe_backward(*args, _config(128, 64, 4, 2), interleaved_w1=1)
+    with pytest.raises(ValueError, match="valid only for GLU activations"):
+        sonic_moe_backward(
+            *args,
+            _config(128, 64, 4, 2, activation="relu"),
+            interleaved_w1=True,
+        )
     with pytest.raises(ValueError, match="both be None or both be tensors"):
         sonic_moe_backward(*args, _config(128, 64, 4, 2), b1=b1)
     with pytest.raises(ValueError, match="b1 must have shape"):
@@ -1627,4 +1820,28 @@ def test_sonic_moe_backward_rejects_unsupported_contracts():
             route_weights.half(),
             args[-1],
             route_config,
+        )
+    with pytest.raises(TypeError, match="interleaved_w1 must be bool"):
+        sonic_moe_backward_routes(
+            args[0],
+            args[1],
+            args[2],
+            token_indices,
+            expert_indices,
+            route_weights,
+            args[-1],
+            route_config,
+            interleaved_w1="yes",
+        )
+    with pytest.raises(ValueError, match="valid only for GLU activations"):
+        sonic_moe_backward_routes(
+            args[0],
+            args[1],
+            args[2],
+            token_indices,
+            expert_indices,
+            route_weights,
+            args[-1],
+            _config(128, 64, 4, 1, activation="relu"),
+            interleaved_w1=True,
         )

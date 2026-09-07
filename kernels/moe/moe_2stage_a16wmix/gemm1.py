@@ -170,10 +170,11 @@ def _gemm1_body_a16w4(
     or a matching raw 16-bit dense type. The selected activation produces an
     A16 intermediate
     ``[sorted_size, inter_dim]`` stored by SORTED POSITION.  The backward
-    recompute specialization sets ``logical_dense_weight`` to consume the
-    public row-major ``[E, N_OUT, K]`` weight directly and
+    recompute specialization sets ``logical_dense_weight`` to consume a
+    row-major ``[E, N_OUT, K]`` weight directly and
     ``store_preactivation`` to materialize both gate/up accumulators without
-    applying the activation.
+    applying the activation.  For GLU, ``w_layout="interleaved"`` gives those
+    logical rows the native ``[g0, u0, g1, u1, ...]`` order.
     """
     _is_int4 = w_dtype == "int4"
     _is_dense = w_dtype in ("bf16", "fp16")
@@ -181,6 +182,7 @@ def _gemm1_body_a16w4(
     elem_dtype = fx.Float16 if const_expr(_is_fp16) else fx.BFloat16
     elem_ir_type = T.f16 if const_expr(_is_fp16) else T.bf16
     _is_glu = act in ("silu", "swiglu", "geglu", "reglu", "situv2")
+    _is_row_interleaved = w_layout == "interleaved"
     N_OUT = (2 if _is_glu else 1) * INTER
     elem_bytes = 2  # bf16
     a_elem_bytes = 2
@@ -582,14 +584,20 @@ def _gemm1_body_a16w4(
         else:
             # Standard W folds expert_off into the resource base (see w_tiles).
             _row_expert_off = fx.Int32(0) if const_expr(_fold_w_expert) else expert_off
-            row_gate = _row_expert_off + col_g
+            row_gate = _row_expert_off + (
+                col_g * fx.Int32(2) if const_expr(_is_row_interleaved) else col_g
+            )
             n_blk_gate.append(row_gate // fx.Int32(16))
             n_intra_gate.append(row_gate % fx.Int32(16))
             ng = expert_off + by_n + n_tile_base + fx.Int32(ni * 16)
             scale_mni_gate.append(ng // fx.Int32(32))
             scale_np_gate.append((ng // fx.Int32(16)) % fx.Int32(2))
             if _is_glu:
-                row_up = row_gate + inter_i32
+                row_up = (
+                    row_gate + fx.Int32(1)
+                    if const_expr(_is_row_interleaved)
+                    else row_gate + inter_i32
+                )
                 n_blk_up.append(row_up // fx.Int32(16))
                 n_intra_up.append(row_up % fx.Int32(16))
                 nu = ng + inter_i32
@@ -804,7 +812,11 @@ def _gemm1_body_a16w4(
         gate_bias = []
         up_bias = []
         for ni in range_constexpr(num_acc_n):
-            gate_idx = col_g_list[ni]
+            gate_idx = (
+                col_g_list[ni] * fx.Int32(2)
+                if const_expr(_is_row_interleaved)
+                else col_g_list[ni]
+            )
             gate_raw = llvm.load(
                 elem_ir_type,
                 _gep1(bias_base, gate_idx * fx.Int32(2)),
@@ -812,7 +824,11 @@ def _gemm1_body_a16w4(
             )
             gate_bias.append(fx.Float32(elem_dtype(gate_raw)))
             if _is_glu:
-                up_idx = gate_idx + inter_i32
+                up_idx = (
+                    gate_idx + fx.Int32(1)
+                    if const_expr(_is_row_interleaved)
+                    else gate_idx + inter_i32
+                )
                 up_raw = llvm.load(
                     elem_ir_type,
                     _gep1(bias_base, up_idx * fx.Int32(2)),
@@ -854,20 +870,30 @@ def _gemm1_body_a16w4(
                     # legacy per-expert GEMM.  Store gate/up separately and
                     # defer activation to its existing derivative pipeline.
                     out_base = sorted_row * fx.Int32(N_OUT)
+                    gate_out_col = (
+                        col_g_list[ni] * fx.Int32(2)
+                        if const_expr(_is_row_interleaved)
+                        else col_g_list[ni]
+                    )
                     buffer_ops.buffer_store(
                         g.to(elem_dtype),
                         _raw(out_rsrc),
-                        _raw(out_base + col_g_list[ni]),
+                        _raw(out_base + gate_out_col),
                         mask=preactivation_valid,
                     )
                     if const_expr(_is_glu):
                         u = fx.Float32(fx.Vector(fx.memref_load_vec(acc_up[mi][ni]))[ii])
                         if const_expr(has_bias):
                             u = u + up_bias[ni]
+                        up_out_col = (
+                            gate_out_col + fx.Int32(1)
+                            if const_expr(_is_row_interleaved)
+                            else gate_out_col + inter_i32
+                        )
                         buffer_ops.buffer_store(
                             u.to(elem_dtype),
                             _raw(out_rsrc),
-                            _raw(out_base + col_g_list[ni] + inter_i32),
+                            _raw(out_base + up_out_col),
                             mask=preactivation_valid,
                         )
                 elif const_expr(act == "situv2"):
@@ -938,12 +964,16 @@ def compile_gemm1_a16w4_port(
     dwordx4 is one MFMA K32 fragment. Dense W must match ``a_dtype``. Quantized
     weight modes currently require ``a_dtype="bf16"``.
 
-    ``w_layout`` (default ``"standard"``): W/scale preshuffle the kernel consumes.
+    ``w_layout`` (default ``"standard"``): W/scale layout the kernel consumes.
     ``"standard"`` is the N-major ``shuffle_weight``/``e8m0_shuffle`` (GGUU) layout.
     ``"guinterleave"`` (mxfp4 only) consumes aiter's native GUGU stage1 layout
     (``shuffle_weight_a16w4``/``shuffle_scale_a16w4``, ``is_guinterleave=True``) directly,
     no host relayout. Stage2 (gemm2) needs no mode: its gate_up=False native layout is
     byte-identical to standard when E*model_dim % 256 == 0.
+    ``"interleaved"`` is a distinct backward-only raw dense layout.  With
+    ``logical_dense_weight=True`` it consumes each expert's row-major GLU rows
+    as ``[g0, u0, g1, u1, ...]`` and writes stored preactivation in that same
+    order; it is not the quantized preshuffle used by ``"guinterleave"``.
 
     ``k_wave`` (aiter slice-K, default 1): repartition 4 waves into (4/k_wave) N-waves x
     k_wave K-waves; partials LDS-reduced. k_wave in {1,2,4}; requires 4 % k_wave == 0 and
@@ -967,10 +997,17 @@ def compile_gemm1_a16w4_port(
         assert w_dtype == a_dtype, "dense w_dtype must match a_dtype"
     else:
         assert a_dtype == "bf16", "quantized weights currently require a_dtype='bf16'"
-    assert w_layout in ("standard", "guinterleave"), f"w_layout must be 'standard' or 'guinterleave', got {w_layout!r}"
+    assert w_layout in ("standard", "guinterleave", "interleaved"), (
+        "w_layout must be 'standard', 'guinterleave', or 'interleaved', "
+        f"got {w_layout!r}"
+    )
     assert not (
         w_layout == "guinterleave" and w_dtype != "mxfp4"
     ), f"w_layout='guinterleave' is mxfp4-only, got w_dtype={w_dtype!r}"
+    assert not (
+        w_layout == "interleaved"
+        and (w_dtype not in ("bf16", "fp16") or not logical_dense_weight)
+    ), "w_layout='interleaved' requires raw dense A16 logical weights"
     assert k_wave in (1, 2, 4), f"k_wave must be 1, 2, or 4, got {k_wave}"
     assert 4 % k_wave == 0, f"4 must be divisible by k_wave, got {k_wave}"
     assert isinstance(round_preact_bf16, bool), "round_preact_bf16 must be bool"
@@ -984,6 +1021,7 @@ def compile_gemm1_a16w4_port(
     _INTER = D_INTER
     _is_glu = act in ("silu", "swiglu", "geglu", "reglu", "situv2")
     assert not (w_layout == "guinterleave" and not _is_glu), "w_layout='guinterleave' is valid only for GLU activations"
+    assert not (w_layout == "interleaved" and not _is_glu), "w_layout='interleaved' is valid only for GLU activations"
     _N_OUT = (2 if _is_glu else 1) * _INTER
     assert not logical_dense_weight or w_dtype in ("bf16", "fp16"), (
         "logical_dense_weight is valid only for dense A16 weights"
