@@ -10,11 +10,11 @@ inference workspace. Re-sorting and recomputing the two forward intermediates
 makes retained graphs and overlapping forward calls safe.
 
 The implementation is entirely FlyDSL on device.  Short-route BF16 SwiGLU W1
-preactivation and W2 projection recomputes use device-driven grouped gfx950
-MFMA kernels; the remaining matrix products use the general A16W16 GEMM. Small
-FlyDSL kernels implement routing metadata, gather/scatter, activation
+preactivation, W2 projection, and dA contractions use device-driven grouped
+gfx950 MFMA kernels; the remaining matrix products use the general A16W16 GEMM.
+Small FlyDSL kernels implement routing metadata, gather/scatter, activation
 derivatives, and the top-K reduction. The bring-up path still performs one host
-synchronization to dispatch the four remaining GEMMs per active expert; later
+synchronization to dispatch the three remaining GEMMs per active expert; later
 grouped kernels can remove that synchronization without changing the public
 API.
 """
@@ -36,6 +36,7 @@ from kernels.common.kernels_common import get_warp_size
 from kernels.common.mem_ops import atomic_add
 from kernels.common.tensor_shim import _run_compiled
 from kernels.gemm.gemm_a16w16_gfx950 import gemm_a16w16
+from kernels.moe.grouped_da_gfx950 import compile_grouped_da_gfx950
 from kernels.moe.moe_2stage_a16wmix.gemm1 import (
     _gelu_tanh_f32,
     _relu_f32,
@@ -117,6 +118,24 @@ _GROUPED_W2_BM = 32
 _GROUPED_W2_BN = 256
 _GROUPED_W2_BK = 64
 _GROUPED_W2_MAX_EXPERT_ROWS = 128
+
+# dA consumes public row-major W2 directly: [M, H] @ [H, I] -> [M, I].  The
+# NN-specialized kernel transposes B in LDS and uses CDNA4 LDSReadTrans16_64b
+# before MFMA.  Three measured gfx950 profiles cover decode, sparse short-M,
+# and long/hot expert segments.  The backward already reads frequencies for
+# the remaining dW contractions, so profile selection adds no synchronization.
+_GROUPED_DA_BN = 64
+_GROUPED_DA_MAX_EXPERT_ROWS = 4096
+
+
+def _grouped_da_tuning(max_expert_rows: int, hidden_size: int) -> tuple[int, int, int, int, int]:
+    """Return ``(BM, BN, BK, m_waves, n_waves)`` for grouped dA."""
+
+    if max_expert_rows <= 1 and hidden_size % 128 == 0:
+        return (16, _GROUPED_DA_BN, 128, 1, 4)
+    if max_expert_rows <= 16:
+        return (32, _GROUPED_DA_BN, 64, 2, 2)
+    return (64, _GROUPED_DA_BN, 64, 2, 2)
 
 
 def _use_compact_w1_descriptor_queue(
@@ -266,6 +285,57 @@ def _use_grouped_w2_recompute(
         and hidden_size % _GROUPED_W2_BN == 0
         and intermediate_size % _GROUPED_W2_BK == 0
         and max_expert_rows <= _GROUPED_W2_MAX_EXPERT_ROWS
+    )
+
+
+def _use_grouped_da(
+    *,
+    compute_dtype: str,
+    activation: str,
+    hidden_size: int,
+    intermediate_size: int,
+    tokens: int,
+    routes: int,
+    flat_routes: bool,
+) -> bool:
+    """Return whether the short-M grouped dA specialization is applicable."""
+
+    max_expert_rows = routes if flat_routes else tokens
+    return (
+        compute_dtype == "bf16"
+        and activation == "swiglu"
+        and hidden_size % 64 == 0
+        and intermediate_size % _GROUPED_DA_BN == 0
+        and max_expert_rows <= _GROUPED_DA_MAX_EXPERT_ROWS
+    )
+
+
+@functools.lru_cache(maxsize=64)
+def _compile_grouped_da(
+    hidden_size: int,
+    intermediate_size: int,
+    num_experts: int,
+    block_m: int,
+    block_n: int,
+    block_k: int,
+    m_waves: int,
+    n_waves: int,
+    device_index: int,
+):
+    """Build the grouped raw-W2 dA contraction for BF16 SwiGLU."""
+
+    del device_index
+    return compile_grouped_da_gfx950(
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+        num_experts=num_experts,
+        sorted_block_size=_BACKWARD_SORT_UNIT,
+        block_m=block_m,
+        block_n=block_n,
+        block_k=block_k,
+        stages=2,
+        m_waves=m_waves,
+        n_waves=n_waves,
     )
 
 
@@ -1400,6 +1470,15 @@ def _sonic_moe_backward_impl(
         routes=routes,
         flat_routes=flat_routes,
     )
+    use_grouped_da = _use_grouped_da(
+        compute_dtype=compute_dtype,
+        activation=activation_name,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+        tokens=tokens,
+        routes=routes,
+        flat_routes=flat_routes,
+    )
     grouped_w1_bm, grouped_w1_bn, _, _, compact_w1_grid = _grouped_w1_tuning(
         tokens=tokens,
         hidden_size=hidden_size,
@@ -1492,7 +1571,10 @@ def _sonic_moe_backward_impl(
         else torch.empty((max_padded, projection_size), dtype=hidden_states.dtype, device=device)
     )
     activation = torch.empty((max_padded, intermediate_size), dtype=hidden_states.dtype, device=device)
-    da = torch.empty_like(activation)
+    # Grouped dA writes real expert rows only.  The derivative and dW1/db1
+    # reductions consume full sorter-padded segments, so untouched rows must
+    # remain finite zero rather than uninitialized storage.
+    da = torch.zeros_like(activation) if use_grouped_da else torch.empty_like(activation)
     dz = torch.empty_like(preactivation)
     dx_sorted = torch.empty_like(x_sorted)
     dx_routes = (
@@ -1690,6 +1772,34 @@ def _sonic_moe_backward_impl(
             stream,
         )
 
+        if use_grouped_da:
+            grouped_da_bm, grouped_da_bn, grouped_da_bk, grouped_da_mw, grouped_da_nw = _grouped_da_tuning(
+                max(int(count) for count in frequencies), hidden_size
+            )
+            grouped_da = _compile_grouped_da(
+                hidden_size,
+                intermediate_size,
+                num_experts,
+                grouped_da_bm,
+                grouped_da_bn,
+                grouped_da_bk,
+                grouped_da_mw,
+                grouped_da_nw,
+                device_index,
+            )
+            grouped_da_grid = num_experts * (intermediate_size // grouped_da_bn)
+            _run_compiled(
+                grouped_da,
+                dy.data_ptr(),
+                w2_arg.data_ptr(),
+                expert_frequency.data_ptr(),
+                sorted_expert_ids.data_ptr(),
+                num_valid_ids.data_ptr(),
+                da.data_ptr(),
+                int(grouped_da_grid),
+                stream,
+            )
+
         if use_grouped_w2:
             grouped_w2 = _compile_grouped_w2_recompute(
                 hidden_size,
@@ -1733,14 +1843,15 @@ def _sonic_moe_backward_impl(
                     stream=stream,
                     layout="nt",
                 )
-            gemm_a16w16(
-                dy[start:end],
-                w2_arg[expert],
-                out=da[start:end],
-                user_kwargs=_GEMM_KWARGS,
-                stream=stream,
-                layout="nn",
-            )
+            if not use_grouped_da:
+                gemm_a16w16(
+                    dy[start:end],
+                    w2_arg[expert],
+                    out=da[start:end],
+                    user_kwargs=_GEMM_KWARGS,
+                    stream=stream,
+                    layout="nn",
+                )
             gemm_a16w16(
                 dy[start:end].transpose(0, 1),
                 activation[start:end],

@@ -19,7 +19,9 @@ from kernels.moe.sonic import (
     sonic_moe_backward_routes,
 )
 from kernels.moe.sonic_backward import (
+    _grouped_da_tuning,
     _grouped_w1_tuning,
+    _use_grouped_da,
     _use_grouped_w1_recompute,
     _use_grouped_w2_recompute,
 )
@@ -107,6 +109,75 @@ def test_grouped_w2_policy_keeps_unsupported_contracts_on_legacy(
     intermediate_size,
 ):
     assert not _use_grouped_w2_recompute(
+        compute_dtype=compute_dtype,
+        activation=activation,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+        tokens=128,
+        routes=2048,
+        flat_routes=False,
+    )
+
+
+@pytest.mark.parametrize(
+    ("tokens", "routes", "flat_routes", "expected"),
+    (
+        (1, 16, False, True),
+        (128, 2048, False, True),
+        (129, 2064, False, True),
+        (4096, 32768, False, True),
+        (4097, 32776, False, False),
+        (16, 128, True, True),
+        (16, 4096, True, True),
+        (16, 4097, True, False),
+    ),
+)
+def test_grouped_da_policy_bounds_worst_case_expert_rows(tokens, routes, flat_routes, expected):
+    assert (
+        _use_grouped_da(
+            compute_dtype="bf16",
+            activation="swiglu",
+            hidden_size=3584,
+            intermediate_size=512,
+            tokens=tokens,
+            routes=routes,
+            flat_routes=flat_routes,
+        )
+        is expected
+    )
+
+
+@pytest.mark.parametrize(
+    ("max_expert_rows", "hidden_size", "expected"),
+    (
+        (1, 3584, (16, 64, 128, 1, 4)),
+        (1, 64, (32, 64, 64, 2, 2)),
+        (2, 3584, (32, 64, 64, 2, 2)),
+        (16, 3584, (32, 64, 64, 2, 2)),
+        (17, 3584, (64, 64, 64, 2, 2)),
+        (512, 4096, (64, 64, 64, 2, 2)),
+    ),
+)
+def test_grouped_da_tuning_tracks_actual_expert_rows(max_expert_rows, hidden_size, expected):
+    assert _grouped_da_tuning(max_expert_rows, hidden_size) == expected
+
+
+@pytest.mark.parametrize(
+    ("compute_dtype", "activation", "hidden_size", "intermediate_size"),
+    (
+        ("fp16", "swiglu", 3584, 512),
+        ("bf16", "geglu", 3584, 512),
+        ("bf16", "swiglu", 3552, 512),
+        ("bf16", "swiglu", 3584, 480),
+    ),
+)
+def test_grouped_da_policy_keeps_unsupported_contracts_on_legacy(
+    compute_dtype,
+    activation,
+    hidden_size,
+    intermediate_size,
+):
+    assert not _use_grouped_da(
         compute_dtype=compute_dtype,
         activation=activation,
         hidden_size=hidden_size,

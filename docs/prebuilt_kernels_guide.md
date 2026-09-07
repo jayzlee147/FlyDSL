@@ -621,6 +621,28 @@ from about `251.0 ms` to `201.0 ms` (`1.249x`). At T1 the W2 phase measured
 policy keeps the large-T BM64 path; the independently remeasured
 `T4096/H4096/I2048/E64/K8` full backward remained `22.28 ms`.
 
+The grouped dA specialization completes the backward down-projection pair by
+reading public row-major `W2[E,H,I]` directly and computing
+`dY[sorted,H] @ W2[e,H,I]`. It uses the gfx950 NN pipeline: 16-byte async
+global-to-LDS loads, an LDS transpose plus `LDSReadTrans16_64b` for B, and
+BF16 `MFMA 16x16x32`. Since the backward already synchronizes to obtain expert
+frequencies for dW, the kernel chooses among three measured profiles using the
+actual largest expert segment: `BM16/BN64/BK128/w1x4` for one row,
+`BM32/BN64/BK64/w2x2` through 16 rows, and `BM64/BN64/BK64/w2x2` above that.
+The output is pre-zeroed because real-M tiles intentionally omit sorter
+padding. FP16 and unsupported shapes retain the general GEMM path.
+
+On the same MI355X, isolated dA latency fell from `901.5 us` to `21.5 us` at
+`T1/H3584/I512/E896/K16`, from `49.549 ms` to `0.601 ms` for balanced T128,
+from `921.3 us` to `57.7 us` for T128 routed to 16 hot experts, and from
+`3.446 ms` to `1.611 ms` at balanced `T4096/H4096/I2048/E64/K8`. Paired
+end-to-end backward medians (all four returned gradients checked against the
+legacy path) were `5.266 -> 4.408 ms`, `202.854 -> 153.552 ms`,
+`5.381 -> 4.512 ms`, and `22.360 -> 18.853 ms`, respectively. A prototype
+that reused W1's compact BM16 descriptor queue reached `0.603 ms` on balanced
+T128, slightly behind the selected `0.601 ms` expert-grid profile, so it was
+not retained.
+
 Run the validated A16W4 path or let the shape-bucket tuner choose the tiles with:
 
 ```bash
