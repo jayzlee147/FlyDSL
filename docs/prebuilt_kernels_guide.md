@@ -643,6 +643,19 @@ that reused W1's compact BM16 descriptor queue reached `0.603 ms` on balanced
 T128, slightly behind the selected `0.601 ms` expert-grid profile, so it was
 not retained.
 
+The grouped dX specialization computes `dZ[sorted,2I] @ W1[e,2I,H]` with a
+gfx950-native NN MFMA pipeline and keeps the public row-major weight layout.
+T1 consumes sorter metadata directly, while short-route calls reuse W1's
+existing BM16 compact descriptor queue; no second builder launch is added.
+The persistent grid is capped at 1024 workgroups and selects `BN128/2-wave`
+below 256 active experts or `BN256/4-wave` for dense expert sets when the
+hidden dimension permits it. On `H3584/I512/E896/K16`, isolated dX changed
+from `876.36` to `18.95 us` at T1, from `852.21` to `57.01 us` for T128 with
+16 hot experts, and from `48.410 ms` to `1.209 ms` for balanced T128. The
+corresponding complete backward medians changed from `4.426` to `3.549 ms`,
+`4.592` to `3.735 ms`, and `154.230` to `103.507 ms`. Long T4096 calls retain
+the general BM64 path; paired measurements stayed within 0.4% noise.
+
 Run the validated A16W4 path or let the shape-bucket tuner choose the tiles with:
 
 ```bash
