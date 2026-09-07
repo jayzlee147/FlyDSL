@@ -13,10 +13,10 @@ The implementation is entirely FlyDSL on device.  Short-route BF16 SwiGLU W1
 preactivation, W2 projection, dA, and BF16 dW2 contractions use device-driven
 grouped gfx950 MFMA kernels; the remaining matrix products use the general
 A16W16 GEMM. Small FlyDSL kernels implement routing metadata, gather/scatter,
-activation derivatives, and the top-K reduction. The bring-up path still
-performs one host synchronization to dispatch the remaining dW1 GEMM per active
-expert; later grouped kernels can remove that synchronization without changing
-the public API.
+activation derivatives, and the top-K reduction.  The fully grouped short
+BF16/SwiGLU/no-bias path keeps all sorter extents and expert schedules on the
+device; legacy dtype, activation, bias, ragged-route, and long-token contracts
+retain the conservative host-dispatched fallback.
 """
 
 import functools
@@ -219,6 +219,13 @@ _GROUPED_DW1_MAX_EXPERT_ROWS = 4096
 # frequency readback already required by this backward implementation.
 _INACTIVE_WEIGHT_GRAD_ZERO_ACTIVE_RATIO = 8
 
+# Device-sized row kernels use a host-known allocation bound only to size the
+# launch.  Each workgroup then walks the sorter-produced ``num_valid_ids[0]``
+# extent in a grid-stride loop.  Four workgroups per gfx950 CU is enough to
+# cover latency without launching tens of thousands of idle CTAs for sparse
+# hot-expert distributions.
+_HOSTLESS_ROW_GRID_CAP = 1024
+
 
 def _grouped_dw1_tuning(
     max_expert_rows: int,
@@ -362,6 +369,41 @@ def _use_grouped_dx(
         and (2 * intermediate_size) % _GROUPED_DX_BK == 0
         and hidden_size % 64 == 0
         and (compact_w1 or (tokens == 1 and not flat_routes))
+    )
+
+
+def _use_hostless_grouped_backward(
+    *,
+    flat_routes: bool,
+    has_bias: bool,
+    tokens: int,
+    use_grouped_w1: bool,
+    use_grouped_w2: bool,
+    use_grouped_dw2: bool,
+    use_grouped_da: bool,
+    use_grouped_dw1: bool,
+    use_grouped_dx: bool,
+) -> bool:
+    """Select the fully device-dispatched short fixed-K backward.
+
+    Every matrix contraction must already have a grouped implementation.  The
+    remaining row kernels can then consume the sorter extent directly, so no
+    host-side expert-frequency reconstruction is necessary.  Keep the first
+    rollout deliberately bounded to decode and the tuned T64/T128 regime;
+    larger shapes retain the established fallback until their row scheduling
+    has been profiled independently.
+    """
+
+    return (
+        not flat_routes
+        and not has_bias
+        and tokens <= 128
+        and use_grouped_w1
+        and use_grouped_w2
+        and use_grouped_dw2
+        and use_grouped_da
+        and use_grouped_dw1
+        and use_grouped_dx
     )
 
 
@@ -672,6 +714,23 @@ def _max_padded_flat_routes(
     return blocks * sort_unit, blocks
 
 
+def _materialize_expert_segments(
+    expert_frequency: torch.Tensor,
+    sort_unit: int,
+) -> tuple[list[int], list[tuple[int, int, int]], int, int]:
+    """Synchronously reconstruct padded expert slices for legacy fallbacks."""
+
+    frequencies = expert_frequency.cpu().tolist()
+    segments: list[tuple[int, int, int]] = []
+    offset = 0
+    for expert, count in enumerate(frequencies):
+        if count:
+            padded = ((int(count) + sort_unit - 1) // sort_unit) * sort_unit
+            segments.append((expert, offset, padded))
+            offset += padded
+    return frequencies, segments, offset, max(int(count) for count in frequencies)
+
+
 @functools.lru_cache(maxsize=128)
 def _compile_expert_histogram(num_experts: int, device_index: int):
     """Compile fixed-K expert histogram kernels for one device specialization."""
@@ -723,7 +782,12 @@ def _compile_expert_histogram(num_experts: int, device_index: int):
 
 
 @functools.lru_cache(maxsize=128)
-def _compile_gather(hidden_size: int, compute_dtype: str, device_index: int):
+def _compile_gather(
+    hidden_size: int,
+    compute_dtype: str,
+    device_index: int,
+    device_padded_rows: bool = False,
+):
     """Compile sorted-row gathers for hidden states and output gradients."""
 
     del device_index
@@ -738,21 +802,24 @@ def _compile_gather(hidden_size: int, compute_dtype: str, device_index: int):
         sorted_token_ids: fx.Tensor,
         x_sorted: fx.Tensor,
         dout_sorted: fx.Tensor,
+        num_valid_ids: fx.Tensor,
         i32_tokens: fx.Int32,
         i32_padded_rows: fx.Int32,
     ):
         index = gpu.block_idx.x * fx.Int32(_BLOCK_THREADS) + gpu.thread_idx.x
-        total = i32_padded_rows * fx.Int32(vectors_per_row)
-        if index < total:
+        stride = gpu.grid_dim.x * fx.Int32(_BLOCK_THREADS)
+        ids_rsrc = buffer_ops.create_buffer_resource(sorted_token_ids, max_size=True)
+        x_rsrc = buffer_ops.create_buffer_resource(hidden_states, max_size=True)
+        dout_rsrc = buffer_ops.create_buffer_resource(grad_output, max_size=True)
+        x_sorted_rsrc = buffer_ops.create_buffer_resource(x_sorted, max_size=True)
+        dout_sorted_rsrc = buffer_ops.create_buffer_resource(dout_sorted, max_size=True)
+
+        def gather_vector(index):
             row = index // fx.Int32(vectors_per_row)
             column = (index % fx.Int32(vectors_per_row)) * fx.Int32(vector_width)
-            ids_rsrc = buffer_ops.create_buffer_resource(sorted_token_ids, max_size=True)
-            x_rsrc = buffer_ops.create_buffer_resource(hidden_states, max_size=True)
-            dout_rsrc = buffer_ops.create_buffer_resource(grad_output, max_size=True)
-            x_sorted_rsrc = buffer_ops.create_buffer_resource(x_sorted, max_size=True)
-            dout_sorted_rsrc = buffer_ops.create_buffer_resource(dout_sorted, max_size=True)
-
-            packed = fx.Int32(buffer_ops.buffer_load(ids_rsrc, row, vec_width=1, dtype=T.i32))
+            packed = fx.Int32(
+                buffer_ops.buffer_load(ids_rsrc, row, vec_width=1, dtype=T.i32)
+            )
             token = packed & fx.Int32(_TOKEN_MASK)
             valid = (token >= fx.Int32(0)) & (token < i32_tokens)
             safe_token = valid.select(token, fx.Int32(0))
@@ -771,8 +838,26 @@ def _compile_gather(hidden_size: int, compute_dtype: str, device_index: int):
                 dtype=elem_dtype,
             )
             zero = fx.Vector.filled(vector_width, 0.0, elem_dtype)
-            buffer_ops.buffer_store(valid.select(fx.Vector(x_value), zero), x_sorted_rsrc, destination)
-            buffer_ops.buffer_store(valid.select(fx.Vector(dout_value), zero), dout_sorted_rsrc, destination)
+            buffer_ops.buffer_store(
+                valid.select(fx.Vector(x_value), zero), x_sorted_rsrc, destination
+            )
+            buffer_ops.buffer_store(
+                valid.select(fx.Vector(dout_value), zero), dout_sorted_rsrc, destination
+            )
+
+        padded_rows = i32_padded_rows
+        if const_expr(device_padded_rows):
+            valid_rsrc = buffer_ops.create_buffer_resource(num_valid_ids, max_size=True)
+            padded_rows = fx.Int32(
+                buffer_ops.buffer_load(valid_rsrc, fx.Int32(0), vec_width=1, dtype=T.i32)
+            )
+        total = padded_rows * fx.Int32(vectors_per_row)
+        if const_expr(device_padded_rows):
+            for vector_index in range(index, total, stride):
+                gather_vector(fx.Int32(vector_index))
+        else:
+            if index < total:
+                gather_vector(index)
 
     @flyc.jit
     def launch(
@@ -781,6 +866,7 @@ def _compile_gather(hidden_size: int, compute_dtype: str, device_index: int):
         sorted_token_ids: fx.Tensor,
         x_sorted: fx.Tensor,
         dout_sorted: fx.Tensor,
+        num_valid_ids: fx.Tensor,
         i32_tokens: fx.Int32,
         i32_padded_rows: fx.Int32,
         i32_grid: fx.Int32,
@@ -792,6 +878,7 @@ def _compile_gather(hidden_size: int, compute_dtype: str, device_index: int):
             sorted_token_ids,
             x_sorted,
             dout_sorted,
+            num_valid_ids,
             i32_tokens,
             i32_padded_rows,
         ).launch(
@@ -810,6 +897,7 @@ def _compile_activation_prepare(
     activation_name: str,
     compute_dtype: str,
     device_index: int,
+    device_padded_rows: bool = False,
 ):
     """Compile activation recomputation and routed-dout scaling."""
 
@@ -826,49 +914,80 @@ def _compile_activation_prepare(
         dout_sorted: fx.Tensor,
         dy: fx.Tensor,
         sorted_weights: fx.Tensor,
+        sorted_token_ids: fx.Tensor,
+        num_valid_ids: fx.Tensor,
+        i32_tokens: fx.Int32,
+        i32_padded_rows: fx.Int32,
     ):
-        row = gpu.block_idx.x
         tid = gpu.thread_idx.x
         weights_rsrc = buffer_ops.create_buffer_resource(sorted_weights, max_size=True)
         preact_rsrc = buffer_ops.create_buffer_resource(preactivation, max_size=True)
         activation_rsrc = buffer_ops.create_buffer_resource(activation, max_size=True)
         dout_rsrc = buffer_ops.create_buffer_resource(dout_sorted, max_size=True)
         dy_rsrc = buffer_ops.create_buffer_resource(dy, max_size=True)
-        route_weight = fx.Float32(buffer_ops.buffer_load(weights_rsrc, row, vec_width=1, dtype=T.f32))
+        ids_rsrc = buffer_ops.create_buffer_resource(sorted_token_ids, max_size=True)
 
-        for base in range_constexpr(0, intermediate_size, _BLOCK_THREADS):
-            column = tid + fx.Int32(base)
-            if column < fx.Int32(intermediate_size):
-                gate_offset = row * fx.Int32(projection_size) + column
-                act_offset = row * fx.Int32(intermediate_size) + column
-                gate = buffer_ops.buffer_load(preact_rsrc, gate_offset, vec_width=1, dtype=elem_dtype).extf(T.f32)
-                up_offset = gate_offset + fx.Int32(up_column_offset)
-                up = buffer_ops.buffer_load(
-                    preact_rsrc,
-                    up_offset,
-                    vec_width=1,
-                    dtype=elem_dtype,
-                ).extf(T.f32)
-                activation_f32 = _activation_f32(gate, up, activation_name)
-                buffer_ops.buffer_store(
-                    fx.Float32(activation_f32).to(elem_dtype),
-                    activation_rsrc,
-                    act_offset,
-                )
+        def prepare_row(row):
+            route_weight = fx.Float32(
+                buffer_ops.buffer_load(weights_rsrc, row, vec_width=1, dtype=T.f32)
+            )
 
-        # Materialize dy in A16 before its two GEMMs.  This preserves the
-        # multiply-before-GEMM dependency while making the standalone FlyDSL
-        # backward's A16 input boundary explicit.
-        for base in range_constexpr(0, hidden_size, _BLOCK_THREADS):
-            column = tid + fx.Int32(base)
-            if column < fx.Int32(hidden_size):
-                offset = row * fx.Int32(hidden_size) + column
-                dout_value = buffer_ops.buffer_load(dout_rsrc, offset, vec_width=1, dtype=elem_dtype).extf(T.f32)
-                buffer_ops.buffer_store(
-                    fx.Float32(dout_value * route_weight).to(elem_dtype),
-                    dy_rsrc,
-                    offset,
+            for base in range_constexpr(0, intermediate_size, _BLOCK_THREADS):
+                column = tid + fx.Int32(base)
+                if column < fx.Int32(intermediate_size):
+                    gate_offset = row * fx.Int32(projection_size) + column
+                    act_offset = row * fx.Int32(intermediate_size) + column
+                    gate = buffer_ops.buffer_load(
+                        preact_rsrc, gate_offset, vec_width=1, dtype=elem_dtype
+                    ).extf(T.f32)
+                    up_offset = gate_offset + fx.Int32(up_column_offset)
+                    up = buffer_ops.buffer_load(
+                        preact_rsrc,
+                        up_offset,
+                        vec_width=1,
+                        dtype=elem_dtype,
+                    ).extf(T.f32)
+                    activation_f32 = _activation_f32(gate, up, activation_name)
+                    buffer_ops.buffer_store(
+                        fx.Float32(activation_f32).to(elem_dtype),
+                        activation_rsrc,
+                        act_offset,
+                    )
+
+            # Materialize dy in A16 before its two GEMMs.  This preserves the
+            # multiply-before-GEMM dependency while making the standalone
+            # FlyDSL backward's A16 input boundary explicit.
+            for base in range_constexpr(0, hidden_size, _BLOCK_THREADS):
+                column = tid + fx.Int32(base)
+                if column < fx.Int32(hidden_size):
+                    offset = row * fx.Int32(hidden_size) + column
+                    dout_value = buffer_ops.buffer_load(
+                        dout_rsrc, offset, vec_width=1, dtype=elem_dtype
+                    ).extf(T.f32)
+                    buffer_ops.buffer_store(
+                        fx.Float32(dout_value * route_weight).to(elem_dtype),
+                        dy_rsrc,
+                        offset,
+                    )
+
+        padded_rows = i32_padded_rows
+        if const_expr(device_padded_rows):
+            valid_rsrc = buffer_ops.create_buffer_resource(num_valid_ids, max_size=True)
+            padded_rows = fx.Int32(
+                buffer_ops.buffer_load(valid_rsrc, fx.Int32(0), vec_width=1, dtype=T.i32)
+            )
+
+        if const_expr(device_padded_rows):
+            for row_value in range(gpu.block_idx.x, padded_rows, gpu.grid_dim.x):
+                row = fx.Int32(row_value)
+                packed = fx.Int32(
+                    buffer_ops.buffer_load(ids_rsrc, row, vec_width=1, dtype=T.i32)
                 )
+                token = packed & fx.Int32(_TOKEN_MASK)
+                if token < i32_tokens:
+                    prepare_row(row)
+        else:
+            prepare_row(gpu.block_idx.x)
 
     @flyc.jit
     def launch(
@@ -877,6 +996,9 @@ def _compile_activation_prepare(
         dout_sorted: fx.Tensor,
         dy: fx.Tensor,
         sorted_weights: fx.Tensor,
+        sorted_token_ids: fx.Tensor,
+        num_valid_ids: fx.Tensor,
+        i32_tokens: fx.Int32,
         i32_padded_rows: fx.Int32,
         stream: fx.Stream = fx.Stream(None),
     ):
@@ -886,6 +1008,10 @@ def _compile_activation_prepare(
             dout_sorted,
             dy,
             sorted_weights,
+            sorted_token_ids,
+            num_valid_ids,
+            i32_tokens,
+            i32_padded_rows,
         ).launch(
             grid=(i32_padded_rows, 1, 1),
             block=(_BLOCK_THREADS, 1, 1),
@@ -901,6 +1027,7 @@ def _compile_activation_derivative(
     activation_name: str,
     compute_dtype: str,
     device_index: int,
+    device_padded_rows: bool = False,
 ):
     """Compile the selected activation's Jacobian-vector product."""
 
@@ -915,46 +1042,89 @@ def _compile_activation_derivative(
         preactivation: fx.Tensor,
         da: fx.Tensor,
         dz: fx.Tensor,
+        sorted_token_ids: fx.Tensor,
+        num_valid_ids: fx.Tensor,
+        i32_tokens: fx.Int32,
+        i32_padded_rows: fx.Int32,
     ):
-        row = gpu.block_idx.x
         tid = gpu.thread_idx.x
         preact_rsrc = buffer_ops.create_buffer_resource(preactivation, max_size=True)
         da_rsrc = buffer_ops.create_buffer_resource(da, max_size=True)
         dz_rsrc = buffer_ops.create_buffer_resource(dz, max_size=True)
+        ids_rsrc = buffer_ops.create_buffer_resource(sorted_token_ids, max_size=True)
 
-        for base in range_constexpr(0, intermediate_size, _BLOCK_THREADS):
-            column = tid + fx.Int32(base)
-            if column < fx.Int32(intermediate_size):
-                gate_offset = row * fx.Int32(projection_size) + column
-                up_offset = gate_offset + fx.Int32(up_column_offset)
-                act_offset = row * fx.Int32(intermediate_size) + column
-                gate = buffer_ops.buffer_load(preact_rsrc, gate_offset, vec_width=1, dtype=elem_dtype).extf(T.f32)
-                up = buffer_ops.buffer_load(
-                    preact_rsrc,
-                    up_offset,
-                    vec_width=1,
-                    dtype=elem_dtype,
-                ).extf(T.f32)
-                da_value = buffer_ops.buffer_load(da_rsrc, act_offset, vec_width=1, dtype=elem_dtype).extf(T.f32)
-                dz_gate, dz_up = _activation_backward_f32(
-                    gate,
-                    up,
-                    da_value,
-                    activation_name,
+        def differentiate_row(row):
+            for base in range_constexpr(0, intermediate_size, _BLOCK_THREADS):
+                column = tid + fx.Int32(base)
+                if column < fx.Int32(intermediate_size):
+                    gate_offset = row * fx.Int32(projection_size) + column
+                    up_offset = gate_offset + fx.Int32(up_column_offset)
+                    act_offset = row * fx.Int32(intermediate_size) + column
+                    gate = buffer_ops.buffer_load(
+                        preact_rsrc, gate_offset, vec_width=1, dtype=elem_dtype
+                    ).extf(T.f32)
+                    up = buffer_ops.buffer_load(
+                        preact_rsrc,
+                        up_offset,
+                        vec_width=1,
+                        dtype=elem_dtype,
+                    ).extf(T.f32)
+                    da_value = buffer_ops.buffer_load(
+                        da_rsrc, act_offset, vec_width=1, dtype=elem_dtype
+                    ).extf(T.f32)
+                    dz_gate, dz_up = _activation_backward_f32(
+                        gate,
+                        up,
+                        da_value,
+                        activation_name,
+                    )
+                    buffer_ops.buffer_store(
+                        fx.Float32(dz_gate).to(elem_dtype), dz_rsrc, gate_offset
+                    )
+                    if const_expr(is_glu):
+                        buffer_ops.buffer_store(
+                            fx.Float32(dz_up).to(elem_dtype), dz_rsrc, up_offset
+                        )
+
+        padded_rows = i32_padded_rows
+        if const_expr(device_padded_rows):
+            valid_rsrc = buffer_ops.create_buffer_resource(num_valid_ids, max_size=True)
+            padded_rows = fx.Int32(
+                buffer_ops.buffer_load(valid_rsrc, fx.Int32(0), vec_width=1, dtype=T.i32)
+            )
+
+        if const_expr(device_padded_rows):
+            for row_value in range(gpu.block_idx.x, padded_rows, gpu.grid_dim.x):
+                row = fx.Int32(row_value)
+                packed = fx.Int32(
+                    buffer_ops.buffer_load(ids_rsrc, row, vec_width=1, dtype=T.i32)
                 )
-                buffer_ops.buffer_store(fx.Float32(dz_gate).to(elem_dtype), dz_rsrc, gate_offset)
-                if const_expr(is_glu):
-                    buffer_ops.buffer_store(fx.Float32(dz_up).to(elem_dtype), dz_rsrc, up_offset)
+                token = packed & fx.Int32(_TOKEN_MASK)
+                if token < i32_tokens:
+                    differentiate_row(row)
+        else:
+            differentiate_row(gpu.block_idx.x)
 
     @flyc.jit
     def launch(
         preactivation: fx.Tensor,
         da: fx.Tensor,
         dz: fx.Tensor,
+        sorted_token_ids: fx.Tensor,
+        num_valid_ids: fx.Tensor,
+        i32_tokens: fx.Int32,
         i32_padded_rows: fx.Int32,
         stream: fx.Stream = fx.Stream(None),
     ):
-        activation_derivative_kernel(preactivation, da, dz).launch(
+        activation_derivative_kernel(
+            preactivation,
+            da,
+            dz,
+            sorted_token_ids,
+            num_valid_ids,
+            i32_tokens,
+            i32_padded_rows,
+        ).launch(
             grid=(i32_padded_rows, 1, 1),
             block=(_BLOCK_THREADS, 1, 1),
             stream=stream,
@@ -1066,7 +1236,13 @@ def _compile_bias_gradient_reduction(
 
 
 @functools.lru_cache(maxsize=128)
-def _compile_score_backward(hidden_size: int, topk: int, compute_dtype: str, device_index: int):
+def _compile_score_backward(
+    hidden_size: int,
+    topk: int,
+    compute_dtype: str,
+    device_index: int,
+    device_padded_rows: bool = False,
+):
     """Compile ``ds = dot(dout, materialized_down_projection)``."""
 
     del device_index
@@ -1078,9 +1254,10 @@ def _compile_score_backward(hidden_size: int, topk: int, compute_dtype: str, dev
         projection: fx.Tensor,
         sorted_token_ids: fx.Tensor,
         dtopk_weights: fx.Tensor,
+        num_valid_ids: fx.Tensor,
         i32_tokens: fx.Int32,
+        i32_padded_rows: fx.Int32,
     ):
-        row = gpu.block_idx.x
         tid = gpu.thread_idx.x
         zero_f32 = fx.Float32(0.0)
         fm_fast = arith.FastMathFlags.fast
@@ -1089,30 +1266,6 @@ def _compile_score_backward(hidden_size: int, topk: int, compute_dtype: str, dev
         dout_rsrc = buffer_ops.create_buffer_resource(dout_sorted, max_size=True)
         projection_rsrc = buffer_ops.create_buffer_resource(projection, max_size=True)
         ds_rsrc = buffer_ops.create_buffer_resource(dtopk_weights, max_size=True)
-        packed = fx.Int32(buffer_ops.buffer_load(ids_rsrc, row, vec_width=1, dtype=T.i32))
-        token = packed & fx.Int32(_TOKEN_MASK)
-        slot = packed >> fx.Int32(24)
-        valid_route = token < i32_tokens
-
-        thread_dot = zero_f32
-        for base in range_constexpr(0, hidden_size, _BLOCK_THREADS):
-            column = tid + fx.Int32(base)
-            if column < fx.Int32(hidden_size):
-                offset = row * fx.Int32(hidden_size) + column
-                dout_value = buffer_ops.buffer_load(
-                    dout_rsrc,
-                    offset,
-                    vec_width=1,
-                    dtype=elem_dtype,
-                ).extf(T.f32)
-                projected = buffer_ops.buffer_load(
-                    projection_rsrc,
-                    offset,
-                    vec_width=1,
-                    dtype=elem_dtype,
-                ).extf(T.f32)
-                thread_dot = thread_dot + dout_value * projected
-
         lds = fx.SharedAllocator().allocate(_ScoreBackwardSharedStorage).peek()
         reduction = lds.reduction.view(fx.make_layout(_RED_SLOTS, 1))
 
@@ -1124,27 +1277,113 @@ def _compile_score_backward(hidden_size: int, topk: int, compute_dtype: str, dev
                     result = result + gpu.shuffle_xor(result, offset, _WARP_SIZE)
             return result
 
-        reduced = wave_reduce_add(thread_dot)
-        if const_expr(_RED_SLOTS > 1):
-            lane = tid % fx.Int32(_WARP_SIZE)
-            wave = tid // fx.Int32(_WARP_SIZE)
-            if lane == fx.Int32(0):
-                fx.memref_store(reduced, reduction, wave)
-            gpu.barrier()
-            if wave == fx.Int32(0):
-                in_range = lane < fx.Int32(_RED_SLOTS)
-                safe_lane = in_range.select(lane, fx.Int32(0))
-                partial = fx.memref_load(reduction, safe_lane)
-                reduced = wave_reduce_add(in_range.select(partial, zero_f32))
-                if lane == fx.Int32(0):
-                    fx.memref_store(reduced, reduction, fx.Int32(0))
-            gpu.barrier()
-            reduced = fx.memref_load(reduction, fx.Int32(0))
+        def reduce_row(row, token, slot):
+            thread_dot = zero_f32
+            for base in range_constexpr(0, hidden_size, _BLOCK_THREADS):
+                column = tid + fx.Int32(base)
+                if column < fx.Int32(hidden_size):
+                    offset = row * fx.Int32(hidden_size) + column
+                    dout_value = buffer_ops.buffer_load(
+                        dout_rsrc,
+                        offset,
+                        vec_width=1,
+                        dtype=elem_dtype,
+                    ).extf(T.f32)
+                    projected = buffer_ops.buffer_load(
+                        projection_rsrc,
+                        offset,
+                        vec_width=1,
+                        dtype=elem_dtype,
+                    ).extf(T.f32)
+                    thread_dot = thread_dot + dout_value * projected
 
-        if tid == fx.Int32(0):
-            if valid_route:
+            reduced = wave_reduce_add(thread_dot)
+            if const_expr(_RED_SLOTS > 1):
+                lane = tid % fx.Int32(_WARP_SIZE)
+                wave = tid // fx.Int32(_WARP_SIZE)
+                if lane == fx.Int32(0):
+                    fx.memref_store(reduced, reduction, wave)
+                gpu.barrier()
+                if wave == fx.Int32(0):
+                    in_range = lane < fx.Int32(_RED_SLOTS)
+                    safe_lane = in_range.select(lane, fx.Int32(0))
+                    partial = fx.memref_load(reduction, safe_lane)
+                    reduced = wave_reduce_add(in_range.select(partial, zero_f32))
+                    if lane == fx.Int32(0):
+                        fx.memref_store(reduced, reduction, fx.Int32(0))
+                gpu.barrier()
+                reduced = fx.memref_load(reduction, fx.Int32(0))
+
+            if tid == fx.Int32(0):
                 destination = token * fx.Int32(topk) + slot
                 buffer_ops.buffer_store(reduced, ds_rsrc, destination)
+
+        padded_rows = i32_padded_rows
+        if const_expr(device_padded_rows):
+            valid_rsrc = buffer_ops.create_buffer_resource(num_valid_ids, max_size=True)
+            padded_rows = fx.Int32(
+                buffer_ops.buffer_load(valid_rsrc, fx.Int32(0), vec_width=1, dtype=T.i32)
+            )
+
+        if const_expr(device_padded_rows):
+            for row_value in range(gpu.block_idx.x, padded_rows, gpu.grid_dim.x):
+                row = fx.Int32(row_value)
+                packed = fx.Int32(
+                    buffer_ops.buffer_load(ids_rsrc, row, vec_width=1, dtype=T.i32)
+                )
+                token = packed & fx.Int32(_TOKEN_MASK)
+                slot = packed >> fx.Int32(24)
+                valid_route = token < i32_tokens
+                if valid_route:
+                    reduce_row(row, token, slot)
+        else:
+            row = gpu.block_idx.x
+            packed = fx.Int32(
+                buffer_ops.buffer_load(ids_rsrc, row, vec_width=1, dtype=T.i32)
+            )
+            token = packed & fx.Int32(_TOKEN_MASK)
+            slot = packed >> fx.Int32(24)
+            valid_route = token < i32_tokens
+            # Legacy row grids intentionally retain their original
+            # execute-then-suppress behavior for padded routes.
+            thread_dot = zero_f32
+            for base in range_constexpr(0, hidden_size, _BLOCK_THREADS):
+                column = tid + fx.Int32(base)
+                if column < fx.Int32(hidden_size):
+                    offset = row * fx.Int32(hidden_size) + column
+                    dout_value = buffer_ops.buffer_load(
+                        dout_rsrc,
+                        offset,
+                        vec_width=1,
+                        dtype=elem_dtype,
+                    ).extf(T.f32)
+                    projected = buffer_ops.buffer_load(
+                        projection_rsrc,
+                        offset,
+                        vec_width=1,
+                        dtype=elem_dtype,
+                    ).extf(T.f32)
+                    thread_dot = thread_dot + dout_value * projected
+            reduced = wave_reduce_add(thread_dot)
+            if const_expr(_RED_SLOTS > 1):
+                lane = tid % fx.Int32(_WARP_SIZE)
+                wave = tid // fx.Int32(_WARP_SIZE)
+                if lane == fx.Int32(0):
+                    fx.memref_store(reduced, reduction, wave)
+                gpu.barrier()
+                if wave == fx.Int32(0):
+                    in_range = lane < fx.Int32(_RED_SLOTS)
+                    safe_lane = in_range.select(lane, fx.Int32(0))
+                    partial = fx.memref_load(reduction, safe_lane)
+                    reduced = wave_reduce_add(in_range.select(partial, zero_f32))
+                    if lane == fx.Int32(0):
+                        fx.memref_store(reduced, reduction, fx.Int32(0))
+                gpu.barrier()
+                reduced = fx.memref_load(reduction, fx.Int32(0))
+            if tid == fx.Int32(0):
+                if valid_route:
+                    destination = token * fx.Int32(topk) + slot
+                    buffer_ops.buffer_store(reduced, ds_rsrc, destination)
 
     @flyc.jit
     def launch(
@@ -1152,6 +1391,7 @@ def _compile_score_backward(hidden_size: int, topk: int, compute_dtype: str, dev
         projection: fx.Tensor,
         sorted_token_ids: fx.Tensor,
         dtopk_weights: fx.Tensor,
+        num_valid_ids: fx.Tensor,
         i32_tokens: fx.Int32,
         i32_padded_rows: fx.Int32,
         stream: fx.Stream = fx.Stream(None),
@@ -1161,7 +1401,9 @@ def _compile_score_backward(hidden_size: int, topk: int, compute_dtype: str, dev
             projection,
             sorted_token_ids,
             dtopk_weights,
+            num_valid_ids,
             i32_tokens,
+            i32_padded_rows,
         ).launch(
             grid=(i32_padded_rows, 1, 1),
             block=(_BLOCK_THREADS, 1, 1),
@@ -1370,7 +1612,13 @@ def _compile_ragged_dx_reduction(hidden_size: int, compute_dtype: str, device_in
 
 
 @functools.lru_cache(maxsize=128)
-def _compile_unsort(hidden_size: int, topk: int, compute_dtype: str, device_index: int):
+def _compile_unsort(
+    hidden_size: int,
+    topk: int,
+    compute_dtype: str,
+    device_index: int,
+    device_padded_rows: bool = False,
+):
     """Compile sorted expert-row to dense ``[tokens, topk, H]`` scatter."""
 
     del device_index
@@ -1383,24 +1631,30 @@ def _compile_unsort(hidden_size: int, topk: int, compute_dtype: str, device_inde
         dx_sorted: fx.Tensor,
         sorted_token_ids: fx.Tensor,
         dx_routes: fx.Tensor,
+        num_valid_ids: fx.Tensor,
         i32_tokens: fx.Int32,
         i32_padded_rows: fx.Int32,
     ):
         index = gpu.block_idx.x * fx.Int32(_BLOCK_THREADS) + gpu.thread_idx.x
-        total = i32_padded_rows * fx.Int32(vectors_per_row)
-        if index < total:
+        stride = gpu.grid_dim.x * fx.Int32(_BLOCK_THREADS)
+        ids_rsrc = buffer_ops.create_buffer_resource(sorted_token_ids, max_size=True)
+        source_rsrc = buffer_ops.create_buffer_resource(dx_sorted, max_size=True)
+        destination_rsrc = buffer_ops.create_buffer_resource(dx_routes, max_size=True)
+
+        def unsort_vector(index):
             row = index // fx.Int32(vectors_per_row)
             column = (index % fx.Int32(vectors_per_row)) * fx.Int32(vector_width)
-            ids_rsrc = buffer_ops.create_buffer_resource(sorted_token_ids, max_size=True)
-            source_rsrc = buffer_ops.create_buffer_resource(dx_sorted, max_size=True)
-            destination_rsrc = buffer_ops.create_buffer_resource(dx_routes, max_size=True)
-            packed = fx.Int32(buffer_ops.buffer_load(ids_rsrc, row, vec_width=1, dtype=T.i32))
+            packed = fx.Int32(
+                buffer_ops.buffer_load(ids_rsrc, row, vec_width=1, dtype=T.i32)
+            )
             token = packed & fx.Int32(_TOKEN_MASK)
             slot = packed >> fx.Int32(24)
             valid = token < i32_tokens
             if valid:
                 source = row * fx.Int32(hidden_size) + column
-                destination = ((token * fx.Int32(topk) + slot) * fx.Int32(hidden_size)) + column
+                destination = (
+                    (token * fx.Int32(topk) + slot) * fx.Int32(hidden_size)
+                ) + column
                 value = buffer_ops.buffer_load(
                     source_rsrc,
                     source,
@@ -1409,11 +1663,26 @@ def _compile_unsort(hidden_size: int, topk: int, compute_dtype: str, device_inde
                 )
                 buffer_ops.buffer_store(value, destination_rsrc, destination)
 
+        padded_rows = i32_padded_rows
+        if const_expr(device_padded_rows):
+            valid_rsrc = buffer_ops.create_buffer_resource(num_valid_ids, max_size=True)
+            padded_rows = fx.Int32(
+                buffer_ops.buffer_load(valid_rsrc, fx.Int32(0), vec_width=1, dtype=T.i32)
+            )
+        total = padded_rows * fx.Int32(vectors_per_row)
+        if const_expr(device_padded_rows):
+            for vector_index in range(index, total, stride):
+                unsort_vector(fx.Int32(vector_index))
+        else:
+            if index < total:
+                unsort_vector(index)
+
     @flyc.jit
     def launch(
         dx_sorted: fx.Tensor,
         sorted_token_ids: fx.Tensor,
         dx_routes: fx.Tensor,
+        num_valid_ids: fx.Tensor,
         i32_tokens: fx.Int32,
         i32_padded_rows: fx.Int32,
         i32_grid: fx.Int32,
@@ -1423,6 +1692,7 @@ def _compile_unsort(hidden_size: int, topk: int, compute_dtype: str, device_inde
             dx_sorted,
             sorted_token_ids,
             dx_routes,
+            num_valid_ids,
             i32_tokens,
             i32_padded_rows,
         ).launch(
@@ -1704,6 +1974,17 @@ def _sonic_moe_backward_impl(
         flat_routes=flat_routes,
         compact_w1=use_compact_w1,
     )
+    use_hostless_grouped = _use_hostless_grouped_backward(
+        flat_routes=flat_routes,
+        has_bias=has_bias,
+        tokens=tokens,
+        use_grouped_w1=use_grouped_w1,
+        use_grouped_w2=use_grouped_w2,
+        use_grouped_dw2=use_grouped_dw2,
+        use_grouped_da=use_grouped_da,
+        use_grouped_dw1=use_grouped_dw1,
+        use_grouped_dx=use_grouped_dx,
+    )
     device = hidden_states.device
     device_index = device.index or 0
     with torch.cuda.device(device):
@@ -1791,22 +2072,35 @@ def _sonic_moe_backward_impl(
     # The expert-grid W2 kernel intentionally skips most sorter padding.  Score
     # reduction reads projection before checking the route sentinel, so keep
     # every untouched padded row finite.
-    projection = torch.zeros_like(x_sorted) if use_grouped_w2 else torch.empty_like(x_sorted)
+    projection = (
+        torch.empty_like(x_sorted)
+        if use_hostless_grouped or not use_grouped_w2
+        else torch.zeros_like(x_sorted)
+    )
     # Grouped W1 writes ceil(real_rows/BM)*BM rows instead of every
     # SORTED_BM-padded row.  Zero-initialize the untouched suffix: gather makes
     # padded x/dout zero, so its dy/da/dz and therefore dW/db contributions
     # remain exactly zero while all activation inputs stay finite.
-    preactivation = (
-        torch.zeros((max_padded, projection_size), dtype=hidden_states.dtype, device=device)
-        if use_grouped_w1
-        else torch.empty((max_padded, projection_size), dtype=hidden_states.dtype, device=device)
+    preactivation = torch.empty(
+        (max_padded, projection_size),
+        dtype=hidden_states.dtype,
+        device=device,
     )
+    if use_grouped_w1 and not use_hostless_grouped:
+        preactivation.zero_()
     activation = torch.empty((max_padded, intermediate_size), dtype=hidden_states.dtype, device=device)
     # Grouped dA writes real expert rows only.  The derivative and dW1/db1
     # reductions consume full sorter-padded segments, so untouched rows must
     # remain finite zero rather than uninitialized storage.
-    da = torch.zeros_like(activation) if use_grouped_da else torch.empty_like(activation)
-    dz = torch.empty_like(preactivation)
+    da = (
+        torch.empty_like(activation)
+        if use_hostless_grouped or not use_grouped_da
+        else torch.zeros_like(activation)
+    )
+    # Compact dX intentionally consumes complete BM16 tiles.  Zeroing dz once
+    # supplies the at-most-15 tail rows without forcing dense initialization of
+    # preactivation, dA, and the down projection as well.
+    dz = torch.zeros_like(preactivation) if use_hostless_grouped else torch.empty_like(preactivation)
     dx_sorted = torch.empty_like(x_sorted)
     dx_routes = (
         None
@@ -1951,42 +2245,43 @@ def _sonic_moe_backward_impl(
                 stream,
             )
 
-        # One explicit synchronization is accepted in this bring-up path.  It
-        # determines active expert slices for the remaining per-expert GEMMs;
-        # grouped recompute kernels do not consume this host data.
-        frequencies = expert_frequency.cpu().tolist()
-        segments: list[tuple[int, int, int]] = []
-        offset = 0
-        for expert, count in enumerate(frequencies):
-            if count:
-                padded = ((int(count) + sort_unit - 1) // sort_unit) * sort_unit
-                segments.append((expert, offset, padded))
-                offset += padded
-        padded_rows = offset
-        max_expert_rows = max(int(count) for count in frequencies)
-        active_experts = len(segments)
-
-        # Grouped BF16 SwiGLU TN owns every element of each active expert slab.
-        # For dense routing, allocate without a 9.9-GiB production-shape fill
-        # and clear only inactive expert slabs on device.  Very sparse routing
-        # retains torch's faster dense memset: almost all slabs need clearing
-        # there, so the expert-local conditional kernel cannot recover its
-        # dispatch cost.  This policy adds no synchronization; ``frequencies``
-        # was already materialized for the remaining backward scheduling.
-        selective_weight_grad_zero = (
-            grouped_weight_grads
-            and active_experts * _INACTIVE_WEIGHT_GRAD_ZERO_ACTIVE_RATIO >= num_experts
-        )
-        if selective_weight_grad_zero and active_experts < num_experts:
-            zero_inactive_weight_grads_flydsl(
-                expert_frequency,
-                dw1,
-                dw2,
-                stream=stream,
+        # The fully grouped BF16/SwiGLU short path never reconstructs expert
+        # segments on the host.  Fixed-K routing bounds each expert by the
+        # token count, while row kernels read the exact padded extent from the
+        # sorter's device-resident ``num_valid_ids[0]`` value.  All fallback
+        # contracts retain the original frequency readback and segment loop.
+        if use_hostless_grouped:
+            frequencies = None
+            segments: list[tuple[int, int, int]] = []
+            padded_rows = 0
+            max_expert_rows = tokens
+        else:
+            frequencies, segments, padded_rows, max_expert_rows = (
+                _materialize_expert_segments(expert_frequency, sort_unit)
             )
-        elif grouped_weight_grads and not selective_weight_grad_zero:
-            dw1.zero_()
-            dw2.zero_()
+
+        if grouped_weight_grads:
+            if use_hostless_grouped:
+                # Temporary shape-only choice; the follow-up device policy
+                # replaces this without reintroducing a frequency readback.
+                dw1.zero_()
+                dw2.zero_()
+            else:
+                active_experts = len(segments)
+                selective_weight_grad_zero = (
+                    active_experts * _INACTIVE_WEIGHT_GRAD_ZERO_ACTIVE_RATIO
+                    >= num_experts
+                )
+                if selective_weight_grad_zero and active_experts < num_experts:
+                    zero_inactive_weight_grads_flydsl(
+                        expert_frequency,
+                        dw1,
+                        dw2,
+                        stream=stream,
+                    )
+                elif not selective_weight_grad_zero:
+                    dw1.zero_()
+                    dw2.zero_()
 
         # One sorter block per active expert is itself a valid schedule and is
         # the lowest-latency path.  Compact W1 regimes already produced the
@@ -1995,7 +2290,11 @@ def _sonic_moe_backward_impl(
         use_tn_metadata_direct = (
             (use_grouped_dw1 or use_grouped_dw2)
             and active_expert_storage is None
-            and max_expert_rows <= sort_unit
+            and (
+                routes <= sort_unit
+                if use_hostless_grouped
+                else max_expert_rows <= sort_unit
+            )
         )
         if (
             (use_grouped_dw1 or use_grouped_dw2)
@@ -2016,9 +2315,18 @@ def _sonic_moe_backward_impl(
                 stream=stream,
             )
 
-        gather = _compile_gather(hidden_size, compute_dtype, device_index)
-        gather_work = padded_rows * (hidden_size // 4)
+        gather = _compile_gather(
+            hidden_size,
+            compute_dtype,
+            device_index,
+            use_hostless_grouped,
+        )
+        gather_work = (
+            max_padded if use_hostless_grouped else padded_rows
+        ) * (hidden_size // 4)
         gather_grid = max(1, (gather_work + _BLOCK_THREADS - 1) // _BLOCK_THREADS)
+        if use_hostless_grouped:
+            gather_grid = min(_HOSTLESS_ROW_GRID_CAP, gather_grid)
         _run_compiled(
             gather,
             x_arg,
@@ -2026,6 +2334,7 @@ def _sonic_moe_backward_impl(
             sorted_token_ids,
             x_sorted,
             dout_sorted,
+            num_valid_ids,
             tokens,
             padded_rows,
             gather_grid,
@@ -2053,6 +2362,7 @@ def _sonic_moe_backward_impl(
             activation_name,
             compute_dtype,
             device_index,
+            use_hostless_grouped,
         )
         _run_compiled(
             activation_prepare,
@@ -2061,7 +2371,14 @@ def _sonic_moe_backward_impl(
             dout_sorted,
             dy,
             sorted_weights,
-            padded_rows,
+            sorted_token_ids,
+            num_valid_ids,
+            tokens,
+            (
+                min(_HOSTLESS_ROW_GRID_CAP, max_padded)
+                if use_hostless_grouped
+                else padded_rows
+            ),
             stream,
         )
 
@@ -2105,7 +2422,7 @@ def _sonic_moe_backward_impl(
 
         if use_grouped_da:
             grouped_da_bm, grouped_da_bn, grouped_da_bk, grouped_da_mw, grouped_da_nw = _grouped_da_tuning(
-                max(int(count) for count in frequencies), hidden_size
+                max_expert_rows, hidden_size
             )
             grouped_da = _compile_grouped_da(
                 hidden_size,
@@ -2198,13 +2515,21 @@ def _sonic_moe_backward_impl(
             activation_name,
             compute_dtype,
             device_index,
+            use_hostless_grouped,
         )
         _run_compiled(
             activation_derivative,
             preactivation,
             da,
             dz,
-            padded_rows,
+            sorted_token_ids,
+            num_valid_ids,
+            tokens,
+            (
+                min(_HOSTLESS_ROW_GRID_CAP, max_padded)
+                if use_hostless_grouped
+                else padded_rows
+            ),
             stream,
         )
 
@@ -2217,7 +2542,7 @@ def _sonic_moe_backward_impl(
                 grouped_dw1_m_waves,
                 grouped_dw1_n_waves,
             ) = _grouped_dw1_tuning(
-                max(int(count) for count in frequencies),
+                max_expert_rows,
                 hidden_size,
                 intermediate_size,
             )
@@ -2256,7 +2581,11 @@ def _sonic_moe_backward_impl(
             # padded dOut zero, so activation backward materializes zero dZ in
             # the final partial tile; writing all 16 rows is therefore safe.
             # Unsort/scatter subsequently reads only non-sentinel route rows.
-            active_experts = len(segments)
+            active_experts = (
+                min(routes, num_experts)
+                if use_hostless_grouped
+                else len(segments)
+            )
             grouped_dx_bn, grouped_dx_n_waves = _grouped_dx_tuning(
                 active_experts,
                 hidden_size,
@@ -2271,7 +2600,14 @@ def _sonic_moe_backward_impl(
                 device_index,
             )
             grouped_dx_m_tiles = (
-                sum((int(count) + _GROUPED_DX_BM - 1) // _GROUPED_DX_BM for count in frequencies)
+                (
+                    compact_w1_bound
+                    if use_hostless_grouped
+                    else sum(
+                        (int(count) + _GROUPED_DX_BM - 1) // _GROUPED_DX_BM
+                        for count in frequencies
+                    )
+                )
                 if use_compact_w1
                 else active_experts
             )
@@ -2384,27 +2720,49 @@ def _sonic_moe_backward_impl(
                 stream,
             )
         else:
-            score_backward = _compile_score_backward(hidden_size, topk, compute_dtype, device_index)
+            score_backward = _compile_score_backward(
+                hidden_size,
+                topk,
+                compute_dtype,
+                device_index,
+                use_hostless_grouped,
+            )
             _run_compiled(
                 score_backward,
                 dout_sorted,
                 projection,
                 sorted_token_ids,
                 droute_weights,
+                num_valid_ids,
                 tokens,
-                padded_rows,
+                (
+                    min(_HOSTLESS_ROW_GRID_CAP, max_padded)
+                    if use_hostless_grouped
+                    else padded_rows
+                ),
                 stream,
             )
 
             assert dx_routes is not None
-            unsort = _compile_unsort(hidden_size, topk, compute_dtype, device_index)
-            unsort_work = padded_rows * (hidden_size // 4)
+            unsort = _compile_unsort(
+                hidden_size,
+                topk,
+                compute_dtype,
+                device_index,
+                use_hostless_grouped,
+            )
+            unsort_work = (
+                max_padded if use_hostless_grouped else padded_rows
+            ) * (hidden_size // 4)
             unsort_grid = max(1, (unsort_work + _BLOCK_THREADS - 1) // _BLOCK_THREADS)
+            if use_hostless_grouped:
+                unsort_grid = min(_HOSTLESS_ROW_GRID_CAP, unsort_grid)
             _run_compiled(
                 unsort,
                 dx_sorted,
                 sorted_token_ids,
                 dx_routes,
+                num_valid_ids,
                 tokens,
                 padded_rows,
                 unsort_grid,

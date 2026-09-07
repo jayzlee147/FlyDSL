@@ -779,6 +779,58 @@ def test_sonic_moe_backward_t1_keeps_expert_grid_without_descriptor_builder(monk
     torch.testing.assert_close(actual[3], expected[3], rtol=5e-4, atol=5e-4)
 
 
+@pytest.mark.parametrize("tokens", (1, 64, 128))
+def test_sonic_moe_backward_grouped_short_path_never_materializes_host_segments(
+    monkeypatch,
+    tokens,
+):
+    """Fully grouped fixed-K backward keeps sorter extents device-resident."""
+
+    hidden_size, intermediate_size, num_experts, topk = 256, 128, 8, 4
+    config = _config(
+        hidden_size,
+        intermediate_size,
+        num_experts,
+        topk,
+        compute_dtype="bf16",
+        down_tile_m=128,
+    )
+    args = _make_case(
+        tokens,
+        hidden_size,
+        intermediate_size,
+        num_experts,
+        topk,
+        seed=503 + tokens,
+        dtype=torch.bfloat16,
+    )
+
+    def _unexpected_host_segments(*_args, **_kwargs):
+        raise AssertionError("fully grouped short backward must not copy frequencies to host")
+
+    monkeypatch.setattr(
+        sonic_backward_module,
+        "_materialize_expert_segments",
+        _unexpected_host_segments,
+    )
+    actual = sonic_moe_backward(*args, config)
+    expected = _backward_reference(*args)
+    torch.cuda.synchronize()
+
+    for actual_gradient, expected_gradient in zip(actual[:3], expected[:3]):
+        torch.testing.assert_close(
+            actual_gradient.float(),
+            expected_gradient.float(),
+            rtol=3e-2,
+            atol=5e-2,
+        )
+    # The score dot follows the kernel's wave-reduction order rather than
+    # PyTorch's GEMM reduction order; this test's purpose is the no-readback
+    # dispatch contract, while the dedicated numerical tests use tighter
+    # shape-specific bounds.
+    torch.testing.assert_close(actual[3], expected[3], rtol=2e-3, atol=6e-3)
+
+
 @pytest.mark.parametrize(
     "tokens,hidden_size,intermediate_size,num_experts,topk",
     (
