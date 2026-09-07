@@ -174,3 +174,51 @@ candidate at 1.374 ms and verified its partial-tile results.
 3. Integrate balanced BN512 only if end-to-end AB/BA still shows a stable gain;
    its isolated 1.77% margin is small and its 132 KiB LDS footprint is a
    regression risk under concurrent workloads.
+
+## T128 device-side dispatch experiment (rejected)
+
+The proposed T128 integration was implemented and tested on 2026-09-07, then
+removed because it failed the eager end-to-end performance gate.  The
+experimental implementation produced BM16 and BM64 queues plus
+`[active_experts, max_expert_rows]` in one device scan, and launched three
+mutually exclusive dX profiles:
+
+```text
+active_experts <= 255 and max_expert_rows >= 64: BM64 / BN64 / BK64 / NW4
+active_experts <= 255 and max_expert_rows <= 63: BM16 / BN128 / BK64 / NW2
+active_experts >= 256:                            BM16 / BN256 / BK64 / NW4
+```
+
+Before the performance run, four dual-queue builder cases, four dispatch-boundary
+cases, a `hot -> balanced -> hot` CUDA Graph replay, and the complete three-file
+targeted suite all passed (`224 passed`).  The graph test also prohibited the
+host segment materialization path, and production-shape dX matched the baseline
+bit for bit.  CUDA Graph was used only as a dynamic-dispatch correctness test;
+it was not accepted as performance evidence because the current adapter runs
+the backward eagerly.
+
+The eager measurements below time the complete `sonic_moe_backward`, including
+the builder and all empty guarded launches.  `AB` runs baseline then candidate;
+`BA` reverses the order.  The hot16 result uses 51 interleaved pairs in each
+order.  Absolute latency on the shared machine was noisier and higher than the
+earlier isolated study, but both hot16 orders independently show a clear loss.
+
+| T128 routing | Baseline ms (AB / BA) | Candidate ms (AB / BA) | Mean result |
+|---|---:|---:|---:|
+| balanced, BN256 fallback | 17.7090 / 17.3235 | 17.6568 / 17.8253 | 1.28% slower |
+| balanced, BN512 fallback | 17.2907 / 17.6167 | 19.1760 / 18.2506 | 7.22% slower |
+| hot16, BM64 hot profile | 10.7198 / 11.4939 | 12.2447 / 12.1103 | 9.64% slower |
+
+For hot16, the paired reduction medians were `-13.90%` in AB order and
+`-8.09%` in BA order, far below the required `+1%` admission threshold.  The
+isolated BM64 dX kernel saves only about 25 us.  In eager end-to-end execution,
+that saving is overwhelmed by the third guarded kernel launch, the extra
+secondary-descriptor/statistics work in the builder, and additional queue and
+statistics allocations.  BN512 does not recover the overhead for balanced
+routing.
+
+Consequently, none of the T128 device-side multi-BM code, tests, allocations,
+or expanded builder ABI is retained.  T1, the existing T128 path, and the
+already-integrated T4096 BM64 path remain byte-for-byte unchanged.  A future
+T128 attempt needs to avoid an additional eager launch and per-call allocation
+rather than merely choosing a faster isolated GEMM tile.
