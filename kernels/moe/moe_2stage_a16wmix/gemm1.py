@@ -145,6 +145,7 @@ def _gemm1_body_a16w4(
     f32_swiglu_limit,
     *,
     BM,
+    SORTED_BM,
     TILE_N,
     TILE_K,
     K,
@@ -256,7 +257,10 @@ def _gemm1_body_a16w4(
     # ---- grid decode: m-block (expert block) x n-block (inter tile) -----------
     n_block_idx = bx_i32 % fx.Int32(NUM_N_BLOCKS)
     m_block_idx = bx_i32 // fx.Int32(NUM_N_BLOCKS)
-    e = rocdl.readfirstlane(T.i32, _raw(_global_i32_at(arg_eids, m_block_idx)))
+    # The sorter emits one expert id per SORTED_BM rows.  A smaller compute BM
+    # subdivides that route tile, so all of its sub-blocks share the same id.
+    metadata_block_idx = m_block_idx // fx.Int32(SORTED_BM // BM)
+    e = rocdl.readfirstlane(T.i32, _raw(_global_i32_at(arg_eids, metadata_block_idx)))
     bx_m = m_block_idx * fx.Int32(BM)  # first sorted row of this m-block
     by_n = n_block_idx * fx.Int32(TILE_N)
     expert_off = e * fx.Int32(N_OUT)
@@ -375,10 +379,17 @@ def _gemm1_body_a16w4(
                     fx.slice(s_x_i32x4_tiles, (None, lds_byte // fx.Int32(16))),
                 )
 
-    # ---- A LDS read (CK sub-lane): lane L covers K[L*32..L*32+31] --------------
-    # Each (mi, ku) reads 8 bf16 (one ds_read_b128) -> v8bf16 A operand.
+    # ---- A LDS read (CK sub-lane) ----------------------------------------------
+    # Each (mi, ku) reads 8 bf16 (one ds_read_b128) -> v8bf16 A operand.  The
+    # original mapping assigns every 16-lane group a 32-element slice inside a
+    # 128-wide K chunk.  A dense TILE_K=64 tile has only 16 elements per lane
+    # group, so compact the group stride to keep all reads inside the tile.  The
+    # dense-B loader below uses the same flattened fragment mapping.
     row_a_lds = lane_mod_16
-    col_base_bytes_L = lane_div_16 * fx.Int32(64)  # 32 bf16 * 2 B
+    if const_expr(TILE_K < 128):
+        col_base_bytes_L = lane_div_16 * fx.Int32(KH_TILE_BYTES // 4)
+    else:
+        col_base_bytes_L = lane_div_16 * fx.Int32(64)  # 32 bf16 * 2 B
     s_x_i32_flat = fx.make_view(
         fx.recast_iter(fx.Int32, lds_raw_ptr),
         fx.make_layout(k_wave * A_LDS_STAGES * BM * LDS_STRIDE // 2, 1),
@@ -421,14 +432,20 @@ def _gemm1_body_a16w4(
 
     def load_b_raw_bf16(base_k, n_blk, n_intra):
         # Raw bf16 W: one dwordx4 (8 bf16) per ku = one MFMA K32 B fragment (v8bf16,
-        # the MMA operand directly). K map matches fp4: bf_k0 = base_k//32 + (ku//4)*4
-        # + klane_hw, bf_klane = ku%4.
+        # the MMA operand directly). For TILE_K>=128 the K map matches fp4:
+        # bf_k0 = base_k//32 + (ku//4)*4 + klane_hw, bf_klane = ku%4.  TILE_K=64
+        # instead flattens (lane_group, ku) across the tile's eight fragments.
         raw = []
         base_k0 = base_k // fx.Int32(32)
         for ku in range_constexpr(k_unroll):
-            _k0_blk = ku // 4
-            bf_k0 = base_k0 + fx.Int32(_k0_blk * 4) + lane_div_16
-            bf_klane = fx.Int32(ku % 4)
+            if const_expr(TILE_K < 128):
+                frag = lane_div_16 * fx.Int32(k_unroll) + fx.Int32(ku)
+                bf_k0 = base_k0 + frag // fx.Int32(4)
+                bf_klane = frag % fx.Int32(4)
+            else:
+                _k0_blk = ku // 4
+                bf_k0 = base_k0 + fx.Int32(_k0_blk * 4) + lane_div_16
+                bf_klane = fx.Int32(ku % 4)
             elem_idx = fx.Int32(
                 crd2idx(
                     [fx.Int64(n_blk), fx.Int64(bf_k0), fx.Int64(bf_klane), fx.Int64(n_intra), fx.Int64(0)],
@@ -820,6 +837,7 @@ def gemm1_a16w4_grid(BM, *, INTER, TILE_N, max_m_blocks):
 def compile_gemm1_a16w4_port(
     BM=32,
     *,
+    SORTED_BM=None,
     D_HIDDEN,
     D_INTER,
     NE,
@@ -856,7 +874,12 @@ def compile_gemm1_a16w4_port(
     ``k_wave`` (aiter slice-K, default 1): repartition 4 waves into (4/k_wave) N-waves x
     k_wave K-waves; partials LDS-reduced. k_wave in {1,2,4}; requires 4 % k_wave == 0 and
     D_HIDDEN % (k_wave*TILE_K) == 0.
+
+    ``SORTED_BM`` is the route-sort padding and expert-metadata granularity. It
+    defaults to ``BM`` for compatibility and may be a multiple of ``BM`` when
+    stage 1 subdivides route tiles shared with a larger stage-2 M tile.
     """
+    SORTED_BM = BM if SORTED_BM is None else SORTED_BM
     assert w_dtype in ("mxfp4", "int4", "bf16", "fp16"), (
         "w_dtype must be 'mxfp4', 'int4', 'bf16' or 'fp16', " f"got {w_dtype!r}"
     )
@@ -882,6 +905,7 @@ def compile_gemm1_a16w4_port(
     assert _K % (k_wave * TILE_K) == 0, f"D_HIDDEN (K) must be a multiple of k_wave*TILE_K, got {_K}, k_wave={k_wave}"
     assert _INTER % TILE_N == 0, f"D_INTER must be a multiple of TILE_N={TILE_N}, got {_INTER}"
     assert BM % 16 == 0, f"BM must be a multiple of 16, got {BM}"
+    assert SORTED_BM % BM == 0, f"SORTED_BM ({SORTED_BM}) must be a multiple of BM ({BM})"
     NUM_N_BLOCKS = _INTER // TILE_N
 
     # A-LDS tile BM x TILE_K bf16, double-buffered (must match A_LDS_STAGES in the body).
@@ -924,9 +948,11 @@ def compile_gemm1_a16w4_port(
     _kw_tag = f"_kw{k_wave}" if k_wave > 1 else ""
     _round_tag = "_prebf16" if round_preact_bf16 else ""
     _bias_tag = "_bias" if has_bias else ""
+    _sorted_tag = f"_sbm{SORTED_BM}" if SORTED_BM != BM else ""
     name_suffix = (
         f"a16w4{_wd_tag}{_ad_tag}{_wl_tag}_h{_K}_i{_INTER}_ne{NE}_bm{BM}"
-        f"_tn{TILE_N}{_act_tag}{_bcm_tag}{_xcd_tag}{_wpe_tag}{_kw_tag}{_round_tag}{_bias_tag}"
+        f"{_sorted_tag}_tn{TILE_N}_tk{TILE_K}{_act_tag}{_bcm_tag}{_xcd_tag}"
+        f"{_wpe_tag}{_kw_tag}{_round_tag}{_bias_tag}"
     )
 
     @fx.struct
@@ -1005,6 +1031,7 @@ def compile_gemm1_a16w4_port(
                 f32_situ_linbeta_rcp,
                 f32_swiglu_limit,
                 BM=BM,
+                SORTED_BM=SORTED_BM,
                 TILE_N=TILE_N,
                 TILE_K=TILE_K,
                 K=_K,

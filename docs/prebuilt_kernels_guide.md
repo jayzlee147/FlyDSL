@@ -303,11 +303,12 @@ python3 tests/kernels/test_flash_attn_fwd.py --dtype fp8 --compare --warmup 10 -
 
 The gfx950 inference path composes the existing FlyDSL routing and
 `moe_2stage_a16wmix` MFMA kernels. The routing stage rounds each expert's rows to
-`tile_m` and records packed token/slot indices. Stage 1 gathers the original
-BF16/FP16 rows while loading A and fuses the selected activation; stage 2 consumes
-the sorted A16 intermediate and performs routing-weighted packed A16 atomic scatter. No
-explicit gathered activation tensor is materialized. Supported activations are
-SwiGLU, GEGLU, ReGLU, GELU-tanh, ReLU, SiLU, and ReLU squared.
+`route_tile_m = lcm(tile_m, down_tile_m)` and records packed token/slot indices.
+Stage 1 uses `tile_m`, gathers the original BF16/FP16 rows while loading A, and
+fuses the selected activation. Stage 2 independently uses `down_tile_m`, consumes
+the sorted A16 intermediate, and performs routing-weighted packed A16 atomic
+scatter. No explicit gathered activation tensor is materialized. Supported
+activations are SwiGLU, GEGLU, ReGLU, GELU-tanh, ReLU, SiLU, and ReLU squared.
 
 ```python
 from dataclasses import replace
@@ -326,6 +327,7 @@ cfg = SonicMoEConfig(
     hidden_size=4096, intermediate_size=14336,
     num_experts=256, top_k=8,
     tile_m=32, tile_n=128, tile_k=128,
+    stage1_k_wave=1,
     activation="swiglu",
 )
 # GLU w1: [E, 2*I, H] in [gate | up] order.
@@ -378,10 +380,28 @@ Dense BF16/FP16 shapes may use a 64-wide intermediate dimension. For example,
 `down_tile_k=64`. MXFP4 retains its packed-load requirement that both K tiles
 are at least 128, so this `I=64` configuration is dense-only.
 
+Stage 1 can repartition its fixed four-wave workgroup with
+`stage1_k_wave={1,2,4}`. Values above one assign multiple waves to independent K
+slices and reduce their FP32 partials through LDS; this can help small-M,
+long-contraction shapes at the cost of fewer N partitions and more LDS traffic.
+The hidden size must be divisible by `stage1_k_wave * tile_k`, and the
+constructor rejects combinations whose A buffers or reduction scratch exceed
+gfx950's 160 KiB LDS limit.
+
 Weights are preshuffled once during preparation. Workspaces and compiled launchers
-are reused. Power-of-two expert counts up to 1024 use the FlyDSL router; other
-counts (for example E=896) use a PyTorch softmax/top-k fallback followed by the
-same FlyDSL sort and grouped GEMMs. Call `forward_topk` to supply routing directly.
+are reused. Expert counts with an exact single-wave layout use the FlyDSL router;
+this includes the production E=896 shape (`VPT=14`, 64 threads per token).
+Unsupported counts retain a PyTorch softmax/top-k fallback followed by the same
+FlyDSL sort and grouped GEMMs. With `renormalize=True`, the native router ranks
+raw logits and evaluates exponentials only for the selected K entries; the full-E
+softmax path is retained when non-renormalized probabilities are requested. Call
+`forward_topk` to supply routing directly.
+
+Stage 2 defaults to the faster, lower-memory `stage2_output_mode="atomic"`.
+The experimental `"reduce"` mode is available only for fixed-K routing: it
+writes one A16 row per `(token, slot)` and then reduces those rows in FP32, so it
+allocates an additional `tokens * top_k * hidden_size` A16 scratch tensor. Flat
+ragged routes always use atomic scatter even when the config requests reduce.
 
 `prepare_sonic_mxfp4_weights` is the validated weight-only A16W4 path. It quantizes
 each contiguous 32-value weight block to packed E2M1 FP4 with one E8M0 scale,
@@ -433,14 +453,16 @@ traffic profiles, construct separate tuners with `profile_key="uniform"`,
 cache entries do not collide.
 
 Optional expert-major BF16/FP16 `b1`/`b2` are prepared with the weights and fused
-before the activation and route weighting, respectively. The initial
-The backward paths support dense BF16/FP16 weights, fixed-K or flat ragged
+before the activation and route weighting, respectively. The backward paths
+support dense BF16/FP16 weights, fixed-K or flat ragged
 routing, every supported activation, and optional expert bias. They independently
 re-sort routes and recompute the materialized pre-activation and projection, so
 they do not retain or alias an inference workspace across calls. The bring-up
 implementation uses per-expert A16W16 GEMMs and one host synchronization to read
-expert frequencies; activation, routing, reduction, and every tensor
-calculation remain FlyDSL device kernels. The
+expert frequencies. Its independent sort unit remains 64 rows because those
+generic GEMMs currently require contraction-K blocks aligned to 64; forward
+`route_tile_m` tuning does not alter that invariant. Activation, routing,
+reduction, and every tensor calculation remain FlyDSL device kernels. The
 `dout * route_score` input is rounded to the selected A16 dtype before the
 backward GEMMs, so this is not bitwise parity with a legacy FP32-scaled Triton
 grouped GEMM.
@@ -464,20 +486,27 @@ the numerical and performance distinction.
 ### gfx950 tuning notes
 
 Tune against the complete `(tokens, H, I, E, top_k)` bucket rather than choosing
-`tile_m` from padding alone. `tile_m` controls both per-expert rounding and MFMA
-workgroup efficiency; `tile_n`/`tile_k` trade loop count against LDS and VGPR
-pressure. The default tuner starts from `tile_m={16,32,64,128}` and
-`tile_n,tile_k={128,256}`, pruning candidates that fail the constructor's DMA,
-divisibility, or 160 KiB LDS guards. The cache policy, XCD swizzle, waves-per-EU,
-and persistent stage-2 switches are also exposed on `SonicMoEConfig` for a custom
-candidate sweep.
+the M tiles from padding alone. `tile_m` and `down_tile_m` independently control
+the two MFMA workgroups, while their least common multiple controls per-expert
+routing padding. `tile_n`/`tile_k` and their `down_` counterparts trade loop count
+against LDS and VGPR pressure. The default tuner uses a bounded profile list,
+not a Cartesian product. It covers equal M tiles in `{16,32,64,128}`, the useful
+stage-1/stage-2 pairs `(32,128)` and `(64,128)`, dense-only K64 profiles including
+the measured `S1=(128,256,64) / S2=(128,128,64)` point, Stage-2 XCD swizzle 8,
+and BM16 `stage1_k_wave={2,4}` decode variants. The dense decode set also
+contains the measured asymmetric-N points `S1 BN64/S2 BN128/k_wave=2` and
+`S1 BN128/S2 BN64/k_wave=4`. Packed MXFP4/INT4 candidates keep both K tiles at
+least 128. Illegal DMA, divisibility, and 160 KiB LDS combinations are pruned.
+Cache policy, XCD swizzle, waves-per-EU, and persistent Stage 2 remain available
+for a custom candidate sweep and are included in the autotune cache identity.
 
 For decode, workspace sizing is based on the number of routes that can actually
 activate experts. With `R=tokens*top_k`, `A=min(E,R)`, and distinct top-k IDs per
 token, the padded block bound is the smaller of
-`floor((R + A*(tile_m-1))/tile_m)` and `A*ceil(tokens/tile_m)`. Thus
-`T=1, E=896, top_k=2, tile_m=32` reserves and launches two blocks (64 rows), not
-896 empty expert blocks.
+`floor((R + A*(route_tile_m-1))/route_tile_m)` and
+`A*ceil(tokens/route_tile_m)`. Each GEMM launch then converts that padded-row
+bound to its own M tile. Thus `T=1, E=896, top_k=2, route_tile_m=32` reserves two
+route blocks (64 rows), not 896 empty expert blocks.
 
 For one MI355X warm-cache run at `T=128, H=4096, I=14336, E=8, top_k=2`, with
 weight preparation and JIT excluded, the measured points were:
@@ -500,6 +529,22 @@ PYTHONPATH=. python examples/06-sonicMoE.py \
   --experts 8 --top-k 2 --tile-m 64 --tile-n 128 --tile-k 128 \
   --weight-dtype bf16
 ```
+
+Use the independent Stage-2 and XCD controls to reproduce the current gfx950
+throughput point:
+
+```bash
+PYTHONPATH=. python examples/06-sonicMoE.py \
+  --tokens 4096 --hidden-size 4096 --intermediate-size 2048 \
+  --experts 64 --top-k 8 --tile-m 128 --tile-n 256 --tile-k 64 \
+  --down-tile-m 128 --down-tile-n 128 --down-tile-k 64 \
+  --stage2-xcd-swizzle 8 \
+  --weight-dtype bf16 --check
+```
+
+Add `--stage1-k-wave 2` to benchmark a legal slice-K variant of the same shape.
+`--stage1-k-wave 4` is also available for tile shapes whose larger reduction
+scratch fits in LDS.
 
 Run the validated A16W4 path or let the shape-bucket tuner choose the tiles with:
 

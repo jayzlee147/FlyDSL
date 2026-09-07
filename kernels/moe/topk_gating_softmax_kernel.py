@@ -3,11 +3,11 @@
 
 """TopK Gating Softmax kernel builder using the @flyc.kernel API.
 
-Fuses softmax + top-K selection + optional renormalization for MoE gating:
+Fuses top-K selection + optional softmax for MoE gating:
 
-  1. softmax(logits)  = exp(x - max(x)) / sum(exp(x - max(x)))
-  2. top-K selection   = K iterations of argmax-then-mask
-  3. renormalize       = rescale K selected weights to sum to 1.0
+  1. top-K selection   = K iterations of argmax-then-mask on logits
+  2. renormalize=True  = softmax over only the K selected logits
+  3. renormalize=False = full-expert softmax followed by top-K selection
 
 Outputs: topk_weights (f32), topk_indices (i32), token_expert_indices (i32).
 
@@ -43,14 +43,21 @@ def _pick_layout(num_experts: int):
     """Pick (VPT, THREADS_PER_TOKEN) for the multi-token-per-block fast path.
 
     Constraints:
-      - ``VPT`` is a power of 2 in [1, 16]
+      - ``VPT`` is in [1, 16]
       - ``THREADS_PER_TOKEN = num_experts // VPT`` is a power of 2 <= WARP_SIZE
       - prefer the largest ``VPT`` (fewest loads, widest atom)
 
     For ``num_experts=128`` on a 64-wide wave this picks ``(VPT=16, TPT=8)``
     (TOKENS_PER_BLOCK=32). vLLM's ``topkGatingSoftmax`` uses VPT=8 / TPT=16
     """
-    for vpt in [16, 8, 4, 2, 1]:
+    if num_experts <= 0:
+        return None, None
+
+    # VPT itself does not need to be a power of two: only the lane group used
+    # by the shuffle reductions does.  Trying every exact divisor up to 16
+    # admits production expert counts such as E=896 -> VPT=14, TPT=64 while
+    # retaining the previous layouts for power-of-two expert counts.
+    for vpt in range(16, 0, -1):
         if num_experts % vpt != 0:
             continue
         tpt = num_experts // vpt
@@ -60,6 +67,13 @@ def _pick_layout(num_experts: int):
             continue
         return vpt, tpt
     return None, None
+
+
+def supports_topk_gating_layout(num_experts: int) -> bool:
+    """Return whether the single-wave-per-token router has an exact layout."""
+
+    vpt, _ = _pick_layout(num_experts)
+    return vpt is not None
 
 
 def _compute_topk_gating_layout(num_experts: int, topk: int, dtype_str: str):
@@ -78,10 +92,10 @@ def _compute_topk_gating_layout(num_experts: int, topk: int, dtype_str: str):
         raise ValueError(
             f"num_experts={num_experts} is not supported by the multi-token-per-block "
             f"layout: requires num_experts // VPT to be a power of 2 <= "
-            f"WARP_SIZE={WARP_SIZE} for some VPT in [16, 8, 4, 2, 1]."
+            f"WARP_SIZE={WARP_SIZE} for some integer VPT in [1, 16]."
         )
-    if topk > num_experts:
-        raise ValueError(f"topk={topk} > num_experts={num_experts}")
+    if topk <= 0 or topk > num_experts:
+        raise ValueError(f"topk must be in [1, {num_experts}], got {topk}")
 
     TOKENS_PER_WARP = WARP_SIZE // THREADS_PER_TOKEN
     TOKENS_PER_BLOCK = WARPS_PER_BLOCK * TOKENS_PER_WARP
@@ -316,63 +330,96 @@ def _emit_topk_gating_softmax_body(
             x_list.append(xv)
             thread_max = thread_max.maximumf(xv)
 
-    group_max = group_reduce(thread_max, "max")
+    # With renormalization the full softmax denominator cancels:
+    #
+    #   softmax(x_i) / sum_{j in topk} softmax(x_j)
+    #     = exp(x_i) / sum_{j in topk} exp(x_j)
+    #
+    # Rank raw logits and defer the only K exponentials to the leader lane.
+    # The non-renormalized API must return probabilities from the full-expert
+    # softmax, so retain the original E-wide exp/reduction for that mode.
+    ranking_values = []
+    if renormalize:
+        for v in range_constexpr(VPT):
+            ranking_values.append(x_list[v])
+    else:
+        group_max = group_reduce(thread_max, "max")
+        thread_sum = c_zero_f
+        exp_list = []
+        for v in range_constexpr(VPT):
+            sub = x_list[v] - group_max
+            scaled = sub * c_log2e
+            ev = scaled.exp2(fastmath=fm_fast)
+            exp_list.append(ev)
+            thread_sum = thread_sum + ev
 
-    # Pass 2: exp(x - max) and per-token sum
-    thread_sum = c_zero_f
-    exp_list = []
-    for v in range_constexpr(VPT):
-        sub = x_list[v] - group_max
-        scaled = sub * c_log2e
-        ev = scaled.exp2(fastmath=fm_fast)
-        exp_list.append(ev)
-        thread_sum = thread_sum + ev
+        group_sum = group_reduce(thread_sum, "sum")
+        inv_sum = c_one_f / group_sum
+        ranking_values = []
+        for v in range_constexpr(VPT):
+            ranking_values.append(exp_list[v] * inv_sum)
 
-    group_sum = group_reduce(thread_sum, "sum")
-
-    # Pass 3: normalise -> softmax probabilities (kept in registers)
-    inv_sum = c_one_f / group_sum
-    prob_list = []
-    for v in range_constexpr(VPT):
-        prob_list.append(exp_list[v] * inv_sum)
-
-    # Pass 4: iterative top-K (sub-warp argmax → mask)
-    selected_weights = []  # one f32 per k iter (replicated across the group)
+    # Iterative top-K (sub-warp argmax -> mask).  In renormalized mode these
+    # are logits; otherwise they are full-softmax probabilities.
+    selected_values = []  # one f32 per k iter (replicated across the group)
     selected_indices = []  # one i32 per k iter (replicated across the group)
-    selected_sum = c_zero_f
+    # Track selected local slots in one i32 bitmask.  A real masked logit may
+    # itself be -inf, so overwriting values cannot distinguish it from a
+    # previous winner.  The bitmask also avoids carrying one mutable sentinel
+    # index per VPT slot.
+    c_expert_count = fx.Int32(num_experts)
+    selected_mask = fx.Int32(0)
 
     for k_idx in range_constexpr(topk):
         thread_best_val = c_neg_inf
-        thread_best_idx = fx.Int32(-1)
+        thread_best_idx = c_expert_count
         for v in range_constexpr(VPT):
-            pv = prob_list[v]
+            pv = ranking_values[v]
             ci = col_idx_list[v]
+            is_available = (selected_mask & fx.Int32(1 << v)) == fx.Int32(0)
             is_better = pv > thread_best_val
-            thread_best_val = is_better.select(pv, thread_best_val)
-            thread_best_idx = is_better.select(ci, thread_best_idx)
+            is_equal = ArithValue(pv) == ArithValue(thread_best_val)
+            take_value = is_available & (is_better | (is_equal & (ci < thread_best_idx)))
+            thread_best_val = take_value.select(pv, thread_best_val)
+            thread_best_idx = take_value.select(ci, thread_best_idx)
 
         global_best_val, global_best_idx = group_reduce_argmax(thread_best_val, thread_best_idx)
 
-        selected_weights.append(global_best_val)
+        selected_values.append(global_best_val)
         selected_indices.append(global_best_idx)
-        selected_sum = selected_sum + global_best_val
 
-        for v in range_constexpr(VPT):
-            ci = col_idx_list[v]
-            is_winner = ArithValue(ci) == ArithValue(global_best_idx)
-            prob_list[v] = is_winner.select(c_neg_inf, prob_list[v])
+        local_winner = global_best_idx - expert_lane * c_vpt
+        winner_is_local = (local_winner >= fx.Int32(0)) & (local_winner < c_vpt)
+        safe_local_winner = winner_is_local.select(local_winner, fx.Int32(0))
+        winner_bit = fx.Int32(1) << safe_local_winner
+        selected_mask = winner_is_local.select(selected_mask | winner_bit, selected_mask)
 
-    # Pass 5: leader writes weights/indices/tei (with optional renorm).
-    c_eps = fx.Float32(1e-20)
-    denom = selected_sum.maximumf(c_eps)
-    inv_denom = c_one_f / denom
-
+    # Only one lane per token computes the selected softmax and writes output.
+    # Consequently renormalize=True issues exactly K exp2 operations per token
+    # instead of E operations (and avoids the cross-lane sum reduction).
     if (expert_lane == fx.Int32(0)) & (global_token < i32_num_tokens):
+        selected_exp = []
+        inv_selected_sum = c_one_f
+        if renormalize:
+            selected_max = c_neg_inf
+            for k_idx in range_constexpr(topk):
+                selected_max = selected_max.maximumf(selected_values[k_idx])
+
+            selected_sum = c_zero_f
+            for k_idx in range_constexpr(topk):
+                sub = selected_values[k_idx] - selected_max
+                ev = (sub * c_log2e).exp2(fastmath=fm_fast)
+                selected_exp.append(ev)
+                selected_sum = selected_sum + ev
+
+            c_eps = fx.Float32(1e-20)
+            inv_selected_sum = c_one_f / selected_sum.maximumf(c_eps)
+
         num_tokens_v = ArithValue(i32_num_tokens)
         for k_idx in range_constexpr(topk):
-            w_val = selected_weights[k_idx]
+            w_val = selected_values[k_idx]
             if renormalize:
-                w_val = w_val * inv_denom
+                w_val = selected_exp[k_idx] * inv_selected_sum
             if on_winner_weight is not None:
                 on_winner_weight(local_token, global_token, k_idx, w_val)
             else:
@@ -570,81 +617,98 @@ def build_topk_gating_softmax_module(
                 x_list.append(xv)
                 thread_max = thread_max.maximumf(xv)
 
-        group_max = group_reduce(thread_max, "max")
+        # The full softmax denominator cancels when top-K is renormalized.
+        # Rank raw logits in that mode and let only the leader lane evaluate
+        # the selected K exponentials.  Non-renormalized output retains the
+        # full-expert softmax required by the public API.
+        ranking_values = []
+        if renormalize:
+            for v in range_constexpr(VPT):
+                ranking_values.append(x_list[v])
+        else:
+            group_max = group_reduce(thread_max, "max")
+            thread_sum = c_zero_f
+            exp_list = []
+            for v in range_constexpr(VPT):
+                sub = x_list[v] - group_max
+                scaled = sub * c_log2e
+                ev = scaled.exp2(fastmath=fm_fast)
+                exp_list.append(ev)
+                thread_sum = thread_sum + ev
 
-        # ==================================================================
-        # Pass 2: exp(x - max) and per-token sum
-        # ==================================================================
-        thread_sum = c_zero_f
-        exp_list = []
-        for v in range_constexpr(VPT):
-            sub = x_list[v] - group_max
-            scaled = sub * c_log2e
-            ev = scaled.exp2(fastmath=fm_fast)
-            exp_list.append(ev)
-            thread_sum = thread_sum + ev
+            group_sum = group_reduce(thread_sum, "sum")
+            inv_sum = c_one_f / group_sum
+            ranking_values = []
+            for v in range_constexpr(VPT):
+                ranking_values.append(exp_list[v] * inv_sum)
 
-        group_sum = group_reduce(thread_sum, "sum")
-
-        # ==================================================================
-        # Pass 3: Normalize -> softmax probabilities (kept in registers)
-        # ==================================================================
-        inv_sum = c_one_f / group_sum
-        prob_list = []
-        for v in range_constexpr(VPT):
-            prob_list.append(exp_list[v] * inv_sum)
-
-        # ==================================================================
-        # Pass 4: Iterative Top-K (sub-warp argmax → mask)
-        # ==================================================================
-        # Stash both the winning weight and index per iteration so Pass 5
-        # can write them without recomputing.
-        selected_weights = []  # one f32 per k iter (replicated across the group)
+        # Iterative top-K (sub-warp argmax -> mask).  selected_values holds
+        # logits for renormalized output and probabilities otherwise.
+        selected_values = []  # one f32 per k iter (replicated across the group)
         selected_indices = []  # one i32 per k iter (replicated across the group)
-        selected_sum = c_zero_f
+        # Track selected local slots in one i32 bitmask.  A real masked logit
+        # may itself be -inf, so overwriting values cannot distinguish it from
+        # a previous winner.  The bitmask also avoids carrying one mutable
+        # sentinel index per VPT slot.
+        c_expert_count = fx.Int32(num_experts)
+        selected_mask = fx.Int32(0)
 
         for k_idx in range_constexpr(topk):
             # Per-thread argmax over its VPT slots.
             thread_best_val = c_neg_inf
-            thread_best_idx = fx.Int32(-1)
+            thread_best_idx = c_expert_count
             for v in range_constexpr(VPT):
-                pv = prob_list[v]
+                pv = ranking_values[v]
                 ci = col_idx_list[v]
+                is_available = (selected_mask & fx.Int32(1 << v)) == fx.Int32(0)
                 is_better = pv > thread_best_val
-                thread_best_val = is_better.select(pv, thread_best_val)
-                thread_best_idx = is_better.select(ci, thread_best_idx)
+                is_equal = ArithValue(pv) == ArithValue(thread_best_val)
+                take_value = is_available & (is_better | (is_equal & (ci < thread_best_idx)))
+                thread_best_val = take_value.select(pv, thread_best_val)
+                thread_best_idx = take_value.select(ci, thread_best_idx)
 
             # Sub-warp argmax → all THREADS_PER_TOKEN lanes hold the winner.
             global_best_val, global_best_idx = group_reduce_argmax(thread_best_val, thread_best_idx)
 
-            selected_weights.append(global_best_val)
+            selected_values.append(global_best_val)
             selected_indices.append(global_best_idx)
-            selected_sum = selected_sum + global_best_val
 
-            # Mask the winner out of every thread's local prob slots so
-            # the next iteration finds the runner-up.
-            for v in range_constexpr(VPT):
-                ci = col_idx_list[v]
-                is_winner = ArithValue(ci) == ArithValue(global_best_idx)
-                prob_list[v] = is_winner.select(c_neg_inf, prob_list[v])
-
-        # ==================================================================
-        # Pass 5: Leader writes weights/indices/tei (with optional renorm)
-        # ==================================================================
-        c_eps = fx.Float32(1e-20)
-        denom = selected_sum.maximumf(c_eps)
-        inv_denom = c_one_f / denom
+            # Map the global winner back to its owning lane's local slot and
+            # mark exactly that bit.  Clamp non-owning lanes before the shift
+            # so every emitted shift count remains in [0, VPT).
+            local_winner = global_best_idx - expert_lane * c_vpt
+            winner_is_local = (local_winner >= fx.Int32(0)) & (local_winner < c_vpt)
+            safe_local_winner = winner_is_local.select(local_winner, fx.Int32(0))
+            winner_bit = fx.Int32(1) << safe_local_winner
+            selected_mask = winner_is_local.select(selected_mask | winner_bit, selected_mask)
 
         # Inline the leader-active predicate so the AST rewriter recognises it
         # as a dynamic test (it must contain a Call) and lowers `if ...` to
         # `scf.IfOp`. Wrapping it in a named variable would short-circuit the
         # rewrite and the runtime would try `Boolean.__bool__()` and raise.
         if (expert_lane == fx.Int32(0)) & (global_token < i32_num_tokens):
+            selected_exp = []
+            inv_selected_sum = c_one_f
+            if renormalize:
+                selected_max = c_neg_inf
+                for k_idx in range_constexpr(topk):
+                    selected_max = selected_max.maximumf(selected_values[k_idx])
+
+                selected_sum = c_zero_f
+                for k_idx in range_constexpr(topk):
+                    sub = selected_values[k_idx] - selected_max
+                    ev = (sub * c_log2e).exp2(fastmath=fm_fast)
+                    selected_exp.append(ev)
+                    selected_sum = selected_sum + ev
+
+                c_eps = fx.Float32(1e-20)
+                inv_selected_sum = c_one_f / selected_sum.maximumf(c_eps)
+
             num_tokens_v = ArithValue(i32_num_tokens)
             for k_idx in range_constexpr(topk):
-                w_val = selected_weights[k_idx]
+                w_val = selected_values[k_idx]
                 if renormalize:
-                    w_val = w_val * inv_denom
+                    w_val = selected_exp[k_idx] * inv_selected_sum
                 _store_scalar_f32(weights_div, Int32(k_idx), w_val)
                 _store_scalar_i32(indices_div, Int32(k_idx), selected_indices[k_idx])
                 # tei[t, k] = k * num_tokens + t  (matches vLLM convention)

@@ -44,7 +44,11 @@ if TYPE_CHECKING:
 
 
 _BLOCK_THREADS = 256
-_SORT_UNIT = 64
+# Backward materializes expert segments and contracts across their padded row
+# dimension with the generic A16 GEMM below.  That GEMM uses BLOCK_K=64 and has
+# no K-tail path, so every non-empty segment must remain a multiple of 64.
+# Forward's independently tuned route tile is not a legal substitute here.
+_BACKWARD_SORT_UNIT = 64
 _TOKEN_MASK = 0x00FFFFFF
 _MAX_SIGNED_I32 = (1 << 31) - 1
 _MAX_BUFFER_BYTE_OFFSET = (1 << 32) - 1
@@ -141,23 +145,32 @@ def _activation_backward_f32(gate, up, da, activation: str):
     raise AssertionError(f"unexpected activation {activation!r}")
 
 
-def _max_padded_routes(tokens: int, num_experts: int, topk: int) -> tuple[int, int]:
+def _max_padded_routes(
+    tokens: int,
+    num_experts: int,
+    topk: int,
+    sort_unit: int,
+) -> tuple[int, int]:
     """Return the dense sorter's safe ``(rows, blocks)`` allocation bound."""
 
     routes = tokens * topk
     active_experts = min(num_experts, routes)
-    padding_bound = (routes + active_experts * (_SORT_UNIT - 1)) // _SORT_UNIT
-    per_expert_bound = active_experts * ((tokens + _SORT_UNIT - 1) // _SORT_UNIT)
+    padding_bound = (routes + active_experts * (sort_unit - 1)) // sort_unit
+    per_expert_bound = active_experts * ((tokens + sort_unit - 1) // sort_unit)
     blocks = min(padding_bound, per_expert_bound)
-    return blocks * _SORT_UNIT, blocks
+    return blocks * sort_unit, blocks
 
 
-def _max_padded_flat_routes(routes: int, num_experts: int) -> tuple[int, int]:
+def _max_padded_flat_routes(
+    routes: int,
+    num_experts: int,
+    sort_unit: int,
+) -> tuple[int, int]:
     """Return the ragged sorter's safe ``(rows, blocks)`` allocation bound."""
 
     active_experts = min(num_experts, routes)
-    blocks = (routes + active_experts * (_SORT_UNIT - 1)) // _SORT_UNIT
-    return blocks * _SORT_UNIT, blocks
+    blocks = (routes + active_experts * (sort_unit - 1)) // sort_unit
+    return blocks * sort_unit, blocks
 
 
 @functools.lru_cache(maxsize=128)
@@ -979,6 +992,16 @@ def _validate_backward_inputs(
         raise ValueError(f"hidden_states must be non-empty 2D, got shape {tuple(hidden_states.shape)}")
     if tokens > _TOKEN_MASK:
         raise ValueError(f"token count must fit the sorter's 24-bit token field, got {tokens}")
+    max_padded, _ = _max_padded_routes(tokens, num_experts, topk, _BACKWARD_SORT_UNIT)
+    if max_padded > _MAX_SIGNED_I32:
+        raise ValueError(f"padded route count exceeds the signed 32-bit limit, got {max_padded}")
+    if max_padded * max(hidden_size, projection_size) * 2 > _MAX_BUFFER_BYTE_OFFSET:
+        raise ValueError("fixed-K backward workspace exceeds the 32-bit buffer offset limit")
+    mesh_stride = (
+        (tokens + _BACKWARD_SORT_UNIT - 1) // _BACKWARD_SORT_UNIT
+    ) * _BACKWARD_SORT_UNIT
+    if num_experts * mesh_stride > _MAX_SIGNED_I32:
+        raise ValueError("fixed-K backward sorting mesh exceeds the signed 32-bit index limit")
     for name, tensor in tensors.items():
         if tuple(tensor.shape) != expected[name]:
             raise ValueError(f"{name} must have shape {expected[name]}, got {tuple(tensor.shape)}")
@@ -1065,7 +1088,7 @@ def _validate_backward_route_inputs(
         raise ValueError(f"token count must fit the sorter's 24-bit token field, got {tokens}")
     if routes > _MAX_SIGNED_I32:
         raise ValueError(f"route count exceeds the signed 32-bit limit, got {routes}")
-    max_padded, _ = _max_padded_flat_routes(routes, num_experts)
+    max_padded, _ = _max_padded_flat_routes(routes, num_experts, _BACKWARD_SORT_UNIT)
     if max_padded > _MAX_SIGNED_I32:
         raise ValueError(f"padded route count exceeds the signed 32-bit limit, got {max_padded}")
     if max_padded * max(hidden_size, projection_size) * 2 > _MAX_BUFFER_BYTE_OFFSET:
@@ -1123,6 +1146,7 @@ def _sonic_moe_backward_impl(
     topk = int(config.top_k)
     compute_dtype = str(config.compute_dtype)
     activation_name = str(config.activation)
+    sort_unit = _BACKWARD_SORT_UNIT
     projection_size = intermediate_size * (2 if activation_name in _GLU_ACTIVATIONS else 1)
     has_bias = b1 is not None
     device = hidden_states.device
@@ -1146,15 +1170,15 @@ def _sonic_moe_backward_impl(
             )
         return result
     if flat_routes:
-        max_padded, max_blocks = _max_padded_flat_routes(routes, num_experts)
+        max_padded, max_blocks = _max_padded_flat_routes(routes, num_experts, sort_unit)
         workspace_elements = num_experts
     else:
-        max_padded, max_blocks = _max_padded_routes(tokens, num_experts, topk)
+        max_padded, max_blocks = _max_padded_routes(tokens, num_experts, topk, sort_unit)
         workspace_elements = moe_sorting_get_workspace_size(
             tokens,
             num_experts,
             topk,
-            unit_size=_SORT_UNIT,
+            unit_size=sort_unit,
         )
 
     # Backward owns every buffer: no forward LRU scratch is retained or read.
@@ -1234,7 +1258,7 @@ def _sonic_moe_backward_impl(
                 num_experts,
                 tokens=tokens,
                 max_padded_routes=max_padded,
-                unit_size=_SORT_UNIT,
+                unit_size=sort_unit,
                 sorted_route_ids=sorted_route_ids,
             )
         else:
@@ -1250,7 +1274,7 @@ def _sonic_moe_backward_impl(
                 num_valid_ids,
                 sorter_dummy,
                 num_experts,
-                unit_size=_SORT_UNIT,
+                unit_size=sort_unit,
                 workspace=sorting_workspace,
             )
 
@@ -1262,7 +1286,7 @@ def _sonic_moe_backward_impl(
         offset = 0
         for expert, count in enumerate(frequencies):
             if count:
-                padded = ((int(count) + _SORT_UNIT - 1) // _SORT_UNIT) * _SORT_UNIT
+                padded = ((int(count) + sort_unit - 1) // sort_unit) * sort_unit
                 segments.append((expert, offset, padded))
                 offset += padded
         padded_rows = offset

@@ -7,12 +7,14 @@ The hot path is three logical stages:
 
 1. router softmax + top-k + expert sort/token rounding (and output zeroing),
 2. grouped stage-1 GEMM with indexed row-gather and fused activation, and
-3. grouped down-projection with routing-weighted atomic scatter.
+3. grouped down-projection with routing-weighted atomic scatter, or fixed-slot
+   stores followed by an FP32 top-k reduction.
 
 No gathered activation tensor is materialized.  Expert rows are represented by
-``sorted_token_ids`` and each expert's row count is rounded to ``tile_m`` by the
-sorting kernel.  Stage 1 gathers the original activation rows while loading A;
-stage 2 consumes the sorted 16-bit intermediate and scatters directly to tokens.
+``sorted_token_ids`` and each expert's row count is rounded to ``route_tile_m``
+by the sorting kernel.  Stage 1 gathers the original activation rows while
+loading A; stage 2 consumes the sorted 16-bit intermediate and either scatters
+directly to tokens or writes fixed top-k route rows for reduction.
 
 Weights may be dense BF16/FP16 (A16W16) or per-1x32 E8M0-scaled MXFP4
 (A16W4). MXFP4 currently uses BF16 activations; dense weights use the compute
@@ -27,12 +29,15 @@ expert bias gradients.
 from __future__ import annotations
 
 import functools
+import math
 import threading
 from collections import OrderedDict
 from dataclasses import dataclass, field
 
 import torch
 
+import flydsl.compiler as flyc
+import flydsl.expr as fx
 from flydsl.runtime.device import get_rocm_arch
 from kernels.common.tensor_shim import _run_compiled
 from kernels.moe.moe_2stage_a16wmix.gemm1 import (
@@ -43,12 +48,14 @@ from kernels.moe.moe_2stage_a16wmix.gemm2 import (
     compile_gemm2_a16w4_port,
     gemm2_a16w4_grid,
 )
+from kernels.moe.moe_gemm_2stage.moe_reduce import compile_moe_reduction
 from kernels.moe.moe_ragged_sorting_kernel import moe_ragged_sorting_flydsl
 from kernels.moe.moe_sorting_kernel import (
     moe_softmax_sort_flydsl,
     moe_sorting_flydsl,
     moe_sorting_get_workspace_size,
 )
+from kernels.moe.topk_gating_softmax_kernel import supports_topk_gating_layout
 from kernels.moe.sonic_backward import (
     sonic_moe_backward as sonic_moe_backward,
     sonic_moe_backward_routes as sonic_moe_backward_routes,
@@ -68,6 +75,7 @@ _COMPUTE_DTYPES = {
     "fp16": torch.float16,
 }
 _SUPPORTED_ACTIVATIONS = frozenset({"swiglu", "geglu", "reglu", "gelu_tanh_approx", "relu", "silu", "relu_sq"})
+_SUPPORTED_STAGE2_OUTPUT_MODES = frozenset({"atomic", "reduce"})
 _GLU_ACTIVATIONS = frozenset({"swiglu", "geglu", "reglu"})
 _GEMM1_ACTIVATIONS = {
     # gemm1's historical ``silu`` spelling means the fused SwiGLU epilogue.
@@ -85,9 +93,12 @@ _GEMM1_ACTIVATIONS = {
 class SonicMoEConfig:
     """Static shape and tile configuration for :class:`SonicMoE`.
 
-    ``tile_n``/``tile_k`` configure the stage-1 GEMM.  The down-projection
-    defaults to the same values and can be tuned independently with
-    ``down_tile_n``/``down_tile_k``.  All tiles are compile-time constants.
+    ``tile_m``/``tile_n``/``tile_k`` configure the stage-1 GEMM, and
+    ``stage1_k_wave`` optionally partitions its four waves across K.  The
+    down-projection defaults to the same tile values and can be tuned
+    independently with ``down_tile_m``/``down_tile_n``/``down_tile_k``.
+    Routing is padded to the least common multiple of both M tiles so the two
+    GEMMs can share one sorted layout.  All tiles are compile-time constants.
     """
 
     hidden_size: int
@@ -97,19 +108,31 @@ class SonicMoEConfig:
     tile_m: int = 32
     tile_n: int = 128
     tile_k: int = 128
+    down_tile_m: int | None = None
     down_tile_n: int | None = None
     down_tile_k: int | None = None
     renormalize: bool = True
     stage1_b_cache_mod: int | None = None
     stage2_b_cache_mod: int | None = None
     stage1_xcd_swizzle: int = 0
+    stage1_k_wave: int = 1
     stage2_xcd_swizzle: int = 1
     waves_per_eu: int | None = None
     persistent_stage2: bool = False
+    stage2_output_mode: str = "atomic"
     activation: str = "swiglu"
     compute_dtype: str = "bf16"
 
     def __post_init__(self) -> None:
+        if not isinstance(self.stage2_output_mode, str):
+            raise TypeError(
+                "stage2_output_mode must be a string, got " f"{type(self.stage2_output_mode).__name__}"
+            )
+        if self.stage2_output_mode not in _SUPPORTED_STAGE2_OUTPUT_MODES:
+            raise ValueError(
+                f"unsupported stage2_output_mode {self.stage2_output_mode!r}; expected one of "
+                f"{sorted(_SUPPORTED_STAGE2_OUTPUT_MODES)}"
+            )
         if self.compute_dtype not in _COMPUTE_DTYPES:
             raise ValueError(
                 f"unsupported compute_dtype {self.compute_dtype!r}; expected one of " f"{sorted(_COMPUTE_DTYPES)}"
@@ -128,6 +151,7 @@ class SonicMoEConfig:
             "tile_m": self.tile_m,
             "tile_n": self.tile_n,
             "tile_k": self.tile_k,
+            "down_tile_m": self.stage2_tile_m,
             "down_tile_n": self.stage2_tile_n,
             "down_tile_k": self.stage2_tile_k,
         }
@@ -138,8 +162,11 @@ class SonicMoEConfig:
             raise ValueError(f"top_k ({self.top_k}) cannot exceed num_experts ({self.num_experts})")
         if self.top_k > 16:
             raise ValueError(f"top_k must be <= 16 for the gfx950 router, got {self.top_k}")
-        if self.tile_m % 16 != 0:
-            raise ValueError(f"tile_m must be a multiple of 16, got {self.tile_m}")
+        if self.tile_m % 16 != 0 or self.stage2_tile_m % 16 != 0:
+            raise ValueError(
+                "tile_m and down_tile_m must be multiples of 16, got "
+                f"{self.tile_m}/{self.stage2_tile_m}"
+            )
         if self.tile_n % 64 != 0 or self.stage2_tile_n % 64 != 0:
             raise ValueError(
                 "tile_n and down_tile_n must be multiples of 64, got " f"{self.tile_n}/{self.stage2_tile_n}"
@@ -159,14 +186,23 @@ class SonicMoEConfig:
             raise ValueError(
                 "tile_m * tile_k must be a multiple of 2048 A16 elements for " "the stage1 direct-to-LDS copy"
             )
-        if (self.tile_m * self.stage2_tile_k) % 2048 != 0:
+        if (self.stage2_tile_m * self.stage2_tile_k) % 2048 != 0:
             raise ValueError(
-                "tile_m * down_tile_k must be a multiple of 2048 A16 elements for " "the stage2 direct-to-LDS copy"
+                "down_tile_m * down_tile_k must be a multiple of 2048 A16 elements for "
+                "the stage2 direct-to-LDS copy"
             )
         if self.hidden_size % 32 != 0 or self.intermediate_size % 32 != 0:
             raise ValueError("hidden_size and intermediate_size must be multiples of 32 for the " "16-bit preshuffle")
         if self.hidden_size % self.tile_k != 0:
             raise ValueError(f"hidden_size ({self.hidden_size}) must be divisible by tile_k ({self.tile_k})")
+        if self.stage1_k_wave not in (1, 2, 4):
+            raise ValueError(f"stage1_k_wave must be 1, 2, or 4, got {self.stage1_k_wave}")
+        stage1_k_span = self.stage1_k_wave * self.tile_k
+        if self.hidden_size % stage1_k_span != 0:
+            raise ValueError(
+                f"hidden_size ({self.hidden_size}) must be divisible by "
+                f"stage1_k_wave * tile_k ({self.stage1_k_wave} * {self.tile_k} = {stage1_k_span})"
+            )
         if self.intermediate_size % self.tile_n != 0:
             raise ValueError(
                 "intermediate_size " f"({self.intermediate_size}) must be divisible by tile_n ({self.tile_n})"
@@ -188,9 +224,24 @@ class SonicMoEConfig:
             raise ValueError("XCD swizzle values must be non-negative")
 
         # Fail before JIT compilation if a tile cannot fit the gfx950 160 KiB LDS.
-        stage1_stages = 2 if self.hidden_size // self.tile_k > 1 else 1
-        stage1_lds = stage1_stages * self.tile_m * self.tile_k * 2
-        stage2_lds = self.tile_m * self.stage2_tile_k * 2 + self.tile_m * self.stage2_tile_n * 4
+        stage1_k_tiles_per_wave = self.hidden_size // stage1_k_span
+        stage1_stages = 2 if stage1_k_tiles_per_wave > 1 else 1
+        stage1_a_lds = self.stage1_k_wave * stage1_stages * self.tile_m * self.tile_k * 2
+        if self.stage1_k_wave > 1:
+            stage1_n_waves = 4 // self.stage1_k_wave
+            stage1_acc_n = (self.tile_n // stage1_n_waves) // 16
+            stage1_m_repeat = self.tile_m // 16
+            stage1_reduce_lds = 4 * (stage1_acc_n * stage1_m_repeat) * 64 * 4 * 4
+            stage1_lds = max(stage1_a_lds, stage1_reduce_lds)
+        else:
+            stage1_lds = stage1_a_lds
+        # Stage 2 reuses the A-tile storage for the FP32 epilogue only after
+        # the contraction has finished.  Their lifetimes do not overlap, so
+        # the kernel reserves the larger region rather than their sum.
+        stage2_lds = max(
+            self.stage2_tile_m * self.stage2_tile_k * 2,
+            self.stage2_tile_m * self.stage2_tile_n * 4,
+        )
         if stage1_lds > _GFX950_LDS_BYTES:
             raise ValueError(
                 f"stage1 tile needs {stage1_lds} LDS bytes, exceeding gfx950's " f"{_GFX950_LDS_BYTES} bytes"
@@ -205,14 +256,24 @@ class SonicMoEConfig:
         return self.tile_n if self.down_tile_n is None else self.down_tile_n
 
     @property
+    def stage2_tile_m(self) -> int:
+        return self.tile_m if self.down_tile_m is None else self.down_tile_m
+
+    @property
     def stage2_tile_k(self) -> int:
         return self.tile_k if self.down_tile_k is None else self.down_tile_k
+
+    @property
+    def route_tile_m(self) -> int:
+        """Padding/metadata granularity shared by both grouped GEMMs."""
+
+        return math.lcm(self.tile_m, self.stage2_tile_m)
 
     @property
     def supports_flydsl_router(self) -> bool:
         """Whether the logits-to-top-k FlyDSL layout supports this expert count."""
 
-        return self.num_experts <= 1024 and not (self.num_experts & (self.num_experts - 1))
+        return supports_topk_gating_layout(self.num_experts)
 
     @property
     def is_glu(self) -> bool:
@@ -276,8 +337,13 @@ class SonicMoEWorkspace:
 
     tokens: int
     routes: int | None
+    route_tile_m: int
     max_padded_tokens: int
+    # Number of route-metadata blocks.  Compute-grid upper bounds are larger
+    # when a GEMM uses an M tile smaller than ``route_tile_m``.
     max_m_blocks: int
+    stage1_max_m_blocks: int
+    stage2_max_m_blocks: int
     sorted_token_ids: torch.Tensor
     sorted_weights: torch.Tensor
     sorted_expert_ids: torch.Tensor
@@ -288,6 +354,7 @@ class SonicMoEWorkspace:
     router_topk_ids: torch.Tensor
     router_topk_expert_indices: torch.Tensor
     intermediate: torch.Tensor
+    route_output: torch.Tensor | None
     output: torch.Tensor
     _launch_lock: threading.Lock = field(
         default_factory=threading.Lock,
@@ -312,6 +379,8 @@ class SonicMoEWorkspace:
             self.intermediate,
             self.output,
         ]
+        if self.route_output is not None:
+            tensors.append(self.route_output)
         if self.sorting_workspace is not None:
             tensors.append(self.sorting_workspace)
         return frozenset(tensor.untyped_storage().data_ptr() for tensor in tensors)
@@ -330,19 +399,20 @@ class SonicMoEWorkspace:
         if routes is not None and routes < 0:
             raise ValueError(f"routes must be non-negative, got {routes}")
 
-        # If A experts are active, Q padded tiles need at least
-        # Q*tile_m - A*(tile_m-1) real routes.  Dense top-k routing additionally
-        # has at most one edge per (token, expert); flat routing deliberately
-        # supports duplicates, so it cannot use that tighter bound.
+        # If A experts are active, Q padded route tiles need at least
+        # Q*route_tile_m - A*(route_tile_m-1) real routes. Dense top-k routing
+        # additionally has at most one edge per (token, expert); flat routing
+        # deliberately supports duplicates, so it cannot use that tighter bound.
         route_count = tokens * config.top_k if routes is None else int(routes)
         active_experts = min(config.num_experts, route_count)
-        padding_bound = (route_count + active_experts * (config.tile_m - 1)) // config.tile_m
+        route_tile_m = config.route_tile_m
+        padding_bound = (route_count + active_experts * (route_tile_m - 1)) // route_tile_m
         if routes is None:
-            per_expert_bound = active_experts * ((tokens + config.tile_m - 1) // config.tile_m)
+            per_expert_bound = active_experts * ((tokens + route_tile_m - 1) // route_tile_m)
             max_blocks = min(padding_bound, per_expert_bound)
         else:
             max_blocks = padding_bound
-        max_padded = max_blocks * config.tile_m
+        max_padded = max_blocks * route_tile_m
         if max_padded > _MAX_SIGNED_I32:
             raise ValueError(
                 "padded route count exceeds the sorting kernel's signed 32-bit " f"index limit: {max_padded}"
@@ -361,9 +431,9 @@ class SonicMoEWorkspace:
                 tokens,
                 config.num_experts,
                 config.top_k,
-                unit_size=config.tile_m,
+                unit_size=route_tile_m,
             )
-            mesh_stride = ((tokens + config.tile_m - 1) // config.tile_m) * config.tile_m
+            mesh_stride = ((tokens + route_tile_m - 1) // route_tile_m) * route_tile_m
             if config.num_experts * mesh_stride > _MAX_SIGNED_I32:
                 raise ValueError(
                     "sorting mesh exceeds the kernel's signed 32-bit byte-index limit: "
@@ -382,8 +452,11 @@ class SonicMoEWorkspace:
         return cls(
             tokens=tokens,
             routes=routes,
+            route_tile_m=route_tile_m,
             max_padded_tokens=max_padded,
             max_m_blocks=max_blocks,
+            stage1_max_m_blocks=max_padded // config.tile_m,
+            stage2_max_m_blocks=max_padded // config.stage2_tile_m,
             # Keep a one-element backing allocation for the all-empty ragged
             # case so raw buffer descriptors never receive a null data pointer.
             sorted_token_ids=torch.empty(max(1, max_padded), dtype=torch.int32, device=device),
@@ -403,6 +476,15 @@ class SonicMoEWorkspace:
                 (max(1, max_padded), config.intermediate_size),
                 dtype=_COMPUTE_DTYPES[config.compute_dtype],
                 device=device,
+            ),
+            route_output=(
+                torch.empty(
+                    (tokens, config.top_k, config.hidden_size),
+                    dtype=_COMPUTE_DTYPES[config.compute_dtype],
+                    device=device,
+                )
+                if config.stage2_output_mode == "reduce" and routes is None
+                else None
             ),
             output=torch.empty(
                 (tokens, config.hidden_size),
@@ -940,6 +1022,7 @@ def _get_stage1_launcher(
     del device_index
     return compile_gemm1_a16w4_port(
         BM=config.tile_m,
+        SORTED_BM=config.route_tile_m,
         D_HIDDEN=config.hidden_size,
         D_INTER=config.intermediate_size,
         NE=config.num_experts,
@@ -953,7 +1036,7 @@ def _get_stage1_launcher(
         w_dtype=weight_dtype,
         a_dtype=config.compute_dtype,
         w_layout="standard",
-        k_wave=1,
+        k_wave=config.stage1_k_wave,
         round_preact_bf16=True,
         has_bias=has_bias,
     )
@@ -965,12 +1048,14 @@ def _get_stage2_launcher(
     b_cache_mod: int,
     weight_dtype: str,
     has_bias: bool,
+    output_mode: str,
     device_index: int,
 ):
     # See _get_stage1_launcher: keep a distinct loaded function per device.
     del device_index
     return compile_gemm2_a16w4_port(
-        BM=config.tile_m,
+        BM=config.stage2_tile_m,
+        SORTED_BM=config.route_tile_m,
         NE=config.num_experts,
         N_OUT=config.hidden_size,
         D_INTER=config.intermediate_size,
@@ -984,6 +1069,8 @@ def _get_stage2_launcher(
         persist=config.persistent_stage2,
         has_bias=has_bias,
         round_projection_bf16=True,
+        output_mode=output_mode,
+        TOPK=config.top_k,
     )
 
 
@@ -1126,7 +1213,7 @@ class SonicMoE:
         if out.device != self.weights.device or out.dtype != expected_dtype or not out.is_contiguous():
             raise ValueError(f"out must be contiguous {expected_dtype} on the same ROCm device as the weights")
         if out.data_ptr() % 4:
-            raise ValueError("out must be 4-byte aligned for packed 16-bit atomic scatter")
+            raise ValueError("out must be 4-byte aligned for packed 16-bit output stores")
         if out.requires_grad:
             raise ValueError("SonicMoE is inference-only; out must not require gradients")
 
@@ -1153,6 +1240,11 @@ class SonicMoE:
         cfg = self.config
         tokens = workspace.tokens
         stream = torch.cuda.current_stream(hidden_states.device)
+        # Flat routes have no fixed slot dimension and may contain duplicate
+        # edges, so only dense fixed-K workspaces may select the reduce path.
+        output_mode = cfg.stage2_output_mode if workspace.routes is None else "atomic"
+        if output_mode == "reduce" and workspace.route_output is None:
+            raise RuntimeError("reduce stage2 output requires a fixed-top-k route workspace")
 
         stage1 = _get_stage1_launcher(
             cfg,
@@ -1165,7 +1257,7 @@ class SonicMoE:
             cfg.tile_m,
             INTER=cfg.intermediate_size,
             TILE_N=cfg.tile_n,
-            max_m_blocks=workspace.max_m_blocks,
+            max_m_blocks=workspace.stage1_max_m_blocks,
         )
         _run_compiled(
             stage1,
@@ -1192,13 +1284,14 @@ class SonicMoE:
             _stage2_cache_mod(cfg, tokens),
             self.weights.weight_dtype,
             self.weights.has_bias,
+            output_mode,
             hidden_states.device.index or 0,
         )
         grid2 = gemm2_a16w4_grid(
-            cfg.tile_m,
+            cfg.stage2_tile_m,
             N_OUT=cfg.hidden_size,
             TILE_N=cfg.stage2_tile_n,
-            max_m_blocks=workspace.max_m_blocks,
+            max_m_blocks=workspace.stage2_max_m_blocks,
             persist=cfg.persistent_stage2,
         )
         _run_compiled(
@@ -1212,11 +1305,31 @@ class SonicMoE:
             workspace.sorted_token_ids.data_ptr(),
             workspace.sorted_weights.data_ptr(),
             tokens,
-            workspace.max_m_blocks,
+            workspace.stage2_max_m_blocks,
             int(grid2),
-            out.data_ptr(),
+            (workspace.route_output if output_mode == "reduce" else out).data_ptr(),
             stream,
         )
+        if output_mode == "reduce":
+            assert workspace.route_output is not None
+            reduction_dtype = "f16" if cfg.compute_dtype == "fp16" else "bf16"
+            reduce = compile_moe_reduction(
+                topk=cfg.top_k,
+                model_dim=cfg.hidden_size,
+                dtype_str=reduction_dtype,
+            )
+            route_output_ptr = flyc.from_c_void_p(fx.Uint8, workspace.route_output.data_ptr())
+            out_ptr = flyc.from_c_void_p(fx.Uint8, out.data_ptr())
+            unused_ptr = flyc.from_c_void_p(fx.Uint8, self.weights.dummy_scale.data_ptr())
+            _run_compiled(
+                reduce,
+                route_output_ptr,
+                out_ptr,
+                unused_ptr,
+                unused_ptr,
+                tokens,
+                stream,
+            )
         return out
 
     def __call__(
@@ -1262,10 +1375,10 @@ class SonicMoE:
         ):
             raise ValueError("router_logits exceed the FlyDSL router's 32-bit byte-offset limit")
 
-        # The current FlyDSL top-k gating layout maps a power-of-two expert row
-        # (up to 1024 experts) to fixed lane groups. Models such as Kimi K2.5 use
-        # E=896, so retain full operator coverage with a PyTorch router fallback;
-        # the grouped GEMMs and expert sort remain FlyDSL kernels.
+        # Exact layouts map an expert row to power-of-two lane groups; VPT may
+        # be non-power-of-two (for example E=896 uses VPT=14, TPT=64).  Retain
+        # the PyTorch router only for counts without such a layout; expert sort
+        # and both grouped GEMMs remain FlyDSL in that fallback.
         if not self.config.supports_flydsl_router:
             probs = torch.softmax(router_logits.float(), dim=-1)
             topk_weights, topk_ids = torch.topk(probs, self.config.top_k, dim=-1)
@@ -1297,7 +1410,7 @@ class SonicMoE:
                 self.config.num_experts,
                 self.config.top_k,
                 dtype_str,
-                unit_size=self.config.tile_m,
+                unit_size=self.config.route_tile_m,
                 renormalize=self.config.renormalize,
                 workspace=workspace.sorting_workspace,
                 topk_scratch=(
@@ -1437,7 +1550,7 @@ class SonicMoE:
                 self.config.num_experts,
                 tokens=tokens,
                 max_padded_routes=workspace.max_padded_tokens,
-                unit_size=self.config.tile_m,
+                unit_size=self.config.route_tile_m,
             )
             if routes == 0:
                 return output
@@ -1518,7 +1631,7 @@ class SonicMoE:
                 workspace.num_valid_ids,
                 output,
                 self.config.num_experts,
-                unit_size=self.config.tile_m,
+                unit_size=self.config.route_tile_m,
                 workspace=workspace.sorting_workspace,
             )
             return self._run_grouped_gemms(hidden_states, workspace, output)

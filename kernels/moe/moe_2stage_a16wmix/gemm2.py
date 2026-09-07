@@ -37,10 +37,10 @@ NUM_CU = 256
 
 
 # @flyc.jit is LOAD-BEARING: it AST-rewrites ``if token_id < i32_M`` into an scf.if.
-# Without it the guard runs as a plain Python if (dropped at trace), so the atomic-fadd
+# Without it the guard runs as a plain Python if (dropped at trace), so the output
 # scatter fires on padded/OOB rows -- ~13x s2 regression (39us -> ~490us at E896).
 @flyc.jit
-def _atomic_a16_epilog(
+def _weighted_a16_epilog(
     lds_acc_base_i32,
     accm,
     arg_out,
@@ -55,6 +55,8 @@ def _atomic_a16_epilog(
     N_OUT,
     BN,
     out_dtype,
+    output_mode,
+    TOPK,
 ):
     elem_dtype = fx.Float16 if const_expr(out_dtype == "fp16") else fx.BFloat16
     _kMChunks = kmchunks_for(BM)
@@ -97,21 +99,35 @@ def _atomic_a16_epilog(
         row_in_block = fx.Int32(mr * 8) + m_lane
         token_id = packed[mr] & fx.Int32(0x00FFFFFF)
         if token_id < i32_M:
-            row_base_addr = token_id * fx.Int32(N_OUT) + n_block_idx * fx.Int32(BN) + col_start
+            if const_expr(output_mode == "reduce"):
+                # Fixed-K sorting preserves the original top-k slot in the high
+                # byte.  Each (token, slot) pair is unique, so this path can use
+                # ordinary stores into [tokens, TOPK, N_OUT] without atomics.
+                slot = (packed[mr] >> fx.Int32(24)) & fx.Int32(0xFF)
+                row_base_addr = (
+                    (fx.Int64(token_id) * fx.Int64(TOPK) + fx.Int64(slot)) * fx.Int64(N_OUT)
+                    + fx.Int64(n_block_idx * fx.Int32(BN) + col_start)
+                )
+            else:
+                row_base_addr = token_id * fx.Int32(N_OUT) + n_block_idx * fx.Int32(BN) + col_start
             for s in range_constexpr(_s_count):
                 idx0 = row_in_block * fx.Int32(BN) + col_start + fx.Int32(s * 64)
                 v2 = Vec(llvm.load(T.vec(2, T.f32), _gep3(lds_base, idx0 * fx.Int32(4))))
                 pk = Vec.from_elements([v2[0] * weight[mr], v2[1] * weight[mr]], fx.Float32).to(elem_dtype)
-                off = (row_base_addr + fx.Int32(s * 64)) * fx.Int32(2)
-                out_ptr = _gep1(out_base, off)
-                llvm.AtomicRMWOp(
-                    llvm.AtomicBinOp.fadd,
-                    out_ptr,
-                    _raw(pk),
-                    llvm.AtomicOrdering.monotonic,
-                    syncscope="agent",
-                    alignment=4,
-                )
+                if const_expr(output_mode == "reduce"):
+                    off = (row_base_addr + fx.Int64(s * 64)) * fx.Int64(2)
+                    llvm.StoreOp(_raw(pk), _gep1(out_base, off), alignment=4)
+                else:
+                    off = (row_base_addr + fx.Int32(s * 64)) * fx.Int32(2)
+                    out_ptr = _gep1(out_base, off)
+                    llvm.AtomicRMWOp(
+                        llvm.AtomicBinOp.fadd,
+                        out_ptr,
+                        _raw(pk),
+                        llvm.AtomicOrdering.monotonic,
+                        syncscope="agent",
+                        alignment=4,
+                    )
 
 
 def _gemm2_body_a16w4(
@@ -130,6 +146,7 @@ def _gemm2_body_a16w4(
     i32_M,
     *,
     BM,
+    SORTED_BM,
     TILE_N,
     TILE_K,
     N_OUT,
@@ -141,12 +158,16 @@ def _gemm2_body_a16w4(
     use_k16=False,
     has_bias=False,
     round_projection_bf16=False,
+    output_mode="atomic",
+    TOPK=1,
 ):
     """A16W4/A16W16 stage2 body. K=inter_dim, N=model_dim.
 
     A is the BF16/FP16 stage1 intermediate by sorted position. W2 is
-    mxfp4/int4 (BF16 activation only) or matching dense BF16/FP16. Output uses
-    packed A16 atomic-fadd routing-weighted scatter to [tokens, model_dim].
+    mxfp4/int4 (BF16 activation only) or matching dense BF16/FP16. Output either
+    uses packed A16 atomic-fadd routing-weighted scatter to [tokens, model_dim],
+    or ordinary weighted A16 stores to [tokens, TOPK, model_dim] for a following
+    FP32 top-k reduction.
     """
     _is_int4 = w_dtype == "int4"
     _is_dense = w_dtype in ("bf16", "fp16")
@@ -203,7 +224,10 @@ def _gemm2_body_a16w4(
 
     m_block_idx = bx_i32 // fx.Int32(_num_n_blocks)
     n_block_idx = bx_i32 % fx.Int32(_num_n_blocks)
-    e = rocdl.readfirstlane(T.i32, _raw(_global_i32_at(arg_eids, m_block_idx)))
+    # The shared route layout stores one expert id per SORTED_BM rows. A
+    # smaller stage-2 compute BM subdivides that metadata block.
+    metadata_block_idx = m_block_idx // fx.Int32(SORTED_BM // BM)
+    e = rocdl.readfirstlane(T.i32, _raw(_global_i32_at(arg_eids, metadata_block_idx)))
     m_row = m_block_idx * fx.Int32(BM)  # first sorted row of this m-block
     by_n = n_block_idx * fx.Int32(TILE_N)
     expert_off = e * fx.Int32(N_OUT)
@@ -490,8 +514,8 @@ def _gemm2_body_a16w4(
                     _mma(accm[mi][ni], a8, bb)
         gpu.barrier()
 
-    # ---- epilogue: atomic bf16 scatter (routing-weighted). K-loop done, so the A-LDS
-    # region (offset 0) is reused for the epilog's f32 acc staging.
+    # ---- epilogue: routing-weighted atomic scatter or fixed-slot store. K-loop
+    # done, so the A-LDS region (offset 0) is reused for f32 accumulator staging.
     gpu.barrier()
     lds_acc_base_i32 = fx.Int32(fx.ptrtoint(lds_raw_ptr))
     if const_expr(has_bias):
@@ -523,7 +547,7 @@ def _gemm2_body_a16w4(
                 vec = vec.to(elem_dtype).to(fx.Float32)
             row.append(vec.ir_value())
         accm_v.append(row)
-    _atomic_a16_epilog(
+    _weighted_a16_epilog(
         lds_acc_base_i32,
         accm_v,
         arg_out,
@@ -538,6 +562,8 @@ def _gemm2_body_a16w4(
         N_OUT,
         TILE_N,
         a_dtype,
+        output_mode,
+        TOPK,
     )
 
 
@@ -557,6 +583,7 @@ def gemm2_a16w4_grid(BM, *, N_OUT, TILE_N, max_m_blocks, persist=False):
 def compile_gemm2_a16w4_port(
     BM=32,
     *,
+    SORTED_BM=None,
     NE,
     N_OUT,
     D_INTER,
@@ -570,16 +597,25 @@ def compile_gemm2_a16w4_port(
     persist=False,
     has_bias=False,
     round_projection_bf16=False,
+    output_mode="atomic",
+    TOPK=1,
 ):
     """A16W4/A16W16 grouped down-projection builder.
 
-    N_OUT = model_dim (down-proj output). D_INTER = inter_dim (contraction). Output
-    uses the configured A16 dtype via packed atomic routing-weighted scatter.
+    N_OUT = model_dim (down-proj output). D_INTER = inter_dim (contraction).
+    ``output_mode='atomic'`` uses packed A16 routing-weighted atomic scatter;
+    ``output_mode='reduce'`` writes one weighted A16 row per original fixed-K
+    route for a subsequent FP32 top-k reduction. ``TOPK`` is compile-time.
+
+    ``SORTED_BM`` is the route-sort padding and expert-metadata granularity. It
+    defaults to ``BM`` and may be a multiple when this GEMM subdivides a route
+    tile shared with stage 1.
 
     ``xcd_swizzle`` (>0) bijectively round-robins the launch index across the 8 XCDs to
     balance per-XCD/HBM traffic (gemm2 is HBM-bound), + optional M-group swizzle for
     per-XCD L2 locality (group = xcd_swizzle m-blocks).
     """
+    SORTED_BM = BM if SORTED_BM is None else SORTED_BM
     assert w_dtype in ("mxfp4", "int4", "bf16", "fp16"), (
         "w_dtype must be 'mxfp4', 'int4', 'bf16' or 'fp16', " f"got {w_dtype!r}"
     )
@@ -590,23 +626,32 @@ def compile_gemm2_a16w4_port(
         assert a_dtype == "bf16", "quantized weights currently require a_dtype='bf16'"
     assert isinstance(has_bias, bool), "has_bias must be bool"
     assert isinstance(round_projection_bf16, bool), "round_projection_bf16 must be bool"
+    assert output_mode in ("atomic", "reduce"), "output_mode must be 'atomic' or 'reduce'"
+    assert isinstance(TOPK, int) and 0 < TOPK <= 255, "TOPK must be an integer in [1, 255]"
     # Arch-gate K=16 (gfx942) vs K=32 (gfx950); see a16wmix_use_k16.
     _use_k16 = a16wmix_use_k16()
     _K = D_INTER
     assert _K % TILE_K == 0, f"D_INTER (K) must be a multiple of {TILE_K}, got {_K}"
     assert N_OUT % TILE_N == 0, f"model_dim (N_OUT) must be a multiple of {TILE_N}, got {N_OUT}"
     assert BM % 16 == 0, f"BM must be a multiple of 16, got {BM}"
+    assert SORTED_BM % BM == 0, f"SORTED_BM ({SORTED_BM}) must be a multiple of BM ({BM})"
     _num_n_blocks = N_OUT // TILE_N
     KH_TILE_BYTES = TILE_K * 2
 
-    # LDS: A tile (BM x TILE_K bf16) then f32 accumulator region (BM x TILE_N f32).
+    # A and epilogue accumulator staging use LDS in disjoint phases, so reserve
+    # their maximum rather than their sum.
     _a_bytes = BM * KH_TILE_BYTES
     _acc_bytes = lds_acc_bytes_for(BM, TILE_N)
-    _lds_bytes = _a_bytes + _acc_bytes
+    _lds_bytes = max(_a_bytes, _acc_bytes)
 
     _wd_tag = "" if w_dtype == "mxfp4" else f"_{w_dtype}"
     _ad_tag = "" if a_dtype == "bf16" else f"_a{a_dtype}"
-    _name = f"gemm2_a16w4{_wd_tag}{_ad_tag}_port_ne{NE}_h{N_OUT}_i{_K}_bm{BM}_tn{TILE_N}"
+    _output_tag = "atomic" if output_mode == "atomic" else f"reduce_tk{TOPK}"
+    _sorted_tag = f"_sbm{SORTED_BM}" if SORTED_BM != BM else ""
+    _name = (
+        f"gemm2_a16w4{_wd_tag}{_ad_tag}_port_ne{NE}_h{N_OUT}_i{_K}_bm{BM}_tn{TILE_N}"
+        f"_tk{TILE_K}{_sorted_tag}_{_output_tag}"
+    )
     if b_cache_mod != 2:
         _name += f"_bcm{b_cache_mod}"
     if xcd_swizzle > 0:
@@ -685,6 +730,7 @@ def compile_gemm2_a16w4_port(
                 wave,
                 i32_M,
                 BM=BM,
+                SORTED_BM=SORTED_BM,
                 TILE_N=TILE_N,
                 TILE_K=TILE_K,
                 N_OUT=N_OUT,
@@ -696,6 +742,8 @@ def compile_gemm2_a16w4_port(
                 use_k16=_use_k16,
                 has_bias=has_bias,
                 round_projection_bf16=round_projection_bf16,
+                output_mode=output_mode,
+                TOPK=TOPK,
             )
 
         if const_expr(persist):

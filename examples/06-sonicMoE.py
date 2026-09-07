@@ -41,8 +41,27 @@ def _parse_args():
     parser.add_argument("--tile-m", type=int, default=32)
     parser.add_argument("--tile-n", type=int, default=128)
     parser.add_argument("--tile-k", type=int, default=128)
+    parser.add_argument(
+        "--stage1-k-wave",
+        type=int,
+        choices=(1, 2, 4),
+        default=1,
+        help="partition the four stage-1 waves across K and LDS-reduce partials",
+    )
+    parser.add_argument("--down-tile-m", type=int, default=None)
     parser.add_argument("--down-tile-n", type=int, default=None)
     parser.add_argument("--down-tile-k", type=int, default=None)
+    parser.add_argument("--stage1-xcd-swizzle", type=int, default=0)
+    parser.add_argument("--stage2-xcd-swizzle", type=int, default=1)
+    parser.add_argument(
+        "--stage2-output-mode",
+        choices=("atomic", "reduce"),
+        default="atomic",
+        help=(
+            "stage-2 accumulation strategy; reduce is fixed-top-k only and "
+            "allocates a tokens*top_k*hidden_size A16 scratch"
+        ),
+    )
     parser.add_argument("--weight-dtype", choices=("bf16", "fp16", "mxfp4"), default="bf16")
     parser.add_argument(
         "--activation",
@@ -82,8 +101,13 @@ def main():
         tile_m=args.tile_m,
         tile_n=args.tile_n,
         tile_k=args.tile_k,
+        stage1_k_wave=args.stage1_k_wave,
+        down_tile_m=args.down_tile_m,
         down_tile_n=args.down_tile_n,
         down_tile_k=args.down_tile_k,
+        stage1_xcd_swizzle=args.stage1_xcd_swizzle,
+        stage2_xcd_swizzle=args.stage2_xcd_swizzle,
+        stage2_output_mode=args.stage2_output_mode,
         activation=args.activation,
         compute_dtype=compute_dtype,
     )
@@ -135,8 +159,9 @@ def main():
                 print(
                     "  "
                     f"({candidate.tile_m},{candidate.tile_n},{candidate.tile_k})/"
-                    f"({candidate.tile_m},{candidate.stage2_tile_n},"
-                    f"{candidate.stage2_tile_k}): {elapsed_ms * 1000.0:.2f} us"
+                    f"({candidate.stage2_tile_m},{candidate.stage2_tile_n},"
+                    f"{candidate.stage2_tile_k}), stage1_k_wave={candidate.stage1_k_wave}: "
+                    f"{elapsed_ms * 1000.0:.2f} us"
                 )
         else:
             print("autotune: winner loaded from the in-memory/disk shape-profile cache")
@@ -217,11 +242,13 @@ def main():
     print(
         f"device={props.name}, arch={get_rocm_arch()}, "
         f"shape=T{args.tokens} H{args.hidden_size} I{args.intermediate_size} "
-        f"E{args.experts} K{args.top_k} W={args.weight_dtype} A={args.activation}"
+        f"E{args.experts} K{args.top_k} W={args.weight_dtype} A={args.activation} "
+        f"S2={run_config.stage2_output_mode}"
     )
     print(
         f"tiles=({run_config.tile_m},{run_config.tile_n},{run_config.tile_k})/"
-        f"({run_config.tile_m},{run_config.stage2_tile_n},{run_config.stage2_tile_k}), "
+        f"({run_config.stage2_tile_m},{run_config.stage2_tile_n},{run_config.stage2_tile_k}), "
+        f"stage1_k_wave={run_config.stage1_k_wave}, route_m={run_config.route_tile_m}, "
         f"padded_rows={padded}, padding_ratio={padding_ratio:.3f}"
     )
     print(f"latency={latency_us:.2f} us, useful_throughput={useful_tflops:.2f} TFLOP/s")

@@ -372,7 +372,14 @@ def test_sonic_moe_backward_matches_a16_reference(
     dtype,
     compute_dtype,
 ):
-    config = _config(hidden_size, intermediate_size, num_experts, topk, compute_dtype=compute_dtype)
+    config = _config(
+        hidden_size,
+        intermediate_size,
+        num_experts,
+        topk,
+        compute_dtype=compute_dtype,
+        down_tile_m=128,
+    )
     args = _make_case(
         tokens,
         hidden_size,
@@ -620,6 +627,7 @@ def test_sonic_moe_backward_routes_matches_a16_reference(
         1,
         activation=activation_name,
         compute_dtype=compute_dtype,
+        down_tile_m=128,
     )
     fixed_case = _make_case(
         tokens,

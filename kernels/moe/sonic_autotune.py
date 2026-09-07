@@ -23,16 +23,19 @@ from kernels.moe.moe_2stage_a16wmix.gemm2 import compile_gemm2_a16w4_port
 from kernels.moe.moe_sorting_kernel import moe_softmax_sort_flydsl
 from kernels.moe.sonic import SonicMoE, SonicMoEConfig, SonicMoEWeights
 
-_CACHE_SCHEMA_VERSION = 5
+_CACHE_SCHEMA_VERSION = 9
+_DENSE_WEIGHT_DTYPES = frozenset({"bf16", "fp16"})
 _TUNING_FIELDS = (
     "tile_m",
     "tile_n",
     "tile_k",
+    "down_tile_m",
     "down_tile_n",
     "down_tile_k",
     "stage1_b_cache_mod",
     "stage2_b_cache_mod",
     "stage1_xcd_swizzle",
+    "stage1_k_wave",
     "stage2_xcd_swizzle",
     "waves_per_eu",
     "persistent_stage2",
@@ -57,6 +60,7 @@ def _source_fingerprint() -> str:
     paths.update(
         {
             moe_dir / "topk_gating_softmax_kernel.py",
+            moe_dir / "moe_gemm_2stage" / "moe_reduce.py",
             moe_dir / "moe_2stage_a16wmix" / "utils.py",
             repo_root / "kernels" / "common" / "buffer_ops.py",
             repo_root / "kernels" / "common" / "kernels_common.py",
@@ -81,54 +85,141 @@ def _token_bucket(tokens: int) -> int:
     return 1 << (tokens - 1).bit_length()
 
 
-def default_sonic_moe_candidates(base: SonicMoEConfig) -> tuple[SonicMoEConfig, ...]:
-    """Return a bounded gfx950 tile search space, pruning illegal configs."""
+def default_sonic_moe_candidates(
+    base: SonicMoEConfig,
+    weight_dtype: str | None = None,
+) -> tuple[SonicMoEConfig, ...]:
+    """Return a small, curated gfx950 search space.
 
-    tile_shapes = [
-        (
-            base.tile_n,
-            base.tile_k,
-            base.stage2_tile_n,
-            base.stage2_tile_k,
-        ),
-        (128, 128, 128, 128),
-        (256, 128, 256, 128),
-        (128, 256, 128, 256),
-    ]
-    tile_shapes = list(dict.fromkeys(tile_shapes))
-    candidates: list[SonicMoEConfig] = [base]
-    seen = {
-        (
-            base.tile_m,
-            base.tile_n,
-            base.tile_k,
-            base.stage2_tile_n,
-            base.stage2_tile_k,
+    ``weight_dtype`` is deliberately explicit because MXFP4 (and packed INT4
+    formats) cannot use the dense K64 load path.  Omitting it selects the
+    conservative packed-weight-safe space; :class:`SonicMoEAutotuner` always
+    supplies the prepared weights' actual format.
+
+    The profiles below are intentionally not a Cartesian product.  They retain
+    the caller's exact config, cover useful routing granularities, add the
+    measured gfx950 throughput shapes, and add two BM16 split-K profiles for
+    high-expert-count decode.
+    """
+
+    if weight_dtype is not None and not isinstance(weight_dtype, str):
+        raise TypeError(f"weight_dtype must be str or None, got {type(weight_dtype).__name__}")
+    dense_weights = weight_dtype in _DENSE_WEIGHT_DTYPES
+    candidates: list[SonicMoEConfig] = []
+    seen: set[tuple[int | bool | None, ...]] = set()
+
+    def append_candidate(**overrides: int) -> None:
+        try:
+            candidate = replace(base, **overrides)
+        except (TypeError, ValueError):
+            return
+        # Packed 4-bit formats require at least K128 in both GEMMs.  Treat an
+        # unknown format conservatively so future INT4 formats cannot
+        # accidentally inherit the dense-only K64 profiles.
+        if not dense_weights and (candidate.tile_k < 128 or candidate.stage2_tile_k < 128):
+            return
+        effective = (
+            candidate.tile_m,
+            candidate.stage2_tile_m,
+            candidate.tile_n,
+            candidate.tile_k,
+            candidate.stage2_tile_n,
+            candidate.stage2_tile_k,
+            candidate.stage1_b_cache_mod,
+            candidate.stage2_b_cache_mod,
+            candidate.stage1_xcd_swizzle,
+            candidate.stage1_k_wave,
+            candidate.stage2_xcd_swizzle,
+            candidate.waves_per_eu,
+            candidate.persistent_stage2,
         )
-    }
-    for tile_m in (16, 32, 64, 128):
-        for tile_n, tile_k, down_tile_n, down_tile_k in tile_shapes:
-            try:
-                candidate = replace(
-                    base,
+        if effective not in seen:
+            seen.add(effective)
+            candidates.append(candidate)
+
+    append_candidate()
+
+    # Route-density profiles.  Equal M tiles avoid excess padding at decode;
+    # split M lets Stage2 use BM128 without forcing the same Stage1 block size.
+    for tile_m, down_tile_m in (
+        (16, 16),
+        (32, 32),
+        (64, 64),
+        (128, 128),
+        (32, 128),
+        (64, 128),
+    ):
+        append_candidate(tile_m=tile_m, down_tile_m=down_tile_m)
+
+    # K128 is safe for packed weights.  BN256/BN128 is the useful asymmetric
+    # Stage1/Stage2 pair on gfx950, while XCD=8 improves Stage2 distribution.
+    for tile_m, down_tile_m in ((32, 128), (64, 128), (128, 128)):
+        append_candidate(
+            tile_m=tile_m,
+            down_tile_m=down_tile_m,
+            tile_n=256,
+            tile_k=128,
+            down_tile_n=128,
+            down_tile_k=128,
+            stage1_xcd_swizzle=0,
+            stage1_k_wave=1,
+            stage2_xcd_swizzle=8,
+        )
+
+    if dense_weights:
+        # Dense A16W16 kernels have a corrected K64 fragment map.  Keep the
+        # measured BN64 fallback for narrower I and the best BN256 profile,
+        # each paired with Stage2 BN128/BK64.
+        for tile_n in (64, 256):
+            for tile_m, down_tile_m in ((32, 128), (64, 128), (128, 128)):
+                append_candidate(
                     tile_m=tile_m,
+                    down_tile_m=down_tile_m,
                     tile_n=tile_n,
-                    tile_k=tile_k,
-                    down_tile_n=down_tile_n,
-                    down_tile_k=down_tile_k,
+                    tile_k=64,
+                    down_tile_n=128,
+                    down_tile_k=64,
+                    stage1_xcd_swizzle=0,
+                    stage1_k_wave=1,
+                    stage2_xcd_swizzle=8,
                 )
-            except (TypeError, ValueError):
-                continue
-            effective = (
-                candidate.tile_m,
-                candidate.tile_n,
-                candidate.tile_k,
-                candidate.stage2_tile_n,
-                candidate.stage2_tile_k,
-            )
-            if effective not in seen:
-                seen.add(effective)
-                candidates.append(candidate)
+
+        # Skinny high-E profiles measured on H3584/I512.  BN64 exposes more
+        # independent Stage-1 work at T=1; the reciprocal narrow Stage-2 tile
+        # is a smaller win once T grows to the 128-token bucket.  XCD grouping
+        # does not help these sparse grids, so retain group size 1.
+        append_candidate(
+            tile_m=16,
+            down_tile_m=16,
+            tile_n=64,
+            tile_k=128,
+            down_tile_n=128,
+            down_tile_k=128,
+            stage1_xcd_swizzle=0,
+            stage1_k_wave=2,
+            stage2_xcd_swizzle=1,
+        )
+        append_candidate(
+            tile_m=16,
+            down_tile_m=16,
+            tile_n=128,
+            tile_k=128,
+            down_tile_n=64,
+            down_tile_k=128,
+            stage1_xcd_swizzle=0,
+            stage1_k_wave=4,
+            stage2_xcd_swizzle=1,
+        )
+
+    # BM16 minimizes expert padding for decode.  Split-K=2 won on the measured
+    # H3584 shape; retain split-K=4 as the other bounded gfx950 alternative.
+    for stage1_k_wave in (2, 4):
+        append_candidate(
+            tile_m=16,
+            down_tile_m=16,
+            stage1_k_wave=stage1_k_wave,
+        )
+
     return tuple(candidates)
 
 
@@ -156,7 +247,11 @@ class SonicMoEAutotuner:
             raise ValueError(f"warmup must be >= 0 and rep > 0, got {warmup}/{rep}")
         self.base_config = base_config
         self.weights = weights
-        self.candidates = tuple(default_sonic_moe_candidates(base_config) if candidates is None else candidates)
+        self.candidates = tuple(
+            default_sonic_moe_candidates(base_config, weights.weight_dtype)
+            if candidates is None
+            else candidates
+        )
         if not self.candidates:
             raise ValueError("at least one SonicMoE autotune candidate is required")
         self._validate_candidate_semantics()
@@ -197,6 +292,7 @@ class SonicMoEAutotuner:
             "num_experts",
             "top_k",
             "renormalize",
+            "stage2_output_mode",
             "activation",
             "compute_dtype",
         )
@@ -241,6 +337,7 @@ class SonicMoEAutotuner:
             "num_experts": self.base_config.num_experts,
             "top_k": self.base_config.top_k,
             "renormalize": self.base_config.renormalize,
+            "stage2_output_mode": self.base_config.stage2_output_mode,
             "activation": self.base_config.activation,
             "profile_key": self.profile_key,
             "validated": self.validate_candidates,

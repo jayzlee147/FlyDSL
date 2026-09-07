@@ -19,6 +19,7 @@ import os
 import pytest
 
 from kernels.moe.topk_gating_softmax_kernel import (
+    _compute_topk_gating_layout,
     build_topk_gating_softmax_module,
 )
 from tests.kernels.benchmark_common import (
@@ -73,6 +74,9 @@ def run_test(num_tokens, num_experts, topk, dtype_str, renormalize=True):
     torch.manual_seed(42)
     torch_dtype = _torch_dtype(dtype_str)
     gating_fp32 = (torch.rand((num_tokens, num_experts), device="cuda", dtype=DTYPE_FP32) * 4.0) - 2.0
+    # An all-equal row makes the tie-break observable.  The kernel contract is
+    # deterministic: lower expert indices win ties, in ascending order.
+    gating_fp32[0].zero_()
     # Quantize to the kernel's input dtype FIRST so the reference sees the
     # exact bytes the kernel sees. Otherwise the K-th expert can flip at
     # bf16/f16 precision boundaries (both vLLM and FlyDSL pick a different
@@ -170,6 +174,13 @@ def run_test(num_tokens, num_experts, topk, dtype_str, renormalize=True):
         print("  FAILED: kernel selected experts below the top-K threshold")
         passed = False
 
+    expected_tie_indices = torch.arange(topk, dtype=torch.int32)
+    tie_break_match = torch.equal(got_indices[0], expected_tie_indices)
+    print(f"  Lower-index tie break correct: {tie_break_match}")
+    if not tie_break_match:
+        print(f"  FAILED: expected tie indices {expected_tie_indices.tolist()}, got {got_indices[0].tolist()}")
+        passed = False
+
     # 2. Check topk_weights: for matching rows, compare sorted weights
     got_weights = topk_weights_dev.cpu().to(DTYPE_FP32)
     exp_weights = ref_weights.cpu().to(DTYPE_FP32)
@@ -209,6 +220,56 @@ def run_test(num_tokens, num_experts, topk, dtype_str, renormalize=True):
     return passed, flydsl_gpu_us
 
 
+def test_e896_layout():
+    layout = _compute_topk_gating_layout(896, 16, "bf16")
+    assert layout["VPT"] == 14
+    assert layout["THREADS_PER_TOKEN"] == 64
+    assert layout["TOKENS_PER_BLOCK"] == 4
+    assert layout["ELEMS_PER_ATOM"] == 2
+    assert layout["ATOMS_PER_THREAD"] == 7
+
+
+def test_renormalized_topk_keeps_masked_negative_infinity_indices_valid():
+    """A row with fewer than K finite logits must still emit K unique IDs."""
+
+    num_experts = 8
+    topk = 4
+    launch = build_topk_gating_softmax_module(
+        num_experts=num_experts,
+        topk=topk,
+        dtype_str="bf16",
+        renormalize=True,
+    )
+    logits = torch.full((1, num_experts), float("-inf"), device="cuda", dtype=torch.bfloat16)
+    logits[0, 5] = 2.0
+    logits[0, 2] = 1.0
+    weights = torch.empty((1, topk), device="cuda", dtype=torch.float32)
+    indices = torch.empty((1, topk), device="cuda", dtype=torch.int32)
+    token_expert_indices = torch.empty_like(indices)
+
+    launch(
+        logits,
+        weights,
+        indices,
+        token_expert_indices,
+        1,
+        stream=torch.cuda.current_stream(),
+    )
+    torch.cuda.synchronize()
+
+    expected_indices = torch.tensor([[5, 2, 0, 1]], device="cuda", dtype=torch.int32)
+    expected_weights = torch.softmax(
+        torch.tensor([[2.0, 1.0, float("-inf"), float("-inf")]], device="cuda"),
+        dim=-1,
+    )
+    assert torch.equal(indices, expected_indices)
+    torch.testing.assert_close(weights, expected_weights, rtol=1e-5, atol=1e-6)
+    assert torch.equal(
+        token_expert_indices,
+        torch.arange(topk, device="cuda", dtype=torch.int32).unsqueeze(0),
+    )
+
+
 def test_all():
     print("=" * 80)
     print("Running TopK Gating Softmax Tests")
@@ -222,21 +283,34 @@ def test_all():
             if not p:
                 continue
             toks, exps, k, dt = [x.strip() for x in p.split(",")]
-            configs.append((int(toks), int(exps), int(k), dt))
+            configs.append((int(toks), int(exps), int(k), dt, True))
     else:
         configs = [
-            (1024, 128, 6, "bf16"),
-            (512, 64, 2, "bf16"),
-            (256, 8, 2, "f32"),
-            (128, 128, 6, "f16"),
+            (1024, 128, 6, "bf16", True),
+            (512, 64, 2, "bf16", True),
+            (256, 8, 2, "f32", True),
+            (128, 128, 6, "f16", True),
+            # Kimi-K3 production expert count.  Cover all input dtypes and a
+            # non-multiple-of-TOKENS_PER_BLOCK tail (65 % 4 == 1).
+            (65, 896, 16, "bf16", True),
+            (65, 896, 16, "f16", True),
+            (65, 896, 16, "f32", True),
+            # Non-renormalized routing must retain full E-way softmax weights.
+            (65, 896, 16, "bf16", False),
         ]
 
     do_compare = os.environ.get("ROCDSL_COMPARE_AITER", "0") == "1"
     perf_rows = []
 
     failures = 0
-    for num_tokens, num_experts, topk, dtype_str in configs:
-        ok, flydsl_gpu_us = run_test(num_tokens, num_experts, topk, dtype_str, renormalize=True)
+    for num_tokens, num_experts, topk, dtype_str, renormalize in configs:
+        ok, flydsl_gpu_us = run_test(
+            num_tokens,
+            num_experts,
+            topk,
+            dtype_str,
+            renormalize=renormalize,
+        )
         if not ok:
             failures += 1
 
@@ -244,7 +318,7 @@ def test_all():
             perf_rows.append(
                 PerfRow(
                     op="topk_gating_softmax",
-                    shape=f"{num_tokens}x{num_experts}xk{topk}",
+                    shape=f"{num_tokens}x{num_experts}xk{topk}-renorm{int(renormalize)}",
                     dtype=dtype_str,
                     flydsl_gpu_us=flydsl_gpu_us,
                     aiter_gpu_us=None,

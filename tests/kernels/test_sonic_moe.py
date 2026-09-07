@@ -26,7 +26,7 @@ from kernels.moe.sonic import (
     sonic_moe_mxfp4_reference,
     sonic_moe_reference,
 )
-from kernels.moe.sonic_autotune import SonicMoEAutotuner
+from kernels.moe.sonic_autotune import SonicMoEAutotuner, default_sonic_moe_candidates
 
 pytestmark = [pytest.mark.l2_device, pytest.mark.rocm_lower]
 
@@ -153,6 +153,184 @@ def test_sonic_moe_fp16_forward_matches_reference():
     torch.cuda.synchronize()
     assert returned is out
     _assert_close(out, expected)
+
+
+def test_sonic_moe_stage1_k_wave2_matches_reference():
+    config = _config(stage1_k_wave=2)
+    x, w1, w2, router_logits = _make_case(seed=147)
+    expected = sonic_moe_reference(x, w1, w2, router_logits, config)
+    actual = SonicMoE(config, prepare_sonic_bf16_weights(w1, w2, config))(x, router_logits)
+    torch.cuda.synchronize()
+    _assert_close(actual, expected)
+
+
+@pytest.mark.parametrize(
+    ("compute_dtype", "torch_dtype"),
+    (("bf16", torch.bfloat16), ("fp16", torch.float16)),
+)
+def test_sonic_moe_dense_stage1_tile_k64_matches_k128(compute_dtype, torch_dtype):
+    """Pin the compact dense-fragment map used by gfx950 Stage1 K64."""
+
+    config64 = _config(
+        tile_m=32,
+        tile_n=64,
+        tile_k=64,
+        down_tile_n=128,
+        down_tile_k=128,
+        compute_dtype=compute_dtype,
+    )
+    config128 = replace(config64, tile_k=128)
+    x, w1, w2, router_logits = _make_case(seed=149, dtype=torch_dtype)
+    topk_ids, topk_weights = _topk_from_logits(router_logits, config64)
+
+    op64 = SonicMoE(config64, _prepare_dense_weights(w1, w2, config64))
+    op128 = SonicMoE(config128, _prepare_dense_weights(w1, w2, config128))
+    out64 = op64.forward_topk(x, topk_ids, topk_weights)
+    out128 = op128.forward_topk(x, topk_ids, topk_weights)
+    torch.cuda.synchronize()
+
+    expected = sonic_moe_reference(x, w1, w2, router_logits, config64)
+    _assert_close(out64, expected)
+    _assert_close(out128, expected)
+
+    def unsort_intermediate(op):
+        workspace = op.workspace
+        assert workspace is not None
+        padded = int(workspace.num_valid_ids[0].item())
+        packed = workspace.sorted_token_ids[:padded]
+        token = packed & 0x00FFFFFF
+        valid = token < TOKENS
+        token = token[valid].to(torch.long)
+        slot = ((packed[valid] >> 24) & 0xFF).to(torch.long)
+        routes = torch.empty(
+            (TOKENS, TOP_K, INTERMEDIATE_SIZE),
+            dtype=torch_dtype,
+            device=x.device,
+        )
+        routes[token, slot] = workspace.intermediate[:padded][valid]
+        return routes
+
+    _assert_close(unsort_intermediate(op64), unsort_intermediate(op128))
+
+
+@pytest.mark.parametrize("stage1_tile_m,stage2_tile_m", ((32, 128), (64, 128), (48, 64)))
+def test_sonic_moe_independent_stage_tile_m_matches_fixed_and_ragged_reference(
+    stage1_tile_m,
+    stage2_tile_m,
+):
+    """A route tile may be subdivided by either grouped GEMM independently."""
+
+    config = _config(tile_m=stage1_tile_m, down_tile_m=stage2_tile_m)
+    x, w1, w2, router_logits = _make_case(seed=150 + stage1_tile_m + stage2_tile_m)
+    topk_ids, topk_weights = _topk_from_logits(router_logits, config)
+    op = SonicMoE(config, prepare_sonic_bf16_weights(w1, w2, config))
+    expected = sonic_moe_reference(x, w1, w2, router_logits, config)
+
+    actual = op.forward_topk(x, topk_ids, topk_weights)
+    torch.cuda.synchronize()
+    _assert_close(actual, expected)
+    assert op.workspace is not None
+    assert op.workspace.route_tile_m == math.lcm(stage1_tile_m, stage2_tile_m)
+    assert op.workspace.max_padded_tokens % config.route_tile_m == 0
+    assert op.workspace.stage1_max_m_blocks == op.workspace.max_padded_tokens // stage1_tile_m
+    assert op.workspace.stage2_max_m_blocks == op.workspace.max_padded_tokens // stage2_tile_m
+
+    router_actual = op(x, router_logits)
+    torch.cuda.synchronize()
+    _assert_close(router_actual, expected)
+
+    token_indices = torch.arange(TOKENS, dtype=torch.int32, device=x.device).repeat_interleave(TOP_K)
+    ragged = op.forward_routes(
+        x,
+        token_indices,
+        topk_ids.reshape(-1),
+        topk_weights.reshape(-1),
+    )
+    torch.cuda.synchronize()
+    _assert_close(ragged, expected)
+
+
+@pytest.mark.parametrize(
+    ("weight_dtype", "compute_dtype", "torch_dtype"),
+    (
+        ("bf16", "bf16", torch.bfloat16),
+        ("fp16", "fp16", torch.float16),
+        ("mxfp4", "bf16", torch.bfloat16),
+    ),
+)
+def test_sonic_moe_reduce_mode_fixed_topk_matches_reference_and_route_sum(
+    weight_dtype,
+    compute_dtype,
+    torch_dtype,
+):
+    config = _config(stage2_output_mode="reduce", compute_dtype=compute_dtype)
+    x, w1, w2, router_logits = _make_case(seed=151, dtype=torch_dtype)
+    generator = torch.Generator(device=x.device).manual_seed(157)
+    b1 = (
+        torch.randn(
+            (NUM_EXPERTS, config.stage1_projection_size),
+            dtype=torch.float32,
+            device=x.device,
+            generator=generator,
+        )
+        / 8
+    ).to(torch_dtype)
+    b2 = (
+        torch.randn(
+            (NUM_EXPERTS, HIDDEN_SIZE),
+            dtype=torch.float32,
+            device=x.device,
+            generator=generator,
+        )
+        / 8
+    ).to(torch_dtype)
+    if weight_dtype == "mxfp4":
+        prepared = prepare_sonic_mxfp4_weights(w1, w2, config, b1=b1, b2=b2)
+        expected = sonic_moe_mxfp4_reference(x, w1, w2, router_logits, config, b1=b1, b2=b2)
+    else:
+        prepared = _prepare_dense_weights(w1, w2, config, b1=b1, b2=b2)
+        expected = sonic_moe_reference(x, w1, w2, router_logits, config, b1=b1, b2=b2)
+    op = SonicMoE(config, prepared)
+    topk_ids, topk_weights = _topk_from_logits(router_logits, config)
+
+    router_out = torch.empty_like(x)
+    actual_router = op(x, router_logits, out=router_out)
+    torch.cuda.synchronize()
+    assert actual_router is router_out
+    assert op.workspace is not None and op.workspace.route_output is not None
+    assert op.workspace.route_output.shape == (TOKENS, TOP_K, HIDDEN_SIZE)
+    assert torch.equal(router_out, op.workspace.route_output.float().sum(dim=1).to(torch_dtype))
+    _assert_close(router_out, expected)
+
+    topk_out = torch.empty_like(x)
+    actual_topk = op.forward_topk(x, topk_ids, topk_weights, out=topk_out)
+    torch.cuda.synchronize()
+    assert actual_topk is topk_out
+    assert op.workspace is not None and op.workspace.route_output is not None
+    assert torch.equal(topk_out, op.workspace.route_output.float().sum(dim=1).to(torch_dtype))
+    _assert_close(topk_out, expected)
+
+
+def test_sonic_moe_reduce_config_keeps_ragged_routes_atomic():
+    config = _config(stage2_output_mode="reduce")
+    x, w1, w2, router_logits = _make_case(seed=163)
+    topk_ids, topk_weights = _topk_from_logits(router_logits, config)
+    op = SonicMoE(config, prepare_sonic_bf16_weights(w1, w2, config))
+    token_indices = torch.arange(TOKENS, dtype=torch.int32, device=x.device).repeat_interleave(config.top_k)
+
+    expected = sonic_moe_reference(x, w1, w2, router_logits, config)
+    actual = op.forward_routes(
+        x,
+        token_indices,
+        topk_ids.reshape(-1).contiguous(),
+        topk_weights.reshape(-1).contiguous(),
+    )
+    torch.cuda.synchronize()
+
+    assert op.workspace is not None
+    assert op.workspace.routes == TOKENS * TOP_K
+    assert op.workspace.route_output is None
+    _assert_close(actual, expected)
 
 
 def test_sonic_moe_fp16_reference_quantizes_fp32_source_weights():
@@ -530,9 +708,11 @@ def test_sonic_moe_ragged_routes_match_reference_and_frequency():
     assert op.workspace is not None
     assert op.workspace.routes == route_weights.numel()
     expected_blocks = sum(
-        (int(count) + config.tile_m - 1) // config.tile_m for count in expected_frequency if int(count) > 0
+        (int(count) + config.route_tile_m - 1) // config.route_tile_m
+        for count in expected_frequency
+        if int(count) > 0
     )
-    assert int(op.workspace.num_valid_ids[0]) == expected_blocks * config.tile_m
+    assert int(op.workspace.num_valid_ids[0]) == expected_blocks * config.route_tile_m
     assert int(op.workspace.num_valid_ids[1]) == TOKENS
     _assert_close(actual, expected)
 
@@ -550,7 +730,12 @@ def test_sonic_moe_ragged_routes_match_reference_and_frequency():
     )
     torch.cuda.synchronize()
     assert op_tile32.workspace is not None
-    assert int(op_tile32.workspace.num_valid_ids[0]) == expected_blocks * 32
+    expected_tile32_blocks = sum(
+        (int(count) + config_tile32.route_tile_m - 1) // config_tile32.route_tile_m
+        for count in expected_frequency
+        if int(count) > 0
+    )
+    assert int(op_tile32.workspace.num_valid_ids[0]) == expected_tile32_blocks * config_tile32.route_tile_m
     assert torch.equal(frequency_tile32, expected_frequency)
     _assert_close(actual_tile32, expected)
 
@@ -562,7 +747,7 @@ def test_sonic_moe_ragged_routes_match_reference_and_frequency():
     )
     torch.cuda.synchronize()
     assert op.workspace is not None
-    assert int(op.workspace.num_valid_ids[0]) == expected_blocks * config.tile_m
+    assert int(op.workspace.num_valid_ids[0]) == expected_blocks * config.route_tile_m
     assert torch.equal(op.workspace.expert_frequency, expected_frequency)
     _assert_close(actual_tile16_again, expected)
 
@@ -920,6 +1105,17 @@ def test_sonic_moe_workspace_bound_scales_with_active_experts():
     assert dense_routes.max_m_blocks == 2
     assert dense_routes.max_padded_tokens == 32
 
+    split_tiles = SonicMoEWorkspace.allocate(
+        _config(num_experts=2, top_k=2, tile_m=32, down_tile_m=128),
+        tokens=16,
+        device=device,
+    )
+    assert split_tiles.route_tile_m == 128
+    assert split_tiles.max_m_blocks == 2
+    assert split_tiles.max_padded_tokens == 256
+    assert split_tiles.stage1_max_m_blocks == 8
+    assert split_tiles.stage2_max_m_blocks == 2
+
     config = _config(num_experts=896, top_k=2, tile_m=32)
     generator = torch.Generator(device=device).manual_seed(53)
     x = torch.randn((1, HIDDEN_SIZE), dtype=torch.bfloat16, device=device, generator=generator)
@@ -1004,6 +1200,45 @@ def test_sonic_moe_autotuner_search_and_disk_cache(tmp_path):
         cache_dir=tmp_path / "biased",
     )
     assert tuner._cache_key(x, router_logits) != biased_tuner._cache_key(x, router_logits)
+    reduce_config = replace(config, stage2_output_mode="reduce")
+    reduce_tuner = SonicMoEAutotuner(
+        reduce_config,
+        weights,
+        candidates=(reduce_config,),
+        warmup=0,
+        rep=1,
+        cache_dir=tmp_path / "reduce",
+    )
+    assert tuner._cache_key(x, router_logits) != reduce_tuner._cache_key(x, router_logits)
+    split_m_config = replace(config, down_tile_m=128)
+    split_m_tuner = SonicMoEAutotuner(
+        split_m_config,
+        weights,
+        candidates=(split_m_config,),
+        warmup=0,
+        rep=1,
+        cache_dir=tmp_path / "split-m",
+    )
+    assert tuner._cache_key(x, router_logits) != split_m_tuner._cache_key(x, router_logits)
+    k_wave_config = replace(config, stage1_k_wave=2)
+    k_wave_tuner = SonicMoEAutotuner(
+        k_wave_config,
+        weights,
+        candidates=(k_wave_config,),
+        warmup=0,
+        rep=1,
+        cache_dir=tmp_path / "stage1-k-wave",
+    )
+    assert tuner._cache_key(x, router_logits) != k_wave_tuner._cache_key(x, router_logits)
+    with pytest.raises(ValueError, match="semantic values differ"):
+        SonicMoEAutotuner(
+            reduce_config,
+            weights,
+            candidates=(config,),
+            warmup=0,
+            rep=1,
+            cache_dir=tmp_path / "mixed-output-mode",
+        )
 
     expected = sonic_moe_reference(x, w1, w2, router_logits, config)
     actual = tuner(x, router_logits)
@@ -1077,7 +1312,9 @@ def test_sonic_moe_autotuner_search_and_disk_cache(tmp_path):
     recovered(x, router_logits)
     torch.cuda.synchronize()
     assert recovered.search_count == 1
-    assert '"version": 5' in non_object_cache_file.read_text(encoding="utf-8")
+    rewritten_cache = non_object_cache_file.read_text(encoding="utf-8")
+    assert '"version": 9' in rewritten_cache
+    assert '"stage1_k_wave": 1' in rewritten_cache
 
 
 def test_sonic_moe_router_and_multiphase_sort_fallback():
@@ -1092,6 +1329,54 @@ def test_sonic_moe_router_and_multiphase_sort_fallback():
     torch.cuda.synchronize()
     assert op.workspace is not None
     assert op.workspace.sorting_workspace is not None
+    _assert_close(actual, expected)
+
+
+def test_sonic_moe_fused_router_handles_negative_infinity_masks():
+    """Fewer than K finite logits must not emit an invalid expert index."""
+
+    device = _gfx950_device()
+    config = _config(num_experts=8, top_k=4)
+    generator = torch.Generator(device=device).manual_seed(173)
+    x = torch.randn((1, HIDDEN_SIZE), device=device, dtype=torch.bfloat16, generator=generator)
+    w1 = (
+        torch.randn(
+            (config.num_experts, 2 * INTERMEDIATE_SIZE, HIDDEN_SIZE),
+            device=device,
+            dtype=torch.float32,
+            generator=generator,
+        )
+        / math.sqrt(HIDDEN_SIZE)
+    ).to(torch.bfloat16)
+    w2 = (
+        torch.randn(
+            (config.num_experts, HIDDEN_SIZE, INTERMEDIATE_SIZE),
+            device=device,
+            dtype=torch.float32,
+            generator=generator,
+        )
+        / math.sqrt(INTERMEDIATE_SIZE)
+    ).to(torch.bfloat16)
+    logits = torch.full(
+        (1, config.num_experts),
+        float("-inf"),
+        device=device,
+        dtype=torch.bfloat16,
+    )
+    logits[0, 5] = 2.0
+    logits[0, 2] = 1.0
+    op = SonicMoE(config, prepare_sonic_bf16_weights(w1, w2, config))
+
+    expected = sonic_moe_reference(x, w1, w2, logits, config)
+    actual = op(x, logits)
+    torch.cuda.synchronize()
+
+    assert op.workspace is not None
+    route_blocks = int(op.workspace.num_valid_ids[0].item()) // config.route_tile_m
+    selected_experts = op.workspace.sorted_expert_ids[:route_blocks]
+    assert torch.all((selected_experts >= 0) & (selected_experts < config.num_experts))
+    assert set(selected_experts.cpu().tolist()) == {0, 1, 2, 5}
+    assert torch.isfinite(actual).all()
     _assert_close(actual, expected)
 
 
@@ -1220,27 +1505,27 @@ def test_sonic_moe_runs_sequentially_on_two_devices():
         _assert_close(actual, expected)
 
 
-def test_sonic_moe_non_power_of_two_router_fallback():
-    """Arbitrary expert counts use torch top-k but keep FlyDSL sort/GEMMs."""
+def test_sonic_moe_unsupported_router_layout_falls_back():
+    """Expert counts without an exact lane layout retain the torch fallback."""
 
     device = _gfx950_device()
-    config = _config(num_experts=6)
+    config = _config(num_experts=17)
     assert not config.supports_flydsl_router
     generator = torch.Generator(device=device).manual_seed(29)
     x = torch.randn((3, HIDDEN_SIZE), device=device, dtype=torch.bfloat16, generator=generator)
     w1 = torch.randn(
-        (6, 2 * INTERMEDIATE_SIZE, HIDDEN_SIZE),
+        (17, 2 * INTERMEDIATE_SIZE, HIDDEN_SIZE),
         device=device,
         dtype=torch.bfloat16,
         generator=generator,
     ) / math.sqrt(HIDDEN_SIZE)
     w2 = torch.randn(
-        (6, HIDDEN_SIZE, INTERMEDIATE_SIZE),
+        (17, HIDDEN_SIZE, INTERMEDIATE_SIZE),
         device=device,
         dtype=torch.bfloat16,
         generator=generator,
     ) / math.sqrt(INTERMEDIATE_SIZE)
-    logits = torch.randn((3, 6), device=device, dtype=torch.bfloat16, generator=generator)
+    logits = torch.randn((3, 17), device=device, dtype=torch.bfloat16, generator=generator)
     op = SonicMoE(config, prepare_sonic_bf16_weights(w1, w2, config))
 
     expected = sonic_moe_reference(x, w1, w2, logits, config)
@@ -1249,14 +1534,174 @@ def test_sonic_moe_non_power_of_two_router_fallback():
     _assert_close(actual, expected)
 
 
+def test_sonic_moe_stage1_k_wave_config_and_default_candidates():
+    config = _config()
+    assert config.stage1_k_wave == 1
+
+    k_wave2 = replace(config, stage1_k_wave=2)
+    assert k_wave2.stage1_k_wave == 2
+    candidate_k_waves = {
+        candidate.stage1_k_wave
+        for candidate in default_sonic_moe_candidates(k_wave2, "bf16")
+    }
+    assert {1, 2}.issubset(candidate_k_waves)
+
+    k_wave4 = _config(hidden_size=512, stage1_k_wave=4)
+    assert k_wave4.stage1_k_wave == 4
+    for invalid in (0, 3, 8):
+        with pytest.raises(ValueError, match="stage1_k_wave must be 1, 2, or 4"):
+            _config(stage1_k_wave=invalid)
+    with pytest.raises(ValueError, match=r"stage1_k_wave \* tile_k"):
+        _config(hidden_size=384, stage1_k_wave=2)
+    with pytest.raises(ValueError, match="stage1 tile needs"):
+        SonicMoEConfig(
+            hidden_size=512,
+            intermediate_size=256,
+            num_experts=4,
+            top_k=2,
+            tile_m=128,
+            tile_n=256,
+            tile_k=128,
+            stage1_k_wave=4,
+        )
+
+
+@pytest.mark.parametrize("weight_dtype", ("bf16", "fp16"))
+def test_sonic_moe_default_candidates_include_curated_gfx950_dense_profiles(weight_dtype):
+    config = SonicMoEConfig(
+        hidden_size=4096,
+        intermediate_size=2048,
+        num_experts=64,
+        top_k=8,
+    )
+    candidates = default_sonic_moe_candidates(config, weight_dtype)
+
+    assert len(candidates) <= 19
+    assert len(candidates) == len(set(candidates))
+    assert {
+        (candidate.tile_m, candidate.stage2_tile_m)
+        for candidate in candidates
+    }.issuperset({(16, 16), (32, 128), (64, 128), (128, 128)})
+    assert any(
+        candidate.tile_m == 128
+        and candidate.stage2_tile_m == 128
+        and candidate.tile_n == 256
+        and candidate.tile_k == 64
+        and candidate.stage2_tile_n == 128
+        and candidate.stage2_tile_k == 64
+        and candidate.stage1_xcd_swizzle == 0
+        and candidate.stage2_xcd_swizzle == 8
+        for candidate in candidates
+    )
+    decode_k_waves = {
+        candidate.stage1_k_wave
+        for candidate in candidates
+        if candidate.tile_m == 16 and candidate.stage2_tile_m == 16
+    }
+    assert {2, 4}.issubset(decode_k_waves)
+    assert any(
+        candidate.tile_m == 16
+        and candidate.tile_n == 64
+        and candidate.stage1_k_wave == 2
+        and candidate.stage2_tile_m == 16
+        and candidate.stage2_tile_n == 128
+        and candidate.stage2_xcd_swizzle == 1
+        for candidate in candidates
+    )
+    assert any(
+        candidate.tile_m == 16
+        and candidate.tile_n == 128
+        and candidate.stage1_k_wave == 4
+        and candidate.stage2_tile_m == 16
+        and candidate.stage2_tile_n == 64
+        and candidate.stage2_xcd_swizzle == 1
+        for candidate in candidates
+    )
+
+
+@pytest.mark.parametrize("weight_dtype", (None, "mxfp4", "int4"))
+def test_sonic_moe_default_candidates_keep_packed_weights_at_k128(weight_dtype):
+    config = SonicMoEConfig(
+        hidden_size=4096,
+        intermediate_size=2048,
+        num_experts=64,
+        top_k=8,
+    )
+    candidates = default_sonic_moe_candidates(config, weight_dtype)
+
+    assert candidates
+    assert all(candidate.tile_k >= 128 for candidate in candidates)
+    assert all(candidate.stage2_tile_k >= 128 for candidate in candidates)
+    assert any(candidate.stage2_xcd_swizzle == 8 for candidate in candidates)
+    with pytest.raises(TypeError, match="weight_dtype must be str or None"):
+        default_sonic_moe_candidates(config, torch.bfloat16)
+
+
+def test_sonic_moe_candidate_fingerprint_covers_gfx950_tuning_axes():
+    config = SonicMoEConfig(
+        hidden_size=4096,
+        intermediate_size=2048,
+        num_experts=64,
+        top_k=8,
+    )
+    probes = (
+        config,
+        replace(config, down_tile_m=128),
+        replace(config, stage1_k_wave=2),
+        replace(config, stage2_xcd_swizzle=8),
+    )
+    tuner = object.__new__(SonicMoEAutotuner)
+    tuner.candidates = probes
+    fingerprints = tuner._candidate_fingerprint()
+
+    assert len({tuple(sorted(fingerprint.items())) for fingerprint in fingerprints}) == len(probes)
+    assert fingerprints[1]["down_tile_m"] == 128
+    assert fingerprints[2]["stage1_k_wave"] == 2
+    assert fingerprints[3]["stage2_xcd_swizzle"] == 8
+
+
 def test_sonic_moe_config_validation():
     device = _gfx950_device()
     config = _config()
+    assert config.down_tile_m is None
     assert config.down_tile_n is None
     assert config.down_tile_k is None
+    assert config.stage2_tile_m == config.tile_m
     assert config.stage2_tile_n == config.tile_n
     assert config.stage2_tile_k == config.tile_k
+    assert config.route_tile_m == config.tile_m
+    assert config.stage1_k_wave == 1
+    split_m_config = replace(config, tile_m=32, down_tile_m=128)
+    assert split_m_config.stage2_tile_m == 128
+    assert split_m_config.route_tile_m == 128
+    # Stage 2 overlays its A tile and FP32 epilogue scratch because their
+    # lifetimes are disjoint.  Each 128 KiB region fits gfx950 even though
+    # summing them would incorrectly reject this configuration as 256 KiB.
+    overlay_config = SonicMoEConfig(
+        hidden_size=512,
+        intermediate_size=512,
+        num_experts=4,
+        top_k=2,
+        tile_m=32,
+        tile_n=128,
+        tile_k=128,
+        down_tile_m=128,
+        down_tile_n=256,
+        down_tile_k=512,
+    )
+    assert overlay_config.stage2_tile_m == 128
+    with pytest.raises(ValueError, match="stage2 tile needs"):
+        replace(overlay_config, hidden_size=1024, down_tile_n=512)
+    candidate_m_tiles = {
+        (candidate.tile_m, candidate.stage2_tile_m)
+        for candidate in default_sonic_moe_candidates(config)
+    }
+    assert (32, 128) in candidate_m_tiles
+    assert (64, 128) in candidate_m_tiles
     assert config.renormalize is True
+    assert _config(num_experts=896, top_k=16).supports_flydsl_router
+    assert config.stage2_output_mode == "atomic"
+    assert replace(config, stage2_output_mode="reduce").stage2_output_mode == "reduce"
 
     invalid_configs = [
         {"hidden_size": 0},
@@ -1265,6 +1710,7 @@ def test_sonic_moe_config_validation():
         {"top_k": 0},
         {"top_k": NUM_EXPERTS + 1},
         {"tile_m": 0},
+        {"down_tile_m": 0},
         {"tile_n": 0},
         {"tile_k": 0},
         {"hidden_size": HIDDEN_SIZE - 1},
@@ -1279,10 +1725,107 @@ def test_sonic_moe_config_validation():
         _config(activation=None)
     with pytest.raises(ValueError, match="unsupported compute_dtype"):
         _config(compute_dtype="fp32")
+    with pytest.raises(ValueError, match="unsupported stage2_output_mode"):
+        _config(stage2_output_mode="not-a-mode")
+    with pytest.raises(TypeError, match="stage2_output_mode must be a string"):
+        _config(stage2_output_mode=None)
+
+    atomic_workspace = SonicMoEWorkspace.allocate(config, TOKENS, device)
+    reduce_config = replace(config, stage2_output_mode="reduce")
+    reduce_workspace = SonicMoEWorkspace.allocate(reduce_config, TOKENS, device)
+    ragged_reduce_workspace = SonicMoEWorkspace.allocate(
+        reduce_config,
+        TOKENS,
+        device,
+        routes=TOKENS * TOP_K,
+    )
+    assert atomic_workspace.route_output is None
+    assert reduce_workspace.route_output is not None
+    assert reduce_workspace.route_output.shape == (TOKENS, TOP_K, HIDDEN_SIZE)
+    assert ragged_reduce_workspace.route_output is None
 
     large_mesh_config = _config(num_experts=300, top_k=1)
     with pytest.raises(ValueError, match="signed 32-bit byte-index"):
         SonicMoEWorkspace.allocate(large_mesh_config, 8_000_000, device)
+
+
+def test_sonic_moe_stage2_launcher_cache_separates_output_modes(monkeypatch):
+    config = _config(stage2_output_mode="reduce")
+    compile_calls = []
+
+    def fake_compile_gemm2(**kwargs):
+        compile_calls.append(kwargs)
+        return object()
+
+    monkeypatch.setattr("kernels.moe.sonic.compile_gemm2_a16w4_port", fake_compile_gemm2)
+    _get_stage2_launcher.cache_clear()
+    try:
+        atomic = _get_stage2_launcher(config, 0, "bf16", False, "atomic", 0)
+        assert _get_stage2_launcher(config, 0, "bf16", False, "atomic", 0) is atomic
+        reduce = _get_stage2_launcher(config, 0, "bf16", False, "reduce", 0)
+        assert _get_stage2_launcher(config, 0, "bf16", False, "reduce", 0) is reduce
+
+        assert atomic is not reduce
+        assert [call["output_mode"] for call in compile_calls] == ["atomic", "reduce"]
+        assert [call["TOPK"] for call in compile_calls] == [TOP_K, TOP_K]
+        assert [call["BM"] for call in compile_calls] == [config.stage2_tile_m] * 2
+        assert [call["SORTED_BM"] for call in compile_calls] == [config.route_tile_m] * 2
+        assert _get_stage2_launcher.cache_info().currsize == 2
+    finally:
+        _get_stage2_launcher.cache_clear()
+
+
+def test_sonic_moe_launchers_receive_independent_compute_and_route_tiles(monkeypatch):
+    config = _config(tile_m=32, down_tile_m=128, stage1_k_wave=2)
+    compile_calls = {}
+
+    def fake_compile_gemm1(**kwargs):
+        compile_calls["stage1"] = kwargs
+        return object()
+
+    def fake_compile_gemm2(**kwargs):
+        compile_calls["stage2"] = kwargs
+        return object()
+
+    monkeypatch.setattr("kernels.moe.sonic.compile_gemm1_a16w4_port", fake_compile_gemm1)
+    monkeypatch.setattr("kernels.moe.sonic.compile_gemm2_a16w4_port", fake_compile_gemm2)
+    _get_stage1_launcher.cache_clear()
+    _get_stage2_launcher.cache_clear()
+    try:
+        _get_stage1_launcher(config, 0, "bf16", False, 0)
+        _get_stage2_launcher(config, 0, "bf16", False, "atomic", 0)
+        assert compile_calls["stage1"]["BM"] == 32
+        assert compile_calls["stage1"]["SORTED_BM"] == 128
+        assert compile_calls["stage1"]["k_wave"] == 2
+        assert compile_calls["stage2"]["BM"] == 128
+        assert compile_calls["stage2"]["SORTED_BM"] == 128
+    finally:
+        _get_stage1_launcher.cache_clear()
+        _get_stage2_launcher.cache_clear()
+
+
+def test_sonic_moe_stage1_launcher_cache_separates_k_wave(monkeypatch):
+    compile_calls = []
+
+    def fake_compile_gemm1(**kwargs):
+        compile_calls.append(kwargs)
+        return object()
+
+    monkeypatch.setattr("kernels.moe.sonic.compile_gemm1_a16w4_port", fake_compile_gemm1)
+    _get_stage1_launcher.cache_clear()
+    try:
+        default_config = _config()
+        split_k_config = replace(default_config, stage1_k_wave=2)
+        default_launcher = _get_stage1_launcher(default_config, 0, "bf16", False, 0)
+        assert _get_stage1_launcher(default_config, 0, "bf16", False, 0) is default_launcher
+        split_k_launcher = _get_stage1_launcher(split_k_config, 0, "bf16", False, 0)
+        assert _get_stage1_launcher(split_k_config, 0, "bf16", False, 0) is split_k_launcher
+
+        assert default_launcher is not split_k_launcher
+        assert [call["k_wave"] for call in compile_calls] == [1, 2]
+        assert _get_stage1_launcher.cache_info().currsize == 2
+    finally:
+        _get_stage1_launcher.cache_clear()
 
 
 def test_sonic_moe_tensor_shape_and_dtype_validation():
