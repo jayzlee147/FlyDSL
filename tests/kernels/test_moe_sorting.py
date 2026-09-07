@@ -63,6 +63,100 @@ def _call_flydsl(topk_ids, topk_weights, E, model_dim=4096, topk=None, unit_size
     return moe_sorting_flydsl(topk_ids, topk_weights, s_ids, s_w, s_eids, nv, buf, E, unit_size, expert_mask)
 
 
+@pytest.mark.parametrize("tokens", (16, 129, 2057), ids=("oneshot", "p0v2", "four-kernel"))
+@pytest.mark.parametrize("distribution", ("balanced", "hot16"))
+def test_moe_sorting_optional_frequency_matches_fixed_topk_routes(tokens, distribution):
+    """Every fixed-K sorting path exports exact counts without changing outputs."""
+
+    experts, topk, unit_size, model_dim = 64, 4, 16, 64
+    token = torch.arange(tokens, dtype=torch.int32, device="cuda")[:, None]
+    slot = torch.arange(topk, dtype=torch.int32, device="cuda")[None, :]
+    active_experts = experts if distribution == "balanced" else 16
+    topk_ids = ((token * topk + slot) % active_experts).contiguous()
+    topk_weights = torch.rand((tokens, topk), dtype=torch.float32, device="cuda")
+
+    max_padded = tokens * topk + experts * unit_size - topk
+    max_blocks = (max_padded + unit_size - 1) // unit_size
+    sorted_ids = torch.empty(max_padded, dtype=torch.int32, device="cuda")
+    sorted_weights = torch.empty(max_padded, dtype=torch.float32, device="cuda")
+    sorted_expert_ids = torch.empty(max_blocks, dtype=torch.int32, device="cuda")
+    num_valid_ids = torch.empty(2, dtype=torch.int32, device="cuda")
+    moe_buf = torch.empty((tokens, model_dim), dtype=torch.bfloat16, device="cuda")
+    frequency = torch.full((experts,), -1, dtype=torch.int32, device="cuda")
+
+    returned = moe_sorting_flydsl(
+        topk_ids,
+        topk_weights,
+        sorted_ids,
+        sorted_weights,
+        sorted_expert_ids,
+        num_valid_ids,
+        moe_buf,
+        experts,
+        unit_size=unit_size,
+        expert_frequency_out=frequency,
+    )
+    torch.cuda.synchronize()
+
+    expected = torch.bincount(topk_ids.flatten().long(), minlength=experts).to(torch.int32)
+    assert all(
+        actual is expected_tensor
+        for actual, expected_tensor in zip(
+            returned,
+            (sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, moe_buf),
+        )
+    )
+    assert torch.equal(frequency, expected)
+    assert int(frequency.sum()) == tokens * topk
+
+
+def test_moe_sorting_optional_frequency_validates_contract_and_aliasing():
+    experts, tokens, topk, unit_size = 4, 4, 2, 16
+    topk_ids = torch.tensor(
+        [[0, 1], [1, 2], [2, 3], [3, 0]],
+        dtype=torch.int32,
+        device="cuda",
+    )
+    topk_weights = torch.full((tokens, topk), 0.5, dtype=torch.float32, device="cuda")
+    max_padded = tokens * topk + experts * unit_size - topk
+    max_blocks = (max_padded + unit_size - 1) // unit_size
+    sorted_ids = torch.empty(max_padded, dtype=torch.int32, device="cuda")
+    sorted_weights = torch.empty(max_padded, dtype=torch.float32, device="cuda")
+    sorted_expert_ids = torch.empty(max_blocks, dtype=torch.int32, device="cuda")
+    num_valid_ids = torch.empty(2, dtype=torch.int32, device="cuda")
+    moe_buf = torch.empty((tokens, 64), dtype=torch.bfloat16, device="cuda")
+
+    def invoke(frequency):
+        return moe_sorting_flydsl(
+            topk_ids,
+            topk_weights,
+            sorted_ids,
+            sorted_weights,
+            sorted_expert_ids,
+            num_valid_ids,
+            moe_buf,
+            experts,
+            unit_size=unit_size,
+            expert_frequency_out=frequency,
+        )
+
+    with pytest.raises(TypeError, match="torch.Tensor"):
+        invoke([0] * experts)
+    with pytest.raises(ValueError, match="shape"):
+        invoke(torch.empty(experts - 1, dtype=torch.int32, device="cuda"))
+    with pytest.raises(ValueError, match="contiguous int32"):
+        invoke(torch.empty(experts, dtype=torch.int64, device="cuda"))
+    with pytest.raises(ValueError, match="same device"):
+        invoke(torch.empty(experts, dtype=torch.int32))
+    noncontiguous = torch.empty(experts * 2, dtype=torch.int32, device="cuda")[::2]
+    with pytest.raises(ValueError, match="contiguous int32"):
+        invoke(noncontiguous)
+    with pytest.raises(ValueError, match="must not alias"):
+        invoke(topk_ids.flatten()[:experts])
+    with pytest.raises(ValueError, match="must not alias"):
+        invoke(sorted_ids[:experts])
+
+
 BENCH_ITERS = 20
 BENCH_WARMUP = 10
 BENCH_MEASURE = 50

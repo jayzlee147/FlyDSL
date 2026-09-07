@@ -2001,6 +2001,7 @@ class SonicMoE:
         out: torch.Tensor | None = None,
         *,
         interleaved_w1: bool = False,
+        expert_frequency_out: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, SonicMoEForwardState]:
         """Run fixed-K forward and retain exact A16 W1 preactivation.
 
@@ -2017,6 +2018,10 @@ class SonicMoE:
         Function: it permits gradient-bearing inputs so an adapter can save
         them and provide the corresponding backward implementation.  Calling
         it directly does not attach a ``grad_fn`` to ``output`` or state.
+
+        When supplied, ``expert_frequency_out`` follows the same caller-owned
+        contiguous int32 ``[num_experts]`` contract as :meth:`__call__` and is
+        populated from the fixed-K sorter without changing the return tuple.
 
         Forward-only graph capture is deliberately rejected in this phase.
         Safe capture requires an explicit graph-private preallocated state slot
@@ -2047,6 +2052,7 @@ class SonicMoE:
                 topk_weights,
                 out,
                 interleaved_w1=interleaved_w1,
+                expert_frequency_out=expert_frequency_out,
             )
 
     def _forward_topk_training_on_current_device(
@@ -2057,6 +2063,7 @@ class SonicMoE:
         out: torch.Tensor | None,
         *,
         interleaved_w1: bool,
+        expert_frequency_out: torch.Tensor | None,
     ) -> tuple[torch.Tensor, SonicMoEForwardState]:
         tokens = self._validate_training_hidden(hidden_states)
         expected = (tokens, self.config.top_k)
@@ -2095,6 +2102,17 @@ class SonicMoE:
             topk_weights,
             *self.weights.tensors,
         )
+        frequency = None
+        if expert_frequency_out is not None:
+            frequency = self._validate_expert_frequency_out(
+                expert_frequency_out,
+                workspace,
+                output,
+                hidden_states,
+                topk_ids,
+                topk_weights,
+                *self.weights.tensors,
+            )
         preactivation = torch.empty(
             (tokens, self.config.top_k, 2 * self.config.intermediate_size),
             dtype=torch.bfloat16,
@@ -2118,6 +2136,7 @@ class SonicMoE:
                 unit_size=self.config.route_tile_m,
                 workspace=workspace.sorting_workspace,
                 direct_single_token=True,
+                expert_frequency_out=frequency,
             )
             result = self._run_grouped_gemms_training(
                 hidden_states,
@@ -2141,6 +2160,7 @@ class SonicMoE:
                 workspace.sorting_workspace,
                 workspace.intermediate,
                 workspace.route_output,
+                frequency,
             )
             ready_event.record(stream)
 
@@ -2166,6 +2186,8 @@ class SonicMoE:
         topk_ids: torch.Tensor,
         topk_weights: torch.Tensor,
         out: torch.Tensor | None = None,
+        *,
+        expert_frequency_out: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Run the grouped MLP from precomputed route ids and weights.
 
@@ -2174,6 +2196,10 @@ class SonicMoE:
         must be distinct and in ``[0, num_experts)``; this hot path intentionally
         avoids a device synchronization to validate their values.  Weights are
         consumed as-is; normalize them before this call when desired.
+
+        When supplied, ``expert_frequency_out`` follows the same caller-owned
+        contiguous int32 ``[num_experts]`` contract as :meth:`__call__` and is
+        populated directly by the fixed-K sorter.
         """
 
         if not hidden_states.is_cuda:
@@ -2184,6 +2210,7 @@ class SonicMoE:
                 topk_ids,
                 topk_weights,
                 out,
+                expert_frequency_out,
             )
 
     def _forward_topk_on_current_device(
@@ -2192,6 +2219,7 @@ class SonicMoE:
         topk_ids: torch.Tensor,
         topk_weights: torch.Tensor,
         out: torch.Tensor | None,
+        expert_frequency_out: torch.Tensor | None,
     ) -> torch.Tensor:
         tokens = self._validate_hidden(hidden_states)
         expected = (tokens, self.config.top_k)
@@ -2225,6 +2253,17 @@ class SonicMoE:
             topk_weights,
             *self.weights.tensors,
         )
+        frequency = None
+        if expert_frequency_out is not None:
+            frequency = self._validate_expert_frequency_out(
+                expert_frequency_out,
+                workspace,
+                output,
+                hidden_states,
+                topk_ids,
+                topk_weights,
+                *self.weights.tensors,
+            )
         with workspace._launch_lock:
             moe_sorting_flydsl(
                 topk_ids,
@@ -2238,8 +2277,12 @@ class SonicMoE:
                 unit_size=self.config.route_tile_m,
                 workspace=workspace.sorting_workspace,
                 direct_single_token=True,
+                expert_frequency_out=frequency,
             )
-            return self._run_grouped_gemms(hidden_states, workspace, output)
+            result = self._run_grouped_gemms(hidden_states, workspace, output)
+        if frequency is not None:
+            frequency.record_stream(torch.cuda.current_stream(hidden_states.device))
+        return result
 
 
 @torch.no_grad()

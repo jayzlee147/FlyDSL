@@ -266,6 +266,129 @@ def test_sonic_moe_training_state_covers_fixed_topk_sort_paths(tokens):
     torch.testing.assert_close(state.preactivation.float(), expected.float(), rtol=3e-2, atol=5e-2)
 
 
+@pytest.mark.parametrize("training", (False, True), ids=("inference", "training"))
+@pytest.mark.parametrize("tokens", (1, 129), ids=("direct-t1", "multiphase"))
+def test_sonic_moe_fixed_topk_frequency_matches_routes(training, tokens):
+    """Both public fixed-K entry points fill caller-owned frequency storage."""
+
+    config = _config(stage1_k_wave=2 if tokens == 1 else 1)
+    x, w1, w2, router_logits = _make_case(tokens=tokens, seed=307 + tokens)
+    topk_ids, topk_weights = _topk_from_logits(router_logits, config)
+    expected = sonic_moe_reference(x, w1, w2, router_logits, config)
+    expected_frequency = torch.bincount(
+        topk_ids.flatten().long(),
+        minlength=config.num_experts,
+    ).to(torch.int32)
+    frequency = torch.full_like(expected_frequency, -1)
+    out = torch.empty_like(x)
+    op = SonicMoE(config, prepare_sonic_bf16_weights(w1, w2, config))
+
+    if training:
+        returned, state = op.forward_topk_training(
+            x,
+            topk_ids,
+            topk_weights,
+            out=out,
+            expert_frequency_out=frequency,
+        )
+        assert state.preactivation.shape[0] == tokens
+    else:
+        returned = op.forward_topk(
+            x,
+            topk_ids,
+            topk_weights,
+            out=out,
+            expert_frequency_out=frequency,
+        )
+    torch.cuda.synchronize()
+
+    assert returned is out
+    assert torch.equal(frequency, expected_frequency)
+    _assert_close(out, expected)
+
+
+@pytest.mark.parametrize("training", (False, True), ids=("inference", "training"))
+def test_sonic_moe_fixed_topk_frequency_rejects_aliases(training):
+    config = _config()
+    x, w1, w2, router_logits = _make_case(seed=439)
+    topk_ids, topk_weights = _topk_from_logits(router_logits, config)
+    op = SonicMoE(config, prepare_sonic_bf16_weights(w1, w2, config))
+    out = torch.empty_like(x)
+
+    def invoke(frequency):
+        if training:
+            return op.forward_topk_training(
+                x,
+                topk_ids,
+                topk_weights,
+                out=out,
+                expert_frequency_out=frequency,
+            )
+        return op.forward_topk(
+            x,
+            topk_ids,
+            topk_weights,
+            out=out,
+            expert_frequency_out=frequency,
+        )
+
+    input_alias = topk_ids.flatten()[: config.num_experts]
+    with pytest.raises(ValueError, match="must not alias an input or output"):
+        invoke(input_alias)
+
+    output_alias = out.view(torch.int32).flatten()[: config.num_experts]
+    with pytest.raises(ValueError, match="must not alias an input or output"):
+        invoke(output_alias)
+
+    workspace = op.reserve(x.shape[0])
+    with pytest.raises(ValueError, match="must not alias internal workspace storage"):
+        invoke(workspace.expert_frequency)
+
+
+@pytest.mark.parametrize("training", (False, True), ids=("inference", "training"))
+def test_sonic_moe_fixed_topk_frequency_cross_stream_lifetime(training):
+    config = _config()
+    x, w1, w2, router_logits = _make_case(seed=443)
+    topk_ids, topk_weights = _topk_from_logits(router_logits, config)
+    expected_frequency = torch.bincount(
+        topk_ids.flatten().long(),
+        minlength=config.num_experts,
+    ).to(torch.int32)
+    op = SonicMoE(config, prepare_sonic_bf16_weights(w1, w2, config))
+    producer = torch.cuda.Stream(device=x.device)
+    consumer = torch.cuda.Stream(device=x.device)
+    producer.wait_stream(torch.cuda.current_stream(x.device))
+
+    with torch.cuda.stream(producer):
+        frequency = torch.empty(config.num_experts, dtype=torch.int32, device=x.device)
+        if training:
+            output, state = op.forward_topk_training(
+                x,
+                topk_ids,
+                topk_weights,
+                expert_frequency_out=frequency,
+            )
+        else:
+            output = op.forward_topk(
+                x,
+                topk_ids,
+                topk_weights,
+                expert_frequency_out=frequency,
+            )
+            state = None
+
+    consumer.wait_stream(producer)
+    with torch.cuda.stream(consumer):
+        observed = frequency.clone()
+        checksum = output.float().sum()
+        if state is not None:
+            checksum = checksum + state.preactivation.float().sum()
+    torch.cuda.current_stream(x.device).wait_stream(consumer)
+
+    assert torch.equal(observed, expected_frequency)
+    assert torch.isfinite(checksum)
+
+
 def test_sonic_moe_training_state_records_current_stream_and_ready_event():
     config = _config()
     x, w1, w2, router_logits = _make_case(seed=283)

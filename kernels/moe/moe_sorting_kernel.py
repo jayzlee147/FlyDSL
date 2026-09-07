@@ -1565,6 +1565,7 @@ def _compile_moe_sorting_multiphase(
     topk: int,
     unit_size: int = UNIT_SIZE,
     has_mask: bool = False,
+    export_frequency: bool = False,
 ):
     """Compile the multiphase MoE sorting kernels (2 or 4 kernels via HBM workspace).
 
@@ -1588,6 +1589,10 @@ def _compile_moe_sorting_multiphase(
         Experts per token (e.g. 8).
     unit_size : int
         GEMM tile-M for padding alignment (default 32).
+    export_frequency : bool
+        Build an opt-in producer variant that stores each expert's raw count
+        directly to a caller-owned output.  The default variant retains the
+        original kernel signatures and generated ISA.
     """
     E = num_experts
 
@@ -1814,12 +1819,13 @@ def _compile_moe_sorting_multiphase(
     class P1SharedStorage:
         reduce: fx.Array[fx.Int32, K3_NUM_WAVES, 16]
 
-    @flyc.kernel
-    def p1_count_kernel(
+    @flyc.jit
+    def _p1_count_body(
         workspace: fx.Tensor,
         expert_mask_tensor: fx.Tensor,
         i32_mesh_stride: fx.Int32,
         i32_mesh_size: fx.Int32,
+        expert_frequency_out: fx.Tensor,
     ):
         eid = gpu.block_idx.x
         tid = gpu.thread_idx.x
@@ -1897,16 +1903,77 @@ def _compile_moe_sorting_multiphase(
         safe_cs = is_t0.select(cs_offset, c_oob_idx)
         buffer_ops.buffer_store(total, ws_rsrc, safe_cs)
 
-    @flyc.jit
-    def launch_p1(
-        workspace: fx.Tensor,
-        expert_mask_tensor: fx.Tensor,
-        i32_mesh_stride: fx.Int32,
-        i32_mesh_size: fx.Int32,
-        stream: fx.Stream = fx.Stream(None),
-    ):
-        launcher = p1_count_kernel(workspace, expert_mask_tensor, i32_mesh_stride, i32_mesh_size)
-        launcher.launch(grid=(E, 1, 1), block=(K3_BLOCK, 1, 1), stream=stream)
+        if export_frequency:
+            frequency_rsrc = buffer_ops.create_buffer_resource(expert_frequency_out, max_size=True)
+            buffer_ops.buffer_store(total, frequency_rsrc, is_t0.select(eid, c_oob_idx))
+
+    if export_frequency:
+
+        @flyc.kernel
+        def p1_count_kernel(
+            workspace: fx.Tensor,
+            expert_mask_tensor: fx.Tensor,
+            i32_mesh_stride: fx.Int32,
+            i32_mesh_size: fx.Int32,
+            expert_frequency_out: fx.Tensor,
+        ):
+            _p1_count_body(
+                workspace,
+                expert_mask_tensor,
+                i32_mesh_stride,
+                i32_mesh_size,
+                expert_frequency_out,
+            )
+
+    else:
+
+        @flyc.kernel
+        def p1_count_kernel(
+            workspace: fx.Tensor,
+            expert_mask_tensor: fx.Tensor,
+            i32_mesh_stride: fx.Int32,
+            i32_mesh_size: fx.Int32,
+        ):
+            _p1_count_body(
+                workspace,
+                expert_mask_tensor,
+                i32_mesh_stride,
+                i32_mesh_size,
+                workspace,
+            )
+
+    if export_frequency:
+
+        @flyc.jit
+        def launch_p1(
+            workspace: fx.Tensor,
+            expert_mask_tensor: fx.Tensor,
+            i32_mesh_stride: fx.Int32,
+            i32_mesh_size: fx.Int32,
+            expert_frequency_out: fx.Tensor,
+            stream: fx.Stream = fx.Stream(None),
+        ):
+            launcher = p1_count_kernel(
+                workspace,
+                expert_mask_tensor,
+                i32_mesh_stride,
+                i32_mesh_size,
+                expert_frequency_out,
+            )
+            launcher.launch(grid=(E, 1, 1), block=(K3_BLOCK, 1, 1), stream=stream)
+
+    else:
+
+        @flyc.jit
+        def launch_p1(
+            workspace: fx.Tensor,
+            expert_mask_tensor: fx.Tensor,
+            i32_mesh_stride: fx.Int32,
+            i32_mesh_size: fx.Int32,
+            stream: fx.Stream = fx.Stream(None),
+        ):
+            launcher = p1_count_kernel(workspace, expert_mask_tensor, i32_mesh_stride, i32_mesh_size)
+            launcher.launch(grid=(E, 1, 1), block=(K3_BLOCK, 1, 1), stream=stream)
 
     # --- P0_v2: Fused clear+scatter+count kernel (for T <= 2048) --------------
     # Replaces K1+K2+K3 with a single kernel launch.
@@ -1926,14 +1993,15 @@ def _compile_moe_sorting_multiphase(
     class P0V2SharedStorage:
         reduce: fx.Array[fx.Int32, P0V2_NUM_WAVES, 16]
 
-    @flyc.kernel(known_block_size=[P0V2_BLOCK, 1, 1])
-    def p0v2_kernel(
+    @flyc.jit
+    def _p0v2_body(
         topk_ids: fx.Tensor,
         workspace: fx.Tensor,
         expert_mask_tensor: fx.Tensor,
         i32_tokens: fx.Int32,
         i32_mesh_stride: fx.Int32,
         i32_mesh_size: fx.Int32,
+        expert_frequency_out: fx.Tensor,
     ):
         eid = gpu.block_idx.x
         tid = gpu.thread_idx.x
@@ -2057,18 +2125,91 @@ def _compile_moe_sorting_multiphase(
         safe_cs = is_t0.select(cs_offset, c_oob_idx)
         buffer_ops.buffer_store(total, ws_rsrc, safe_cs)
 
-    @flyc.jit
-    def launch_p0v2(
-        topk_ids: fx.Tensor,
-        workspace: fx.Tensor,
-        expert_mask_tensor: fx.Tensor,
-        i32_tokens: fx.Int32,
-        i32_mesh_stride: fx.Int32,
-        i32_mesh_size: fx.Int32,
-        stream: fx.Stream = fx.Stream(None),
-    ):
-        launcher = p0v2_kernel(topk_ids, workspace, expert_mask_tensor, i32_tokens, i32_mesh_stride, i32_mesh_size)
-        launcher.launch(grid=(E, 1, 1), block=(P0V2_BLOCK, 1, 1), stream=stream)
+        if export_frequency:
+            frequency_rsrc = buffer_ops.create_buffer_resource(expert_frequency_out, max_size=True)
+            buffer_ops.buffer_store(total, frequency_rsrc, is_t0.select(eid, c_oob_idx))
+
+    if export_frequency:
+
+        @flyc.kernel(known_block_size=[P0V2_BLOCK, 1, 1])
+        def p0v2_kernel(
+            topk_ids: fx.Tensor,
+            workspace: fx.Tensor,
+            expert_mask_tensor: fx.Tensor,
+            i32_tokens: fx.Int32,
+            i32_mesh_stride: fx.Int32,
+            i32_mesh_size: fx.Int32,
+            expert_frequency_out: fx.Tensor,
+        ):
+            _p0v2_body(
+                topk_ids,
+                workspace,
+                expert_mask_tensor,
+                i32_tokens,
+                i32_mesh_stride,
+                i32_mesh_size,
+                expert_frequency_out,
+            )
+
+    else:
+
+        @flyc.kernel(known_block_size=[P0V2_BLOCK, 1, 1])
+        def p0v2_kernel(
+            topk_ids: fx.Tensor,
+            workspace: fx.Tensor,
+            expert_mask_tensor: fx.Tensor,
+            i32_tokens: fx.Int32,
+            i32_mesh_stride: fx.Int32,
+            i32_mesh_size: fx.Int32,
+        ):
+            _p0v2_body(
+                topk_ids,
+                workspace,
+                expert_mask_tensor,
+                i32_tokens,
+                i32_mesh_stride,
+                i32_mesh_size,
+                workspace,
+            )
+
+    if export_frequency:
+
+        @flyc.jit
+        def launch_p0v2(
+            topk_ids: fx.Tensor,
+            workspace: fx.Tensor,
+            expert_mask_tensor: fx.Tensor,
+            i32_tokens: fx.Int32,
+            i32_mesh_stride: fx.Int32,
+            i32_mesh_size: fx.Int32,
+            expert_frequency_out: fx.Tensor,
+            stream: fx.Stream = fx.Stream(None),
+        ):
+            launcher = p0v2_kernel(
+                topk_ids,
+                workspace,
+                expert_mask_tensor,
+                i32_tokens,
+                i32_mesh_stride,
+                i32_mesh_size,
+                expert_frequency_out,
+            )
+            launcher.launch(grid=(E, 1, 1), block=(P0V2_BLOCK, 1, 1), stream=stream)
+
+    else:
+
+        @flyc.jit
+        def launch_p0v2(
+            topk_ids: fx.Tensor,
+            workspace: fx.Tensor,
+            expert_mask_tensor: fx.Tensor,
+            i32_tokens: fx.Int32,
+            i32_mesh_stride: fx.Int32,
+            i32_mesh_size: fx.Int32,
+            stream: fx.Stream = fx.Stream(None),
+        ):
+            launcher = p0v2_kernel(topk_ids, workspace, expert_mask_tensor, i32_tokens, i32_mesh_stride, i32_mesh_size)
+            launcher.launch(grid=(E, 1, 1), block=(P0V2_BLOCK, 1, 1), stream=stream)
 
     # --- K4: P23 prefix-sum + scatter + moe_buf zeroing ---------------------
     # Parallel design (matching CK P23): each block [0, E) independently
@@ -2303,89 +2444,193 @@ def _compile_moe_sorting_multiphase(
         )
         launcher.launch(grid=(n_grid, 1, 1), block=(K4_BLOCK, 1, 1), stream=stream)
 
-    @flyc.jit
-    def launch_p0v2_p23(
-        topk_ids: fx.Tensor,
-        workspace: fx.Tensor,
-        topk_weights_tensor: fx.Tensor,
-        sorted_token_ids: fx.Tensor,
-        sorted_weights_out: fx.Tensor,
-        sorted_expert_ids: fx.Tensor,
-        num_valid_ids_out: fx.Tensor,
-        moe_buf: fx.Tensor,
-        expert_mask_tensor: fx.Tensor,
-        i32_tokens: fx.Int32,
-        i32_mesh_stride: fx.Int32,
-        i32_mesh_size: fx.Int32,
-        i32_moe_buf_elems: fx.Int32,
-        n_grid_p23: fx.Int32,
-        stream: fx.Stream = fx.Stream(None),
-    ):
-        l1 = p0v2_kernel(topk_ids, workspace, expert_mask_tensor, i32_tokens, i32_mesh_stride, i32_mesh_size)
-        l1.launch(grid=(E, 1, 1), block=(P0V2_BLOCK, 1, 1), stream=stream)
+    if export_frequency:
 
-        l2 = p23_kernel(
-            workspace,
-            topk_weights_tensor,
-            sorted_token_ids,
-            sorted_weights_out,
-            sorted_expert_ids,
-            num_valid_ids_out,
-            moe_buf,
-            expert_mask_tensor,
-            i32_tokens,
-            i32_mesh_stride,
-            i32_mesh_size,
-            i32_moe_buf_elems,
-        )
-        l2.launch(grid=(n_grid_p23, 1, 1), block=(K4_BLOCK, 1, 1), stream=stream)
+        @flyc.jit
+        def launch_p0v2_p23(
+            topk_ids: fx.Tensor,
+            workspace: fx.Tensor,
+            expert_frequency_out: fx.Tensor,
+            topk_weights_tensor: fx.Tensor,
+            sorted_token_ids: fx.Tensor,
+            sorted_weights_out: fx.Tensor,
+            sorted_expert_ids: fx.Tensor,
+            num_valid_ids_out: fx.Tensor,
+            moe_buf: fx.Tensor,
+            expert_mask_tensor: fx.Tensor,
+            i32_tokens: fx.Int32,
+            i32_mesh_stride: fx.Int32,
+            i32_mesh_size: fx.Int32,
+            i32_moe_buf_elems: fx.Int32,
+            n_grid_p23: fx.Int32,
+            stream: fx.Stream = fx.Stream(None),
+        ):
+            l1 = p0v2_kernel(
+                topk_ids,
+                workspace,
+                expert_mask_tensor,
+                i32_tokens,
+                i32_mesh_stride,
+                i32_mesh_size,
+                expert_frequency_out,
+            )
+            l1.launch(grid=(E, 1, 1), block=(P0V2_BLOCK, 1, 1), stream=stream)
 
-    @flyc.jit
-    def launch_4k_fused(
-        topk_ids: fx.Tensor,
-        workspace: fx.Tensor,
-        topk_weights_tensor: fx.Tensor,
-        sorted_token_ids: fx.Tensor,
-        sorted_weights_out: fx.Tensor,
-        sorted_expert_ids: fx.Tensor,
-        num_valid_ids_out: fx.Tensor,
-        moe_buf: fx.Tensor,
-        expert_mask_tensor: fx.Tensor,
-        i32_tokens: fx.Int32,
-        i32_mesh_stride: fx.Int32,
-        i32_mesh_size: fx.Int32,
-        i32_moe_buf_elems: fx.Int32,
-        i32_ws_total: fx.Int32,
-        i32_p0_niters: fx.Int32,
-        n_grid_k1: fx.Int32,
-        n_grid_k2: fx.Int32,
-        n_grid_p23: fx.Int32,
-        stream: fx.Stream = fx.Stream(None),
-    ):
-        l1 = clear_workspace_kernel(workspace, i32_ws_total)
-        l1.launch(grid=(n_grid_k1, 1, 1), block=(K1_BLOCK, 1, 1), stream=stream)
+            l2 = p23_kernel(
+                workspace,
+                topk_weights_tensor,
+                sorted_token_ids,
+                sorted_weights_out,
+                sorted_expert_ids,
+                num_valid_ids_out,
+                moe_buf,
+                expert_mask_tensor,
+                i32_tokens,
+                i32_mesh_stride,
+                i32_mesh_size,
+                i32_moe_buf_elems,
+            )
+            l2.launch(grid=(n_grid_p23, 1, 1), block=(K4_BLOCK, 1, 1), stream=stream)
 
-        l2 = p0_scatter_kernel(topk_ids, workspace, i32_tokens, i32_mesh_stride, i32_p0_niters)
-        l2.launch(grid=(n_grid_k2, 1, 1), block=(K2_BLOCK, 1, 1), stream=stream)
+        @flyc.jit
+        def launch_4k_fused(
+            topk_ids: fx.Tensor,
+            workspace: fx.Tensor,
+            expert_frequency_out: fx.Tensor,
+            topk_weights_tensor: fx.Tensor,
+            sorted_token_ids: fx.Tensor,
+            sorted_weights_out: fx.Tensor,
+            sorted_expert_ids: fx.Tensor,
+            num_valid_ids_out: fx.Tensor,
+            moe_buf: fx.Tensor,
+            expert_mask_tensor: fx.Tensor,
+            i32_tokens: fx.Int32,
+            i32_mesh_stride: fx.Int32,
+            i32_mesh_size: fx.Int32,
+            i32_moe_buf_elems: fx.Int32,
+            i32_ws_total: fx.Int32,
+            i32_p0_niters: fx.Int32,
+            n_grid_k1: fx.Int32,
+            n_grid_k2: fx.Int32,
+            n_grid_p23: fx.Int32,
+            stream: fx.Stream = fx.Stream(None),
+        ):
+            l1 = clear_workspace_kernel(workspace, i32_ws_total)
+            l1.launch(grid=(n_grid_k1, 1, 1), block=(K1_BLOCK, 1, 1), stream=stream)
 
-        l3 = p1_count_kernel(workspace, expert_mask_tensor, i32_mesh_stride, i32_mesh_size)
-        l3.launch(grid=(E, 1, 1), block=(K3_BLOCK, 1, 1), stream=stream)
+            l2 = p0_scatter_kernel(topk_ids, workspace, i32_tokens, i32_mesh_stride, i32_p0_niters)
+            l2.launch(grid=(n_grid_k2, 1, 1), block=(K2_BLOCK, 1, 1), stream=stream)
 
-        l4 = p23_kernel(
-            workspace,
-            topk_weights_tensor,
-            sorted_token_ids,
-            sorted_weights_out,
-            sorted_expert_ids,
-            num_valid_ids_out,
-            moe_buf,
-            expert_mask_tensor,
-            i32_tokens,
-            i32_mesh_stride,
-            i32_mesh_size,
-            i32_moe_buf_elems,
-        )
-        l4.launch(grid=(n_grid_p23, 1, 1), block=(K4_BLOCK, 1, 1), stream=stream)
+            l3 = p1_count_kernel(
+                workspace,
+                expert_mask_tensor,
+                i32_mesh_stride,
+                i32_mesh_size,
+                expert_frequency_out,
+            )
+            l3.launch(grid=(E, 1, 1), block=(K3_BLOCK, 1, 1), stream=stream)
+
+            l4 = p23_kernel(
+                workspace,
+                topk_weights_tensor,
+                sorted_token_ids,
+                sorted_weights_out,
+                sorted_expert_ids,
+                num_valid_ids_out,
+                moe_buf,
+                expert_mask_tensor,
+                i32_tokens,
+                i32_mesh_stride,
+                i32_mesh_size,
+                i32_moe_buf_elems,
+            )
+            l4.launch(grid=(n_grid_p23, 1, 1), block=(K4_BLOCK, 1, 1), stream=stream)
+
+    else:
+
+        @flyc.jit
+        def launch_p0v2_p23(
+            topk_ids: fx.Tensor,
+            workspace: fx.Tensor,
+            topk_weights_tensor: fx.Tensor,
+            sorted_token_ids: fx.Tensor,
+            sorted_weights_out: fx.Tensor,
+            sorted_expert_ids: fx.Tensor,
+            num_valid_ids_out: fx.Tensor,
+            moe_buf: fx.Tensor,
+            expert_mask_tensor: fx.Tensor,
+            i32_tokens: fx.Int32,
+            i32_mesh_stride: fx.Int32,
+            i32_mesh_size: fx.Int32,
+            i32_moe_buf_elems: fx.Int32,
+            n_grid_p23: fx.Int32,
+            stream: fx.Stream = fx.Stream(None),
+        ):
+            l1 = p0v2_kernel(topk_ids, workspace, expert_mask_tensor, i32_tokens, i32_mesh_stride, i32_mesh_size)
+            l1.launch(grid=(E, 1, 1), block=(P0V2_BLOCK, 1, 1), stream=stream)
+
+            l2 = p23_kernel(
+                workspace,
+                topk_weights_tensor,
+                sorted_token_ids,
+                sorted_weights_out,
+                sorted_expert_ids,
+                num_valid_ids_out,
+                moe_buf,
+                expert_mask_tensor,
+                i32_tokens,
+                i32_mesh_stride,
+                i32_mesh_size,
+                i32_moe_buf_elems,
+            )
+            l2.launch(grid=(n_grid_p23, 1, 1), block=(K4_BLOCK, 1, 1), stream=stream)
+
+        @flyc.jit
+        def launch_4k_fused(
+            topk_ids: fx.Tensor,
+            workspace: fx.Tensor,
+            topk_weights_tensor: fx.Tensor,
+            sorted_token_ids: fx.Tensor,
+            sorted_weights_out: fx.Tensor,
+            sorted_expert_ids: fx.Tensor,
+            num_valid_ids_out: fx.Tensor,
+            moe_buf: fx.Tensor,
+            expert_mask_tensor: fx.Tensor,
+            i32_tokens: fx.Int32,
+            i32_mesh_stride: fx.Int32,
+            i32_mesh_size: fx.Int32,
+            i32_moe_buf_elems: fx.Int32,
+            i32_ws_total: fx.Int32,
+            i32_p0_niters: fx.Int32,
+            n_grid_k1: fx.Int32,
+            n_grid_k2: fx.Int32,
+            n_grid_p23: fx.Int32,
+            stream: fx.Stream = fx.Stream(None),
+        ):
+            l1 = clear_workspace_kernel(workspace, i32_ws_total)
+            l1.launch(grid=(n_grid_k1, 1, 1), block=(K1_BLOCK, 1, 1), stream=stream)
+
+            l2 = p0_scatter_kernel(topk_ids, workspace, i32_tokens, i32_mesh_stride, i32_p0_niters)
+            l2.launch(grid=(n_grid_k2, 1, 1), block=(K2_BLOCK, 1, 1), stream=stream)
+
+            l3 = p1_count_kernel(workspace, expert_mask_tensor, i32_mesh_stride, i32_mesh_size)
+            l3.launch(grid=(E, 1, 1), block=(K3_BLOCK, 1, 1), stream=stream)
+
+            l4 = p23_kernel(
+                workspace,
+                topk_weights_tensor,
+                sorted_token_ids,
+                sorted_weights_out,
+                sorted_expert_ids,
+                num_valid_ids_out,
+                moe_buf,
+                expert_mask_tensor,
+                i32_tokens,
+                i32_mesh_stride,
+                i32_mesh_size,
+                i32_moe_buf_elems,
+            )
+            l4.launch(grid=(n_grid_p23, 1, 1), block=(K4_BLOCK, 1, 1), stream=stream)
 
     return launch_clear_ws, launch_p0, launch_p1, launch_p23, launch_p0v2, launch_p0v2_p23, launch_4k_fused
 
@@ -2433,7 +2678,15 @@ def moe_sorting_get_workspace_size(M, num_experts, topk, unit_size=UNIT_SIZE):
     return ws_mesh_i32 + (num_experts + 1)
 
 
-def compile_moe_sorting(*, num_experts, topk, max_tokens=128, unit_size=UNIT_SIZE, has_mask=False):
+def compile_moe_sorting(
+    *,
+    num_experts,
+    topk,
+    max_tokens=128,
+    unit_size=UNIT_SIZE,
+    has_mask=False,
+    export_frequency=False,
+):
     """Compile MoE sorting kernels for all paths (oneshot + multiphase).
 
     Returns (launch_oneshot, launch_p0v2_p23, launch_4k_fused) covering all T ranges.
@@ -2443,7 +2696,11 @@ def compile_moe_sorting(*, num_experts, topk, max_tokens=128, unit_size=UNIT_SIZ
         num_experts=num_experts, topk=topk, max_tokens=max_tokens, unit_size=unit_size, has_mask=has_mask
     )
     _, _, _, _, _, launch_p0v2_p23, launch_4k_fused = _compile_moe_sorting_multiphase(
-        num_experts=num_experts, topk=topk, unit_size=unit_size, has_mask=has_mask
+        num_experts=num_experts,
+        topk=topk,
+        unit_size=unit_size,
+        has_mask=has_mask,
+        export_frequency=export_frequency,
     )
     return launch_oneshot, launch_p0v2_p23, launch_4k_fused
 
@@ -2474,6 +2731,7 @@ def moe_sorting_flydsl(
     num_local_tokens=None,
     workspace=None,
     direct_single_token=False,
+    expert_frequency_out=None,
 ):
     """MoE sorting using FlyDSL kernel (oneshot + multiphase paths).
 
@@ -2492,6 +2750,11 @@ def moe_sorting_flydsl(
     The default retains ascending expert order for the public sorter ABI and
     backward's host-side segment reconstruction.
 
+    ``expert_frequency_out`` is optional caller-owned contiguous int32 storage
+    with shape ``[num_experts]``.  Multiphase count producers write it directly;
+    other paths use the standalone top-k histogram.  Omitting it preserves the
+    legacy launch sequence and selects the original producer ABI.
+
     Returns
     -------
     sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, moe_buf
@@ -2508,6 +2771,42 @@ def moe_sorting_flydsl(
     moe_buf_i32 = moe_buf.view(torch.int32)
     moe_buf_elems = moe_buf_i32.numel()
 
+    if expert_frequency_out is not None:
+        if not isinstance(expert_frequency_out, torch.Tensor):
+            raise TypeError("expert_frequency_out must be a torch.Tensor")
+        if tuple(expert_frequency_out.shape) != (num_experts,):
+            raise ValueError(
+                "expert_frequency_out must have shape "
+                f"{(num_experts,)}, got {tuple(expert_frequency_out.shape)}"
+            )
+        if (
+            not expert_frequency_out.is_cuda
+            or expert_frequency_out.device != device
+            or expert_frequency_out.dtype != torch.int32
+            or not expert_frequency_out.is_contiguous()
+        ):
+            raise ValueError(
+                "expert_frequency_out must be contiguous int32 on the same device as topk_ids"
+            )
+        frequency_storage = expert_frequency_out.untyped_storage().data_ptr()
+        protected_tensors = (
+            topk_ids,
+            topk_weights,
+            sorted_ids,
+            sorted_weights,
+            sorted_expert_ids,
+            num_valid_ids,
+            moe_buf,
+            expert_mask,
+            workspace,
+        )
+        if any(
+            frequency_storage == tensor.untyped_storage().data_ptr()
+            for tensor in protected_tensors
+            if isinstance(tensor, torch.Tensor)
+        ):
+            raise ValueError("expert_frequency_out must not alias sorter inputs, outputs, or workspace")
+
     # EP: prepare mask tensor and flag.
     has_mask = expert_mask is not None
     if not has_mask:
@@ -2523,6 +2822,7 @@ def moe_sorting_flydsl(
     # Rank-2 ``moe_buf`` is the inference output.  Backward passes rank-1
     # scratch and reconstructs ascending expert segments on the host, so it
     # must retain the generic expert-sorted layout.
+    emitted_frequency = False
     if direct_single_token and M == 1 and not has_mask and moe_buf_i32.ndim == 2:
         n_zero_blocks = min((moe_buf_elems + BLOCK_SIZE - 1) // BLOCK_SIZE, num_cu * target_occupancy)
         n_grid_blocks = 1 + n_zero_blocks
@@ -2590,18 +2890,26 @@ def moe_sorting_flydsl(
         if workspace is None:
             workspace = torch.empty(ws_total, dtype=torch.int32, device=device)
 
+        emit_from_count_producer = expert_frequency_out is not None and not has_mask
         _, launch_p0v2_p23, launch_4k_fused = compile_moe_sorting(
-            num_experts=num_experts, topk=topk, unit_size=unit_size, has_mask=has_mask
+            num_experts=num_experts,
+            topk=topk,
+            unit_size=unit_size,
+            has_mask=has_mask,
+            export_frequency=emit_from_count_producer,
         )
         stream = torch.cuda.current_stream(device)
         n_zero_blocks = min((moe_buf_elems + BLOCK_SIZE - 1) // BLOCK_SIZE, num_cu * target_occupancy)
         k4_grid = num_experts + n_zero_blocks
         base_key = (num_experts, topk, unit_size, has_mask, moe_buf_i32.ndim, device.index)
+        if emit_from_count_producer:
+            base_key += ("frequency",)
 
         if M <= 2048:
             p0v2_args = (
                 topk_ids,
                 workspace,
+                *((expert_frequency_out,) if emit_from_count_producer else ()),
                 topk_weights,
                 sorted_ids,
                 sorted_weights,
@@ -2625,6 +2933,7 @@ def moe_sorting_flydsl(
             k4_args = (
                 topk_ids,
                 workspace,
+                *((expert_frequency_out,) if emit_from_count_producer else ()),
                 topk_weights,
                 sorted_ids,
                 sorted_weights,
@@ -2643,6 +2952,11 @@ def moe_sorting_flydsl(
                 k4_grid,
             )
             _launch_cached(_multiphase_cf_cache, base_key + ("4k_fused",), launch_4k_fused, k4_args, stream)
+
+        emitted_frequency = emit_from_count_producer
+
+    if expert_frequency_out is not None and not emitted_frequency:
+        topk_frequency_flydsl(topk_ids, expert_frequency_out, num_experts)
 
     return sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, moe_buf
 
@@ -2877,9 +3191,8 @@ def moe_softmax_sort_flydsl(
             expert_mask=expert_mask,
             num_local_tokens=M,
             workspace=workspace,
+            expert_frequency_out=expert_frequency_out,
         )
-        if expert_frequency_out is not None:
-            topk_frequency_flydsl(topk_ids, expert_frequency_out, num_experts)
 
     return sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, moe_buf
 
