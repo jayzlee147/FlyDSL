@@ -723,6 +723,12 @@ The grouped dX specialization computes `dZ[sorted,2I] @ W1[e,2I,H]` with a
 gfx950-native NN MFMA pipeline and keeps the public row-major weight layout.
 T1 consumes sorter metadata directly, while short-route calls reuse W1's
 existing BM16 compact descriptor queue; no second builder launch is added.
+For fixed-K grouped calls, the BF16 C-shuffle epilogue decodes each sorted
+row's packed token/slot ID and stores directly to its unique
+`dX_routes[T,K,H]` destination.  This preserves the original BF16 boundary and
+top-K reduction order while eliminating both the padded `dX_sorted` workspace
+and the standalone unsort launch.  Ragged and generic fallback calls retain
+their original sorted-output paths.
 The persistent grid is capped at 1024 workgroups and selects `BN128/2-wave`
 below 256 active experts or `BN256/4-wave` for dense expert sets when the
 hidden dimension permits it. On `H3584/I512/E896/K16`, isolated dX changed

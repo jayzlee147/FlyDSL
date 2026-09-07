@@ -10,6 +10,12 @@ on an AMD Instinct MI355X (`gfx950`).  It compares every recommendation with
 the configuration selected by commit `e0656bd`.  The study does not change a
 production kernel or include sorter/descriptor-builder latency.
 
+Production fixed-K backward now preserves the same GEMM body and BF16 rounding
+but decodes the packed token/slot ID in its epilogue and writes directly to
+`dX_routes[T,K,H]`.  This removes the padded `dX_sorted` allocation and the
+standalone unsort launch.  The isolated measurements below predate that
+epilogue fusion; ragged and generic fallback paths still use sorted output.
+
 ## Reproduction
 
 The measurements used `rocm/pytorch:latest`, PyTorch

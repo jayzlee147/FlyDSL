@@ -531,6 +531,12 @@ def _use_grouped_dx(
     )
 
 
+def _use_direct_grouped_dx_routes(*, use_grouped_dx: bool, flat_routes: bool) -> bool:
+    """Fold fixed-K grouped dX's sorted-row permutation into its epilogue."""
+
+    return use_grouped_dx and not flat_routes
+
+
 def _use_hostless_grouped_backward(
     *,
     flat_routes: bool,
@@ -619,6 +625,8 @@ def _compile_grouped_dx(
     device_index: int,
     min_active_experts: int = 0,
     max_active_experts: int | None = None,
+    store_route_slots: bool = False,
+    top_k: int = 1,
 ):
     """Build the gfx950 grouped ``dZ @ W1`` specialization."""
 
@@ -636,6 +644,8 @@ def _compile_grouped_dx(
         device_index=device_index,
         min_active_experts=min_active_experts,
         max_active_experts=max_active_experts,
+        store_route_slots=store_route_slots,
+        top_k=top_k,
     )
 
 
@@ -2964,6 +2974,10 @@ def _sonic_moe_backward_impl(
         flat_routes=flat_routes,
         compact_w1=use_compact_w1,
     )
+    direct_grouped_dx_routes = _use_direct_grouped_dx_routes(
+        use_grouped_dx=use_grouped_dx,
+        flat_routes=flat_routes,
+    )
     use_large_grouped_dx = use_grouped_dx and _use_large_grouped_dx_descriptor_queue(
         tokens=tokens,
         hidden_size=hidden_size,
@@ -3175,7 +3189,7 @@ def _sonic_moe_backward_impl(
         dtype=hidden_states.dtype,
         device=device,
     )
-    dx_sorted = torch.empty_like(x_sorted)
+    dx_sorted = None if direct_grouped_dx_routes else torch.empty_like(x_sorted)
     dx_routes = (
         None if flat_routes else torch.empty((tokens, topk, hidden_size), dtype=hidden_states.dtype, device=device)
     )
@@ -3818,7 +3832,8 @@ def _sonic_moe_backward_impl(
         if use_grouped_dx:
             # Compact queues round real expert rows to their selected BM.
             # Every scheduled tail stays inside the sorter's 64-row padding,
-            # and unsort/scatter subsequently reads only non-sentinel routes.
+            # and the fixed-K route epilogue ignores non-sentinel rows.  Ragged
+            # routing retains the separate sorted-output reduction below.
             if use_large_grouped_dx:
                 grouped_dx_bm = _LARGE_GROUPED_DX_BM
                 grouped_dx_profiles = ((_LARGE_GROUPED_DX_BN, _LARGE_GROUPED_DX_N_WAVES, 0, None),)
@@ -3868,6 +3883,8 @@ def _sonic_moe_backward_impl(
                     device_index,
                     min_active_experts,
                     max_active_experts,
+                    store_route_slots=direct_grouped_dx_routes,
+                    top_k=topk,
                 )
                 grouped_dx_grid = max(
                     1,
@@ -3891,7 +3908,12 @@ def _sonic_moe_backward_impl(
                         if min_active_experts > 0 or max_active_experts is not None
                         else num_valid_ids.data_ptr()
                     ),
-                    dx_sorted.data_ptr(),
+                    (dx_routes if direct_grouped_dx_routes else dx_sorted).data_ptr(),
+                    *(
+                        (sorted_token_ids.data_ptr(), tokens)
+                        if direct_grouped_dx_routes
+                        else ()
+                    ),
                     grouped_dx_grid,
                     stream,
                 )
@@ -3920,6 +3942,7 @@ def _sonic_moe_backward_impl(
                     layout="tn",
                 )
             if not use_grouped_dx:
+                assert dx_sorted is not None
                 gemm_a16w16(
                     dz[start:end],
                     w1_arg[expert],
@@ -3942,6 +3965,7 @@ def _sonic_moe_backward_impl(
         if flat_routes:
             assert sorted_route_ids is not None
             assert dx_accum is not None
+            assert dx_sorted is not None
             assert dout_sorted is not None
             assert projection is not None
             route_score_backward = _compile_route_score_backward(
@@ -4007,28 +4031,30 @@ def _sonic_moe_backward_impl(
                 )
 
             assert dx_routes is not None
-            unsort = _compile_unsort(
-                hidden_size,
-                topk,
-                compute_dtype,
-                device_index,
-                use_hostless_grouped,
-            )
-            unsort_work = (max_padded if use_hostless_grouped else padded_rows) * (hidden_size // 4)
-            unsort_grid = max(1, (unsort_work + _BLOCK_THREADS - 1) // _BLOCK_THREADS)
-            if use_hostless_grouped:
-                unsort_grid = min(_HOSTLESS_ROW_GRID_CAP, unsort_grid)
-            _run_compiled(
-                unsort,
-                dx_sorted,
-                sorted_token_ids,
-                dx_routes,
-                num_valid_ids,
-                tokens,
-                padded_rows,
-                unsort_grid,
-                stream,
-            )
+            if not direct_grouped_dx_routes:
+                assert dx_sorted is not None
+                unsort = _compile_unsort(
+                    hidden_size,
+                    topk,
+                    compute_dtype,
+                    device_index,
+                    use_hostless_grouped,
+                )
+                unsort_work = (max_padded if use_hostless_grouped else padded_rows) * (hidden_size // 4)
+                unsort_grid = max(1, (unsort_work + _BLOCK_THREADS - 1) // _BLOCK_THREADS)
+                if use_hostless_grouped:
+                    unsort_grid = min(_HOSTLESS_ROW_GRID_CAP, unsort_grid)
+                _run_compiled(
+                    unsort,
+                    dx_sorted,
+                    sorted_token_ids,
+                    dx_routes,
+                    num_valid_ids,
+                    tokens,
+                    padded_rows,
+                    unsort_grid,
+                    stream,
+                )
 
             reduction_dtype = "f16" if compute_dtype == "fp16" else "bf16"
             reduce = compile_moe_reduction(topk=topk, model_dim=hidden_size, dtype_str=reduction_dtype)

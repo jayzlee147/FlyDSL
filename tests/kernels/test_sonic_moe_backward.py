@@ -28,6 +28,7 @@ from kernels.moe.sonic_backward import (
     _grouped_dw2_tuning,
     _grouped_dx_tuning,
     _grouped_w1_tuning,
+    _use_direct_grouped_dx_routes,
     _use_fused_da_dscore,
     _use_grouped_da,
     _use_grouped_dw1,
@@ -508,6 +509,29 @@ def test_grouped_dx_policy(
 )
 def test_grouped_dx_tuning(active_experts, hidden_size, expected):
     assert _grouped_dx_tuning(active_experts, hidden_size) == expected
+
+
+@pytest.mark.parametrize(
+    ("use_grouped_dx", "flat_routes", "expected"),
+    (
+        (True, False, True),
+        (True, True, False),
+        (False, False, False),
+        (False, True, False),
+    ),
+)
+def test_direct_grouped_dx_routes_policy_is_fixed_k_only(
+    use_grouped_dx,
+    flat_routes,
+    expected,
+):
+    assert (
+        _use_direct_grouped_dx_routes(
+            use_grouped_dx=use_grouped_dx,
+            flat_routes=flat_routes,
+        )
+        is expected
+    )
 
 
 def _gfx950_device():
@@ -1014,11 +1038,15 @@ def test_sonic_moe_backward_grouped_short_path_never_materializes_host_segments(
     def _unexpected_host_segments(*_args, **_kwargs):
         raise AssertionError("fully grouped short backward must not copy frequencies to host")
 
+    def _unexpected_unsort(*_args, **_kwargs):
+        raise AssertionError("fixed-K grouped dX must write route slots directly")
+
     monkeypatch.setattr(
         sonic_backward_module,
         "_materialize_expert_segments",
         _unexpected_host_segments,
     )
+    monkeypatch.setattr(sonic_backward_module, "_compile_unsort", _unexpected_unsort)
     actual = sonic_moe_backward(*args, config)
     expected = _backward_reference(*args)
     torch.cuda.synchronize()
@@ -1392,6 +1420,9 @@ def test_sonic_moe_backward_large_grouped_dx_uses_independent_bm64_queue(
         compiled_block_m.append(compile_args[3])
         return original_compile(*compile_args, **kwargs)
 
+    def _unexpected_unsort(*_args, **_kwargs):
+        raise AssertionError("fixed-K BM64 grouped dX must write route slots directly")
+
     monkeypatch.setattr(
         sonic_backward_module,
         "build_compact_m_tile_descriptors",
@@ -1402,6 +1433,7 @@ def test_sonic_moe_backward_large_grouped_dx_uses_independent_bm64_queue(
         "_compile_grouped_dx",
         _tracked_compile,
     )
+    monkeypatch.setattr(sonic_backward_module, "_compile_unsort", _unexpected_unsort)
 
     torch.cuda.synchronize()
     stream = torch.cuda.Stream(device=args[0].device)

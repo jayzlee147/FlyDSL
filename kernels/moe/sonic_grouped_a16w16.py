@@ -3,10 +3,12 @@
 
 """Device-scheduled row-major A16 grouped GEMM for SonicMoE backward.
 
-This kernel covers the ``dX_sorted = dZ @ W1`` contraction, where ``dZ`` is
+This kernel covers the ``dX = dZ @ W1`` contraction, where ``dZ`` is
 route-sorted row-major A16 and each expert's public weight is row-major
-``[K, N]``.  It intentionally keeps the public SonicMoE weight layout and
-performs the B transpose through LDS for gfx950 MFMA consumption.
+``[K, N]``.  Its epilogue can retain sorted row order or scatter fixed-K rows
+directly to their unique route slots.  It intentionally keeps the public
+SonicMoE weight layout and performs the B transpose through LDS for gfx950 MFMA
+consumption.
 """
 
 import functools
@@ -55,6 +57,8 @@ def compile_sonic_grouped_a16w16_nn(
     device_index: int = 0,
     min_active_experts: int = 0,
     max_active_experts: int | None = None,
+    store_route_slots: bool = False,
+    top_k: int = 1,
 ):
     """Compile a BF16 grouped NN GEMM with a device-derived M schedule.
 
@@ -65,7 +69,9 @@ def compile_sonic_grouped_a16w16_nn(
     are tied to a ROCm device.  The optional inclusive active-expert interval
     is read from ``arg_cumsum[0]`` in compact mode and permits mutually
     exclusive gfx950 launch profiles without copying routing statistics to the
-    host.  Unguarded calls retain the original launcher ABI and metadata use.
+    host.  ``store_route_slots=True`` folds the fixed-K sorted-row permutation
+    into the BF16 epilogue and writes ``[token, slot, output]`` directly.  The
+    default sorted-output mode retains the original launcher ABI.
     """
 
     del device_index
@@ -77,6 +83,10 @@ def compile_sonic_grouped_a16w16_nn(
         not isinstance(max_active_experts, int) or max_active_experts < min_active_experts
     ):
         raise ValueError("max_active_experts must be None or at least min_active_experts")
+    if not isinstance(store_route_slots, bool):
+        raise ValueError("store_route_slots must be a bool")
+    if not isinstance(top_k, int) or top_k <= 0 or top_k > 256:
+        raise ValueError("top_k must be an int in [1, 256]")
     if (min_active_experts > 0 or max_active_experts is not None) and not compact_grid:
         raise ValueError("active-expert guards require compact_grid=True")
     if block_m % 16 or sorted_block_m % block_m:
@@ -143,6 +153,7 @@ def compile_sonic_grouped_a16w16_nn(
         f"_bm{block_m}_bn{block_n}_bk{block_k}_s{stages}_nw{n_waves}"
         f"_{'compact' if compact_grid else 'metadata'}"
         f"_amin{min_active_experts}_amax{max_active_experts}"
+        f"_{f'routek{top_k}' if store_route_slots else 'sorted'}"
     )
 
     @fx.struct
@@ -163,6 +174,8 @@ def compile_sonic_grouped_a16w16_nn(
         arg_eids: fx.Int64,
         arg_cumsum: fx.Int64,
         arg_out: fx.Int64,
+        arg_sorted_token_ids: fx.Int64,
+        i32_tokens: fx.Int32,
     ):
         tid = fx.Int32(gpu.thread_id("x"))
         block_id = fx.Int32(gpu.block_id("x"))
@@ -378,15 +391,33 @@ def compile_sonic_grouped_a16w16_nn(
                         smem_c + local_row * fx.Int32(block_n) + local_col,
                         result_type=fx.Vector.make_type(cshuffle_vec_size, elem_dtype),
                     )
-                    global_element = (
-                        fx.Int64(m_row + local_row) * fx.Int64(output_size)
-                        + fx.Int64(n_col + local_col)
-                    )
-                    llvm.StoreOp(
-                        _raw(c_vec),
-                        _gep1(out_base, global_element * fx.Int64(elem_bytes)),
-                        alignment=16,
-                    )
+                    sorted_row = m_row + local_row
+                    if const_expr(store_route_slots):
+                        packed = fx.Int32(_global_i32_at(arg_sorted_token_ids, sorted_row))
+                        token = packed & fx.Int32(0x00FFFFFF)
+                        slot = (packed >> fx.Int32(24)) & fx.Int32(0xFF)
+                        valid = (token < i32_tokens) & (slot < fx.Int32(top_k))
+                        if valid:
+                            route_row = token * fx.Int32(top_k) + slot
+                            global_element = (
+                                fx.Int64(route_row) * fx.Int64(output_size)
+                                + fx.Int64(n_col + local_col)
+                            )
+                            llvm.StoreOp(
+                                _raw(c_vec),
+                                _gep1(out_base, global_element * fx.Int64(elem_bytes)),
+                                alignment=16,
+                            )
+                    else:
+                        global_element = (
+                            fx.Int64(sorted_row) * fx.Int64(output_size)
+                            + fx.Int64(n_col + local_col)
+                        )
+                        llvm.StoreOp(
+                            _raw(c_vec),
+                            _gep1(out_base, global_element * fx.Int64(elem_bytes)),
+                            alignment=16,
+                        )
             gpu.barrier()
 
         cumsum0 = rocdl.readfirstlane(T.i32, _raw(_global_i32_at(arg_cumsum, fx.Int32(0))))
@@ -443,29 +474,63 @@ def compile_sonic_grouped_a16w16_nn(
         for work in range(block_id + grid_size, work_count, gpu.grid_dim.x):
             _run_work(fx.Int32(work))
 
-    @flyc.jit
-    def launch(
-        arg_a: fx.Int64,
-        arg_b: fx.Int64,
-        arg_schedule: fx.Int64,
-        arg_eids: fx.Int64,
-        arg_cumsum: fx.Int64,
-        arg_out: fx.Int64,
-        i32_grid: fx.Int32,
-        stream: fx.Stream,
-    ):
-        grouped_nn_kernel(
-            arg_a,
-            arg_b,
-            arg_schedule,
-            arg_eids,
-            arg_cumsum,
-            arg_out,
-        ).launch(
-            grid=(fx.Int64(i32_grid), 1, 1),
-            block=(block_threads, 1, 1),
-            stream=stream,
-        )
+    if store_route_slots:
+
+        @flyc.jit
+        def launch(
+            arg_a: fx.Int64,
+            arg_b: fx.Int64,
+            arg_schedule: fx.Int64,
+            arg_eids: fx.Int64,
+            arg_cumsum: fx.Int64,
+            arg_out: fx.Int64,
+            arg_sorted_token_ids: fx.Int64,
+            i32_tokens: fx.Int32,
+            i32_grid: fx.Int32,
+            stream: fx.Stream,
+        ):
+            grouped_nn_kernel(
+                arg_a,
+                arg_b,
+                arg_schedule,
+                arg_eids,
+                arg_cumsum,
+                arg_out,
+                arg_sorted_token_ids,
+                i32_tokens,
+            ).launch(
+                grid=(fx.Int64(i32_grid), 1, 1),
+                block=(block_threads, 1, 1),
+                stream=stream,
+            )
+
+    else:
+
+        @flyc.jit
+        def launch(
+            arg_a: fx.Int64,
+            arg_b: fx.Int64,
+            arg_schedule: fx.Int64,
+            arg_eids: fx.Int64,
+            arg_cumsum: fx.Int64,
+            arg_out: fx.Int64,
+            i32_grid: fx.Int32,
+            stream: fx.Stream,
+        ):
+            grouped_nn_kernel(
+                arg_a,
+                arg_b,
+                arg_schedule,
+                arg_eids,
+                arg_cumsum,
+                arg_out,
+                fx.Int64(0),
+                fx.Int32(0),
+            ).launch(
+                grid=(fx.Int64(i32_grid), 1, 1),
+                block=(block_threads, 1, 1),
+                stream=stream,
+            )
 
     return launch
 
