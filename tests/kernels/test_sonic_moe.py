@@ -1781,7 +1781,7 @@ def test_sonic_moe_autotuner_search_and_disk_cache(tmp_path):
     torch.cuda.synchronize()
     assert recovered.search_count == 1
     rewritten_cache = non_object_cache_file.read_text(encoding="utf-8")
-    assert '"version": 10' in rewritten_cache
+    assert '"version": 11' in rewritten_cache
     assert '"stage1_k_wave": 1' in rewritten_cache
 
 
@@ -2680,12 +2680,76 @@ def test_sonic_moe_stage2_pipeline_gate_is_exact():
 
     assert _stage2_stages(replace(tuned, stage2_pipeline_stages=1), 4096) == 1
     assert _stage2_stages(replace(tuned, stage2_pipeline_stages=2), 4095) == 2
+    assert _stage2_stages(replace(tuned, stage2_pipeline_stages=2, stage2_output_mode="reduce"), 4096) == 1
+    assert _stage2_stages(replace(tuned, stage2_pipeline_stages=2, compute_dtype="fp16"), 4096) == 1
 
 
-@pytest.mark.parametrize("value", (0, 3, True, "2"))
-def test_sonic_moe_rejects_invalid_stage2_pipeline_depth(value):
+@pytest.mark.parametrize("value", (0, 3))
+def test_sonic_moe_rejects_invalid_stage2_pipeline_depth_value(value):
     with pytest.raises(ValueError, match="stage2_pipeline_stages"):
         _config(stage2_pipeline_stages=value)
+
+
+@pytest.mark.parametrize("value", (True, 1.0, 2.0, "2"))
+def test_sonic_moe_rejects_non_integer_stage2_pipeline_depth(value):
+    with pytest.raises(TypeError, match="stage2_pipeline_stages"):
+        _config(stage2_pipeline_stages=value)
+
+
+def test_sonic_moe_stage2_pipeline_single_k_tile_normalizes_to_one():
+    config = _config(stage2_pipeline_stages=2)
+    assert config.intermediate_size == config.stage2_tile_k
+    assert config.stage2_effective_pipeline_stages == 1
+    assert _stage2_stages(config, 4096) == 1
+
+
+def test_sonic_moe_stage2_pipeline_lds_is_validated_at_config_construction():
+    serial = SonicMoEConfig(
+        hidden_size=256,
+        intermediate_size=512,
+        num_experts=4,
+        top_k=2,
+        tile_m=16,
+        tile_n=128,
+        tile_k=128,
+        down_tile_m=256,
+        down_tile_n=128,
+        down_tile_k=256,
+        stage2_pipeline_stages=1,
+    )
+    assert serial.stage2_effective_pipeline_stages == 1
+    with pytest.raises(ValueError, match="stage2 tile needs"):
+        replace(serial, stage2_pipeline_stages=2)
+
+
+def test_sonic_moe_stage2_pipeline_field_preserves_legacy_positional_abi():
+    config = SonicMoEConfig(
+        256,
+        128,
+        4,
+        2,
+        16,
+        128,
+        128,
+        None,
+        None,
+        None,
+        False,
+        0,
+        2,
+        3,
+        1,
+        4,
+        None,
+        False,
+        "reduce",
+        "relu",
+        "fp16",
+    )
+    assert config.stage2_output_mode == "reduce"
+    assert config.activation == "relu"
+    assert config.compute_dtype == "fp16"
+    assert config.stage2_pipeline_stages is None
 
 
 def test_sonic_moe_stage2_pipeline_gate_rejects_ragged_routes(monkeypatch):

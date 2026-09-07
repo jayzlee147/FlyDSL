@@ -35,7 +35,7 @@ Formal paired acceptance on an independently reserved gfx950::
 
     PYTHONPATH=. python tools/accept_sonic_e896_forward.py \
         --exclusive-gpu --profiles full-candidate --pairs 11 \
-        --require-performance --output /tmp/sonic-e896-forward.json
+        --output /tmp/sonic-e896-forward.json
 """
 
 from __future__ import annotations
@@ -98,6 +98,18 @@ RESOURCE_GATE_FIELDS = (
     "private_segment_fixed_size",
     "sgpr_spill_count",
     "vgpr_spill_count",
+)
+CODEGEN_ENVIRONMENT_VARIABLES = (
+    "FLYDSL_GPU_ARCH",
+    "HSA_OVERRIDE_GFX_VERSION",
+    "FLYDSL_A16WMIX_FORCE_K16",
+    "FLYDSL_DUMP_IR",
+    "FLYDSL_DUMP_DIR",
+    "FLYDSL_COMPILE_OPT_LEVEL",
+    "FLYDSL_COMPILE_BACKEND",
+    "FLYDSL_COMPILE_LLVM_DIR",
+    "FLYDSL_DEBUG_ENABLE_DEBUG_INFO",
+    "FLYDSL_EXTRA_SOURCE_DIRS",
 )
 STATIC_TO_TORCH_DTYPE = {
     "bf16": "torch.bfloat16",
@@ -338,18 +350,50 @@ def _sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
-def _git_value(repo: Path, *args: str) -> str | None:
+def _git_command(repo: Path, *args: str) -> tuple[dict[str, Any], bytes]:
+    """Run one auditable Git query with an explicit safe-directory override."""
+
+    resolved_repo = repo.resolve()
+    command = (
+        "git",
+        "-c",
+        f"safe.directory={resolved_repo}",
+        "-C",
+        str(resolved_repo),
+        *args,
+    )
     try:
         completed = subprocess.run(
-            ("git", "-C", str(repo), *args),
-            check=True,
+            command,
+            check=False,
             stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-            text=True,
+            stderr=subprocess.PIPE,
         )
-    except (OSError, subprocess.CalledProcessError):
-        return None
-    return completed.stdout.strip()
+        stdout = completed.stdout
+        stderr = completed.stderr
+        return (
+            {
+                "command": list(command),
+                "returncode": completed.returncode,
+                "stdout": stdout.decode("utf-8", errors="backslashreplace"),
+                "stderr": stderr.decode("utf-8", errors="backslashreplace"),
+            },
+            stdout,
+        )
+    except OSError as error:
+        return (
+            {
+                "command": list(command),
+                "returncode": None,
+                "stdout": "",
+                "stderr": f"{type(error).__name__}: {error}",
+            },
+            b"",
+        )
+
+
+def _codegen_environment() -> dict[str, str | None]:
+    return {name: os.environ.get(name) for name in CODEGEN_ENVIRONMENT_VARIABLES}
 
 
 def _resolved_profile_config(name: str, stack: tuple[str, ...] = ()) -> dict[str, Any]:
@@ -377,12 +421,33 @@ def _effective_cache_mod(config: dict[str, Any], stage: int) -> int:
 
 def _effective_stage2_stages(config: dict[str, Any]) -> int:
     requested = config["stage2_pipeline_stages"]
+    if requested is not None and type(requested) is not int:
+        raise TypeError(f"stage2_pipeline_stages must be None or an integer, got {type(requested).__name__}")
+    if requested not in (None, 1, 2):
+        raise ValueError(f"stage2_pipeline_stages must be None, 1, or 2, got {requested!r}")
     if requested is None:
-        # This E896 shape does not match sonic.py's sole automatic two-stage gate.
+        auto_eligible = (
+            HIDDEN == 4096
+            and INTERMEDIATE == 2048
+            and EXPERTS == 64
+            and TOPK == 8
+            and config["down_tile_m"] == 128
+            and config["down_tile_n"] == 128
+            and config["down_tile_k"] == 64
+            and math.lcm(config["tile_m"], config["down_tile_m"]) == 128
+            and config["stage2_xcd_swizzle"] == 8
+            and config["stage2_b_cache_mod"] in (None, 0)
+            and config["waves_per_eu"] is None
+            and not config["persistent_stage2"]
+            and config["stage2_output_mode"] == "atomic"
+            and config["compute_dtype"] == "bf16"
+        )
+        requested = 2 if auto_eligible else 1
+    if config["stage2_output_mode"] != "atomic" or config["compute_dtype"] != "bf16":
         return 1
-    if config["stage2_output_mode"] != "atomic":
-        return 1
-    return int(requested)
+    k_tiles = INTERMEDIATE // int(config["down_tile_k"])
+    force_k16 = os.environ.get("FLYDSL_A16WMIX_FORCE_K16", "0") not in ("0", "", "false", "False")
+    return 2 if requested == 2 and k_tiles > 1 and not force_k16 else 1
 
 
 def _static_lds_usage(config: dict[str, Any]) -> dict[str, int]:
@@ -647,23 +712,155 @@ def _profile_record(profile: Profile) -> dict[str, Any]:
     }
 
 
-def _collect_source_identity(repo: Path) -> dict[str, Any]:
-    files: dict[str, dict[str, str]] = {}
+def _collect_source_identity(
+    repo: Path,
+    *,
+    allow_dirty: bool,
+    enforce_provenance: bool = True,
+) -> dict[str, Any]:
+    """Fingerprint runtime sources and retain complete Git command provenance."""
+
+    files: dict[str, dict[str, Any]] = {}
     aggregate = hashlib.sha256()
+    source_errors = []
     for relative in (*RUNTIME_SOURCE_FILES, "tools/accept_sonic_e896_forward.py"):
         path = repo / relative
-        digest = _sha256(path)
-        files[relative] = {"path": str(path.resolve()), "sha256": digest}
-        aggregate.update(relative.encode())
-        aggregate.update(bytes.fromhex(digest))
+        try:
+            digest = _sha256(path)
+        except OSError as error:
+            files[relative] = {
+                "path": str(path.resolve()),
+                "sha256": None,
+                "error": f"{type(error).__name__}: {error}",
+            }
+            source_errors.append(relative)
+        else:
+            files[relative] = {"path": str(path.resolve()), "sha256": digest}
+            aggregate.update(relative.encode())
+            aggregate.update(bytes.fromhex(digest))
+
+    head_command, head_stdout = _git_command(repo, "rev-parse", "HEAD")
+    branch_command, branch_stdout = _git_command(repo, "branch", "--show-current")
+    status_command, status_stdout = _git_command(
+        repo,
+        "status",
+        "--short",
+        "--untracked-files=all",
+    )
+    unstaged_command, unstaged_diff = _git_command(repo, "diff", "--binary", "--no-ext-diff", "--")
+    staged_command, staged_diff = _git_command(
+        repo,
+        "diff",
+        "--cached",
+        "--binary",
+        "--no-ext-diff",
+        "--",
+    )
+    untracked_command, untracked_stdout = _git_command(
+        repo,
+        "ls-files",
+        "--others",
+        "--exclude-standard",
+        "-z",
+    )
+    head = head_stdout.decode("utf-8", errors="replace").strip()
+    branch = branch_stdout.decode("utf-8", errors="replace").strip()
+    status = status_stdout.decode("utf-8", errors="replace").strip()
+    dirty = bool(status)
+
+    dirty_hasher = hashlib.sha256()
+    dirty_hasher.update(b"unstaged\0")
+    dirty_hasher.update(unstaged_diff)
+    dirty_hasher.update(b"staged\0")
+    dirty_hasher.update(staged_diff)
+    untracked_files = []
+    untracked_content_errors = []
+    for encoded_relative in sorted(filter(None, untracked_stdout.split(b"\0"))):
+        relative = encoded_relative.decode("utf-8", errors="surrogateescape")
+        path = repo / relative
+        content_hasher = hashlib.sha256()
+        content_bytes = 0
+        dirty_hasher.update(b"untracked\0")
+        dirty_hasher.update(encoded_relative)
+        dirty_hasher.update(b"\0")
+        try:
+            if path.is_symlink():
+                content = os.readlink(path).encode("utf-8", errors="surrogateescape")
+                kind = "symlink"
+                content_hasher.update(content)
+                dirty_hasher.update(content)
+                content_bytes = len(content)
+            else:
+                kind = "file"
+                with path.open("rb") as source:
+                    while chunk := source.read(1024 * 1024):
+                        content_hasher.update(chunk)
+                        dirty_hasher.update(chunk)
+                        content_bytes += len(chunk)
+        except OSError as error:
+            kind = "unreadable"
+            untracked_content_errors.append(relative)
+            untracked_files.append(
+                {
+                    "path": relative,
+                    "kind": kind,
+                    "bytes": None,
+                    "sha256": None,
+                    "error": f"{type(error).__name__}: {error}",
+                }
+            )
+            continue
+        untracked_files.append(
+            {
+                "path": relative,
+                "kind": kind,
+                "bytes": content_bytes,
+                "sha256": content_hasher.hexdigest(),
+            }
+        )
+
+    git_commands = {
+        "head": head_command,
+        "branch": branch_command,
+        "status": status_command,
+        "unstaged_diff": unstaged_command,
+        "staged_diff": staged_command,
+        "untracked_files": untracked_command,
+    }
+    query_success = all(command["returncode"] == 0 for command in git_commands.values())
+    checks = {
+        "git_queries_succeeded": query_success,
+        "head_resolved": head_command["returncode"] == 0 and bool(re.fullmatch(r"[0-9a-fA-F]{40,64}", head)),
+        # An empty branch is a valid detached-HEAD provenance state.
+        "branch_query_succeeded": branch_command["returncode"] == 0,
+        "runtime_sources_readable": not source_errors,
+        "untracked_content_hashed": not untracked_content_errors,
+        "worktree_clean_or_explicitly_allowed": not dirty or allow_dirty,
+    }
     return {
         "repo": str(repo.resolve()),
-        "head": _git_value(repo, "rev-parse", "HEAD"),
-        "branch": _git_value(repo, "branch", "--show-current"),
-        "status": _git_value(repo, "status", "--short"),
+        "head": head or None,
+        "branch": branch,
+        "detached_head": branch_command["returncode"] == 0 and not branch,
+        "status": status,
+        "dirty": dirty,
+        "allow_dirty": allow_dirty,
+        "enforced": enforce_provenance,
+        "git": {
+            "safe_directory": str(repo.resolve()),
+            "commands": git_commands,
+            "working_tree_content_sha256": dirty_hasher.hexdigest(),
+            "unstaged_diff_sha256": hashlib.sha256(unstaged_diff).hexdigest(),
+            "staged_diff_sha256": hashlib.sha256(staged_diff).hexdigest(),
+            "untracked_files": untracked_files,
+            "untracked_content_errors": untracked_content_errors,
+        },
+        "codegen_environment": _codegen_environment(),
         "runtime_sha256": aggregate.hexdigest(),
         "files": files,
         "comparison_model": "config-only; baseline and candidates execute these identical runtime sources",
+        "checks": checks,
+        "passed": all(checks.values()) if enforce_provenance else True,
     }
 
 
@@ -707,7 +904,11 @@ def _plan_payload(args: argparse.Namespace, repo: Path) -> dict[str, Any]:
             "fields": list(WEIGHT_COMPATIBILITY_FIELDS),
             "all_profiles_match_baseline": weight_reuse_passed,
         },
-        "source_identity": _collect_source_identity(repo),
+        "source_identity": _collect_source_identity(
+            repo,
+            allow_dirty=True,
+            enforce_provenance=False,
+        ),
     }
 
 
@@ -745,19 +946,39 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=20260907)
     parser.add_argument("--correctness-repeats", type=int, default=2)
     parser.add_argument("--warmup", type=int, default=2)
-    parser.add_argument("--pairs", type=int, default=7, help="alternating ABBA/BAAB timing blocks")
+    parser.add_argument(
+        "--pairs",
+        type=int,
+        default=7,
+        help="paired timing rounds; every round executes both ABBA and BAAB",
+    )
     parser.add_argument("--peak-samples", type=int, default=2)
     parser.add_argument(
         "--skip-peak-memory",
         action="store_true",
         help="skip peak-memory sampling (normally retained even with --correctness-only)",
     )
-    parser.add_argument("--min-speedup", type=float, default=1.0)
+    parser.add_argument(
+        "--min-speedup",
+        type=float,
+        default=1.01,
+        help="minimum median and paired speedup (default: 1.01, a 1%% net gain)",
+    )
     parser.add_argument("--min-paired-win-rate", type=float, default=0.75)
     parser.add_argument(
         "--require-performance",
         action="store_true",
-        help="make performance thresholds part of the process exit gate",
+        help="deprecated compatibility flag; timing already requires the performance gate",
+    )
+    parser.add_argument(
+        "--skip-performance-gate",
+        action="store_true",
+        help="record timing thresholds without making them part of acceptance",
+    )
+    parser.add_argument(
+        "--allow-dirty",
+        action="store_true",
+        help="permit a dirty worktree while retaining diffs and untracked-content hashes",
     )
     parser.add_argument(
         "--dump-dir",
@@ -785,6 +1006,8 @@ def _parse_args() -> argparse.Namespace:
         parser.error("--list-profiles and --self-test are mutually exclusive")
     if args.require_performance and args.correctness_only:
         parser.error("--require-performance cannot be combined with --correctness-only")
+    if args.require_performance and args.skip_performance_gate:
+        parser.error("--require-performance and --skip-performance-gate are mutually exclusive")
     if not args.list_profiles and not args.self_test and not args.correctness_only and not args.exclusive_gpu:
         parser.error("timing requires --exclusive-gpu after independently reserving the selected GPU")
     return args
@@ -813,6 +1036,75 @@ def _make_routing(torch, case: str, generator) -> tuple[Any, Any, dict[str, Any]
             "active_experts": topology["active_experts"],
             "active_frequency_min": topology["active_frequency_min"],
             "active_frequency_max": topology["active_frequency_max"],
+        },
+    )
+
+
+def _chunked_torch_oracle(
+    torch,
+    x,
+    w1,
+    w2,
+    ids,
+    scores,
+    *,
+    retain_interleaved_state: bool,
+    route_chunk: int = 256,
+) -> tuple[Any, Any | None, dict[str, Any]]:
+    """Independent expert-major PyTorch oracle without materializing route weights."""
+
+    if route_chunk < 1:
+        raise ValueError("route_chunk must be positive")
+    flat_ids = ids.reshape(-1)
+    flat_scores = scores.reshape(-1)
+    output = torch.zeros((TOKENS, HIDDEN), device=x.device, dtype=torch.float32)
+    state = (
+        torch.empty((TOKENS * TOPK, 2 * INTERMEDIATE), device=x.device, dtype=torch.bfloat16)
+        if retain_interleaved_state
+        else None
+    )
+    active_experts = 0
+    route_chunks = 0
+    with torch.no_grad():
+        x_float = x.float()
+        expert_ids = [int(expert) for expert in torch.unique(flat_ids).tolist()]
+        for expert in expert_ids:
+            flat_positions = torch.nonzero(flat_ids == expert, as_tuple=False).flatten()
+            if not flat_positions.numel():
+                continue
+            active_experts += 1
+            expert_w1 = w1[expert].float()
+            expert_w2 = w2[expert].float()
+            for start in range(0, flat_positions.numel(), route_chunk):
+                route_chunks += 1
+                positions = flat_positions[start : start + route_chunk]
+                token_indices = torch.div(positions, TOPK, rounding_mode="floor")
+                preactivation = (x_float[token_indices] @ expert_w1.T).to(torch.bfloat16)
+                gate, up = preactivation.float().chunk(2, dim=-1)
+                intermediate = (torch.nn.functional.silu(gate) * up).to(torch.bfloat16)
+                projection = (intermediate.float() @ expert_w2.T).to(torch.bfloat16)
+                output.index_add_(
+                    0,
+                    token_indices,
+                    projection.float() * flat_scores[positions, None],
+                )
+                if state is not None:
+                    state[positions] = torch.stack(
+                        preactivation.chunk(2, dim=-1),
+                        dim=-1,
+                    ).reshape(positions.numel(), 2 * INTERMEDIATE)
+            del expert_w1, expert_w2, flat_positions
+    return (
+        output.to(torch.bfloat16),
+        None if state is None else state.view(TOKENS, TOPK, 2 * INTERMEDIATE),
+        {
+            "implementation": "independent expert-major chunked PyTorch matmul",
+            "route_chunk": route_chunk,
+            "active_experts": active_experts,
+            "route_chunks": route_chunks,
+            "accumulation_dtype": "torch.float32",
+            "stage_boundaries": "BF16 after W1, activation, and W2; BF16 after FP32 weighted sum",
+            "training_state_layout": "[g0,u0,g1,u1,...]" if retain_interleaved_state else None,
         },
     )
 
@@ -1038,56 +1330,87 @@ def _config_dict(config) -> dict[str, Any]:
 
 
 def _artifact_resources(launcher) -> dict[str, Any]:
-    artifacts = list(getattr(launcher, "_mem_cache", {}).values())
+    """Return every kernel metadata record from every compiled launcher artifact."""
+
+    artifacts = list(getattr(launcher, "_mem_cache", {}).items())
+    records = []
+    artifact_errors = []
+    for artifact_index, (cache_key, artifact) in enumerate(artifacts):
+        ir_text = getattr(artifact, "ir", None)
+        cache_key_text = repr(cache_key)
+        artifact_label = cache_key_text[:512]
+        cache_key_sha256 = hashlib.sha256(cache_key_text.encode()).hexdigest()
+        if not isinstance(ir_text, str):
+            artifact_errors.append(
+                {
+                    "artifact_index": artifact_index,
+                    "cache_key_repr_prefix": artifact_label,
+                    "cache_key_sha256": cache_key_sha256,
+                    "reason": "compiled launcher artifact has no textual IR",
+                }
+            )
+            continue
+        matches = list(re.finditer(r'gpu\.kernel_metadata<"([^"]+)"', ir_text))
+        if not matches:
+            artifact_errors.append(
+                {
+                    "artifact_index": artifact_index,
+                    "cache_key_repr_prefix": artifact_label,
+                    "cache_key_sha256": cache_key_sha256,
+                    "reason": "compiled launcher artifact has no gpu.kernel_metadata record",
+                }
+            )
+            continue
+        for metadata_index, match in enumerate(matches):
+            start = match.start()
+            end = ir_text.find("}>", start)
+            if end < 0:
+                artifact_errors.append(
+                    {
+                        "artifact_index": artifact_index,
+                        "cache_key_repr_prefix": artifact_label,
+                        "cache_key_sha256": cache_key_sha256,
+                        "metadata_index": metadata_index,
+                        "kernel": match.group(1),
+                        "reason": "gpu.kernel_metadata record is unterminated",
+                    }
+                )
+                continue
+            raw_metadata = ir_text[start : end + 2]
+            fields = {}
+            for key in RESOURCE_METADATA_FIELDS:
+                field_match = re.search(rf"{key} = (\d+) : i64", raw_metadata)
+                if field_match:
+                    fields[key] = int(field_match.group(1))
+            records.append(
+                {
+                    "metadata_found": True,
+                    "missing_reason": None,
+                    "artifact_index": artifact_index,
+                    "cache_key_repr_prefix": artifact_label,
+                    "cache_key_sha256": cache_key_sha256,
+                    "metadata_index": metadata_index,
+                    "kernel": match.group(1),
+                    "raw_metadata": raw_metadata,
+                    "raw_metadata_sha256": hashlib.sha256(raw_metadata.encode()).hexdigest(),
+                    "fields": fields,
+                }
+            )
     if not artifacts:
-        return {
-            "metadata_found": False,
-            "missing_reason": "compiled launcher has no in-memory artifacts",
-            "kernel": None,
-            "raw_metadata": None,
-            "fields": {},
-        }
-    ir_text = getattr(artifacts[-1], "ir", None)
-    if not isinstance(ir_text, str):
-        return {
-            "metadata_found": False,
-            "missing_reason": "latest launcher artifact has no textual IR",
-            "kernel": None,
-            "raw_metadata": None,
-            "fields": {},
-        }
-    matches = list(re.finditer(r'gpu\.kernel_metadata<"([^"]+)"', ir_text))
-    if not matches:
-        return {
-            "metadata_found": False,
-            "missing_reason": "latest launcher artifact has no gpu.kernel_metadata record",
-            "kernel": None,
-            "raw_metadata": None,
-            "fields": {},
-        }
-    start = matches[-1].start()
-    end = ir_text.find("}>", start)
-    if end < 0:
-        return {
-            "metadata_found": False,
-            "missing_reason": "gpu.kernel_metadata record is unterminated",
-            "kernel": matches[-1].group(1),
-            "raw_metadata": ir_text[start : start + 2500],
-            "fields": {},
-        }
-    raw_metadata = ir_text[start : end + 2]
-    fields = {}
-    for key in RESOURCE_METADATA_FIELDS:
-        match = re.search(rf"{key} = (\d+) : i64", raw_metadata)
-        if match:
-            fields[key] = int(match.group(1))
+        artifact_errors.append(
+            {
+                "artifact_index": None,
+                "cache_key_repr_prefix": None,
+                "cache_key_sha256": None,
+                "reason": "compiled launcher has no in-memory artifacts",
+            }
+        )
     return {
-        "metadata_found": True,
-        "missing_reason": None,
-        "kernel": matches[-1].group(1),
-        "raw_metadata": raw_metadata,
-        "raw_metadata_sha256": hashlib.sha256(raw_metadata.encode()).hexdigest(),
-        "fields": fields,
+        "artifacts_found": bool(artifacts),
+        "artifact_count": len(artifacts),
+        "metadata_count": len(records),
+        "records": records,
+        "artifact_errors": artifact_errors,
     }
 
 
@@ -1117,11 +1440,34 @@ def _resource_gate(metadata: dict[str, Any]) -> dict[str, Any]:
 def _isa_resources(dump_dir: Path | None, kernel_name: str | None) -> dict[str, Any]:
     if dump_dir is None or kernel_name is None:
         return {}
-    files = sorted((dump_dir / kernel_name).glob("*_final_isa.s"))
-    if not files:
+    direct_files = sorted((dump_dir / kernel_name).glob("*_final_isa.s"))
+    files = direct_files or sorted(dump_dir.rglob("*_final_isa.s"))
+    selected = None
+    text = None
+    for path in reversed(files):
+        candidate = path.read_text(encoding="utf-8")
+        if re.search(rf"(?m)^\s*\.amdhsa_kernel\s+{re.escape(kernel_name)}\s*$", candidate):
+            selected = path
+            text = candidate
+            break
+    if selected is None or text is None:
         return {}
-    text = files[-1].read_text(encoding="utf-8")
-    result: dict[str, Any] = {"isa_path": str(files[-1])}
+    metadata_match = re.search(
+        rf"(?ms)^\s*\.amdhsa_kernel\s+{re.escape(kernel_name)}\s*$.*?^\s*\.end_amdhsa_kernel\s*$",
+        text,
+    )
+    metadata_text = metadata_match.group(0) if metadata_match else text
+    function_match = re.search(
+        rf"(?ms)^{re.escape(kernel_name)}:\s*(?:#.*)?$.*?^\s*\.size\s+{re.escape(kernel_name)},",
+        text,
+    )
+    function_text = function_match.group(0) if function_match else text
+    result: dict[str, Any] = {
+        "isa_path": str(selected),
+        "isa_kernel": kernel_name,
+        "isa_kernel_metadata_found": metadata_match is not None,
+        "isa_function_body_found": function_match is not None,
+    }
     for field in (
         "group_segment_fixed_size",
         "private_segment_fixed_size",
@@ -1129,17 +1475,72 @@ def _isa_resources(dump_dir: Path | None, kernel_name: str | None) -> dict[str, 
         "next_free_sgpr",
         "accum_offset",
     ):
-        match = re.search(rf"\.amdhsa_{field}\s+(\d+)", text)
+        match = re.search(rf"\.amdhsa_{field}\s+(\d+)", metadata_text)
         if match:
             result[f"isa_{field}"] = int(match.group(1))
-    result["isa_uses_flat_scratch"] = bool(re.search(r"\.uses_flat_scratch,\s+1", text))
-    result["isa_scratch_instructions"] = len(re.findall(r"\b(?:buffer_|flat_)?scratch_(?:load|store)\w*", text))
-    result["isa_mfma_instructions"] = len(re.findall(r"\bv_mfma_", text))
-    result["isa_buffer_load_lds_instructions"] = len(re.findall(r"\bbuffer_load_\w+.*\blds\b", text))
+    result["isa_uses_flat_scratch"] = bool(re.search(r"\.uses_flat_scratch,\s+1", metadata_text))
+    result["isa_scratch_instructions"] = len(
+        re.findall(r"\b(?:buffer_|flat_)?scratch_(?:load|store)\w*", function_text)
+    )
+    result["isa_mfma_instructions"] = len(re.findall(r"\bv_mfma_", function_text))
+    result["isa_buffer_load_lds_instructions"] = len(re.findall(r"\bbuffer_load_\w+.*\blds\b", function_text))
     return result
 
 
+def _kernel_name_matches(kernel_name: str, expected: str) -> bool:
+    return kernel_name == expected or kernel_name.startswith(f"{expected}_")
+
+
+def _launcher_resource(
+    launcher,
+    dump_dir: Path | None,
+    *,
+    expected_kernels: tuple[str, ...] = (),
+) -> dict[str, Any]:
+    metadata = _artifact_resources(launcher)
+    kernels = []
+    for record in metadata["records"]:
+        kernels.append(
+            {
+                "metadata": record,
+                "isa": _isa_resources(dump_dir, record["kernel"]),
+                "gate": _resource_gate(record),
+            }
+        )
+    actual_names = [entry["metadata"]["kernel"] for entry in kernels]
+    missing_expected = [
+        expected
+        for expected in expected_kernels
+        if not any(_kernel_name_matches(actual, expected) for actual in actual_names)
+    ]
+    coverage_checks = {
+        "artifacts_present": metadata["artifacts_found"],
+        "all_artifacts_have_complete_metadata": not metadata["artifact_errors"],
+        "at_least_one_kernel_metadata_record": bool(kernels),
+        "all_expected_kernels_present": not missing_expected,
+        "all_discovered_kernels_pass_resource_gate": bool(kernels)
+        and all(entry["gate"]["passed"] for entry in kernels),
+    }
+    return {
+        "artifact_metadata": metadata,
+        "expected_kernels": list(expected_kernels),
+        "actual_kernels": actual_names,
+        "missing_expected_kernels": missing_expected,
+        "kernels": kernels,
+        "coverage_checks": coverage_checks,
+        "passed": all(coverage_checks.values()),
+    }
+
+
 def _launcher_resources(sonic, config, api: str, dump_dir: Path | None, device_index: int) -> dict[str, Any]:
+    import kernels.moe.moe_sorting_kernel as sorting
+
+    _, _, sorter = sorting.compile_moe_sorting(
+        num_experts=config.num_experts,
+        topk=config.top_k,
+        unit_size=config.route_tile_m,
+        has_mask=False,
+    )
     if api == "training":
         tile_n, waves_per_eu = sonic._training_stage1_tuning(config, TOKENS, False)
         stage1 = sonic._get_stage1_training_launcher(
@@ -1171,17 +1572,34 @@ def _launcher_resources(sonic, config, api: str, dump_dir: Path | None, device_i
         stages,
         device_index,
     )
-    resources = {}
-    for name, launcher in (("stage1", stage1), ("stage2", stage2)):
-        metadata = _artifact_resources(launcher)
-        resources[name] = {
-            "metadata": metadata,
-            "isa": _isa_resources(dump_dir, metadata.get("kernel")),
-            "gate": _resource_gate(metadata),
-        }
+    launchers = [
+        (
+            "sorter",
+            sorter,
+            ("clear_workspace_kernel", "p0_scatter_kernel", "p1_count_kernel", "p23_kernel"),
+        ),
+        ("stage1", stage1, ()),
+        ("stage2", stage2, ()),
+    ]
+    if config.stage2_output_mode == "reduce":
+        reduction_dtype = "f16" if config.compute_dtype == "fp16" else "bf16"
+        reduction = sonic.compile_moe_reduction(
+            topk=config.top_k,
+            model_dim=config.hidden_size,
+            dtype_str=reduction_dtype,
+        )
+        launchers.append(("reduce", reduction, ("moe_reduction_kernel",)))
+    resources = {
+        name: _launcher_resource(
+            launcher,
+            dump_dir,
+            expected_kernels=expected,
+        )
+        for name, launcher, expected in launchers
+    }
     return {
         "kernels": resources,
-        "passed": all(entry["gate"]["passed"] for entry in resources.values()),
+        "passed": all(entry["passed"] for entry in resources.values()),
     }
 
 
@@ -1197,25 +1615,43 @@ def _run_correctness(
     case: str,
     ids,
     scores,
+    oracle_output,
+    oracle_state,
     repeats: int,
     dump_dir: Path | None,
 ) -> dict[str, Any]:
     baseline_output, baseline_state = _run_api(baseline_op, api, x, ids, scores, baseline_out)
     candidate_output, candidate_state = _run_api(candidate_op, api, x, ids, scores, candidate_out)
     torch.cuda.synchronize()
-    output_metrics = _tensor_metrics(torch, candidate_output, baseline_output, OUTPUT_LIMITS)
-    state_metrics = None
+    candidate_baseline_output = _tensor_metrics(torch, candidate_output, baseline_output, OUTPUT_LIMITS)
+    baseline_oracle_output = _tensor_metrics(torch, baseline_output, oracle_output, OUTPUT_LIMITS)
+    candidate_oracle_output = _tensor_metrics(torch, candidate_output, oracle_output, OUTPUT_LIMITS)
+    candidate_baseline_state = None
+    baseline_oracle_state = None
+    candidate_oracle_state = None
     if api == "training":
-        assert baseline_state is not None and candidate_state is not None
-        state_metrics = _tensor_metrics(
+        assert baseline_state is not None and candidate_state is not None and oracle_state is not None
+        candidate_baseline_state = _tensor_metrics(
             torch,
             candidate_state.preactivation,
             baseline_state.preactivation,
             STATE_LIMITS,
         )
+        baseline_oracle_state = _tensor_metrics(
+            torch,
+            baseline_state.preactivation,
+            oracle_state,
+            STATE_LIMITS,
+        )
+        candidate_oracle_state = _tensor_metrics(
+            torch,
+            candidate_state.preactivation,
+            oracle_state,
+            STATE_LIMITS,
+        )
 
     first_output = candidate_output.clone()
-    first_state = None if candidate_state is None else candidate_state.preactivation
+    first_state = None if candidate_state is None else candidate_state.preactivation.clone()
     repeatability = []
     for repeat in range(1, repeats):
         repeated_output, repeated_state = _run_api(candidate_op, api, x, ids, scores, candidate_out)
@@ -1223,19 +1659,34 @@ def _run_correctness(
         entry = {
             "repeat": repeat,
             "output_bitwise_equal": bool(torch.equal(repeated_output, first_output)),
+            "output_vs_first": _tensor_metrics(torch, repeated_output, first_output, OUTPUT_LIMITS),
+            "output_vs_oracle": _tensor_metrics(torch, repeated_output, oracle_output, OUTPUT_LIMITS),
         }
         if api == "training":
-            assert repeated_state is not None and first_state is not None
+            assert repeated_state is not None and first_state is not None and oracle_state is not None
             entry["state_bitwise_equal"] = bool(torch.equal(repeated_state.preactivation, first_state))
+            entry["state_vs_oracle"] = _tensor_metrics(
+                torch,
+                repeated_state.preactivation,
+                oracle_state,
+                STATE_LIMITS,
+            )
         repeatability.append(entry)
-        del repeated_state
+        del repeated_output, repeated_state
 
     output_bitwise_required = candidate_op.config.stage2_output_mode == "reduce"
     output_bitwise_passed = all(entry["output_bitwise_equal"] for entry in repeatability)
+    output_tolerance_passed = all(
+        entry["output_vs_first"]["passed"] and entry["output_vs_oracle"]["passed"] for entry in repeatability
+    )
     state_bitwise_required = api == "training"
     state_bitwise_passed = all(entry.get("state_bitwise_equal", True) for entry in repeatability)
-    repeatability_passed = (not output_bitwise_required or output_bitwise_passed) and (
-        not state_bitwise_required or state_bitwise_passed
+    state_tolerance_passed = all(entry.get("state_vs_oracle", {"passed": True})["passed"] for entry in repeatability)
+    repeatability_passed = (
+        output_tolerance_passed
+        and (not output_bitwise_required or output_bitwise_passed)
+        and state_tolerance_passed
+        and (not state_bitwise_required or state_bitwise_passed)
     )
     runtime_topology = {
         "baseline": _runtime_topology(sonic, baseline_op.config, baseline_op.workspace, case, api),
@@ -1273,23 +1724,39 @@ def _run_correctness(
     }
     resource_gate_passed = all(resource["passed"] for resource in resources.values())
     functional_passed = bool(
-        output_metrics["passed"]
-        and (state_metrics is None or state_metrics["passed"])
+        candidate_baseline_output["passed"]
+        and baseline_oracle_output["passed"]
+        and candidate_oracle_output["passed"]
+        and (candidate_baseline_state is None or candidate_baseline_state["passed"])
+        and (baseline_oracle_state is None or baseline_oracle_state["passed"])
+        and (candidate_oracle_state is None or candidate_oracle_state["passed"])
         and repeatability_passed
         and topology_passed
     )
     passed = functional_passed and resource_gate_passed
     result = {
         "candidate_vs_baseline": {
-            "output": output_metrics,
-            "training_preactivation": state_metrics,
+            "output": candidate_baseline_output,
+            "training_preactivation": candidate_baseline_state,
+        },
+        "baseline_vs_oracle": {
+            "output": baseline_oracle_output,
+            "training_preactivation": baseline_oracle_state,
+        },
+        "candidate_vs_oracle": {
+            "output": candidate_oracle_output,
+            "training_preactivation": candidate_oracle_state,
         },
         "candidate_repeatability": {
             "samples": repeatability,
             "output_bitwise_required": output_bitwise_required,
             "output_bitwise_passed": output_bitwise_passed,
+            "output_tolerance_required": True,
+            "output_tolerance_passed": output_tolerance_passed,
             "training_state_bitwise_required": state_bitwise_required,
             "training_state_bitwise_passed": state_bitwise_passed,
+            "training_state_tolerance_required": state_bitwise_required,
+            "training_state_tolerance_passed": state_tolerance_passed,
             "passed": repeatability_passed,
         },
         "runtime_topology": runtime_topology,
@@ -1331,7 +1798,8 @@ def _stats(values: Iterable[float]) -> dict[str, Any]:
 
 def _measure_abba(torch, calls: dict[str, Callable[[], Any]], pairs: int) -> dict[str, Any]:
     raw_samples = []
-    blocks = []
+    sequence_blocks = []
+    pair_blocks = []
     by_mode = {
         "baseline": {"device": [], "host": []},
         "candidate": {"device": [], "host": []},
@@ -1341,28 +1809,46 @@ def _measure_abba(torch, calls: dict[str, Callable[[], Any]], pairs: int) -> dic
         ("BAAB", ("candidate", "baseline", "baseline", "candidate")),
     )
     for pair in range(pairs):
-        order_name, order = orders[pair % 2]
-        block_samples = {"baseline": [], "candidate": []}
-        for position, mode in enumerate(order):
-            sample = _event_time(torch, calls[mode])
-            by_mode[mode]["device"].append(sample["device_ms"])
-            by_mode[mode]["host"].append(sample["host_ms"])
-            block_samples[mode].append(sample["device_ms"])
-            raw_samples.append(
+        pair_samples = {"baseline": [], "candidate": []}
+        sequence_order = orders if pair % 2 == 0 else tuple(reversed(orders))
+        for sequence_index, (sequence_name, order) in enumerate(sequence_order):
+            sequence_samples = {"baseline": [], "candidate": []}
+            for position, mode in enumerate(order):
+                sample = _event_time(torch, calls[mode])
+                by_mode[mode]["device"].append(sample["device_ms"])
+                by_mode[mode]["host"].append(sample["host_ms"])
+                sequence_samples[mode].append(sample["device_ms"])
+                pair_samples[mode].append(sample["device_ms"])
+                raw_samples.append(
+                    {
+                        "pair": pair,
+                        "sequence": sequence_name,
+                        "sequence_index": sequence_index,
+                        "position": position,
+                        "mode": mode,
+                        **sample,
+                    }
+                )
+            sequence_baseline = statistics.mean(sequence_samples["baseline"])
+            sequence_candidate = statistics.mean(sequence_samples["candidate"])
+            sequence_blocks.append(
                 {
                     "pair": pair,
-                    "order": order_name,
-                    "position": position,
-                    "mode": mode,
-                    **sample,
+                    "sequence": sequence_name,
+                    "sequence_index": sequence_index,
+                    "baseline_mean_device_ms": sequence_baseline,
+                    "candidate_mean_device_ms": sequence_candidate,
+                    "speedup": sequence_baseline / sequence_candidate,
+                    "candidate_faster": sequence_candidate < sequence_baseline,
                 }
             )
-        baseline_mean = statistics.mean(block_samples["baseline"])
-        candidate_mean = statistics.mean(block_samples["candidate"])
-        blocks.append(
+        baseline_mean = statistics.mean(pair_samples["baseline"])
+        candidate_mean = statistics.mean(pair_samples["candidate"])
+        pair_blocks.append(
             {
                 "pair": pair,
-                "order": order_name,
+                "sequence_order": [name for name, _ in sequence_order],
+                "samples_per_mode": len(pair_samples["baseline"]),
                 "baseline_mean_device_ms": baseline_mean,
                 "candidate_mean_device_ms": candidate_mean,
                 "speedup": baseline_mean / candidate_mean,
@@ -1371,10 +1857,12 @@ def _measure_abba(torch, calls: dict[str, Callable[[], Any]], pairs: int) -> dic
         )
     baseline_device = _stats(by_mode["baseline"]["device"])
     candidate_device = _stats(by_mode["candidate"]["device"])
-    paired_speedups = [block["speedup"] for block in blocks]
+    paired_speedups = [block["speedup"] for block in pair_blocks]
     return {
+        "design": "every pair executes both ABBA and BAAB; sequence order alternates by pair",
         "raw_samples": raw_samples,
-        "blocks": blocks,
+        "sequence_blocks": sequence_blocks,
+        "pair_blocks": pair_blocks,
         "summary": {
             "baseline_device": baseline_device,
             "candidate_device": candidate_device,
@@ -1382,26 +1870,55 @@ def _measure_abba(torch, calls: dict[str, Callable[[], Any]], pairs: int) -> dic
             "candidate_host": _stats(by_mode["candidate"]["host"]),
             "median_speedup": baseline_device["median_ms"] / candidate_device["median_ms"],
             "paired_speedup_median": statistics.median(paired_speedups),
-            "paired_win_rate": sum(block["candidate_faster"] for block in blocks) / len(blocks),
+            "paired_win_rate": sum(block["candidate_faster"] for block in pair_blocks) / len(pair_blocks),
         },
     }
 
 
-def _peak_sample(torch, call: Callable[[], Any]) -> dict[str, int]:
+def _clear_operator_workspaces(operators: dict[str, Any]) -> dict[str, bool]:
+    for op in operators.values():
+        op.clear_workspace()
+    return {name: op.workspace is None for name, op in operators.items()}
+
+
+def _peak_sample(
+    torch,
+    mode: str,
+    calls: dict[str, Callable[[], Any]],
+    operators: dict[str, Any],
+) -> dict[str, Any]:
+    workspaces_absent = _clear_operator_workspaces(operators)
     gc.collect()
     torch.cuda.empty_cache()
     torch.cuda.synchronize()
     resident_allocated = torch.cuda.memory_allocated()
     resident_reserved = torch.cuda.memory_reserved()
     torch.cuda.reset_peak_memory_stats()
-    value = call()
+    value = calls[mode]()
     torch.cuda.synchronize()
     peak_allocated = torch.cuda.max_memory_allocated()
     peak_reserved = torch.cuda.max_memory_reserved()
+    selected_workspace = operators[mode].workspace
+    if selected_workspace is None:
+        raise RuntimeError(f"{mode} peak sample completed without publishing a workspace")
+    selected_memory = _workspace_owned_memory(selected_workspace, operators[mode].config)
+    other = "candidate" if mode == "baseline" else "baseline"
+    isolation_gates = {
+        "both_workspaces_absent_before_sample": all(workspaces_absent.values()),
+        "selected_workspace_allocated": selected_workspace is not None,
+        "other_workspace_absent_after_sample": operators[other].workspace is None,
+        "selected_workspace_accounting_passed": selected_memory["passed"],
+    }
     del value
+    operators[mode].clear_workspace()
     gc.collect()
     torch.cuda.synchronize()
     return {
+        "mode": mode,
+        "workspace_absent_before_sample": workspaces_absent,
+        "selected_owned_workspace": selected_memory,
+        "isolation_gates": isolation_gates,
+        "isolation_passed": all(isolation_gates.values()),
         "resident_allocated_bytes": resident_allocated,
         "resident_reserved_bytes": resident_reserved,
         "peak_allocated_bytes": peak_allocated,
@@ -1411,7 +1928,12 @@ def _peak_sample(torch, call: Callable[[], Any]) -> dict[str, int]:
     }
 
 
-def _measure_peaks(torch, calls: dict[str, Callable[[], Any]], samples: int) -> dict[str, Any]:
+def _measure_peaks(
+    torch,
+    calls: dict[str, Callable[[], Any]],
+    operators: dict[str, Any],
+    samples: int,
+) -> dict[str, Any]:
     raw = {"baseline": [], "candidate": []}
     for sample in range(samples):
         order = ("baseline", "candidate") if sample % 2 == 0 else ("candidate", "baseline")
@@ -1420,7 +1942,7 @@ def _measure_peaks(torch, calls: dict[str, Callable[[], Any]], samples: int) -> 
                 {
                     "sample": sample,
                     "order": "AB" if sample % 2 == 0 else "BA",
-                    **_peak_sample(torch, calls[mode]),
+                    **_peak_sample(torch, mode, calls, operators),
                 }
             )
     summary = {}
@@ -1438,7 +1960,24 @@ def _measure_peaks(torch, calls: dict[str, Callable[[], Any]], samples: int) -> 
     summary["candidate_minus_baseline_peak_allocated_bytes"] = (
         summary["candidate"]["peak_allocated_bytes_median"] - summary["baseline"]["peak_allocated_bytes_median"]
     )
-    return {"raw_samples": raw, "summary": summary}
+    owned_baseline = statistics.median(
+        value["selected_owned_workspace"]["total_owned_storage_bytes"] for value in raw["baseline"]
+    )
+    owned_candidate = statistics.median(
+        value["selected_owned_workspace"]["total_owned_storage_bytes"] for value in raw["candidate"]
+    )
+    isolation_passed = all(value["isolation_passed"] for values in raw.values() for value in values)
+    return {
+        "method": "in-process isolated: clear both operator workspaces before every single-mode sample",
+        "raw_samples": raw,
+        "summary": summary,
+        "owned_workspace_comparison": {
+            "baseline_bytes_median": owned_baseline,
+            "candidate_bytes_median": owned_candidate,
+            "candidate_minus_baseline_bytes": owned_candidate - owned_baseline,
+        },
+        "isolation_passed": isolation_passed,
+    }
 
 
 def _warmup(torch, calls: dict[str, Callable[[], Any]], iterations: int) -> None:
@@ -1498,6 +2037,16 @@ class _MockTensor:
         return self._storage
 
 
+class _MockOperator:
+    def __init__(self):
+        self.workspace = object()
+        self.clear_calls = 0
+
+    def clear_workspace(self) -> None:
+        self.clear_calls += 1
+        self.workspace = None
+
+
 def _mock_config(config: dict[str, Any]) -> SimpleNamespace:
     result = SimpleNamespace(**config)
     result.stage2_tile_m = config["down_tile_m"]
@@ -1548,19 +2097,47 @@ def _self_test_payload(repo: Path) -> dict[str, Any]:
     reduce_workspace = records["reduce-output"]["static_footprint"]["sonic_moe_workspace"]
     reduce_parent_workspace = records["xcd8-cached"]["static_footprint"]["sonic_moe_workspace"]
     reduce_route_bytes = records["reduce-output"]["static_footprint"]["reduce_route_output_workspace_bytes"]
+    source_identity = _collect_source_identity(
+        repo,
+        allow_dirty=True,
+        enforce_provenance=False,
+    )
 
     raw_metadata = (
-        'gpu.kernel_metadata<"mock", !llvm.func<void ()>, metadata = {'
+        'gpu.kernel_metadata<"mock_a", !llvm.func<void ()>, metadata = {'
         "agpr_count = 0 : i64, group_segment_fixed_size = 65536 : i64, "
         "private_segment_fixed_size = 0 : i64, sgpr_count = 32 : i64, "
         "sgpr_spill_count = 0 : i64, vgpr_count = 128 : i64, "
         "vgpr_spill_count = 0 : i64, wavefront_size = 64 : i64}>"
     )
-    launcher = SimpleNamespace(_mem_cache={"mock": SimpleNamespace(ir=raw_metadata)})
-    parsed_metadata = _artifact_resources(launcher)
-    passing_resource_gate = _resource_gate(parsed_metadata)
-    absent_metadata = _artifact_resources(SimpleNamespace(_mem_cache={}))
-    absent_resource_gate = _resource_gate(absent_metadata)
+    second_raw_metadata = raw_metadata.replace('"mock_a"', '"mock_b"').replace(
+        "vgpr_count = 128",
+        "vgpr_count = 96",
+    )
+    launcher = SimpleNamespace(_mem_cache={"mock": SimpleNamespace(ir=f"{raw_metadata}\n{second_raw_metadata}")})
+    parsed_artifacts = _artifact_resources(launcher)
+    parsed_metadata = parsed_artifacts["records"][0]
+    passing_resource_gate = _launcher_resource(
+        launcher,
+        None,
+        expected_kernels=("mock_a", "mock_b"),
+    )
+    absent_resource_gate = _launcher_resource(SimpleNamespace(_mem_cache={}), None)
+    missing_expected_resource_gate = _launcher_resource(
+        launcher,
+        None,
+        expected_kernels=("mock_a", "mock_b", "mock_c"),
+    )
+    partial_artifact_resource_gate = _launcher_resource(
+        SimpleNamespace(
+            _mem_cache={
+                "good": SimpleNamespace(ir=raw_metadata),
+                "missing": SimpleNamespace(ir="module {}"),
+            }
+        ),
+        None,
+        expected_kernels=("mock_a",),
+    )
     missing_resource_gate = _resource_gate(
         {
             "metadata_found": True,
@@ -1591,6 +2168,8 @@ def _self_test_payload(repo: Path) -> dict[str, Any]:
             "fields": oversized_lds_fields,
         }
     )
+    mock_operators = {"baseline": _MockOperator(), "candidate": _MockOperator()}
+    mock_clear_result = _clear_operator_workspaces(mock_operators)
 
     checks = {
         "all_profiles_static_valid": len(records) == len(PROFILES),
@@ -1607,6 +2186,16 @@ def _self_test_payload(repo: Path) -> dict[str, Any]:
         "reduce_workspace_delta_is_route_output": (
             reduce_workspace["total_owned_bytes"] - reduce_parent_workspace["total_owned_bytes"] == reduce_route_bytes
         ),
+        "reduce_workspace_delta_is_exactly_448_mib": reduce_route_bytes == 469_762_048,
+        "peak_isolation_clear_removes_both_workspaces": (
+            all(mock_clear_result.values()) and all(operator.clear_calls == 1 for operator in mock_operators.values())
+        ),
+        "git_queries_use_explicit_safe_directory": all(
+            command["command"][:3] == ["git", "-c", f"safe.directory={repo.resolve()}"]
+            for command in source_identity["git"]["commands"].values()
+        ),
+        "git_provenance_queries_succeed": source_identity["checks"]["git_queries_succeeded"],
+        "dirty_tree_content_is_hashed": bool(source_identity["git"]["working_tree_content_sha256"]),
         "m80_balanced_padding": (records["m80-equal"]["topology"]["balanced"]["actual_padded_rows"] == 71680),
         "m80_hot16_padding": (records["m80-equal"]["topology"]["hot16"]["actual_padded_rows"] == 66560),
         "distribution_aware_m_tiles_direct_to_lds": all(
@@ -1619,8 +2208,11 @@ def _self_test_payload(repo: Path) -> dict[str, Any]:
             for name in ("m80-equal", "m96-equal", "m112-equal")
             for stage in ("stage1_total_bytes", "stage2_total_bytes")
         ),
+        "all_multiphase_metadata_records_are_enumerated": parsed_artifacts["metadata_count"] == 2,
         "complete_zero_spill_metadata_passes": passing_resource_gate["passed"],
         "absent_metadata_fails": not absent_resource_gate["passed"],
+        "missing_expected_kernel_fails": not missing_expected_resource_gate["passed"],
+        "artifact_without_metadata_fails": not partial_artifact_resource_gate["passed"],
         "missing_metadata_field_fails": not missing_resource_gate["passed"],
         "nonzero_spill_fails": not spilling_resource_gate["passed"],
         "nonzero_private_segment_fails": not private_resource_gate["passed"],
@@ -1640,12 +2232,14 @@ def _self_test_payload(repo: Path) -> dict[str, Any]:
         "resource_gate_examples": {
             "passing": passing_resource_gate,
             "absent": absent_resource_gate,
+            "missing_expected": missing_expected_resource_gate,
+            "partial_artifact": partial_artifact_resource_gate,
             "missing_field": missing_resource_gate,
             "spilling": spilling_resource_gate,
             "private_segment": private_resource_gate,
             "oversized_lds": oversized_lds_resource_gate,
         },
-        "source_identity": _collect_source_identity(repo),
+        "source_identity": source_identity,
         "passed": all(checks.values()),
     }
 
@@ -1655,6 +2249,22 @@ def _execute(args: argparse.Namespace, repo: Path) -> dict[str, Any]:
         args.dump_dir = args.dump_dir.resolve()
         os.environ["FLYDSL_DUMP_IR"] = "1"
         os.environ["FLYDSL_DUMP_DIR"] = str(args.dump_dir)
+
+    source_identity = _collect_source_identity(
+        repo,
+        allow_dirty=args.allow_dirty,
+        enforce_provenance=True,
+    )
+    if not source_identity["passed"]:
+        return {
+            "schema": "flydsl.sonic_e896_forward_acceptance.v1",
+            "generated_at_utc": datetime.now(timezone.utc).isoformat(),
+            "command": [sys.executable, *sys.argv],
+            "failure_stage": "git-provenance-preflight",
+            "source_identity": source_identity,
+            "codegen_environment": _codegen_environment(),
+            "passed": False,
+        }
 
     import torch
 
@@ -1694,6 +2304,27 @@ def _execute(args: argparse.Namespace, repo: Path) -> dict[str, Any]:
         dtype=torch.bfloat16,
     ).uniform_(-0.02, 0.02, generator=generator)
     weights = sonic.prepare_sonic_bf16_weights(w1, w2, configs["baseline"])
+    routing_inputs = {}
+    oracle_results = {}
+    retain_oracle_state = "training" in dict.fromkeys(args.apis)
+    for case_index, case in enumerate(dict.fromkeys(args.cases)):
+        route_generator = torch.Generator(device="cuda").manual_seed(args.seed + 1000 + case_index)
+        ids, scores, routing_summary = _make_routing(torch, case, route_generator)
+        oracle_output, oracle_state, oracle_metadata = _chunked_torch_oracle(
+            torch,
+            x,
+            w1,
+            w2,
+            ids,
+            scores,
+            retain_interleaved_state=retain_oracle_state,
+        )
+        routing_inputs[case] = (ids, scores, routing_summary)
+        oracle_results[case] = {
+            "output": oracle_output,
+            "state": oracle_state,
+            "metadata": oracle_metadata,
+        }
     torch.cuda.synchronize()
     setup_peak = {
         "peak_allocated_bytes": torch.cuda.max_memory_allocated(),
@@ -1705,10 +2336,6 @@ def _execute(args: argparse.Namespace, repo: Path) -> dict[str, Any]:
 
     baseline_op = sonic.SonicMoE(configs["baseline"], weights)
     baseline_out = torch.empty_like(x)
-    routing_inputs = {}
-    for case_index, case in enumerate(dict.fromkeys(args.cases)):
-        route_generator = torch.Generator(device="cuda").manual_seed(args.seed + 1000 + case_index)
-        routing_inputs[case] = _make_routing(torch, case, route_generator)
     report: dict[str, Any] = {
         "schema": "flydsl.sonic_e896_forward_acceptance.v1",
         "generated_at_utc": datetime.now(timezone.utc).isoformat(),
@@ -1716,7 +2343,8 @@ def _execute(args: argparse.Namespace, repo: Path) -> dict[str, Any]:
         "exclusive_gpu_asserted": args.exclusive_gpu,
         "timing_status": "skipped (--correctness-only)" if args.correctness_only else "measured",
         "device": _device_identity(torch, args.device, arch),
-        "source_identity": _collect_source_identity(repo),
+        "source_identity": source_identity,
+        "codegen_environment": _codegen_environment(),
         "contract": {
             "shape": {"T": TOKENS, "H": HIDDEN, "I": INTERMEDIATE, "E": EXPERTS, "K": TOPK},
             "dtype": "torch.bfloat16",
@@ -1729,6 +2357,7 @@ def _execute(args: argparse.Namespace, repo: Path) -> dict[str, Any]:
             "routing_seeds": {case: args.seed + 1000 + index for index, case in enumerate(dict.fromkeys(args.cases))},
         },
         "numerical_limits": {"output": OUTPUT_LIMITS, "training_preactivation": STATE_LIMITS},
+        "oracle": {case: oracle_results[case]["metadata"] for case in dict.fromkeys(args.cases)},
         "setup_peak_memory": setup_peak,
         "baseline": profile_records["baseline"],
         "prepared_weight_reuse_gate": {
@@ -1742,7 +2371,9 @@ def _execute(args: argparse.Namespace, repo: Path) -> dict[str, Any]:
 
     correctness_all = True
     resource_all = True
+    memory_isolation_all = True
     performance_all = True
+    performance_required = not args.correctness_only and not args.skip_performance_gate
     for profile_name in selected:
         print(f"[sonic-e896-forward] profile={profile_name}", file=sys.stderr, flush=True)
         profile = profile_records[profile_name]
@@ -1773,6 +2404,8 @@ def _execute(args: argparse.Namespace, repo: Path) -> dict[str, Any]:
                     case,
                     ids,
                     scores,
+                    oracle_results[case]["output"],
+                    oracle_results[case]["state"],
                     args.correctness_repeats,
                     args.dump_dir,
                 )
@@ -1801,14 +2434,19 @@ def _execute(args: argparse.Namespace, repo: Path) -> dict[str, Any]:
                 api_result: dict[str, Any] = {"correctness": correctness}
                 if args.skip_peak_memory:
                     api_result["peak_memory_status"] = "skipped (--skip-peak-memory)"
+                    memory_isolation_passed = True
                 else:
-                    peak_memory = _measure_peaks(torch, calls, args.peak_samples)
-                    peak_memory["owned_workspace_comparison"] = correctness["owned_workspace_comparison"]
-                    peak_memory["interpretation"] = (
-                        "process peak samples include both live operators; use the separately "
-                        "deduplicated owned-workspace comparison for config-attributable bytes"
+                    peak_memory = _measure_peaks(
+                        torch,
+                        calls,
+                        {"baseline": baseline_op, "candidate": candidate_op},
+                        args.peak_samples,
                     )
+                    peak_memory["correctness_run_owned_workspace_comparison"] = correctness[
+                        "owned_workspace_comparison"
+                    ]
                     api_result["peak_memory"] = peak_memory
+                    memory_isolation_passed = bool(peak_memory["isolation_passed"])
 
                 if args.correctness_only:
                     api_result["timing_status"] = "skipped (--correctness-only)"
@@ -1830,10 +2468,16 @@ def _execute(args: argparse.Namespace, repo: Path) -> dict[str, Any]:
                     api_result["timing"] = timing
                     api_result["performance_gate"] = performance_gate
                     performance_passed = bool(performance_gate["passed"])
-                api_result["acceptance_passed"] = correctness["passed"] and performance_passed
+                api_result["memory_isolation_passed"] = memory_isolation_passed
+                api_result["acceptance_passed"] = (
+                    correctness["passed"]
+                    and memory_isolation_passed
+                    and (not performance_required or performance_passed)
+                )
                 case_result["apis"][api] = api_result
                 correctness_all &= correctness["functional_passed"]
                 resource_all &= correctness["resource_gate_passed"]
+                memory_isolation_all &= memory_isolation_passed
                 performance_all &= performance_passed
             profile_result["cases"][case] = case_result
         profile_result["correctness_passed"] = all(
@@ -1843,6 +2487,11 @@ def _execute(args: argparse.Namespace, repo: Path) -> dict[str, Any]:
         )
         profile_result["resource_gate_passed"] = all(
             api_result["correctness"]["resource_gate_passed"]
+            for case_result in profile_result["cases"].values()
+            for api_result in case_result["apis"].values()
+        )
+        profile_result["memory_isolation_passed"] = all(
+            api_result["memory_isolation_passed"]
             for case_result in profile_result["cases"].values()
             for api_result in case_result["apis"].values()
         )
@@ -1860,9 +2509,13 @@ def _execute(args: argparse.Namespace, repo: Path) -> dict[str, Any]:
     baseline_op.clear_workspace()
     report["correctness_passed"] = bool(correctness_all)
     report["resource_gate_passed"] = bool(resource_all)
+    report["memory_isolation_passed"] = bool(memory_isolation_all)
     report["performance_passed"] = None if args.correctness_only else bool(performance_all)
-    report["performance_required"] = args.require_performance
-    report["passed"] = bool(correctness_all and resource_all and (not args.require_performance or performance_all))
+    report["performance_required"] = performance_required
+    report["performance_gate_opt_out"] = bool(args.skip_performance_gate)
+    report["passed"] = bool(
+        correctness_all and resource_all and memory_isolation_all and (not performance_required or performance_all)
+    )
     return report
 
 

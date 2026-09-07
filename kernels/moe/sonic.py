@@ -141,10 +141,11 @@ class SonicMoEConfig:
     stage2_xcd_swizzle: int = 1
     waves_per_eu: int | None = None
     persistent_stage2: bool = False
-    stage2_pipeline_stages: int | None = None
     stage2_output_mode: str = "atomic"
     activation: str = "swiglu"
     compute_dtype: str = "bf16"
+    # Appended to preserve the positional ABI of every pre-existing field.
+    stage2_pipeline_stages: int | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.stage2_output_mode, str):
@@ -243,14 +244,13 @@ class SonicMoEConfig:
             raise ValueError("stage1_b_cache_mod must be None, 0 (cached), or 2 (non-temporal)")
         if self.stage2_b_cache_mod not in (None, 0, 2):
             raise ValueError("stage2_b_cache_mod must be None, 0 (cached), or 2 (non-temporal)")
-        if isinstance(self.stage2_pipeline_stages, bool) or self.stage2_pipeline_stages not in (
-            None,
-            1,
-            2,
-        ):
+        if self.stage2_pipeline_stages is not None and type(self.stage2_pipeline_stages) is not int:
+            raise TypeError(
+                f"stage2_pipeline_stages must be None or an integer, got {type(self.stage2_pipeline_stages).__name__}"
+            )
+        if self.stage2_pipeline_stages not in (None, 1, 2):
             raise ValueError(
-                "stage2_pipeline_stages must be None (auto), 1, or 2, got "
-                f"{self.stage2_pipeline_stages!r}"
+                f"stage2_pipeline_stages must be None (auto), 1, or 2, got {self.stage2_pipeline_stages!r}"
             )
         if self.stage1_xcd_swizzle < 0 or self.stage2_xcd_swizzle < 0:
             raise ValueError("XCD swizzle values must be non-negative")
@@ -270,8 +270,9 @@ class SonicMoEConfig:
         # Stage 2 reuses the A-tile storage for the FP32 epilogue only after
         # the contraction has finished.  Their lifetimes do not overlap, so
         # the kernel reserves the larger region rather than their sum.
+        stage2_stages = self.stage2_effective_pipeline_stages
         stage2_lds = max(
-            self.stage2_tile_m * self.stage2_tile_k * 2,
+            stage2_stages * self.stage2_tile_m * self.stage2_tile_k * 2,
             self.stage2_tile_m * self.stage2_tile_n * 4,
         )
         if stage1_lds > _GFX950_LDS_BYTES:
@@ -314,6 +315,44 @@ class SonicMoEConfig:
     @property
     def stage1_projection_size(self) -> int:
         return self.intermediate_size * (2 if self.is_glu else 1)
+
+    @property
+    def stage2_auto_pipeline_eligible(self) -> bool:
+        """Whether this config matches the token-independent part of the auto gate."""
+
+        return (
+            self.hidden_size == 4096
+            and self.intermediate_size == 2048
+            and self.num_experts == 64
+            and self.top_k == 8
+            and self.stage2_tile_m == 128
+            and self.stage2_tile_n == 128
+            and self.stage2_tile_k == 64
+            and self.route_tile_m == 128
+            and self.stage2_xcd_swizzle == 8
+            and self.stage2_b_cache_mod in (None, 0)
+            and self.waves_per_eu is None
+            and not self.persistent_stage2
+            and self.stage2_output_mode == "atomic"
+            and self.compute_dtype == "bf16"
+        )
+
+    @property
+    def stage2_effective_pipeline_stages(self) -> int:
+        """Pipeline depth the builder can realize, excluding token dispatch.
+
+        A single K tile has nothing to overlap, so an explicit request for two
+        stages intentionally normalizes to one, matching the GEMM builder.
+        ``None`` reserves two-stage LDS only for the exact auto-policy shape.
+        """
+
+        requested = self.stage2_pipeline_stages
+        if requested is None:
+            requested = 2 if self.stage2_auto_pipeline_eligible else 1
+        if self.stage2_output_mode != "atomic" or self.compute_dtype != "bf16":
+            return 1
+        k_tiles = self.intermediate_size // self.stage2_tile_k
+        return 2 if requested == 2 and k_tiles > 1 else 1
 
 
 @dataclass(frozen=True)
@@ -1084,29 +1123,9 @@ def _stage2_stages(config: SonicMoEConfig, tokens: int) -> int:
     """
 
     if config.stage2_pipeline_stages is not None:
-        return config.stage2_pipeline_stages
+        return config.stage2_effective_pipeline_stages
 
-    return (
-        2
-        if (
-            tokens == 4096
-            and config.hidden_size == 4096
-            and config.intermediate_size == 2048
-            and config.num_experts == 64
-            and config.top_k == 8
-            and config.stage2_tile_m == 128
-            and config.stage2_tile_n == 128
-            and config.stage2_tile_k == 64
-            and config.route_tile_m == 128
-            and config.stage2_xcd_swizzle == 8
-            and config.stage2_b_cache_mod in (None, 0)
-            and config.waves_per_eu is None
-            and not config.persistent_stage2
-            and config.stage2_output_mode == "atomic"
-            and config.compute_dtype == "bf16"
-        )
-        else 1
-    )
+    return 2 if tokens == 4096 and config.stage2_auto_pipeline_eligible else 1
 
 
 @functools.lru_cache(maxsize=256)
