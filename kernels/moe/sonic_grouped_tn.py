@@ -45,6 +45,9 @@ _SORTED_BLOCK_M = 64
 _NUM_CU = 256
 _PERSIST_THRESHOLD = _NUM_CU * 4
 _MAX_SIGNED_I32 = (1 << 31) - 1
+_MAX_BUFFER_BYTES = (1 << 32) - 1
+_ZERO_VECTOR_ELEMENTS = GFX950_DMA_BYTES // 2
+_ZERO_BLOCK_THREADS = 1024
 
 
 def _global_bf16_ptr(address):
@@ -204,6 +207,169 @@ def grouped_dw2_tuning(hidden_size: int, intermediate_size: int) -> tuple[int, i
     """Semantic alias for dW2 callers of the reusable grouped TN policy."""
 
     return grouped_tn_tuning(hidden_size, intermediate_size)
+
+
+@functools.lru_cache(maxsize=64)
+def compile_inactive_weight_grad_zero(
+    dw1_expert_elements: int,
+    dw2_expert_elements: int,
+    num_experts: int,
+    device_index: int,
+):
+    """Compile an expert-local zero fill for grouped BF16 weight gradients.
+
+    The dense dW1 allocation for the production SonicMoE shape is larger than
+    4 GiB.  Address each expert slab with an i64 base and give the buffer
+    instruction an expert-local resource, keeping every vector offset within
+    the hardware's 32-bit BRSRC window.
+    """
+
+    del device_index
+    if min(dw1_expert_elements, dw2_expert_elements, num_experts) <= 0:
+        raise ValueError("weight-gradient slab sizes and num_experts must be positive")
+    if dw1_expert_elements % _ZERO_VECTOR_ELEMENTS:
+        raise ValueError("dW1 expert slabs must have 128-bit size alignment")
+    if dw2_expert_elements % _ZERO_VECTOR_ELEMENTS:
+        raise ValueError("dW2 expert slabs must have 128-bit size alignment")
+    dw1_expert_bytes = dw1_expert_elements * 2
+    dw2_expert_bytes = dw2_expert_elements * 2
+    if max(dw1_expert_bytes, dw2_expert_bytes) > _MAX_BUFFER_BYTES:
+        raise ValueError("each expert-local weight-gradient slab must fit one BRSRC")
+    dw1_vectors = dw1_expert_elements // _ZERO_VECTOR_ELEMENTS
+    dw2_vectors = dw2_expert_elements // _ZERO_VECTOR_ELEMENTS
+
+    @flyc.kernel(
+        name=(
+            f"sonic_zero_inactive_weight_grads_e{num_experts}"
+            f"_v{dw1_vectors}x{dw2_vectors}"
+        ),
+        known_block_size=[_ZERO_BLOCK_THREADS, 1, 1],
+    )
+    def zero_inactive_weight_grads_kernel(
+        expert_frequency: fx.Tensor,
+        dw1_base: fx.Int64,
+        dw2_base: fx.Int64,
+    ):
+        expert = fx.Int32(gpu.block_idx.x)
+        tid = fx.Int32(gpu.thread_idx.x)
+        frequency_rsrc = buffer_ops.create_buffer_resource(expert_frequency, max_size=True)
+        frequency = rocdl.readfirstlane(
+            T.i32,
+            _raw(buffer_ops.buffer_load(frequency_rsrc, expert, vec_width=1, dtype=T.i32)),
+        )
+        if frequency == fx.Int32(0):
+            # Do not form a descriptor over the full dense tensor: dW1 can be
+            # larger than 4 GiB, while the AMD buffer offset is only 32 bits.
+            # The i64 expert base plus exact expert-local resource keeps both
+            # the address and the OOB bound correct for the last expert.
+            dw1_addr = dw1_base + fx.Int64(expert) * fx.Int64(dw1_expert_bytes)
+            dw2_addr = dw2_base + fx.Int64(expert) * fx.Int64(dw2_expert_bytes)
+            dw1_rsrc = buffer_ops.create_buffer_resource_from_addr(
+                _raw(dw1_addr),
+                num_records_bytes=dw1_expert_bytes,
+            )
+            dw2_rsrc = buffer_ops.create_buffer_resource_from_addr(
+                _raw(dw2_addr),
+                num_records_bytes=dw2_expert_bytes,
+            )
+            # Store raw zero dwords so lowering selects one 128-bit buffer
+            # store rather than a typed packed-BF16 sequence.
+            zero = fx.Vector.filled(GFX950_DMA_BYTES // 4, 0, fx.Int32)
+            for vector_index in range(
+                tid,
+                fx.Int32(dw1_vectors),
+                fx.Int32(_ZERO_BLOCK_THREADS),
+            ):
+                buffer_ops.buffer_store(
+                    zero,
+                    dw1_rsrc,
+                    vector_index * fx.Int32(GFX950_DMA_BYTES // 4),
+                )
+            for vector_index in range(
+                tid,
+                fx.Int32(dw2_vectors),
+                fx.Int32(_ZERO_BLOCK_THREADS),
+            ):
+                buffer_ops.buffer_store(
+                    zero,
+                    dw2_rsrc,
+                    vector_index * fx.Int32(GFX950_DMA_BYTES // 4),
+                )
+
+    @flyc.jit
+    def launch(
+        expert_frequency: fx.Tensor,
+        dw1_base: fx.Int64,
+        dw2_base: fx.Int64,
+        stream: fx.Stream = fx.Stream(None),
+    ):
+        zero_inactive_weight_grads_kernel(
+            expert_frequency,
+            dw1_base,
+            dw2_base,
+        ).launch(
+            grid=(num_experts, 1, 1),
+            block=(_ZERO_BLOCK_THREADS, 1, 1),
+            stream=stream,
+        )
+
+    return launch
+
+
+def zero_inactive_weight_grads_flydsl(
+    expert_frequency: torch.Tensor,
+    dw1: torch.Tensor,
+    dw2: torch.Tensor,
+    *,
+    stream: torch.cuda.Stream | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Zero only inactive expert slabs before grouped dW1/dW2 overwrite actives."""
+
+    if expert_frequency.ndim != 1:
+        raise ValueError("expert_frequency must have shape [E]")
+    num_experts = int(expert_frequency.numel())
+    if num_experts <= 0:
+        raise ValueError("expert_frequency must contain at least one expert")
+    if dw1.ndim != 3 or dw2.ndim != 3:
+        raise ValueError("dw1 and dw2 must be dense three-dimensional expert weights")
+    if int(dw1.shape[0]) != num_experts or int(dw2.shape[0]) != num_experts:
+        raise ValueError("weight gradients and expert_frequency must have the same E")
+    tensors = (expert_frequency, dw1, dw2)
+    if any(tensor.device != expert_frequency.device for tensor in tensors):
+        raise ValueError("inactive-gradient zero tensors must share one device")
+    if expert_frequency.dtype != torch.int32:
+        raise TypeError("expert_frequency must use int32")
+    if dw1.dtype != torch.bfloat16 or dw2.dtype != torch.bfloat16:
+        raise TypeError("inactive-gradient zero currently requires BF16 outputs")
+    if not all(tensor.is_contiguous() for tensor in tensors):
+        raise ValueError("inactive-gradient zero tensors must be contiguous")
+    dw1_expert_elements = int(dw1.numel()) // num_experts
+    dw2_expert_elements = int(dw2.numel()) // num_experts
+    if dw1_expert_elements % _ZERO_VECTOR_ELEMENTS:
+        raise ValueError("dW1 expert slabs must have 128-bit size alignment")
+    if dw2_expert_elements % _ZERO_VECTOR_ELEMENTS:
+        raise ValueError("dW2 expert slabs must have 128-bit size alignment")
+    if max(dw1_expert_elements, dw2_expert_elements) * 2 > _MAX_BUFFER_BYTES:
+        raise ValueError("each expert-local weight-gradient slab must fit one BRSRC")
+    if stream is None:
+        stream = torch.cuda.current_stream(expert_frequency.device)
+    launcher = compile_inactive_weight_grad_zero(
+        dw1_expert_elements,
+        dw2_expert_elements,
+        num_experts,
+        expert_frequency.device.index or 0,
+    )
+    _run_compiled(
+        launcher,
+        expert_frequency,
+        dw1.data_ptr(),
+        dw2.data_ptr(),
+        stream,
+    )
+    expert_frequency.record_stream(stream)
+    dw1.record_stream(stream)
+    dw2.record_stream(stream)
+    return dw1, dw2
 
 
 @functools.lru_cache(maxsize=128)
@@ -973,10 +1139,12 @@ __all__ = [
     "build_active_expert_queue_flydsl",
     "compile_active_expert_queue",
     "compile_grouped_tn",
+    "compile_inactive_weight_grad_zero",
     "grouped_dw2_flydsl",
     "grouped_dw2_tuning",
     "grouped_tn_from_metadata_flydsl",
     "grouped_tn_from_queue_flydsl",
     "grouped_tn_flydsl",
     "grouped_tn_tuning",
+    "zero_inactive_weight_grads_flydsl",
 ]

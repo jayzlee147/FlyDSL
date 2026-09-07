@@ -60,6 +60,7 @@ from kernels.moe.sonic_grouped_tn import (
     build_active_expert_queue_flydsl,
     grouped_tn_from_metadata_flydsl,
     grouped_tn_from_queue_flydsl,
+    zero_inactive_weight_grads_flydsl,
 )
 
 if TYPE_CHECKING:
@@ -190,6 +191,11 @@ _GROUPED_DX_DENSE_EXPERTS = 256
 # sorter-padding traffic in both profiles.
 _GROUPED_DW1_BLOCK_K = 32
 _GROUPED_DW1_MAX_EXPERT_ROWS = 4096
+# The custom inactive-only fill wins once at least one eighth of the production
+# expert set is live.  Below that point nearly the whole 9.9-GiB pair is still
+# written and torch's dense memset is faster.  The decision reuses the host
+# frequency readback already required by this backward implementation.
+_INACTIVE_WEIGHT_GRAD_ZERO_ACTIVE_RATIO = 8
 
 
 def _grouped_dw1_tuning(
@@ -1788,8 +1794,12 @@ def _sonic_moe_backward_impl(
     dx_accum = torch.empty((tokens, hidden_size), dtype=torch.float32, device=device) if flat_routes else None
 
     dx = torch.empty_like(hidden_states, memory_format=torch.contiguous_format)
-    dw1 = torch.zeros_like(w1, memory_format=torch.contiguous_format)
-    dw2 = torch.zeros_like(w2, memory_format=torch.contiguous_format)
+    # The grouped pair is initialized from routing metadata below, before its
+    # first contraction; every other path retains eager zero initialization.
+    grouped_weight_grads = use_grouped_dw1 and use_grouped_dw2
+    weight_grad_factory = torch.empty_like if grouped_weight_grads else torch.zeros_like
+    dw1 = weight_grad_factory(w1, memory_format=torch.contiguous_format)
+    dw2 = weight_grad_factory(w2, memory_format=torch.contiguous_format)
     droute_weights = torch.empty_like(route_weights, memory_format=torch.contiguous_format)
     db1 = torch.empty_like(b1, memory_format=torch.contiguous_format) if b1 is not None else None
     db2 = torch.empty_like(b2, memory_format=torch.contiguous_format) if b2 is not None else None
@@ -1932,6 +1942,29 @@ def _sonic_moe_backward_impl(
                 offset += padded
         padded_rows = offset
         max_expert_rows = max(int(count) for count in frequencies)
+        active_experts = len(segments)
+
+        # Grouped BF16 SwiGLU TN owns every element of each active expert slab.
+        # For dense routing, allocate without a 9.9-GiB production-shape fill
+        # and clear only inactive expert slabs on device.  Very sparse routing
+        # retains torch's faster dense memset: almost all slabs need clearing
+        # there, so the expert-local conditional kernel cannot recover its
+        # dispatch cost.  This policy adds no synchronization; ``frequencies``
+        # was already materialized for the remaining backward scheduling.
+        selective_weight_grad_zero = (
+            grouped_weight_grads
+            and active_experts * _INACTIVE_WEIGHT_GRAD_ZERO_ACTIVE_RATIO >= num_experts
+        )
+        if selective_weight_grad_zero and active_experts < num_experts:
+            zero_inactive_weight_grads_flydsl(
+                expert_frequency,
+                dw1,
+                dw2,
+                stream=stream,
+            )
+        elif grouped_weight_grads and not selective_weight_grad_zero:
+            dw1.zero_()
+            dw2.zero_()
 
         # One sorter block per active expert is itself a valid schedule and is
         # the lowest-latency path.  Compact W1 regimes already produced the

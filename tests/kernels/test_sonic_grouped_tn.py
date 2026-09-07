@@ -17,6 +17,7 @@ from kernels.moe.sonic_grouped_tn import (
     grouped_dw2_tuning,
     grouped_tn_from_metadata_flydsl,
     grouped_tn_from_queue_flydsl,
+    zero_inactive_weight_grads_flydsl,
 )
 
 
@@ -244,6 +245,61 @@ def test_grouped_tn_uses_64_bit_output_base_for_last_production_expert():
     expected = lhs[:1].float().transpose(0, 1) @ rhs[:1].float()
     torch.testing.assert_close(output[-1].float(), expected, rtol=3e-2, atol=5e-2)
     assert torch.count_nonzero(output[0]) == 0
+
+
+def test_inactive_weight_grad_zero_preserves_active_expert_slabs():
+    device = _gfx950_device()
+    frequency = torch.tensor([0, 3, 0, 1], dtype=torch.int32, device=device)
+    dw1 = torch.full((4, 128, 64), 7.0, dtype=torch.bfloat16, device=device)
+    dw2 = torch.full((4, 64, 64), 9.0, dtype=torch.bfloat16, device=device)
+
+    returned_dw1, returned_dw2 = zero_inactive_weight_grads_flydsl(
+        frequency,
+        dw1,
+        dw2,
+    )
+    torch.cuda.synchronize()
+
+    assert returned_dw1 is dw1
+    assert returned_dw2 is dw2
+    for expert in (0, 2):
+        assert torch.count_nonzero(dw1[expert]) == 0
+        assert torch.count_nonzero(dw2[expert]) == 0
+    for expert in (1, 3):
+        assert torch.all(dw1[expert] == 7)
+        assert torch.all(dw2[expert] == 9)
+
+
+def test_inactive_weight_grad_zero_uses_64_bit_last_expert_base():
+    device = _gfx950_device()
+    num_experts = 896
+    # 896 * 1024 * 3584 BF16 elements is about 6.1 GiB.  Only the final
+    # expert is inactive, so this also keeps the device-side clear itself
+    # small while exercising an expert base well beyond the 32-bit window.
+    dw1 = torch.empty(
+        (num_experts, 1024, 3584),
+        dtype=torch.bfloat16,
+        device=device,
+    )
+    dw2 = torch.empty(
+        (num_experts, 64, 64),
+        dtype=torch.bfloat16,
+        device=device,
+    )
+    dw1[0].fill_(3.0)
+    dw1[-1].fill_(5.0)
+    dw2[0].fill_(7.0)
+    dw2[-1].fill_(9.0)
+    frequency = torch.ones(num_experts, dtype=torch.int32, device=device)
+    frequency[-1] = 0
+
+    zero_inactive_weight_grads_flydsl(frequency, dw1, dw2)
+    torch.cuda.synchronize()
+
+    assert torch.all(dw1[0] == 3)
+    assert torch.count_nonzero(dw1[-1]) == 0
+    assert torch.all(dw2[0] == 7)
+    assert torch.count_nonzero(dw2[-1]) == 0
 
 
 def test_grouped_tn_empty_routes_are_an_exact_noop():

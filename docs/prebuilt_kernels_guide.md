@@ -656,6 +656,22 @@ corresponding complete backward medians changed from `4.426` to `3.549 ms`,
 `4.592` to `3.735 ms`, and `154.230` to `103.507 ms`. Long T4096 calls retain
 the general BM64 path; paired measurements stayed within 0.4% noise.
 
+Grouped BF16 SwiGLU dW1/dW2 initialization also avoids a dense fill when the
+active-expert set is sufficiently dense. Both output tensors are allocated
+uninitialized; grouped TN overwrites every element of every active expert,
+while one expert-grid kernel issues 128-bit stores only for inactive slabs. A
+64-bit expert base plus an exact expert-local BRSRC keeps the production
+`dW1[E,2I,H]` correct even when its total allocation exceeds 4 GiB. If fewer
+than one eighth of experts are active, the original dense fill remains faster
+and is retained; FP16, non-SwiGLU, and non-grouped paths are unchanged.
+
+On an otherwise idle MI355X, same-device warm-cache medians were
+`8.555 -> 7.188 ms` for balanced `T128/H3584/I512/E896/K16`. A GPU profile
+reduced five fill kernels totaling `1.492 ms` to the three unrelated scratch
+fills totaling `0.084 ms`. The sparse guard kept T1 at `1.810 -> 1.797 ms` and
+T128/hot16 at `2.116 -> 2.114 ms`; the all-active
+`T4096/H4096/I2048/E64/K8` case improved from `15.005` to `14.570 ms`.
+
 Run the validated A16W4 path or let the shape-bucket tuner choose the tiles with:
 
 ```bash
