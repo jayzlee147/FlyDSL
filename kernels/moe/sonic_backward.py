@@ -1192,7 +1192,6 @@ def _compile_activation_prepare_from_forward_state(
     interleaved_w1: bool,
     device_index: int,
     device_padded_rows: bool = False,
-    defer_dy_scaling: bool = False,
 ):
     """Gather route-order BF16 preactivation and prepare backward rows.
 
@@ -1266,9 +1265,7 @@ def _compile_activation_prepare_from_forward_state(
                         row * fx.Int32(intermediate_size) + column,
                     )
 
-            route_weight = fx.Float32(1.0)
-            if const_expr(not defer_dy_scaling):
-                route_weight = fx.Float32(buffer_ops.buffer_load(weights_rsrc, row, vec_width=1, dtype=T.f32))
+            route_weight = fx.Float32(buffer_ops.buffer_load(weights_rsrc, row, vec_width=1, dtype=T.f32))
             for base in range_constexpr(0, hidden_size, _BLOCK_THREADS):
                 column = tid + fx.Int32(base)
                 if column < fx.Int32(hidden_size):

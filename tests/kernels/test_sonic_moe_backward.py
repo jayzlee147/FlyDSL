@@ -28,6 +28,7 @@ from kernels.moe.sonic_backward import (
     _grouped_dw2_tuning,
     _grouped_dx_tuning,
     _grouped_w1_tuning,
+    _use_fused_da_dscore,
     _use_grouped_da,
     _use_grouped_dw1,
     _use_grouped_dw2,
@@ -49,6 +50,33 @@ _ACTIVATIONS = (
     "relu_sq",
 )
 _DTYPES = ((torch.bfloat16, "bf16"), (torch.float16, "fp16"))
+
+
+@pytest.mark.parametrize(
+    ("overrides", "expected"),
+    (
+        ({}, True),
+        ({"reuse_forward_preactivation": False}, False),
+        ({"use_hostless_grouped": False}, False),
+        ({"use_compact_w1": False}, False),
+        ({"flat_routes": True}, False),
+        ({"has_bias": True}, False),
+        ({"compute_dtype": "fp16"}, False),
+        ({"activation": "geglu"}, False),
+    ),
+)
+def test_fused_da_dscore_policy_is_narrow(overrides, expected):
+    kwargs = {
+        "reuse_forward_preactivation": True,
+        "use_hostless_grouped": True,
+        "use_compact_w1": True,
+        "flat_routes": False,
+        "has_bias": False,
+        "compute_dtype": "bf16",
+        "activation": "swiglu",
+    }
+    kwargs.update(overrides)
+    assert _use_fused_da_dscore(**kwargs) is expected
 
 
 @pytest.mark.parametrize(
@@ -640,6 +668,7 @@ def _backward_reference(
     b1=None,
     b2=None,
     interleaved_w1=False,
+    reassociate_da_dscore=False,
 ):
     """Match the standalone backward's explicit A16 materialization contract."""
 
@@ -689,13 +718,22 @@ def _backward_reference(
             activation_name,
             interleaved_w1=interleaved_w1,
         )
-        projection = activation.float() @ w2[expert].float().transpose(0, 1)
-        if b2 is not None:
-            projection = projection + b2[expert].float()
-        projection = projection.to(x.dtype)
-        dtopk_weights[token_indices, slots] = (dout_e.float() * projection.float()).sum(dim=1)
         dy = (dout_e.float() * scores_e[:, None]).to(x.dtype)
-        da = (dy.float() @ w2[expert].float()).to(x.dtype).float()
+        if reassociate_da_dscore:
+            assert b2 is None
+            # The fused gfx950 state path computes the mathematically
+            # equivalent q contraction once, then reuses its A16 boundary for
+            # both gradients instead of materializing activation @ W2.T.
+            q = (dout_e.float() @ w2[expert].float()).to(x.dtype).float()
+            dtopk_weights[token_indices, slots] = (q * activation.float()).sum(dim=1)
+            da = q * scores_e[:, None]
+        else:
+            projection = activation.float() @ w2[expert].float().transpose(0, 1)
+            if b2 is not None:
+                projection = projection + b2[expert].float()
+            projection = projection.to(x.dtype)
+            dtopk_weights[token_indices, slots] = (dout_e.float() * projection.float()).sum(dim=1)
+            da = (dy.float() @ w2[expert].float()).to(x.dtype).float()
         _, dz = _activation_reference(
             preactivation,
             da,
@@ -1950,6 +1988,7 @@ def test_sonic_moe_backward_reuses_route_order_forward_preactivation(
         b1=b1,
         b2=b2,
         interleaved_w1=interleaved_w1,
+        reassociate_da_dscore=tokens == 128 and not has_bias,
     )
     torch.cuda.synchronize()
 
@@ -2160,8 +2199,23 @@ def test_sonic_moe_backward_compact_state_fuses_live_row_prepare(monkeypatch):
         "_compile_activation_derivative",
         _unexpected_legacy_kernel,
     )
+    monkeypatch.setattr(
+        sonic_backward_module,
+        "_compile_activation_derivative_from_forward_state",
+        _unexpected_legacy_kernel,
+    )
+    monkeypatch.setattr(
+        sonic_backward_module,
+        "_compile_grouped_w2_recompute",
+        _unexpected_legacy_kernel,
+    )
+    monkeypatch.setattr(
+        sonic_backward_module,
+        "_compile_score_backward",
+        _unexpected_legacy_kernel,
+    )
     actual = sonic_moe_backward(*args, config, forward_state=state)
-    expected = _backward_reference(*args)
+    expected = _backward_reference(*args, reassociate_da_dscore=True)
     torch.cuda.synchronize()
 
     for actual_gradient, expected_gradient in zip(actual, expected):
