@@ -11,14 +11,17 @@ forward state keep retained graphs and overlapping forward calls safe.
 
 The implementation is entirely FlyDSL on device.  Standalone backward
 recomputes both forward intermediates; fixed-K BF16 SwiGLU backward can instead
-consume an invocation-owned forward state and skip W1 recomputation. Short-route
-W1 fallback, W2 projection, dA, and BF16 dW2 contractions use device-driven
-grouped gfx950 MFMA kernels; the remaining matrix products use the general
-A16W16 GEMM. Small FlyDSL kernels implement routing metadata, gather/scatter,
-activation derivatives, and the top-K reduction.  The fully grouped short
-BF16/SwiGLU/no-bias path keeps all sorter extents and expert schedules on the
-device; legacy dtype, activation, bias, ragged-route, and long-token contracts
-retain the conservative host-dispatched fallback.
+consume an invocation-owned forward state and skip W1 recomputation.  Eligible
+no-bias state paths also compute an A16 ``q = dout @ W2`` once and fuse route
+score, activation-derivative, and dW2-input work without materializing the W2
+projection.  The fused exact-row schedule covers the fully grouped short-token
+BM16 path and the tuned T4096/H4096/I2048/E64/K8 BM64 path.  Other grouped W1,
+W2, dA, dW1, dW2, and dX contractions use gfx950 MFMA kernels where their
+individual policies allow; remaining matrix products use the general A16W16
+GEMM.  Small FlyDSL kernels implement routing metadata, gather/scatter,
+activation derivatives, and the top-K reduction.  Legacy dtype, activation,
+bias, ragged-route, and untuned long-token contracts retain the conservative
+host-dispatched fallback.
 """
 
 import functools

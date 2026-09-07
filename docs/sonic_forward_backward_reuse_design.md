@@ -1,10 +1,11 @@
 # SonicMoE forward-state reuse for backward
 
-Status: phase 1 and the first gfx950 exact-row consumer are implemented and
-measured.  Forward saves compact route-order BF16 preactivation; backward can
-consume it to skip W1 recomputation and, on the compact hostless path, avoid
-BM64-padded gather/state materialization.  Routing-metadata reuse and fused
-dA/dscore remain follow-up work.
+Status: the dual-output Stage-1 state, gfx950 exact-row consumers, and the first
+fused dA/dscore paths are implemented and measured.  Forward saves compact
+route-order BF16 preactivation.  Backward uses it to skip W1 recomputation and,
+on the no-bias fixed-K BF16/SwiGLU BM16 and production BM64 schedules, also
+skips the W2 projection recomputation.  Routing-metadata reuse, bias/ragged
+fusion, and arbitrary-shape scheduling remain follow-up work.
 
 ## Summary
 
@@ -18,18 +19,20 @@ backward sorts the routes again and materializes both matrix products again:
 
 The production T128/H3584/I512/E896/K16 measurements put these two recomputes at
 roughly 1.17 ms and 0.56 ms respectively (the older numbers recorded in
-`prebuilt_kernels_guide.md` are 1.196 ms and 0.667 ms).  They are avoidable.
+`prebuilt_kernels_guide.md` are 1.196 ms and 0.667 ms).  Those measurements
+motivated the retained-state path; its eligible exact-row schedules now remove
+both recomputes.
 
-The recommended training contract is:
+The retained-state training contract is:
 
-- emit immutable, invocation-owned routing metadata and W1 preactivation from
-  forward;
+- emit immutable, invocation-owned W1 preactivation from forward, with routing
+  metadata reuse still planned;
 - regenerate the inexpensive elementwise activation in backward by default;
-- fuse route-score calculation into the unscaled dA contraction, using
-  `dscore = dot(dout @ W2, activation) + dot(dout, b2)`, instead of materializing
-  `[routes, H]` projection;
+- on eligible no-bias exact-row schedules, fuse route-score calculation around
+  `q16=A16(dout @ W2)` instead of materializing a `[routes, H]` projection;
 - retain an opt-in saved-activation mode, and a strict-numerics saved-projection
-  mode for validation, but do not make either the default;
+  mode as possible follow-up validation policies, but do not make either the
+  default;
 - keep inference `forward_topk()` and standalone backward without a forward
   state source-compatible.
 
@@ -38,7 +41,7 @@ This is the same high-level lifetime choice as upstream SonicMoE: its
 reconstructs/fuses the activation and score-gradient work.  It does not retain
 the down projection.
 
-## Implemented phase 1
+## Implemented retained-state path
 
 The BF16 SwiGLU fixed-K training path now exposes:
 
@@ -59,10 +62,14 @@ gradients = sonic_moe_backward(
 
 Stage 1 keeps its existing sorted activation output for Stage 2 and scatters
 the exact rounded gate/up values into an invocation-owned contiguous BF16
-`[T, K, 2I]` tensor.  Backward independently sorts routes, gathers that compact
-state into its sorter order while regenerating activation and `dy`, and skips
-both grouped and generic W1 recomputation.  `forward_state=None` retains the
-standalone implementation.  FP16, non-SwiGLU, ragged routing, and unsupported
+`[T, K, 2I]` tensor.  Backward still independently sorts routes, but consumes
+that compact state while regenerating activation and skips both grouped and
+generic W1 recomputation.  The tuned 64--128-token BM16 path and the production
+`T4096/H4096/I2048/E64/K8` BM64 path use their existing dX descriptor queues as
+exact-row schedules.  Their no-bias fixed-K specialization also fuses dA and
+dscore, so it allocates neither a padded sorted preactivation/dout copy nor the
+unweighted W2 projection.  `forward_state=None` retains the standalone
+implementation.  FP16, non-SwiGLU, ragged routing, bias, and unsupported
 training-forward combinations continue to use an explicit fallback.
 
 The state is immutable and includes shape/layout/dtype, bias-presence, producer
@@ -77,60 +84,60 @@ paired with the exact `x`, W1, B1, and route IDs that produced it.  Proving that
 identity in the low-level API would require retaining or hashing large inputs
 or adding synchronization.
 
-### Eager performance
+### Current eager performance
 
 The table uses an AMD Instinct MI355X (`gfx950`), PyTorch
 `2.13.0+rocm7.14.0`, BF16, real expert-major `MoE` leaf parameters exposed
-through the public `permute(1, 2, 0)` views, two warmups, and 11 AB plus 11 BA
-pairs.  JIT and weight preparation are excluded.  The baseline is the same
-tree with only the training-state call disabled.  “Full” starts from fixed
-route IDs/scores and includes adapter forward plus backward; it excludes router
-logits and top-k.  Times are event medians.
+through the public `permute(1, 2, 0)` views, two warmups, and paired ABBA runs.
+JIT and weight preparation are excluded.  “Full” starts from fixed route
+IDs/scores and includes adapter forward plus backward; it excludes router
+logits and top-k.  Times are event medians.  Triton uses its retained-forward
+ROCm path on the same device and module-view layout.
 
-| Bucket | Compact state | Forward baseline/state | Backward baseline/state | Full baseline/state | Full reduction |
+| Bucket | Compact state | FlyDSL state backward | FlyDSL full | Triton state backward | FlyDSL backward speedup |
 |---|---:|---:|---:|---:|---:|
-| T1, H3584/I512/E896/K16 | 32 KiB | 0.118 / 0.151 ms | 1.765 / 1.733 ms | 1.874 / 1.849 ms | 1.31% |
-| T128 balanced, H3584/I512/E896/K16 | 4 MiB | 1.509 / 1.545 ms | 6.567 / 5.424 ms | 7.860 / 6.761 ms | 13.98% |
-| T128 hot16, H3584/I512/E896/K16 | 4 MiB | 0.243 / 0.256 ms | 2.211 / 2.132 ms | 2.344 / 2.288 ms | 2.38% |
-| T4096, H4096/I2048/E64/K8 | 256 MiB | 1.645 / 2.305 ms | 11.453 / 7.948 ms | 12.995 / 10.095 ms | 22.32% |
+| T1, H3584/I512/E896/K16 | 32 KiB | 1.7212 ms | 1.8493 ms | 9.562 ms | 5.56x |
+| T128 balanced, H3584/I512/E896/K16 | 4 MiB | 4.0925 ms | 5.4465 ms | 19.150 ms | 4.68x |
+| T128 hot16, H3584/I512/E896/K16 | 4 MiB | 2.0294 ms | 2.1783 ms | 10.798 ms | 5.32x |
+| T4096, H4096/I2048/E64/K8 | 256 MiB | 6.7163 ms | 8.3810 ms | 15.684 ms | 2.34x |
 
-The forward store is deliberately visible in these numbers: it costs about
-0.66 ms for the 256 MiB T4096 state, but removing W1 from backward saves about
-3.51 ms.  Across all four buckets, the complete eager step is faster.  Relative
-L2 differences versus the standalone recompute path are at most `3.91e-4`, and
-the largest gradient absolute difference is `2.39e-7`.
+Triton already retains routing metadata while FlyDSL still re-sorts, so
+metadata reuse remains a material opportunity rather than an accounting
+advantage.  The q16 fused path is compared under the accepted tolerance
+contract described below; the table does not assert bitwise parity.
 
-Against the ROCm Triton retained-forward backward on the same device and
-module-view layout, FlyDSL's state path measures 1.733/5.424/2.132/7.948 ms for
-T1/T128-balanced/T128-hot16/T4096 versus Triton's
-9.562/19.150/10.798/15.684 ms, or 5.52x/3.53x/5.06x/1.97x faster.  Triton already
-retains routing metadata while this FlyDSL phase still re-sorts, so metadata
-reuse remains a material opportunity rather than an accounting advantage.
+The fused dA/dscore change was also isolated with the preceding retained-state
+path as its baseline.  At balanced T128 it changed backward from `4.7902` to
+`4.2122 ms`, full time from `6.1175` to `5.5457 ms`, and peak allocation by
+`-399.875 MiB`.  At T4096 it changed backward from `7.7981` to `6.5991 ms`, full
+time from `10.2166` to `9.0715 ms`, and peak allocation by approximately
+`-864 MiB`.  Finally, with the combined backward held fixed, changing the exact
+T4096 training Stage 1 from spill-prone BN256 to BN128 with
+`waves_per_eu=2` changed forward from `2.3494` to `1.7528 ms` and full time from
+`8.8176` to `8.3351 ms`.
 
-### gfx950 compact-row preparation
+### gfx950 exact-row preparation and fusion
 
 The no-bias BF16/SwiGLU fixed-K path for 64--128 tokens already builds a BM16
-device descriptor queue for W1/dX.  Backward now reuses that queue to fuse the
-live-row hidden-state gather, activation reconstruction, and routed `dy`
-preparation.  It reads `grad_output` directly in token order for both `dy` and
-`dscore`, and the activation derivative reads the compact route-order state
-directly.  Consequently this path does not allocate or materialize the padded
-`dout_sorted[P64,H]` or `preactivation[P64,2I]` tensors.  Legacy, bias, ragged,
-long-token, and standalone paths are unchanged.
+device descriptor queue for W1/dX.  Backward reuses that queue to fuse live-row
+hidden-state gather, activation reconstruction, and routed `dy` preparation.
+The production T4096 bucket uses the same data flow with its independently
+tuned BM64 dX queue.  Both read `grad_output` directly in token order for `dy`
+and dscore, and the activation derivative reads compact route-order state
+directly.  They do not allocate or materialize padded
+`dout_sorted[P64,H]`/`preactivation[P64,2I]`, and fused dA/dscore also removes
+the padded projection.  Bias, ragged, unsupported-shape, and standalone paths
+are unchanged.  T1 deliberately keeps the original row kernels because its
+corresponding work is only about 18 us and no descriptor queue is built there.
 
 For balanced `T128/H3584/I512/E896/K16`, only 2,048 routes are real while the
-BM64 sorter extent is 57,344 rows.  The two removed tensors account for
-528,482,304 bytes (504 MiB) of allocation, and the old gather plus state
-prepare plus derivative measured about 0.69 ms.  With the compact-row path,
-the 11-pair event median for retained-state backward is 4.809 ms, down from the
-phase-1 5.424 ms (11.3%); full adapter forward plus backward is 6.143 ms, down
-from 6.761 ms (9.1%).  T1 deliberately keeps the original row kernels because
-its corresponding work is only about 18 us and the descriptor queue is not
-built there.
+BM64 sorter extent is 57,344 rows.  Exact-row preparation avoids walking that
+padded extent.  T4096 has a different density and therefore uses BM64 rather
+than extending the short-route BM16 schedule beyond its measured range.
 
-## Standalone baseline data flow and redundant work
+## Fallback and retained-state data flows
 
-The compatibility autograd function currently does the following:
+The standalone compatibility path does the following:
 
 ```text
 _FlyDSLExpertFunction.forward
@@ -151,17 +158,36 @@ _FlyDSLExpertFunction.backward
      -> dW2, dA, activation derivative, dW1, dX, reductions
 ```
 
+The eligible retained-state path instead does:
+
+```text
+_FlyDSLExpertFunction.forward
+  -> forward_topk_training
+     -> sort
+     -> W1 + activation + compact preactivation state
+     -> W2 + weighted scatter
+
+_FlyDSLExpertFunction.backward
+  -> histogram + BM64 sort                  metadata reuse is still pending
+  -> build/reuse BM16 or BM64 dX queue
+  -> exact-row gather + activation + dout
+  -> grouped dA writes q16=A16(dout @ W2)
+  -> fused derivative + dscore + dy scaling
+  -> dW2, dW1, dX, reductions               no W1/W2 projection recompute
+```
+
 Here `Q = 2I` for a GLU and `Q = I` for a pointwise activation.  `P` is the
 forward-sort padded row count.  `P64` is independently padded to backward's
 current fixed sort unit of 64.
 
-`gemm1.py` already has a `store_preactivation=True` specialization.  It stores
-gate and up separately as A16 and deliberately does not apply the activation.
-The regular forward specialization instead rounds gate/up through A16 when
+`gemm1.py` has a dual-output training specialization.  It stores gate and up
+separately as compact route-order A16 state while preserving the ordinary
+activation output consumed by Stage 2.  The regular forward computation rounds
+gate/up through A16 when
 `round_preact_bf16=True`, applies the activation in FP32 to those rounded
-values, and stores an A16 activation.  A dual-output training epilogue can
-therefore produce both values without another GEMM and without changing the
-forward rounding boundary:
+values, and stores an A16 activation.  The training epilogue therefore produces
+both values without another GEMM and without changing the forward rounding
+boundary:
 
 ```text
 g16 = A16(acc_gate + bias_gate)
@@ -170,10 +196,8 @@ saved_preact = [g16, u16]
 activation16 = A16(activation(FP32(g16), FP32(u16)))
 ```
 
-The existing `store_preactivation` boolean is mutually exclusive with the
-activation output.  It should become an independent optional preactivation
-pointer/compile-time store flag; the ordinary stage-1 output remains the
-activation consumed by stage 2.
+The extra compact pointer and compile-time store flag are used only by
+`forward_topk_training`; inference retains the single-output epilogue.
 
 ## What backward actually needs
 
@@ -203,22 +227,29 @@ dscore_r = dot(q_r, activation_r) + dot(dout[token(r)], b2_e)
 dA_r     = score_r * q_r .
 ```
 
-The grouped dA kernel already owns the `dout @ W2` accumulators.  Its epilogue
-can multiply them by the route weight for dA and reduce their dot product with
-the activation for dscore.  With the current `BN=64` split, each N tile can
-atomically add one FP32 partial per real route after a device-side zero, or a
-future row-owned schedule can loop over all N tiles and write the scalar once.
-The optional bias term is a separate `H` reduction or a fused contribution in
-a row-owned dA schedule.
+The implemented exact-row path materializes the grouped dA accumulator once as
+A16 and then owns each real route in one row workgroup:
 
-This changes the placement of A16 rounding relative to today's explicit
-`dy=A16(dout*score); dA=GEMM(dy,W2)` and today's
-`projection=A16(activation@W2^T+bias); dscore=dot(dout,projection)`.  It matches
-the algebraic/upstream fused formulation, but exact bitwise identity is not
-expected.  Correctness should use the existing BF16/FP16 tolerance contract.
-If bitwise compatibility with the current standalone backward is required, the
-only general solution is to save or recompute the rounded projection; an
-optional saved-projection validation mode is specified below.
+```text
+q16_r          = A16(dout[token(r)] @ W2_e)
+dA_effective_r = FP32(q16_r) * FP32(score_r)
+dscore_r       = reduce_FP32(FP32(q16_r) * FP32(activation16_r))
+dy16_r         = A16(dout[token(r)] * FP32(score_r))   # dW2 input
+```
+
+The current fused rollout is no-bias, so the `dot(dout,b2)` term remains on the
+fallback path.  One row workgroup writes dscore without an initialization pass
+or atomics, applies `dA_effective` to the SwiGLU Jacobian, and scales the
+previously gathered dout in place to create dy16 before dW2 launches.
+
+This q16 ordering is an explicitly accepted gfx950 retained-state ABI.  It is
+not bitwise-equivalent to the fallback or ROCm Triton ordering, which first
+forms `dy16=A16(dout*score)` before the W2 contraction.  It is also not QuACK's
+FP32 GEMM-accumulator epilogue: q is rounded to A16 before score scaling and the
+dscore reduction.  Correctness therefore uses the existing tolerance contract,
+not bitwise identity.  `forward_state=None` preserves the old fallback rounding
+boundary.  A future strict validation mode may save or recompute the rounded
+projection, but it is not the contract of this fused path.
 
 ## State ownership and API
 
@@ -346,7 +377,9 @@ Save routing metadata and frequencies, but leave stage-1 activation in the
 reusable forward workspace.
 
 - Eliminates the backward histogram and sort.
-- Retains W1, activation, and (until dA/dscore fusion lands) W2 recomputation.
+- Retains W1 and activation recomputation.  Without retained preactivation the
+  current fused dA/dscore selector is not eligible, so W2 projection
+  recomputation also remains.
 - Smallest integration step and useful for validating state ownership, streams,
   and layout plumbing.
 
@@ -357,8 +390,9 @@ Add A16 `[capacity, Q]` preactivation written by the forward stage-1 epilogue.
 - Eliminates W1 recomputation.
 - Backward regenerates A16 activation with an elementwise kernel and combines
   that pass with `dy=A16(dout*score)`.
-- After fused dA/dscore is enabled, eliminates W2 recomputation without saving a
-  projection.
+- On the implemented no-bias fixed-K BF16/SwiGLU BM16 and production BM64
+  schedules, fused dA/dscore eliminates W2 recomputation without saving a
+  projection.  Other combinations retain the fallback.
 - Matches upstream SonicMoE's decision to retain preactivation rather than both
   stage outputs.
 
@@ -505,23 +539,26 @@ lifetime contract is what guarantees correctness.
    compact route-order A16 preactivation while preserving the existing
    activation/output path.  Backward validates the state, skips W1 recompute,
    and retains `forward_state=None` as the tested standalone fallback.
-2. **Exact-row state consumers (complete for compact hostless).** Reuse the
-   existing BM16 device queue to fuse gather/activation/`dy`, read state
-   directly in the derivative, and remove the padded sorted dout/preactivation
-   tensors.  Decode keeps its measured lower-latency row kernels.
+2. **Exact-row state consumers (complete for measured schedules).** Reuse the
+   existing BM16 short-route and BM64 T4096 dX queues to fuse
+   gather/activation/`dy`, read state directly in the derivative, and remove the
+   padded sorted dout/preactivation tensors.  Decode keeps its measured
+   lower-latency row kernels.
 3. **Metadata state (next).** Make forward emit invocation-owned routing
    metadata and frequency, then skip backward histogram/sorting.  Reconcile
    forward's B16/B128 and backward's B64 layouts without a host readback.
 4. **Variable sort-unit consumers.** Parameterize grouped dA/dX/dW schedulers by
    the state sort unit and add direct-slot T1 scheduling.  Remove assumptions
    that every saved layout is ascending BM64.
-5. **Fused dA/dscore.** Compute unscaled `dout @ W2`, form dA and score partials
-   in its epilogue, and add the bias contribution.  Delete projection allocation
-   and W2 recompute from this path.  Keep saved-projection mode as a numerical
-   oracle until tolerances and performance are established.
-6. **Policy tuning.** Compare preactivation-only with saved activation.  Measure
+5. **Fused dA/dscore (partial).** The no-bias retained-state BM16 and production
+   BM64 paths compute `q16=A16(dout @ W2)`, form effective dA and dscore in an
+   exact-row kernel, and delete projection allocation/W2 recompute.  Bias,
+   ragged routes, arbitrary shapes, and an independent saved-projection oracle
+   remain follow-up work.
+6. **Policy tuning (partial).** Preactivation-only has been measured on T1,
+   T128 balanced/hot16, and T4096.  Compare it with saved activation, including
    the extra forward stores, forward latency, backward latency, peak allocated
-   memory, and full forward+backward time on T1, T128 balanced/hot16, and T4096.
+   memory, and full forward+backward time.
 7. **Compact state.** Emit exact-R expert offsets/mappings and teach grouped
    backward kernels the varlen layout.  This is highest priority for E896 sparse
    routing, where padded-state residency dominates.
@@ -531,42 +568,45 @@ lifetime contract is what guarantees correctness.
 Each step should be separately guarded so `forward_state=None` remains a tested
 fallback and inference performance is unchanged.
 
-## Required tests
+## Remaining required tests
 
-- Compare all returned gradients against the standalone path for BF16/FP16,
-  every activation, bias/no-bias, fixed-K and ragged routes, duplicate ragged
-  routes, zero-route tokens, and boundary expert counts.  Optimized support may
-  land incrementally, but unsupported combinations must fall back explicitly.
-- Run forward A, forward B with the same operator/key, then backward A; repeat in
-  reverse backward order and verify that A's state was not overwritten.
-- Repeat the overlap test across two streams, and exercise standalone backward
-  on a third stream without a host synchronization.
-- Run backward twice with `retain_graph=True`, including re-entrant autograd from
-  a hook, and compare gradients.
-- Mutate each saved user input with a legal `no_grad` in-place update between
-  forward and backward and assert PyTorch's saved-tensor version error.
-- In a test-only exposed-state path, mutate a saved metadata/preactivation tensor
-  through PyTorch and assert the same version error.
-- Stress allocator reuse after dropping local forward references; this catches
-  missing `record_stream` calls around raw-pointer launches.
-- Test each state layout tag and reject mismatched sort units, shapes, devices,
-  dtypes, operator configs, and forward generations before launching kernels.
-- After capture prerequisites land, warm up outside capture, capture paired
-  forward+backward, replay with changing inputs, and compare eager results.
-  Also verify that forward-only capture and overlapping replay are either given
-  distinct slots or rejected deterministically.
-- Benchmark stage timings and end-to-end time, not only isolated removed GEMMs;
-  a saved state is a win only after accounting for its forward stores and memory
-  pressure.
+- Add one production end-to-end test in which public `forward_topk_training`
+  automatically selects BN128/`waves_per_eu=2` and its state then reaches the
+  exact T4096 BM64 fused backward.  Current T4096 correctness tests construct
+  state with `_make_forward_state` and are marked `large_shape`, so default CI
+  does not cover this composition.
+- Add BM64 fused cross-stream, repeated-state reuse, and `retain_graph=True`
+  coverage.  Exercise forward A/B with the same key and reverse backward order,
+  including allocator pressure after local forward references are dropped.
+- Add exact T4096 interleaved-W1 backward correctness and hot/skew routing
+  coverage, not only the balanced production case.  The public adapter Stage-1
+  ABBA above already uses its normal interleaved module layout, but that does
+  not replace an independent large-shape gradient test.
+- Compare the fused result with an independent numerical oracle.  The existing
+  `reassociate_da_dscore=True` reference reproduces q16 ordering and therefore
+  validates implementation consistency, not the old fallback, Triton, or
+  QuACK FP32-epilogue contract.
+- Keep explicit same-shape `forward_state=None` versus retained-state tolerance
+  tests, plus a ROCm Triton or QuACK reference, so the accepted q16 ABI cannot
+  drift silently.
+- Retain mismatch rejection, saved-tensor versioning, bias/ragged fallback, and
+  eventual paired graph-capture coverage as those optimized combinations land.
+- Benchmark stage timings, peak memory, and end-to-end time together; a state
+  optimization is accepted only after its forward stores and residency cost are
+  included.
 
 ## Acceptance criteria
 
 - No training saved tensor aliases `SonicMoEWorkspace` storage.
 - Overlapping forwards and re-entrant backward are deterministic within the
   existing fixed/ragged reduction guarantees.
-- The implemented phase-1 BF16 SwiGLU state path launches no W1 recompute.
-- After fused dA/dscore lands, the optimized path also launches no W2
-  projection recompute.
+- The implemented BF16 SwiGLU state path launches no W1 recompute.
+- Eligible no-bias exact-row BM16 and T4096 BM64 fused paths launch no W2
+  projection recompute; unsupported combinations select the fallback
+  explicitly.
+- The retained-state q16 contract remains tolerance-stable and is documented as
+  distinct from both fallback/Triton ordering and QuACK's FP32-accumulator
+  epilogue.
 - Inference entry points and their workspace reuse remain unchanged.
 - Standalone backward without a state remains available and numerically tested.
 - Graph capture remains explicitly rejected until the complete preallocation

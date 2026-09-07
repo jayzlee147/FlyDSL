@@ -341,7 +341,8 @@ out = op(hidden_states_bf16, router_logits_bf16)
 
 # The fixed-K BF16 SwiGLU training path can retain the exact route-order
 # preactivation produced by this invocation and reuse it in backward.  This
-# avoids the backward W1 recomputation while inference keeps using
+# avoids the backward W1 recomputation and, on eligible gfx950 exact-row
+# schedules, the W2 projection recomputation.  Inference keeps using
 # ``forward_topk``/``__call__`` without allocating training state.
 out, forward_state = op.forward_topk_training(
     hidden_states_bf16,
@@ -392,12 +393,16 @@ route IDs, and W1 layout), is immutable, and may be reused with
 `retain_graph=True`.  FP16, non-SwiGLU, ragged routing, and unsupported layout
 combinations continue through the standalone backward path or are rejected
 explicitly.  Passing `forward_state=None` always selects that tested fallback.
-For the no-bias 64--128-token hostless specialization, backward also reuses its
-BM16 device work queue to touch only live route rows while jointly gathering
-`x`, reconstructing activation, and preparing `dy`.  It reads compact state in
-the derivative and token-major `grad_output` in dscore, eliminating the padded
-`dout_sorted` and sorted-preactivation workspaces.  Decode keeps the original
-row kernels because their measured latency is lower.
+For the no-bias exact-row specializations, backward reuses an existing dX work
+queue to touch only live route rows while jointly gathering `x`, reconstructing
+activation, and preparing `dy`: the 64--128-token path uses its compact BM16
+queue, while `T4096/H4096/I2048/E64/K8` uses its production BM64 queue.  Both
+read compact state and token-major `grad_output` during exact-row preparation,
+then derive dscore from `q16=A16(dout@W2)` and the regenerated A16 activation.
+This eliminates the padded `dout_sorted` and sorted-preactivation workspaces,
+and the fused dA/dscore path neither allocates nor recomputes the unweighted W2
+projection.  Decode keeps the original row kernels because their measured
+latency is lower.
 
 For GLU backward, both entry points also accept ``interleaved_w1=True``. In
 that mode each expert's raw W1 rows, optional B1 entries, and returned
@@ -501,19 +506,27 @@ cache entries do not collide.
 Optional expert-major BF16/FP16 `b1`/`b2` are prepared with the weights and fused
 before the activation and route weighting, respectively. The backward paths
 support dense BF16/FP16 weights, fixed-K or flat ragged
-routing, every supported activation, and optional expert bias. They independently
-re-sort routes and recompute the materialized pre-activation and projection, so
-they do not retain or alias an inference workspace across calls. The bring-up
-implementation uses device-driven grouped MFMA kernels for BF16 SwiGLU W1 and
-W2 recompute when every expert segment is bounded by 128 rows. The other four
-matrix products still use per-expert A16W16 GEMMs and one host synchronization
-to read expert frequencies. Its independent sort unit remains 64 rows because
-those generic GEMMs currently require contraction-K blocks aligned to 64;
-forward `route_tile_m` tuning does not alter that invariant. Activation,
+routing, every supported activation, and optional expert bias.  The standalone
+fallback independently re-sorts routes and recomputes both the materialized
+preactivation and the unweighted W2 projection.  It does not retain or alias an
+inference workspace across calls.  The dense BF16 SwiGLU fixed-K training path
+instead accepts an invocation-owned forward state, skips W1 recomputation, and
+uses exact-row device schedules on the tuned T64/T128 and T4096 buckets.  The
+eligible no-bias schedules also fuse dA/dscore and skip both the W2 projection
+allocation and its recomputation.  Backward still performs an independent BM64
+sort; routing-metadata reuse has not landed.
+
+The two paths intentionally have different A16 rounding contracts.  The
+fallback forms `dy16=A16(dout*route_score)` before its dA GEMM and materializes
+`projection16=A16(activation@W2^T+b2)` for dscore.  The retained-state fused path
+instead materializes `q16=A16(dout@W2)`, uses
+`dA_effective=FP32(q16)*FP32(route_score)`, and reduces
+`dscore=dot(FP32(q16),FP32(activation16))`; its current rollout excludes bias.
+This q16 rule is the accepted gfx950 retained-state ABI.  It is tolerance-
+validated rather than bitwise-equivalent against the ROCm Triton ordering, and
+it is also not QuACK's FP32-accumulator epilogue.  Passing
+`forward_state=None` preserves the established fallback contract.  Activation,
 routing, reduction, and every tensor calculation remain FlyDSL device kernels.
-The `dout * route_score` input is rounded to the selected A16 dtype before the
-backward GEMMs, so this is not bitwise parity with a legacy FP32-scaled Triton
-grouped GEMM.
 
 Flat-route backward accumulates routed input gradients through an FP32 atomic
 buffer, so high-fan-in tokens can be non-deterministic at the last few bits. The
@@ -615,6 +628,18 @@ warm-cache measurements reduced median end-to-end latency from `2021.448 us` to
 Useful BF16 MoE throughput increased from approximately `815.9` to
 `881.4 TFLOP/s`; routing, padding (`36,480` rows), and Stage 2 were unchanged.
 
+The dual-output training Stage 1 needs a different residency point on this
+exact production bucket.  With `T4096/H4096/I2048/E64/K8`, BF16 SwiGLU,
+`BM128/BN256/BK64`, `route_tile_m=128`, no bias, default cache policy, no XCD
+swizzle, and `stage1_k_wave=1`, the extra route-state scatter made the BN256
+kernel report 512 VGPRs, 256 AGPRs, and 272 dynamic scratch instructions.  The
+training-only selector changes Stage 1 to BN128 and `waves_per_eu=2`, reducing
+those figures to 256 VGPRs, no AGPRs, and 68 scratch instructions; all other
+configurations and the inference launcher retain their requested settings.  In
+a final same-device ABBA run with the retained-state backward held fixed, this
+changed training forward from `2.3494` to `1.7528 ms` and full forward plus
+backward from `8.8176` to `8.3351 ms`.
+
 The first backward grouped specialization reuses the gfx950 Stage-1 MFMA body
 with logical `[E, 2I, H]` weights and a raw preactivation store. T1 uses a
 device-side expert grid directly. Short-route calls with at least 64 tokens
@@ -640,20 +665,21 @@ to `120.84 us` for the corresponding T128 skew, and from `1127.73` to
 bound, while a device counter and compact descriptors suppress empty work and
 expose a hot expert's M tiles to separate CTAs.
 
-The matching W2 recompute specialization reads logical `[E, H, I]` weights and
-writes the unweighted projection directly by sorted row. Its measured
+The matching fallback W2 recompute specialization reads logical `[E, H, I]`
+weights and writes the unweighted projection directly by sorted row. Its measured
 `BM32/BN256/BK64` profile includes zeroing untouched projection padding: on the
 same `T128/H3584/I512/E896/K16` target it reduced this phase from `48.956 ms`
 to `0.667 ms` (`73.4x`), and reduced complete backward on top of grouped W1
 from about `251.0 ms` to `201.0 ms` (`1.249x`). At T1 the W2 phase measured
 `885.1 us` versus `24.4 us` (`36.3x`). The complete T1 backward measured
-`5.27 ms`, down from the original `6.99 ms`. The same conservative 128-row
-policy keeps the large-T BM64 path; the independently remeasured
-`T4096/H4096/I2048/E64/K8` full backward remained `22.28 ms`.
+`5.27 ms`, down from the original `6.99 ms`. These remain the no-state and
+unsupported-state fallback measurements.  The eligible retained-state T128 and
+T4096 paths now derive dscore from q16 in grouped dA and do not launch this W2
+projection at all.
 
-The grouped dA specialization completes the backward down-projection pair by
-reading public row-major `W2[E,H,I]` directly and computing
-`dY[sorted,H] @ W2[e,H,I]`. It uses the gfx950 NN pipeline: 16-byte async
+The grouped dA specialization reads public row-major `W2[E,H,I]` directly and
+computes either the fallback `dy16 @ W2` or, for the retained-state fusion,
+`q16=A16(dout @ W2)`. It uses the gfx950 NN pipeline: 16-byte async
 global-to-LDS loads, an LDS transpose plus `LDSReadTrans16_64b` for B, and
 BF16 `MFMA 16x16x32`. Since the backward already synchronizes to obtain expert
 frequencies for dW, the kernel chooses among three measured profiles using the
@@ -673,6 +699,16 @@ that reused W1's compact BM16 descriptor queue reached `0.603 ms` on balanced
 T128, slightly behind the selected `0.601 ms` expert-grid profile, so it was
 not retained.
 
+The retained-state epilogue subsequently scales q16 by the FP32 route score for
+the activation derivative, reduces `dot(q16, activation16)` into dscore, and
+scales the gathered dout in place to restore the fallback A16 dW2 input
+contract.  On balanced `T128/H3584/I512/E896/K16`, enabling this fusion changed
+backward from `4.7902` to `4.2122 ms`, full forward plus backward from `6.1175`
+to `5.5457 ms`, and reduced peak allocation by `399.875 MiB`.  On
+`T4096/H4096/I2048/E64/K8`, reusing the BM64 descriptor schedule changed
+backward from `7.7981` to `6.5991 ms`, full time from `10.2166` to `9.0715 ms`,
+and reduced peak allocation by approximately `864 MiB`.
+
 The grouped dX specialization computes `dZ[sorted,2I] @ W1[e,2I,H]` with a
 gfx950-native NN MFMA pipeline and keeps the public row-major weight layout.
 T1 consumes sorter metadata directly, while short-route calls reuse W1's
@@ -684,7 +720,9 @@ from `876.36` to `18.95 us` at T1, from `852.21` to `57.01 us` for T128 with
 16 hot experts, and from `48.410 ms` to `1.209 ms` for balanced T128. The
 corresponding complete backward medians changed from `4.426` to `3.549 ms`,
 `4.592` to `3.735 ms`, and `154.230` to `103.507 ms`. Long T4096 calls retain
-the general BM64 path; paired measurements stayed within 0.4% noise.
+the tuned BM64 grouped path.  Its descriptor queue is now also the exact-row
+schedule for retained-state gather/activation and fused dA/dscore, avoiding a
+second queue build.
 
 Grouped BF16 SwiGLU dW1/dW2 initialization also avoids a dense fill when the
 active-expert set is sufficiently dense. Both output tensors are allocated
