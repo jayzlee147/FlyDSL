@@ -1418,6 +1418,7 @@ class SonicMoE:
                     workspace.router_topk_ids,
                     workspace.router_topk_expert_indices,
                 ),
+                direct_single_token=True,
             )
             return self._run_grouped_gemms(hidden_states, workspace, output)
 
@@ -1633,6 +1634,7 @@ class SonicMoE:
                 self.config.num_experts,
                 unit_size=self.config.route_tile_m,
                 workspace=workspace.sorting_workspace,
+                direct_single_token=True,
             )
             return self._run_grouped_gemms(hidden_states, workspace, output)
 

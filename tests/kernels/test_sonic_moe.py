@@ -1380,6 +1380,72 @@ def test_sonic_moe_fused_router_handles_negative_infinity_masks():
     _assert_close(actual, expected)
 
 
+@pytest.mark.parametrize(
+    ("compute_dtype", "torch_dtype", "renormalize"),
+    (
+        ("bf16", torch.bfloat16, True),
+        ("fp16", torch.float16, False),
+    ),
+)
+@pytest.mark.parametrize("stage2_output_mode", ("atomic", "reduce"))
+def test_sonic_moe_single_token_direct_router_preserves_route_slots(
+    compute_dtype,
+    torch_dtype,
+    renormalize,
+    stage2_output_mode,
+):
+    """The T=1 fast path emits one padded block for every top-k slot."""
+
+    config = _config(
+        stage2_output_mode=stage2_output_mode,
+        compute_dtype=compute_dtype,
+        renormalize=renormalize,
+    )
+    x, w1, w2, router_logits = _make_case(tokens=1, seed=181, dtype=torch_dtype)
+    topk_ids, topk_weights = _topk_from_logits(router_logits, config)
+    op = SonicMoE(config, _prepare_dense_weights(w1, w2, config))
+
+    expected = sonic_moe_reference(x, w1, w2, router_logits, config)
+    actual = op(x, router_logits)
+    torch.cuda.synchronize()
+
+    workspace = op.workspace
+    assert workspace is not None
+    assert int(workspace.num_valid_ids[0]) == config.top_k * config.route_tile_m
+    assert int(workspace.num_valid_ids[1]) == 1
+    block_starts = torch.arange(config.top_k, device=x.device) * config.route_tile_m
+    packed = workspace.sorted_token_ids[block_starts]
+    assert torch.equal(packed & 0x00FFFFFF, torch.zeros_like(packed))
+    assert torch.equal(packed >> 24, torch.arange(config.top_k, dtype=torch.int32, device=x.device))
+    assert torch.equal(workspace.sorted_expert_ids[: config.top_k], topk_ids[0])
+    torch.testing.assert_close(
+        workspace.sorted_weights[block_starts],
+        topk_weights[0],
+        rtol=1e-5,
+        atol=1e-6,
+    )
+    assert torch.count_nonzero(workspace.sorted_weights) == config.top_k
+    _assert_close(actual, expected)
+
+    topk_out = torch.empty_like(x)
+    returned = op.forward_topk(x, topk_ids, topk_weights, out=topk_out)
+    torch.cuda.synchronize()
+    assert returned is topk_out
+    assert op.workspace is workspace
+    assert torch.equal(workspace.sorted_expert_ids[: config.top_k], topk_ids[0])
+    assert torch.equal(
+        workspace.sorted_token_ids[block_starts] >> 24,
+        torch.arange(config.top_k, dtype=torch.int32, device=x.device),
+    )
+    torch.testing.assert_close(
+        workspace.sorted_weights[block_starts],
+        topk_weights[0],
+        rtol=1e-5,
+        atol=1e-6,
+    )
+    _assert_close(topk_out, expected)
+
+
 def test_sonic_moe_uses_independent_workspaces_across_streams():
     config = _config()
     x_a, w1, w2, logits_a = _make_case(seed=37)

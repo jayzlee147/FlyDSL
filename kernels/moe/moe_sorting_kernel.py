@@ -7,7 +7,10 @@ Implements the MoE sorting operation used in DeepSeek R1 and similar MoE models.
 Given router top-k selections (topk_ids, topk_weights), reorganizes tokens by expert
 for efficient batched expert GEMM execution.
 
-Algorithm: counting sort in LDS (histogram → prefix-sum → scatter).
+Algorithm: counting sort in LDS (histogram → prefix-sum → scatter).  The fused
+single-token router bypasses counting sort entirely because top-k IDs are
+already unique: each selected route becomes one independently padded expert
+block.
 
 Three paths (selected by T vs ONESHOT_MAX_T = min(sub_tokens, max(16, BLOCK_SIZE // max(topk, E//8)))):
   - Oneshot (T <= ONESHOT_MAX_T): single kernel, all phases in LDS.
@@ -179,7 +182,9 @@ def _lds_store_raw(raw_ptr, val, idx):
 # _make_cache_key, and dict lookup, reducing dispatch from ~70 us to ~5 us.
 # ---------------------------------------------------------------------------
 _oneshot_cf_cache = {}  # sorting constexprs + moe_buf rank + device -> CompiledFunction
+_single_token_cf_cache = {}  # direct fixed-top-k T=1 sorting constexprs + device -> CompiledFunction
 _oneshot_fused_cf_cache = {}  # fused oneshot constexprs + device -> CompiledFunction
+_single_token_fused_cf_cache = {}  # direct T=1 router/sort constexprs + device -> CompiledFunction
 _multiphase_cf_cache = {}  # sorting constexprs + moe_buf rank + kernel name -> CompiledFunction
 _dummy_mask_cache = {}  # (device, stream) -> torch.Tensor(1, dtype=i32, value=1)
 
@@ -698,6 +703,252 @@ def _compile_moe_sorting_oneshot(
         )
 
     return launch_moe_sorting_oneshot
+
+
+# ---------------------------------------------------------------------------
+# FlyDSL GPU kernel — direct fixed-top-k single-token path
+# ---------------------------------------------------------------------------
+@functools.lru_cache(maxsize=256)
+def compile_moe_sorting_single_token(*, topk: int, unit_size: int = UNIT_SIZE):
+    """Compile direct T=1 sorting for precomputed fixed top-k routes."""
+
+    padded_routes = topk * unit_size
+    sentinel = (topk << 24) | 1
+
+    @flyc.kernel(known_block_size=[BLOCK_SIZE, 1, 1])
+    def moe_sorting_single_token_kernel(
+        topk_ids: fx.Tensor,
+        topk_weights: fx.Tensor,
+        sorted_token_ids: fx.Tensor,
+        sorted_weights: fx.Tensor,
+        sorted_expert_ids: fx.Tensor,
+        num_valid_ids: fx.Tensor,
+        moe_buf: fx.Tensor,
+        i32_moe_buf_elems: fx.Int32,
+    ):
+        bid = gpu.block_idx.x
+        tid = gpu.thread_idx.x
+        c_zero = fx.Int32(0)
+        c_one = fx.Int32(1)
+        c_oob = fx.Int32(0x7FFFFFFF)
+
+        moe_buf_rsrc = buffer_ops.create_buffer_resource(moe_buf, max_size=True)
+        topk_ids_rsrc = buffer_ops.create_buffer_resource(topk_ids, max_size=True)
+        topk_weights_rsrc = buffer_ops.create_buffer_resource(topk_weights, max_size=True)
+        sorted_ids_rsrc = buffer_ops.create_buffer_resource(sorted_token_ids, max_size=True)
+        sorted_w_rsrc = buffer_ops.create_buffer_resource(sorted_weights, max_size=True)
+        sorted_e_rsrc = buffer_ops.create_buffer_resource(sorted_expert_ids, max_size=True)
+        nvalid_rsrc = buffer_ops.create_buffer_resource(num_valid_ids, max_size=True)
+
+        if bid != c_zero:
+            zero_gid_v4 = (bid - c_one) * fx.Int32(BLOCK_SIZE) + tid
+            num_zero_blocks = gpu.grid_dim.x - c_one
+            zero_stride_v4 = num_zero_blocks * fx.Int32(BLOCK_SIZE)
+            i32_moe_buf_v4 = i32_moe_buf_elems >> fx.Int32(2)
+            zero_niters = (i32_moe_buf_v4 + zero_stride_v4 - c_one) // zero_stride_v4
+            c_zero_v4 = fx.Vector.filled(4, 0, fx.Int32)
+            z_start = fx.Index(0)
+            z_end = ArithValue(zero_niters).index_cast(T.index)
+            z_step = fx.Index(1)
+            for z in range(z_start, z_end, z_step):
+                z_idx_v4 = zero_gid_v4 + fx.Int32(z) * zero_stride_v4
+                z_valid = z_idx_v4 < i32_moe_buf_v4
+                z_elem = z_valid.select(z_idx_v4 * fx.Int32(4), c_oob)
+                buffer_ops.buffer_store(c_zero_v4, moe_buf_rsrc, z_elem)
+
+        if bid == c_zero:
+            for route_base in range_constexpr(0, padded_routes, BLOCK_SIZE):
+                route_idx = fx.Int32(route_base) + tid
+                route_valid = route_idx < fx.Int32(padded_routes)
+                safe_route = route_valid.select(route_idx, c_oob)
+                buffer_ops.buffer_store(fx.Int32(sentinel), sorted_ids_rsrc, safe_route)
+                buffer_ops.buffer_store(c_zero, sorted_w_rsrc, safe_route)
+            gpu.barrier()
+
+            if tid < fx.Int32(topk):
+                expert = fx.Int32(buffer_ops.buffer_load(topk_ids_rsrc, tid, vec_width=1, dtype=T.i32))
+                weight_bits = fx.Int32(
+                    buffer_ops.buffer_load(topk_weights_rsrc, tid, vec_width=1, dtype=T.i32)
+                )
+                route_base = tid * fx.Int32(unit_size)
+                packed_id = tid << fx.Int32(24)
+                buffer_ops.buffer_store(expert, sorted_e_rsrc, tid)
+                buffer_ops.buffer_store(packed_id, sorted_ids_rsrc, route_base)
+                buffer_ops.buffer_store(weight_bits, sorted_w_rsrc, route_base)
+
+            if tid == c_zero:
+                buffer_ops.buffer_store(fx.Int32(padded_routes), nvalid_rsrc, c_zero)
+                buffer_ops.buffer_store(c_one, nvalid_rsrc, c_one)
+
+    @flyc.jit
+    def launch_moe_sorting_single_token(
+        topk_ids: fx.Tensor,
+        topk_weights: fx.Tensor,
+        sorted_token_ids: fx.Tensor,
+        sorted_weights: fx.Tensor,
+        sorted_expert_ids: fx.Tensor,
+        num_valid_ids: fx.Tensor,
+        moe_buf: fx.Tensor,
+        i32_moe_buf_elems: fx.Int32,
+        n_grid_blocks: fx.Int32,
+        stream: fx.Stream = fx.Stream(None),
+    ):
+        launcher = moe_sorting_single_token_kernel(
+            topk_ids,
+            topk_weights,
+            sorted_token_ids,
+            sorted_weights,
+            sorted_expert_ids,
+            num_valid_ids,
+            moe_buf,
+            i32_moe_buf_elems,
+        )
+        launcher.launch(
+            grid=(n_grid_blocks, 1, 1),
+            block=(BLOCK_SIZE, 1, 1),
+            stream=stream,
+        )
+
+    return launch_moe_sorting_single_token
+
+
+# ---------------------------------------------------------------------------
+# FlyDSL GPU kernel — direct fused single-token path
+# ---------------------------------------------------------------------------
+@functools.lru_cache(maxsize=256)
+def compile_moe_sorting_single_token_fused(
+    *,
+    num_experts: int,
+    topk: int,
+    dtype_str: str = "bf16",
+    renormalize: bool = True,
+    unit_size: int = UNIT_SIZE,
+):
+    """Compile the T=1 router that emits grouped-GEMM metadata directly.
+
+    Top-k selection guarantees distinct experts.  With one token, every
+    selected expert therefore owns exactly one route and one ``unit_size``
+    block.  Writing those K blocks directly avoids the generic E-wide LDS
+    histogram, prefix scan, and scatter while retaining the normal packed-ID
+    and padding contracts.
+    """
+
+    E = num_experts
+    gating_layout = _compute_topk_gating_layout(E, topk, dtype_str)
+    padded_routes = topk * unit_size
+    sentinel = (topk << 24) | 1
+
+    @flyc.kernel(known_block_size=[BLOCK_SIZE, 1, 1])
+    def moe_sorting_single_token_fused_kernel(
+        gating_logits: fx.Tensor,
+        sorted_token_ids: fx.Tensor,
+        sorted_weights_out: fx.Tensor,
+        sorted_expert_ids: fx.Tensor,
+        num_valid_ids: fx.Tensor,
+        moe_buf: fx.Tensor,
+        i32_moe_buf_elems: fx.Int32,
+    ):
+        bid = gpu.block_idx.x
+        tid = gpu.thread_idx.x
+        c_zero = fx.Int32(0)
+        c_one = fx.Int32(1)
+        c_oob = fx.Int32(0x7FFFFFFF)
+
+        moe_buf_rsrc = buffer_ops.create_buffer_resource(moe_buf, max_size=True)
+        sorted_ids_rsrc = buffer_ops.create_buffer_resource(sorted_token_ids, max_size=True)
+        sorted_w_rsrc = buffer_ops.create_buffer_resource(sorted_weights_out, max_size=True)
+        sorted_e_rsrc = buffer_ops.create_buffer_resource(sorted_expert_ids, max_size=True)
+        nvalid_rsrc = buffer_ops.create_buffer_resource(num_valid_ids, max_size=True)
+
+        # Extra blocks clear the final output concurrently with block 0's
+        # routing work.  Sonic output rows are vector-aligned, matching the
+        # existing fused oneshot zeroing contract.
+        if bid != c_zero:
+            zero_gid_v4 = (bid - c_one) * fx.Int32(BLOCK_SIZE) + tid
+            num_zero_blocks = gpu.grid_dim.x - c_one
+            zero_stride_v4 = num_zero_blocks * fx.Int32(BLOCK_SIZE)
+            i32_moe_buf_v4 = i32_moe_buf_elems >> fx.Int32(2)
+            zero_niters = (i32_moe_buf_v4 + zero_stride_v4 - c_one) // zero_stride_v4
+            c_zero_v4 = fx.Vector.filled(4, 0, fx.Int32)
+            z_start = fx.Index(0)
+            z_end = ArithValue(zero_niters).index_cast(T.index)
+            z_step = fx.Index(1)
+            for z in range(z_start, z_end, z_step):
+                z_idx_v4 = zero_gid_v4 + fx.Int32(z) * zero_stride_v4
+                z_valid = z_idx_v4 < i32_moe_buf_v4
+                z_elem = z_valid.select(z_idx_v4 * fx.Int32(4), c_oob)
+                buffer_ops.buffer_store(c_zero_v4, moe_buf_rsrc, z_elem)
+
+        if bid == c_zero:
+            # Initialize every route row to the conventional padding sentinel;
+            # the router leader overwrites row zero of each selected block.
+            for route_base in range_constexpr(0, padded_routes, BLOCK_SIZE):
+                route_idx = fx.Int32(route_base) + tid
+                route_valid = route_idx < fx.Int32(padded_routes)
+                safe_route = route_valid.select(route_idx, c_oob)
+                buffer_ops.buffer_store(fx.Int32(sentinel), sorted_ids_rsrc, safe_route)
+                buffer_ops.buffer_store(c_zero, sorted_w_rsrc, safe_route)
+
+            if tid == c_zero:
+                buffer_ops.buffer_store(fx.Int32(padded_routes), nvalid_rsrc, c_zero)
+                buffer_ops.buffer_store(c_one, nvalid_rsrc, c_one)
+            gpu.barrier()
+
+            def on_winner_idx(_local_token, _global_token, k_int, expert_idx):
+                route_base = fx.Int32(k_int * unit_size)
+                packed_id = fx.Int32(k_int << 24)
+                buffer_ops.buffer_store(expert_idx, sorted_e_rsrc, fx.Int32(k_int))
+                buffer_ops.buffer_store(packed_id, sorted_ids_rsrc, route_base)
+
+            def on_winner_weight(_local_token, _global_token, k_int, weight):
+                route_base = fx.Int32(k_int * unit_size)
+                weight_bits = fx.Int32(ArithValue(weight).bitcast(T.i32))
+                buffer_ops.buffer_store(weight_bits, sorted_w_rsrc, route_base)
+
+            _emit_topk_gating_softmax_body(
+                gating_logits,
+                None,
+                None,
+                None,
+                c_one,
+                num_experts=num_experts,
+                topk=topk,
+                dtype_str=dtype_str,
+                renormalize=renormalize,
+                on_winner_idx=on_winner_idx,
+                on_winner_weight=on_winner_weight,
+                emit_tei=False,
+                **gating_layout,
+            )
+
+    @flyc.jit
+    def launch_moe_sorting_single_token_fused(
+        gating_logits: fx.Tensor,
+        sorted_token_ids: fx.Tensor,
+        sorted_weights_out: fx.Tensor,
+        sorted_expert_ids: fx.Tensor,
+        num_valid_ids_out: fx.Tensor,
+        moe_buf: fx.Tensor,
+        i32_moe_buf_elems: fx.Int32,
+        n_grid_blocks: fx.Constexpr[int],
+        stream: fx.Stream = fx.Stream(None),
+    ):
+        launcher = moe_sorting_single_token_fused_kernel(
+            gating_logits,
+            sorted_token_ids,
+            sorted_weights_out,
+            sorted_expert_ids,
+            num_valid_ids_out,
+            moe_buf,
+            i32_moe_buf_elems,
+        )
+        launcher.launch(
+            grid=(n_grid_blocks, 1, 1),
+            block=(BLOCK_SIZE, 1, 1),
+            stream=stream,
+        )
+
+    return launch_moe_sorting_single_token_fused
 
 
 # ---------------------------------------------------------------------------
@@ -2091,6 +2342,7 @@ def moe_sorting_flydsl(
     expert_mask=None,
     num_local_tokens=None,
     workspace=None,
+    direct_single_token=False,
 ):
     """MoE sorting using FlyDSL kernel (oneshot + multiphase paths).
 
@@ -2103,6 +2355,11 @@ def moe_sorting_flydsl(
 
     All output tensors (sorted_ids, sorted_weights, sorted_expert_ids,
     num_valid_ids, moe_buf) must be pre-allocated by the caller.
+
+    ``direct_single_token=True`` allows inference callers that consume
+    ``sorted_expert_ids`` directly to emit one block per top-k slot at T=1.
+    The default retains ascending expert order for the public sorter ABI and
+    backward's host-side segment reconstruction.
 
     Returns
     -------
@@ -2132,7 +2389,33 @@ def moe_sorting_flydsl(
     target_occupancy = 2
     num_cu = torch.cuda.get_device_properties(device).multi_processor_count
 
-    if M <= min(sub_tokens, ONESHOT_MAX_T):
+    # Rank-2 ``moe_buf`` is the inference output.  Backward passes rank-1
+    # scratch and reconstructs ascending expert segments on the host, so it
+    # must retain the generic expert-sorted layout.
+    if direct_single_token and M == 1 and not has_mask and moe_buf_i32.ndim == 2:
+        n_zero_blocks = min((moe_buf_elems + BLOCK_SIZE - 1) // BLOCK_SIZE, num_cu * target_occupancy)
+        n_grid_blocks = 1 + n_zero_blocks
+        launch_single = compile_moe_sorting_single_token(topk=topk, unit_size=unit_size)
+        single_args = (
+            topk_ids,
+            topk_weights,
+            sorted_ids,
+            sorted_weights,
+            sorted_expert_ids,
+            num_valid_ids,
+            moe_buf_i32,
+            moe_buf_elems,
+            n_grid_blocks,
+        )
+        cache_key = (topk, unit_size, n_grid_blocks, moe_buf_i32.ndim, device.index)
+        _launch_cached(
+            _single_token_cf_cache,
+            cache_key,
+            launch_single,
+            single_args,
+            torch.cuda.current_stream(device),
+        )
+    elif M <= min(sub_tokens, ONESHOT_MAX_T):
         max_tokens = max(M, 8)
         max_tokens = ((max_tokens + 7) // 8) * 8
 
@@ -2283,6 +2566,7 @@ def moe_softmax_sort_flydsl(
     num_local_tokens=None,
     workspace=None,
     topk_scratch=None,
+    direct_single_token=False,
 ):
     """Fused entry point: gating logits → softmax → top-K → sort.
 
@@ -2317,6 +2601,10 @@ def moe_softmax_sort_flydsl(
                        buffers, each shaped ``[M, topk]``, for the 2-kernel
                        gating fallback. Supplying these avoids global scratch
                        reuse and permits independent stream-local workspaces.
+    direct_single_token: if True, T=1 emits one padded expert block per top-k
+                         slot instead of the public sorter's ascending expert
+                         order. Intended for inference consumers that use the
+                         grouped metadata directly.
     """
     if num_local_tokens is not None:
         M = num_local_tokens.item() if isinstance(num_local_tokens, torch.Tensor) else int(num_local_tokens)
@@ -2336,13 +2624,44 @@ def moe_softmax_sort_flydsl(
     sub_tokens = _compute_sub_tokens(num_experts)
     FUSED_ONESHOT_MAX_T = 16
 
+    router_layout_ok = _supports_fused_oneshot(num_experts, topk, dtype_str)
+    single_token_ok = (
+        direct_single_token
+        and M == 1
+        and not has_mask
+        and topk <= num_experts
+        and router_layout_ok
+    )
     fusion_ok = (
         M <= min(sub_tokens, FUSED_ONESHOT_MAX_T)
         and topk <= num_experts
-        and _supports_fused_oneshot(num_experts, topk, dtype_str)
+        and router_layout_ok
     )
 
-    if fusion_ok:
+    if single_token_ok:
+        target_occupancy = 2
+        num_cu = torch.cuda.get_device_properties(device).multi_processor_count
+        n_zero_blocks = min(
+            (moe_buf_elems + BLOCK_SIZE - 1) // BLOCK_SIZE,
+            num_cu * target_occupancy,
+        )
+        n_grid_blocks = 1 + n_zero_blocks
+        launch_moe_sorting_single_token_fused_path(
+            gating_logits,
+            sorted_ids,
+            sorted_weights,
+            sorted_expert_ids,
+            num_valid_ids,
+            moe_buf_i32,
+            moe_buf_elems,
+            n_grid_blocks,
+            num_experts=num_experts,
+            topk=topk,
+            dtype_str=dtype_str,
+            renormalize=renormalize,
+            unit_size=unit_size,
+        )
+    elif fusion_ok:
         max_tokens = max(M, 8)
         max_tokens = ((max_tokens + 7) // 8) * 8
 
@@ -2424,6 +2743,72 @@ def moe_softmax_sort_flydsl(
     return sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, moe_buf
 
 
+def launch_moe_sorting_single_token_fused_path(
+    gating_logits,
+    sorted_ids,
+    sorted_weights,
+    sorted_expert_ids,
+    num_valid_ids,
+    moe_buf_i32,
+    i32_moe_buf_elems,
+    n_grid_blocks,
+    *,
+    num_experts,
+    topk,
+    dtype_str,
+    renormalize=True,
+    unit_size=UNIT_SIZE,
+):
+    """Launch the direct T=1 router-to-grouped-metadata kernel."""
+
+    cache_key = (
+        num_experts,
+        topk,
+        unit_size,
+        n_grid_blocks,
+        dtype_str,
+        renormalize,
+        moe_buf_i32.ndim,
+        gating_logits.device.index,
+    )
+    cf = _single_token_fused_cf_cache.get(cache_key)
+    stream = torch.cuda.current_stream(gating_logits.device)
+    args = (
+        gating_logits,
+        sorted_ids,
+        sorted_weights,
+        sorted_expert_ids,
+        num_valid_ids,
+        moe_buf_i32,
+        i32_moe_buf_elems,
+        n_grid_blocks,
+        fx.Stream(stream),
+    )
+    if cf is not None:
+        cf(*args)
+        return
+
+    launch_fn = compile_moe_sorting_single_token_fused(
+        num_experts=num_experts,
+        topk=topk,
+        dtype_str=dtype_str,
+        renormalize=renormalize,
+        unit_size=unit_size,
+    )
+    launch_fn(
+        gating_logits,
+        sorted_ids,
+        sorted_weights,
+        sorted_expert_ids,
+        num_valid_ids,
+        moe_buf_i32,
+        i32_moe_buf_elems,
+        n_grid_blocks,
+        stream=stream,
+    )
+    _single_token_fused_cf_cache[cache_key] = flyc.compile(launch_fn, *args)
+
+
 def launch_moe_sorting_oneshot_fused_path(
     gating_logits,
     sorted_ids,
@@ -2460,6 +2845,7 @@ def launch_moe_sorting_oneshot_fused_path(
         dtype_str,
         renormalize,
         has_mask,
+        moe_buf_i32.ndim,
         gating_logits.device.index,
     )
     cf = _oneshot_fused_cf_cache.get(cache_key)

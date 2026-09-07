@@ -397,6 +397,16 @@ raw logits and evaluates exponentials only for the selected K entries; the full-
 softmax path is retained when non-renormalized probabilities are requested. Call
 `forward_topk` to supply routing directly.
 
+The Sonic inference entry points additionally specialize unmasked single-token
+routing. Top-k guarantees distinct experts, so the T=1 path emits one padded
+expert block per route slot directly and skips the E-wide histogram, prefix scan,
+and scatter. The logits entry point performs top-k selection and metadata
+emission in the same kernel; `forward_topk` uses the corresponding direct sorter.
+Both kernels overlap output zeroing in separate CTAs. This route-slot order is an
+internal opt-in: the standalone `moe_softmax_sort_flydsl` and
+`moe_sorting_flydsl` APIs retain ascending expert-ID order by default, as does
+backward's segment reconstruction.
+
 Stage 2 defaults to the faster, lower-memory `stage2_output_mode="atomic"`.
 The experimental `"reduce"` mode is available only for fixed-K routing: it
 writes one A16 row per `(token, slot)` and then reduces those rows in FP32, so it
@@ -507,6 +517,21 @@ token, the padded block bound is the smaller of
 `A*ceil(tokens/route_tile_m)`. Each GEMM launch then converts that padded-row
 bound to its own M tile. Thus `T=1, E=896, top_k=2, route_tile_m=32` reserves two
 route blocks (64 rows), not 896 empty expert blocks.
+
+On one MI355X, the dense BF16 decode shape
+`T=1, H=3584, I=512, E=896, top_k=16` with
+`S1=(BM16,BN64,BK128,k_wave=2)` and `S2=(BM16,BN128,BK128)` measured the
+following warm-cache, same-device changes after enabling direct T=1 metadata:
+
+| Entry point | Generic routing | Direct T=1 | Speedup |
+|---|---:|---:|---:|
+| logits, complete MoE forward | 54.598 us | 44.692 us | 1.222x |
+| precomputed top-k, complete MoE forward | 43.283 us | 33.905 us | 1.277x |
+| precomputed top-k sorter kernel | 9.748 us | 2.059 us | 4.73x |
+
+These numbers include output clearing in both complete forwards. A router-only
+CTA was slightly slower end to end because Stage 2's atomic output still needs
+the clear; keeping the concurrent clear CTAs hides that work under routing.
 
 For one MI355X warm-cache run at `T=128, H=4096, I=14336, E=8, top_k=2`, with
 weight preparation and JIT excluded, the measured points were:
