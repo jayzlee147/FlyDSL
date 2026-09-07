@@ -140,14 +140,37 @@ be benchmarked end to end: an empty launch is significant beside the 36 us hot
 kernel.  Until that gate exists, keep the current hostless conservative profile
 rather than applying either T128 candidate unconditionally.
 
+## T4096 production integration
+
+The fixed-K `T4096/H4096/I2048/E64/K8` shape now builds an independent BM64
+descriptor queue and launches BM64/BN256/BK64/NW4 with a 1024-workgroup cap.
+The selection uses only public tensor shapes.  The builder also emits the
+active-expert queue already needed by dW1/dW2, so integration does not add a
+host readback or a second active-expert scan.
+
+An end-to-end backward AB/BA run on the same MI355X class device used two
+warmups and 11 event-timed repetitions per ordering.  Baseline was the same
+tree with the large-dX static gate disabled.  The smaller buckets execute
+identical kernels and remain within measurement noise; T4096 improves by
+12.4% (`1.142x`).
+
+| Bucket | Baseline ms (AB/BA) | Integrated ms (AB/BA) | Result |
+|---|---:|---:|---:|
+| T1 | 1.6964 / 1.6949 | 1.6863 / 1.6835 | unchanged path |
+| T128 balanced | 6.3097 / 6.3327 | 6.2822 / 6.3070 | unchanged path |
+| T128 hot16 | 2.1074 / 2.0967 | 2.0977 / 2.0901 | unchanged path |
+| T4096 balanced | 12.9251 / 12.8789 | 11.3130 / 11.2892 | 12.4% lower latency |
+
+For the T4096 inputs, all four returned gradients were bitwise identical to
+the generic-dX baseline.  A separate sampled kernel check measured the BM64
+candidate at 1.374 ms and verified its partial-tile results.
+
 ## Production order
 
-1. Integrate the shape-static T4096 BM64 queue and dX kernel, then measure queue
-   build plus full backward.
-2. Add device-side distribution statistics and BM64 descriptors without a host
+1. Add device-side distribution statistics and BM64 descriptors without a host
    readback.
-3. Integrate the hot16 BM64 kernel behind that device predicate; require the
+2. Integrate the hot16 BM64 kernel behind that device predicate; require the
    launch overhead to preserve the approximately 25 us isolated saving.
-4. Integrate balanced BN512 only if end-to-end AB/BA still shows a stable gain;
+3. Integrate balanced BN512 only if end-to-end AB/BA still shows a stable gain;
    its isolated 1.77% margin is small and its 132 KiB LDS footprint is a
    regression risk under concurrent workloads.

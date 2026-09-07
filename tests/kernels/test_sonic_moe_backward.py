@@ -338,21 +338,26 @@ def test_grouped_w1_compact_queue_policy(tokens, expected_compact):
         "hidden_size",
         "intermediate_size",
         "tokens",
+        "num_experts",
+        "topk",
         "flat_routes",
         "compact_w1",
         "expected",
     ),
     (
-        ("bf16", "swiglu", 3584, 512, 1, False, False, True),
-        ("bf16", "swiglu", 3584, 512, 7, False, False, False),
-        ("bf16", "swiglu", 3584, 512, 64, False, True, True),
-        ("bf16", "swiglu", 3584, 512, 128, True, True, True),
-        ("bf16", "swiglu", 3584, 512, 1, True, False, False),
-        ("bf16", "swiglu", 3584, 512, 4096, False, False, False),
-        ("fp16", "swiglu", 3584, 512, 64, False, True, False),
-        ("bf16", "geglu", 3584, 512, 64, False, True, False),
-        ("bf16", "swiglu", 3552, 512, 64, False, True, False),
-        ("bf16", "swiglu", 3584, 500, 64, False, True, False),
+        ("bf16", "swiglu", 3584, 512, 1, 64, 8, False, False, True),
+        ("bf16", "swiglu", 3584, 512, 7, 64, 8, False, False, False),
+        ("bf16", "swiglu", 3584, 512, 64, 64, 8, False, True, True),
+        ("bf16", "swiglu", 3584, 512, 128, 64, 8, True, True, True),
+        ("bf16", "swiglu", 3584, 512, 1, 64, 8, True, False, False),
+        ("bf16", "swiglu", 3584, 512, 4096, 64, 8, False, False, False),
+        ("bf16", "swiglu", 4096, 2048, 4096, 64, 8, False, False, True),
+        ("bf16", "swiglu", 4096, 2048, 4096, 65, 8, False, False, False),
+        ("bf16", "swiglu", 4096, 2048, 4096, 64, 8, True, False, False),
+        ("fp16", "swiglu", 3584, 512, 64, 64, 8, False, True, False),
+        ("bf16", "geglu", 3584, 512, 64, 64, 8, False, True, False),
+        ("bf16", "swiglu", 3552, 512, 64, 64, 8, False, True, False),
+        ("bf16", "swiglu", 3584, 500, 64, 64, 8, False, True, False),
     ),
 )
 def test_grouped_dx_policy(
@@ -361,6 +366,8 @@ def test_grouped_dx_policy(
     hidden_size,
     intermediate_size,
     tokens,
+    num_experts,
+    topk,
     flat_routes,
     compact_w1,
     expected,
@@ -372,6 +379,8 @@ def test_grouped_dx_policy(
             hidden_size=hidden_size,
             intermediate_size=intermediate_size,
             tokens=tokens,
+            num_experts=num_experts,
+            topk=topk,
             flat_routes=flat_routes,
             compact_w1=compact_w1,
         )
@@ -1169,6 +1178,89 @@ def test_sonic_moe_backward_grouped_dx_t1_handles_e896_metadata_grid():
     torch.testing.assert_close(actual[3], expected[3], rtol=5e-4, atol=5e-4)
     assert torch.count_nonzero(actual[1][1:-1]) == 0
     assert torch.count_nonzero(actual[2][1:-1]) == 0
+
+
+def test_sonic_moe_backward_large_grouped_dx_uses_independent_bm64_queue(
+    monkeypatch,
+):
+    """The long-token path builds BM64 dX work without a compact W1 queue."""
+
+    tokens, hidden_size, intermediate_size, num_experts, topk = 129, 256, 128, 4, 2
+    config = _config(
+        hidden_size,
+        intermediate_size,
+        num_experts,
+        topk,
+        compute_dtype="bf16",
+        down_tile_m=128,
+    )
+    args = list(
+        _make_case(
+            tokens,
+            hidden_size,
+            intermediate_size,
+            num_experts,
+            topk,
+            seed=439,
+            dtype=torch.bfloat16,
+        )
+    )
+    # Deterministically span three sorter blocks per live expert and leave a
+    # partial BM64 tail.  Fixed-K still requires unique experts per token.
+    args[3][:, 0] = 0
+    args[3][:, 1] = num_experts - 1
+    args = tuple(args)
+
+    monkeypatch.setattr(
+        sonic_backward_module,
+        "_use_large_grouped_dx_descriptor_queue",
+        lambda **_kwargs: True,
+    )
+    original_builder = sonic_backward_module.build_compact_m_tile_descriptors
+    original_compile = sonic_backward_module._compile_grouped_dx
+    builder_kwargs = []
+    compiled_block_m = []
+
+    def _tracked_builder(*builder_args, **kwargs):
+        builder_kwargs.append(kwargs)
+        return original_builder(*builder_args, **kwargs)
+
+    def _tracked_compile(*compile_args, **kwargs):
+        compiled_block_m.append(compile_args[3])
+        return original_compile(*compile_args, **kwargs)
+
+    monkeypatch.setattr(
+        sonic_backward_module,
+        "build_compact_m_tile_descriptors",
+        _tracked_builder,
+    )
+    monkeypatch.setattr(
+        sonic_backward_module,
+        "_compile_grouped_dx",
+        _tracked_compile,
+    )
+
+    torch.cuda.synchronize()
+    stream = torch.cuda.Stream(device=args[0].device)
+    with torch.cuda.stream(stream):
+        actual = sonic_moe_backward(*args, config)
+    stream.synchronize()
+    expected = _backward_reference(*args)
+    torch.cuda.synchronize()
+
+    assert len(builder_kwargs) == 1
+    assert builder_kwargs[0]["block_m"] == 64
+    assert builder_kwargs[0]["sorted_block_m"] == 64
+    assert builder_kwargs[0]["active_expert_storage"] is not None
+    assert compiled_block_m == [64]
+    for actual_gradient, expected_gradient in zip(actual[:3], expected[:3]):
+        torch.testing.assert_close(
+            actual_gradient.float(),
+            expected_gradient.float(),
+            rtol=3e-2,
+            atol=5e-2,
+        )
+    torch.testing.assert_close(actual[3], expected[3], rtol=5e-3, atol=5e-2)
 
 
 @pytest.mark.parametrize("tokens", (65, 129), ids=("oneshot", "multiphase"))

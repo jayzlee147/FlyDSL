@@ -196,17 +196,21 @@ def _grouped_da_tuning(max_expert_rows: int, hidden_size: int) -> tuple[int, int
 
 
 # dX has the row-major NN shape ``[M, 2I] @ [2I, H]``.  BM16 avoids doing the
-# sorter's full 64-row padding.  BN128/2 waves wins for decode and hot routing;
-# BN256/4 waves reduces weight traffic when hundreds of experts are active.
-# Legacy fallbacks reuse their frequency readback, while the short hostless
-# path selects between guarded variants from the device queue.  A persistent
-# four-workgroup-per-CU launch bound (1024 on MI350/MI355X) keeps large
-# descriptor grids resident without a long tail.
+# sorter's full 64-row padding for short experts.  The production T4096 shape
+# instead benefits from one BM64 tile per sorter block: it cuts repeated W1
+# slab loads while retaining enough M work per CTA.  That shape gets its own
+# descriptor queue so the latency-sensitive BM16 W1/short-dX queue remains
+# unchanged.  A persistent four-workgroup-per-CU launch bound (1024 on
+# MI350/MI355X) keeps large descriptor grids resident without a long tail.
 _GROUPED_DX_BM = 16
 _GROUPED_DX_BK = 64
 _GROUPED_DX_STAGES = 2
 _GROUPED_DX_GRID_CAP = 1024
 _GROUPED_DX_DENSE_EXPERTS = 256
+_LARGE_GROUPED_DX_BM = 64
+_LARGE_GROUPED_DX_BN = 256
+_LARGE_GROUPED_DX_N_WAVES = 4
+_LARGE_GROUPED_DX_SHAPE = (4096, 4096, 2048, 64, 8)
 
 # Weight gradients are output-stationary TN contractions.  BM/BN128 with BK32
 # is the measured throughput winner once an expert can own multiple rows;
@@ -273,6 +277,29 @@ def _grouped_dx_tuning(active_experts: int, hidden_size: int) -> tuple[int, int]
     if hidden_size % 128 == 0:
         return (128, 2)
     return (64, 2)
+
+
+def _use_large_grouped_dx_descriptor_queue(
+    *,
+    tokens: int,
+    hidden_size: int,
+    intermediate_size: int,
+    num_experts: int,
+    topk: int,
+    flat_routes: bool,
+) -> bool:
+    """Select the shape-static BM64 dX queue tuned on gfx950.
+
+    Keep this deliberately exact until other long-token shapes have end-to-end
+    measurements.  Every input is host-known, so enabling the queue never
+    introduces a routing-statistics readback.
+    """
+
+    return (
+        not flat_routes
+        and (tokens, hidden_size, intermediate_size, num_experts, topk)
+        == _LARGE_GROUPED_DX_SHAPE
+    )
 
 
 def _use_compact_w1_descriptor_queue(
@@ -355,14 +382,16 @@ def _use_grouped_dx(
     hidden_size: int,
     intermediate_size: int,
     tokens: int,
+    num_experts: int,
+    topk: int,
     flat_routes: bool,
     compact_w1: bool,
 ) -> bool:
     """Select the device-scheduled BF16 SwiGLU dX contraction.
 
-    Compact mode deliberately reuses the already-built W1 descriptor queue.
-    The only queue-free mode is fixed-K T1: every active expert then owns one
-    real row and the sorter metadata itself is an exact BM16 work schedule.
+    Short compact mode deliberately reuses the already-built W1 descriptor
+    queue.  Fixed-K T1 is queue-free because every active expert owns one real
+    row.  The tuned T4096 production shape uses an independent BM64 queue.
     """
 
     return (
@@ -370,7 +399,18 @@ def _use_grouped_dx(
         and activation == "swiglu"
         and (2 * intermediate_size) % _GROUPED_DX_BK == 0
         and hidden_size % 64 == 0
-        and (compact_w1 or (tokens == 1 and not flat_routes))
+        and (
+            compact_w1
+            or (tokens == 1 and not flat_routes)
+            or _use_large_grouped_dx_descriptor_queue(
+                tokens=tokens,
+                hidden_size=hidden_size,
+                intermediate_size=intermediate_size,
+                num_experts=num_experts,
+                topk=topk,
+                flat_routes=flat_routes,
+            )
+        )
     )
 
 
@@ -414,6 +454,7 @@ def _compile_grouped_dx(
     hidden_size: int,
     intermediate_size: int,
     num_experts: int,
+    block_m: int,
     block_n: int,
     n_waves: int,
     compact_grid: bool,
@@ -427,7 +468,7 @@ def _compile_grouped_dx(
         contraction_size=2 * intermediate_size,
         output_size=hidden_size,
         num_experts=num_experts,
-        block_m=_GROUPED_DX_BM,
+        block_m=block_m,
         block_n=block_n,
         block_k=_GROUPED_DX_BK,
         stages=_GROUPED_DX_STAGES,
@@ -2011,8 +2052,21 @@ def _sonic_moe_backward_impl(
         hidden_size=hidden_size,
         intermediate_size=intermediate_size,
         tokens=tokens,
+        num_experts=num_experts,
+        topk=topk,
         flat_routes=flat_routes,
         compact_w1=use_compact_w1,
+    )
+    use_large_grouped_dx = (
+        use_grouped_dx
+        and _use_large_grouped_dx_descriptor_queue(
+            tokens=tokens,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            num_experts=num_experts,
+            topk=topk,
+            flat_routes=flat_routes,
+        )
     )
     use_hostless_grouped = _use_hostless_grouped_backward(
         flat_routes=flat_routes,
@@ -2077,16 +2131,17 @@ def _sonic_moe_backward_impl(
     sorter_dummy = torch.empty(4, dtype=torch.int32, device=device)
     expert_frequency = torch.empty(num_experts, dtype=torch.int32, device=device)
     active_expert_capacity = active_expert_descriptor_capacity(routes, num_experts)
-    # The compact W1 builder can emit this queue in its existing two launches.
-    # Other routing regimes select metadata-direct or standalone construction
-    # after the already-required frequency readback below.
+    # A compact descriptor builder can emit this queue in its existing two
+    # launches.  Other routing regimes select metadata-direct or standalone
+    # construction after the already-required frequency readback below.
     active_expert_storage = (
         torch.empty(
             active_expert_queue_elements(routes, num_experts),
             dtype=torch.int32,
             device=device,
         )
-        if (use_grouped_dw1 or use_grouped_dw2) and use_compact_w1
+        if (use_grouped_dw1 or use_grouped_dw2)
+        and (use_compact_w1 or use_large_grouped_dx)
         else None
     )
     if use_compact_w1:
@@ -2114,6 +2169,21 @@ def _sonic_moe_backward_impl(
         compact_w1_storage = None
         compact_w1_descriptors = None
         compact_w1_total = None
+    if use_large_grouped_dx:
+        large_dx_bound = fixed_compact_m_tile_descriptor_upper_bound(
+            tokens,
+            num_experts,
+            topk,
+            _LARGE_GROUPED_DX_BM,
+        )
+        large_dx_storage = torch.empty(large_dx_bound + 1, dtype=torch.int32, device=device)
+        large_dx_total = large_dx_storage[:1]
+        large_dx_descriptors = large_dx_storage[1:]
+    else:
+        large_dx_bound = 0
+        large_dx_storage = None
+        large_dx_total = None
+        large_dx_descriptors = None
     x_sorted = torch.empty((max_padded, hidden_size), dtype=hidden_states.dtype, device=device)
     dout_sorted = torch.empty_like(x_sorted)
     dy = torch.empty_like(x_sorted)
@@ -2145,9 +2215,10 @@ def _sonic_moe_backward_impl(
         if use_hostless_grouped or not use_grouped_da
         else torch.zeros_like(activation)
     )
-    # Compact dX intentionally consumes complete BM16 tiles.  Zeroing dz once
-    # supplies the at-most-15 tail rows without forcing dense initialization of
-    # preactivation, dA, and the down projection as well.
+    # Hostless compact dX skips sentinel rows in the derivative kernel, so
+    # zeroing dZ supplies its at-most-15-row BM16 tails.  The legacy long-token
+    # path differentiates every sorter-padded row; its zero dA therefore
+    # materializes the complete zero BM64 tail needed by large grouped dX.
     dz = torch.zeros_like(preactivation) if use_hostless_grouped else torch.empty_like(preactivation)
     dx_sorted = torch.empty_like(x_sorted)
     dx_routes = (
@@ -2232,6 +2303,27 @@ def _sonic_moe_backward_impl(
                 num_experts,
                 unit_size=sort_unit,
                 workspace=sorting_workspace,
+            )
+
+        if use_large_grouped_dx:
+            assert large_dx_descriptors is not None
+            assert large_dx_total is not None
+            build_compact_m_tile_descriptors(
+                expert_frequency,
+                sorted_expert_ids,
+                num_valid_ids,
+                large_dx_descriptors,
+                large_dx_total,
+                block_m=_LARGE_GROUPED_DX_BM,
+                sorted_block_m=sort_unit,
+                descriptor_capacity=large_dx_bound,
+                active_expert_storage=active_expert_storage,
+                active_expert_capacity=(
+                    active_expert_capacity
+                    if active_expert_storage is not None
+                    else None
+                ),
+                stream=stream,
             )
 
         # The grouped W1 kernel derives its live CTA bound and expert mapping
@@ -2735,11 +2827,19 @@ def _sonic_moe_backward_impl(
                 )
 
         if use_grouped_dx:
-            # The compact queue rounds real expert rows to BM16.  Gather makes
-            # padded dOut zero, so activation backward materializes zero dZ in
-            # the final partial tile; writing all 16 rows is therefore safe.
-            # Unsort/scatter subsequently reads only non-sentinel route rows.
-            if use_hostless_grouped and active_expert_storage is not None:
+            # Compact queues round real expert rows to their selected BM.
+            # Every scheduled tail stays inside the sorter's 64-row padding,
+            # and unsort/scatter subsequently reads only non-sentinel routes.
+            if use_large_grouped_dx:
+                grouped_dx_bm = _LARGE_GROUPED_DX_BM
+                grouped_dx_profiles = (
+                    (_LARGE_GROUPED_DX_BN, _LARGE_GROUPED_DX_N_WAVES, 0, None),
+                )
+                grouped_dx_m_tiles = large_dx_bound
+                grouped_dx_compact = True
+                grouped_dx_schedule = large_dx_storage
+            elif use_hostless_grouped and active_expert_storage is not None:
+                grouped_dx_bm = _GROUPED_DX_BM
                 sparse_dx = _grouped_dx_tuning(0, hidden_size)
                 dense_dx = _grouped_dx_tuning(_GROUPED_DX_DENSE_EXPERTS, hidden_size)
                 if sparse_dx == dense_dx:
@@ -2750,7 +2850,10 @@ def _sonic_moe_backward_impl(
                         (*dense_dx, _GROUPED_DX_DENSE_EXPERTS, None),
                     )
                 grouped_dx_m_tiles = compact_w1_bound
+                grouped_dx_compact = use_compact_w1
+                grouped_dx_schedule = compact_w1_storage
             else:
+                grouped_dx_bm = _GROUPED_DX_BM
                 active_experts = (
                     min(routes, num_experts)
                     if use_hostless_grouped
@@ -2767,6 +2870,8 @@ def _sonic_moe_backward_impl(
                     if use_compact_w1
                     else active_experts
                 )
+                grouped_dx_compact = use_compact_w1
+                grouped_dx_schedule = compact_w1_storage
 
             for (
                 grouped_dx_bn,
@@ -2778,9 +2883,10 @@ def _sonic_moe_backward_impl(
                     hidden_size,
                     intermediate_size,
                     num_experts,
+                    grouped_dx_bm,
                     grouped_dx_bn,
                     grouped_dx_n_waves,
-                    use_compact_w1,
+                    grouped_dx_compact,
                     device_index,
                     min_active_experts,
                     max_active_experts,
@@ -2797,8 +2903,8 @@ def _sonic_moe_backward_impl(
                     dz.data_ptr(),
                     w1_arg.data_ptr(),
                     (
-                        compact_w1_storage.data_ptr()
-                        if compact_w1_storage is not None
+                        grouped_dx_schedule.data_ptr()
+                        if grouped_dx_schedule is not None
                         else expert_frequency.data_ptr()
                     ),
                     sorted_expert_ids.data_ptr(),

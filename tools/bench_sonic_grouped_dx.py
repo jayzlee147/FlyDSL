@@ -307,7 +307,6 @@ def _run_case(torch, compile_kernel, run_compiled, case, configs, grid_caps, arg
                         schedule_arg.data_ptr(),
                         expert_ids.data_ptr(),
                         num_valid.data_ptr(),
-                        frequency.data_ptr(),  # Unused by the unguarded sweep variants.
                         out.data_ptr(),
                         grid,
                         torch.cuda.current_stream(device),
