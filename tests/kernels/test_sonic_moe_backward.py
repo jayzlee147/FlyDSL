@@ -16,6 +16,7 @@ from kernels.moe.moe_sorting_kernel import _multiphase_cf_cache, _oneshot_cf_cac
 from kernels.moe.sonic import (
     SonicMoE,
     SonicMoEConfig,
+    SonicMoEForwardState,
     prepare_sonic_bf16_weights,
     sonic_moe_backward,
     sonic_moe_backward_routes,
@@ -1952,6 +1953,99 @@ def test_sonic_moe_backward_reuses_route_order_forward_preactivation(
     )
     torch.cuda.synchronize()
 
+    assert torch.equal(state.preactivation, state_snapshot)
+    for actual_gradient, expected_gradient in zip(actual, expected):
+        torch.testing.assert_close(
+            actual_gradient.float(),
+            expected_gradient.float(),
+            rtol=3e-2,
+            atol=5e-2,
+        )
+
+
+@pytest.mark.parametrize(
+    ("interleaved_w1", "has_bias"),
+    ((False, False), (True, True)),
+    ids=("separate-no-bias", "interleaved-bias"),
+)
+def test_sonic_moe_training_forward_state_drives_backward_reference(
+    interleaved_w1,
+    has_bias,
+):
+    """The official training-forward state is directly consumable by backward."""
+
+    tokens, hidden_size, intermediate_size, num_experts, topk = 7, 128, 64, 4, 2
+    config = _config(
+        hidden_size,
+        intermediate_size,
+        num_experts,
+        topk,
+        compute_dtype="bf16",
+    )
+    x, separate_w1, w2, topk_ids, topk_weights, grad_output = _make_case(
+        tokens,
+        hidden_size,
+        intermediate_size,
+        num_experts,
+        topk,
+        seed=673 + int(interleaved_w1),
+        dtype=torch.bfloat16,
+    )
+    if has_bias:
+        separate_b1, b2 = _make_biases(separate_w1, w2, seed=675)
+    else:
+        separate_b1 = b2 = None
+
+    op = SonicMoE(
+        config,
+        prepare_sonic_bf16_weights(
+            separate_w1,
+            w2,
+            config,
+            b1=separate_b1,
+            b2=b2,
+        ),
+    )
+    forward_output, state = op.forward_topk_training(
+        x,
+        topk_ids,
+        topk_weights,
+        interleaved_w1=interleaved_w1,
+    )
+    state_snapshot = state.preactivation.clone()
+
+    backward_w1 = _interleave_glu_rows(separate_w1) if interleaved_w1 else separate_w1
+    backward_b1 = _interleave_glu_rows(separate_b1) if interleaved_w1 and separate_b1 is not None else separate_b1
+    actual = sonic_moe_backward(
+        x,
+        backward_w1,
+        w2,
+        topk_ids,
+        topk_weights,
+        grad_output,
+        config,
+        b1=backward_b1,
+        b2=b2,
+        interleaved_w1=interleaved_w1,
+        forward_state=state,
+    )
+    expected = _backward_reference(
+        x,
+        backward_w1,
+        w2,
+        topk_ids,
+        topk_weights,
+        grad_output,
+        b1=backward_b1,
+        b2=b2,
+        interleaved_w1=interleaved_w1,
+    )
+    torch.cuda.synchronize()
+
+    assert forward_output.shape == x.shape
+    assert isinstance(state, SonicMoEForwardState)
+    assert state.interleaved_w1 is interleaved_w1
+    assert state.has_bias is has_bias
     assert torch.equal(state.preactivation, state_snapshot)
     for actual_gradient, expected_gradient in zip(actual, expected):
         torch.testing.assert_close(
