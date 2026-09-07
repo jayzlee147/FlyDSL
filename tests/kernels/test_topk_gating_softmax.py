@@ -270,6 +270,48 @@ def test_renormalized_topk_keeps_masked_negative_infinity_indices_valid():
     )
 
 
+@pytest.mark.parametrize("renormalize", (True, False), ids=("selected-softmax", "full-softmax"))
+@pytest.mark.parametrize("nonfinite", ("nan", "posinf", "all-neginf"))
+def test_nonfinite_logits_never_emit_out_of_range_indices(renormalize, nonfinite):
+    """Non-finite probabilities may be NaN, but expert IDs must stay safe."""
+
+    num_experts = 8
+    topk = 4
+    launch = build_topk_gating_softmax_module(
+        num_experts=num_experts,
+        topk=topk,
+        dtype_str="bf16",
+        renormalize=renormalize,
+    )
+    if nonfinite == "all-neginf":
+        logits = torch.full(
+            (1, num_experts),
+            float("-inf"),
+            device="cuda",
+            dtype=torch.bfloat16,
+        )
+    else:
+        logits = torch.arange(num_experts, device="cuda", dtype=torch.bfloat16).unsqueeze(0)
+        logits[0, 3] = float("nan") if nonfinite == "nan" else float("inf")
+
+    weights = torch.empty((1, topk), device="cuda", dtype=torch.float32)
+    indices = torch.empty((1, topk), device="cuda", dtype=torch.int32)
+    token_expert_indices = torch.empty_like(indices)
+    launch(
+        logits,
+        weights,
+        indices,
+        token_expert_indices,
+        1,
+        stream=torch.cuda.current_stream(),
+    )
+    torch.cuda.synchronize()
+
+    assert torch.all((indices >= 0) & (indices < num_experts))
+    assert torch.unique(indices).numel() == topk
+    assert torch.isnan(weights).all()
+
+
 def test_all():
     print("=" * 80)
     print("Running TopK Gating Softmax Tests")

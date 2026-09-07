@@ -878,6 +878,48 @@ def test_moe_softmax_sort_fallback(T, E, topk, dtype_str):
     )
 
 
+def test_direct_single_token_frequency_clear_is_ordered_across_waves():
+    """A selected count must not be overwritten by a lagging clear wave."""
+
+    E, topk, unit_size = 896, 16, 16
+    selected = torch.tensor(
+        [0, 1, 255, 256, 257, 511, 512, 513, 767, 768, 769, 880, 881, 882, 883, 895],
+        dtype=torch.int64,
+        device="cuda",
+    )
+    logits = torch.full((1, E), -100, dtype=torch.bfloat16, device="cuda")
+    logits[0, selected] = torch.arange(topk, 0, -1, dtype=torch.bfloat16, device="cuda")
+    sorted_ids = torch.empty(topk * unit_size, dtype=torch.int32, device="cuda")
+    sorted_weights = torch.empty(topk * unit_size, dtype=torch.float32, device="cuda")
+    sorted_experts = torch.empty(topk, dtype=torch.int32, device="cuda")
+    num_valid = torch.empty(2, dtype=torch.int32, device="cuda")
+    output = torch.empty((1, 256), dtype=torch.bfloat16, device="cuda")
+    expected = torch.zeros(E, dtype=torch.int32, device="cuda")
+    expected[selected] = 1
+    frequencies = [torch.full_like(expected, -1) for _ in range(128)]
+
+    for frequency in frequencies:
+        moe_softmax_sort_flydsl(
+            logits,
+            sorted_ids,
+            sorted_weights,
+            sorted_experts,
+            num_valid,
+            output,
+            E,
+            topk,
+            "bf16",
+            unit_size=unit_size,
+            renormalize=True,
+            direct_single_token=True,
+            expert_frequency_out=frequency,
+        )
+    torch.cuda.synchronize()
+
+    for frequency in frequencies:
+        assert torch.equal(frequency, expected)
+
+
 # ---------------------------------------------------------------------------
 # Benchmark utilities
 # ---------------------------------------------------------------------------

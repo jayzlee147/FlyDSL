@@ -37,6 +37,7 @@ from flydsl.expr.typing import Vector as Vec
 from flydsl.runtime.device import get_rocm_arch
 from kernels.common import buffer_ops
 from kernels.common.kernels_common import get_warp_size
+from kernels.common.mem_ops import atomic_add
 from kernels.moe.topk_gating_softmax_kernel import (
     _compute_topk_gating_layout,
     _emit_topk_gating_softmax_body,
@@ -186,6 +187,7 @@ _single_token_cf_cache = {}  # direct fixed-top-k T=1 sorting constexprs + devic
 _oneshot_fused_cf_cache = {}  # fused oneshot constexprs + device -> CompiledFunction
 _single_token_fused_cf_cache = {}  # direct T=1 router/sort constexprs + device -> CompiledFunction
 _multiphase_cf_cache = {}  # sorting constexprs + moe_buf rank + kernel name -> CompiledFunction
+_topk_frequency_cf_cache = {}  # expert count + device -> CompiledFunction
 _dummy_mask_cache = {}  # (device, stream) -> torch.Tensor(1, dtype=i32, value=1)
 
 # Caches for moe_softmax_sort_flydsl's unfused fallback path.
@@ -202,6 +204,98 @@ def _get_dummy_mask(device):
         mask_tensor = torch.ones(1, dtype=torch.int32, device=device)
         _dummy_mask_cache[key] = mask_tensor
     return mask_tensor
+
+
+@functools.lru_cache(maxsize=64)
+def compile_topk_frequency(*, num_experts: int):
+    """Compile an opt-in top-k histogram used by unfused logits routing.
+
+    The clear and histogram are separate launches so no cross-workgroup
+    ordering is required.  This path is only selected when a caller requests
+    ``expert_frequency_out`` and the direct T=1 router is unavailable; legacy
+    calls therefore pay no launch or dispatch overhead.
+    """
+
+    @flyc.kernel(known_block_size=[BLOCK_SIZE, 1, 1])
+    def clear_frequency_kernel(expert_frequency: fx.Tensor):
+        gid = gpu.block_idx.x * fx.Int32(BLOCK_SIZE) + gpu.thread_idx.x
+        if gid < fx.Int32(num_experts):
+            frequency_rsrc = buffer_ops.create_buffer_resource(expert_frequency, max_size=True)
+            buffer_ops.buffer_store(fx.Int32(0), frequency_rsrc, gid)
+
+    @flyc.kernel(known_block_size=[BLOCK_SIZE, 1, 1])
+    def histogram_frequency_kernel(
+        topk_ids: fx.Tensor,
+        expert_frequency: fx.Tensor,
+        i32_routes: fx.Int32,
+    ):
+        gid = gpu.block_idx.x * fx.Int32(BLOCK_SIZE) + gpu.thread_idx.x
+        if gid < i32_routes:
+            ids_rsrc = buffer_ops.create_buffer_resource(topk_ids, max_size=True)
+            expert = buffer_ops.buffer_load(ids_rsrc, gid, vec_width=1, dtype=T.i32)
+            # The FlyDSL/Torch routers produce in-range IDs.  Retain a guard so
+            # malformed internal inputs can never turn this optional output
+            # into an out-of-bounds atomic access.
+            if (expert >= fx.Int32(0)) & (expert < fx.Int32(num_experts)):
+                atomic_add(expert_frequency, expert, fx.Int32(1), dtype_bytes=4)
+
+    @flyc.jit
+    def launch_topk_frequency(
+        topk_ids: fx.Tensor,
+        expert_frequency: fx.Tensor,
+        i32_routes: fx.Int32,
+        clear_grid: fx.Constexpr[int],
+        route_grid: fx.Int32,
+        stream: fx.Stream = fx.Stream(None),
+    ):
+        clear = clear_frequency_kernel(expert_frequency)
+        clear.launch(
+            grid=(clear_grid, 1, 1),
+            block=(BLOCK_SIZE, 1, 1),
+            stream=stream,
+        )
+        histogram = histogram_frequency_kernel(topk_ids, expert_frequency, i32_routes)
+        histogram.launch(
+            grid=(route_grid, 1, 1),
+            block=(BLOCK_SIZE, 1, 1),
+            stream=stream,
+        )
+
+    return launch_topk_frequency
+
+
+def topk_frequency_flydsl(topk_ids, expert_frequency_out, num_experts):
+    """Write a dense int32 expert histogram for contiguous int32 top-k IDs."""
+
+    routes = int(topk_ids.numel())
+    device = topk_ids.device
+    clear_grid = max(1, (num_experts + BLOCK_SIZE - 1) // BLOCK_SIZE)
+    route_grid = max(1, (routes + BLOCK_SIZE - 1) // BLOCK_SIZE)
+    launch_fn = compile_topk_frequency(num_experts=num_experts)
+    stream = torch.cuda.current_stream(device)
+    args = (
+        topk_ids,
+        expert_frequency_out,
+        routes,
+        clear_grid,
+        route_grid,
+        fx.Stream(stream),
+    )
+    cache_key = (num_experts, device.index)
+    compiled = _topk_frequency_cf_cache.get(cache_key)
+    if compiled is not None:
+        compiled(*args)
+        return expert_frequency_out
+    launch_fn(
+        topk_ids,
+        expert_frequency_out,
+        routes,
+        clear_grid,
+        route_grid,
+        stream=stream,
+    )
+    _topk_frequency_cf_cache[cache_key] = flyc.compile(launch_fn, *args)
+    return expert_frequency_out
 
 
 # `_compute_topk_gating_layout` and `_emit_topk_gating_softmax_body` are
@@ -823,6 +917,7 @@ def compile_moe_sorting_single_token_fused(
     dtype_str: str = "bf16",
     renormalize: bool = True,
     unit_size: int = UNIT_SIZE,
+    emit_frequency: bool = False,
 ):
     """Compile the T=1 router that emits grouped-GEMM metadata directly.
 
@@ -845,6 +940,7 @@ def compile_moe_sorting_single_token_fused(
         sorted_weights_out: fx.Tensor,
         sorted_expert_ids: fx.Tensor,
         num_valid_ids: fx.Tensor,
+        expert_frequency_out: fx.Tensor,
         moe_buf: fx.Tensor,
         i32_moe_buf_elems: fx.Int32,
     ):
@@ -859,6 +955,13 @@ def compile_moe_sorting_single_token_fused(
         sorted_w_rsrc = buffer_ops.create_buffer_resource(sorted_weights_out, max_size=True)
         sorted_e_rsrc = buffer_ops.create_buffer_resource(sorted_expert_ids, max_size=True)
         nvalid_rsrc = buffer_ops.create_buffer_resource(num_valid_ids, max_size=True)
+        # Keep the resource binding outside the constexpr branch.  FlyDSL's
+        # AST rewriter lowers nested ``if`` bodies into helper functions, so a
+        # name first assigned inside a sibling branch is otherwise not visible
+        # while emitting those helpers.  The caller supplies a harmless dummy
+        # tensor when frequency output is disabled; all accesses remain gated
+        # by ``emit_frequency``.
+        frequency_rsrc = buffer_ops.create_buffer_resource(expert_frequency_out, max_size=True)
 
         # Extra blocks clear the final output concurrently with block 0's
         # routing work.  Sonic output rows are vector-aligned, matching the
@@ -880,6 +983,17 @@ def compile_moe_sorting_single_token_fused(
                 buffer_ops.buffer_store(c_zero_v4, moe_buf_rsrc, z_elem)
 
         if bid == c_zero:
+            if emit_frequency:
+                for expert_base in range_constexpr(0, E, BLOCK_SIZE):
+                    expert_idx = fx.Int32(expert_base) + tid
+                    expert_valid = expert_idx < fx.Int32(E)
+                    safe_expert = expert_valid.select(expert_idx, c_oob)
+                    buffer_ops.buffer_store(c_zero, frequency_rsrc, safe_expert)
+                # Winner stores are issued by the token-leader lane below.
+                # Make the clear globally complete across all waves first so a
+                # lagging wave cannot overwrite a selected expert's count.
+                gpu.barrier()
+
             # Initialize every route row to the conventional padding sentinel;
             # the router leader overwrites row zero of each selected block.
             for route_base in range_constexpr(0, padded_routes, BLOCK_SIZE):
@@ -899,6 +1013,8 @@ def compile_moe_sorting_single_token_fused(
                 packed_id = fx.Int32(k_int << 24)
                 buffer_ops.buffer_store(expert_idx, sorted_e_rsrc, fx.Int32(k_int))
                 buffer_ops.buffer_store(packed_id, sorted_ids_rsrc, route_base)
+                if emit_frequency:
+                    buffer_ops.buffer_store(c_one, frequency_rsrc, expert_idx)
 
             def on_winner_weight(_local_token, _global_token, k_int, weight):
                 route_base = fx.Int32(k_int * unit_size)
@@ -928,6 +1044,7 @@ def compile_moe_sorting_single_token_fused(
         sorted_weights_out: fx.Tensor,
         sorted_expert_ids: fx.Tensor,
         num_valid_ids_out: fx.Tensor,
+        expert_frequency_out: fx.Tensor,
         moe_buf: fx.Tensor,
         i32_moe_buf_elems: fx.Int32,
         n_grid_blocks: fx.Constexpr[int],
@@ -939,6 +1056,7 @@ def compile_moe_sorting_single_token_fused(
             sorted_weights_out,
             sorted_expert_ids,
             num_valid_ids_out,
+            expert_frequency_out,
             moe_buf,
             i32_moe_buf_elems,
         )
@@ -2567,6 +2685,7 @@ def moe_softmax_sort_flydsl(
     workspace=None,
     topk_scratch=None,
     direct_single_token=False,
+    expert_frequency_out=None,
 ):
     """Fused entry point: gating logits → softmax → top-K → sort.
 
@@ -2605,6 +2724,10 @@ def moe_softmax_sort_flydsl(
                          slot instead of the public sorter's ascending expert
                          order. Intended for inference consumers that use the
                          grouped metadata directly.
+    expert_frequency_out: optional contiguous int32 ``[num_experts]`` output.
+                         The direct T=1 path writes it in the fused kernel. All
+                         other paths preserve their legacy launch sequence when
+                         omitted and use an opt-in top-k histogram when present.
     """
     if num_local_tokens is not None:
         M = num_local_tokens.item() if isinstance(num_local_tokens, torch.Tensor) else int(num_local_tokens)
@@ -2636,6 +2759,7 @@ def moe_softmax_sort_flydsl(
         M <= min(sub_tokens, FUSED_ONESHOT_MAX_T)
         and topk <= num_experts
         and router_layout_ok
+        and expert_frequency_out is None
     )
 
     if single_token_ok:
@@ -2652,6 +2776,7 @@ def moe_softmax_sort_flydsl(
             sorted_weights,
             sorted_expert_ids,
             num_valid_ids,
+            expert_frequency_out if expert_frequency_out is not None else num_valid_ids,
             moe_buf_i32,
             moe_buf_elems,
             n_grid_blocks,
@@ -2660,6 +2785,7 @@ def moe_softmax_sort_flydsl(
             dtype_str=dtype_str,
             renormalize=renormalize,
             unit_size=unit_size,
+            emit_frequency=expert_frequency_out is not None,
         )
     elif fusion_ok:
         max_tokens = max(M, 8)
@@ -2739,6 +2865,8 @@ def moe_softmax_sort_flydsl(
             num_local_tokens=M,
             workspace=workspace,
         )
+        if expert_frequency_out is not None:
+            topk_frequency_flydsl(topk_ids, expert_frequency_out, num_experts)
 
     return sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, moe_buf
 
@@ -2749,6 +2877,7 @@ def launch_moe_sorting_single_token_fused_path(
     sorted_weights,
     sorted_expert_ids,
     num_valid_ids,
+    expert_frequency_out,
     moe_buf_i32,
     i32_moe_buf_elems,
     n_grid_blocks,
@@ -2758,6 +2887,7 @@ def launch_moe_sorting_single_token_fused_path(
     dtype_str,
     renormalize=True,
     unit_size=UNIT_SIZE,
+    emit_frequency=False,
 ):
     """Launch the direct T=1 router-to-grouped-metadata kernel."""
 
@@ -2768,6 +2898,7 @@ def launch_moe_sorting_single_token_fused_path(
         n_grid_blocks,
         dtype_str,
         renormalize,
+        emit_frequency,
         moe_buf_i32.ndim,
         gating_logits.device.index,
     )
@@ -2779,6 +2910,7 @@ def launch_moe_sorting_single_token_fused_path(
         sorted_weights,
         sorted_expert_ids,
         num_valid_ids,
+        expert_frequency_out,
         moe_buf_i32,
         i32_moe_buf_elems,
         n_grid_blocks,
@@ -2794,6 +2926,7 @@ def launch_moe_sorting_single_token_fused_path(
         dtype_str=dtype_str,
         renormalize=renormalize,
         unit_size=unit_size,
+        emit_frequency=emit_frequency,
     )
     launch_fn(
         gating_logits,
@@ -2801,6 +2934,7 @@ def launch_moe_sorting_single_token_fused_path(
         sorted_weights,
         sorted_expert_ids,
         num_valid_ids,
+        expert_frequency_out,
         moe_buf_i32,
         i32_moe_buf_elems,
         n_grid_blocks,

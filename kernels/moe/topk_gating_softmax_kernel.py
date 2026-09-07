@@ -228,7 +228,9 @@ def _emit_topk_gating_softmax_body(
         """Butterfly argmax within a THREADS_PER_TOKEN sub-warp group.
 
         All lanes in the group end with the same (max_val, max_idx).
-        Ties are broken by the lower expert index.
+        Ties are broken by the lower expert index.  Treat NaN as larger than
+        an ordered value, matching torch.topk's useful safety property that
+        a non-finite row still produces in-range expert indices.
         """
         width_i32 = c_tpt
         wv, wi = val, idx
@@ -236,10 +238,16 @@ def _emit_topk_gating_softmax_body(
             off = fx.Int32(THREADS_PER_TOKEN // (2 << _sh))
             peer_v = wv.shuffle_xor(off, width_i32)
             peer_i = wi.shuffle_xor(off, width_i32)
+            self_nan = fx.isnan(wv)
+            peer_nan = fx.isnan(peer_v)
+            both_nan = self_nan & peer_nan
+            both_ordered = ~(self_nan | peer_nan)
             is_greater = peer_v > wv
             is_equal = ArithValue(peer_v) == ArithValue(wv)
             peer_lower_idx = peer_i < wi
-            take_peer = is_greater | (is_equal & peer_lower_idx)
+            take_peer = (peer_nan & ~self_nan) | (
+                both_ordered & is_greater
+            ) | ((both_nan | (both_ordered & is_equal)) & peer_lower_idx)
             wv = take_peer.select(peer_v, wv)
             wi = take_peer.select(peer_i, wi)
         return wv, wi
@@ -377,9 +385,19 @@ def _emit_topk_gating_softmax_body(
             pv = ranking_values[v]
             ci = col_idx_list[v]
             is_available = (selected_mask & fx.Int32(1 << v)) == fx.Int32(0)
+            best_unset = thread_best_idx == c_expert_count
+            pv_nan = fx.isnan(pv)
+            best_nan = fx.isnan(thread_best_val)
+            both_nan = pv_nan & best_nan
+            both_ordered = ~(pv_nan | best_nan)
             is_better = pv > thread_best_val
             is_equal = ArithValue(pv) == ArithValue(thread_best_val)
-            take_value = is_available & (is_better | (is_equal & (ci < thread_best_idx)))
+            take_value = is_available & (
+                best_unset
+                | (pv_nan & ~best_nan)
+                | (both_ordered & is_better)
+                | ((both_nan | (both_ordered & is_equal)) & (ci < thread_best_idx))
+            )
             thread_best_val = take_value.select(pv, thread_best_val)
             thread_best_idx = take_value.select(ci, thread_best_idx)
 
@@ -523,7 +541,8 @@ def build_topk_gating_softmax_module(
             """Butterfly argmax within a THREADS_PER_TOKEN sub-warp group.
 
             All lanes in the group end with the same (max_val, max_idx).
-            Ties are broken by the lower expert index.
+            Ties are broken by the lower expert index.  NaNs rank above
+            ordered values so every non-finite row still produces valid IDs.
             """
             width_i32 = c_tpt
             wv, wi = val, idx
@@ -531,10 +550,16 @@ def build_topk_gating_softmax_module(
                 off = fx.Int32(THREADS_PER_TOKEN // (2 << _sh))
                 peer_v = wv.shuffle_xor(off, width_i32)
                 peer_i = wi.shuffle_xor(off, width_i32)
+                self_nan = fx.isnan(wv)
+                peer_nan = fx.isnan(peer_v)
+                both_nan = self_nan & peer_nan
+                both_ordered = ~(self_nan | peer_nan)
                 is_greater = peer_v > wv
                 is_equal = ArithValue(peer_v) == ArithValue(wv)
                 peer_lower_idx = peer_i < wi
-                take_peer = is_greater | (is_equal & peer_lower_idx)
+                take_peer = (peer_nan & ~self_nan) | (
+                    both_ordered & is_greater
+                ) | ((both_nan | (both_ordered & is_equal)) & peer_lower_idx)
                 wv = take_peer.select(peer_v, wv)
                 wi = take_peer.select(peer_i, wi)
             return wv, wi
@@ -661,9 +686,19 @@ def build_topk_gating_softmax_module(
                 pv = ranking_values[v]
                 ci = col_idx_list[v]
                 is_available = (selected_mask & fx.Int32(1 << v)) == fx.Int32(0)
+                best_unset = thread_best_idx == c_expert_count
+                pv_nan = fx.isnan(pv)
+                best_nan = fx.isnan(thread_best_val)
+                both_nan = pv_nan & best_nan
+                both_ordered = ~(pv_nan | best_nan)
                 is_better = pv > thread_best_val
                 is_equal = ArithValue(pv) == ArithValue(thread_best_val)
-                take_value = is_available & (is_better | (is_equal & (ci < thread_best_idx)))
+                take_value = is_available & (
+                    best_unset
+                    | (pv_nan & ~best_nan)
+                    | (both_ordered & is_better)
+                    | ((both_nan | (both_ordered & is_equal)) & (ci < thread_best_idx))
+                )
                 thread_best_val = take_value.select(pv, thread_best_val)
                 thread_best_idx = take_value.select(ci, thread_best_idx)
 

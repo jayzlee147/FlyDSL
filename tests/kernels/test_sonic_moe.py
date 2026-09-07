@@ -1446,6 +1446,171 @@ def test_sonic_moe_single_token_direct_router_preserves_route_slots(
     _assert_close(topk_out, expected)
 
 
+@pytest.mark.parametrize("tokens", (1, 7, 129), ids=("direct-t1", "oneshot-sort", "multiphase-sort"))
+@pytest.mark.parametrize("renormalize", (True, False), ids=("renorm", "full-softmax"))
+def test_sonic_moe_logits_frequency_matches_selected_routes(tokens, renormalize):
+    """The opt-in logits API reports exact frequencies on every sort path."""
+
+    config = _config(renormalize=renormalize)
+    x, w1, w2, router_logits = _make_case(tokens=tokens, seed=211 + tokens)
+    op = SonicMoE(config, prepare_sonic_bf16_weights(w1, w2, config))
+    expected = sonic_moe_reference(x, w1, w2, router_logits, config)
+    topk_ids, _ = _topk_from_logits(router_logits, config)
+    expected_frequency = torch.bincount(
+        topk_ids.reshape(-1).to(torch.int64),
+        minlength=config.num_experts,
+    ).to(torch.int32)
+    frequency = torch.full(
+        (config.num_experts,),
+        -17,
+        dtype=torch.int32,
+        device=x.device,
+    )
+    out = torch.empty_like(x)
+    x_before = x.clone()
+    logits_before = router_logits.clone()
+
+    returned = op(
+        x,
+        router_logits,
+        out=out,
+        expert_frequency_out=frequency,
+    )
+    torch.cuda.synchronize()
+
+    assert returned is out
+    assert torch.equal(frequency, expected_frequency)
+    assert int(frequency.sum()) == tokens * config.top_k
+    assert torch.equal(x, x_before)
+    assert torch.equal(router_logits, logits_before)
+    _assert_close(out, expected)
+
+
+def test_sonic_moe_logits_frequency_is_fully_overwritten_between_calls():
+    config = _config()
+    x, w1, w2, router_logits = _make_case(tokens=1, seed=229)
+    op = SonicMoE(config, prepare_sonic_bf16_weights(w1, w2, config))
+    frequency = torch.full(
+        (config.num_experts,),
+        12345,
+        dtype=torch.int32,
+        device=x.device,
+    )
+
+    op(x, router_logits, expert_frequency_out=frequency)
+    torch.cuda.synchronize()
+    first = frequency.clone()
+    first_ids, _ = _topk_from_logits(router_logits, config)
+    first_expected = torch.bincount(first_ids.flatten().long(), minlength=config.num_experts).to(torch.int32)
+    assert torch.equal(first, first_expected)
+
+    second_logits = torch.full_like(router_logits, -10)
+    second_logits[0, 1] = 4
+    second_logits[0, 3] = 3
+    frequency.fill_(6789)
+    op(x, second_logits, expert_frequency_out=frequency)
+    torch.cuda.synchronize()
+    assert torch.equal(
+        frequency,
+        torch.tensor([0, 1, 0, 1], dtype=torch.int32, device=x.device),
+    )
+
+
+def test_sonic_moe_logits_frequency_matches_torch_router_fallback():
+    """Expert counts also work when E has no exact FlyDSL router layout."""
+
+    device = _gfx950_device()
+    experts = 17
+    config = _config(num_experts=experts)
+    assert not config.supports_flydsl_router
+    generator = torch.Generator(device=device).manual_seed(231)
+    x = torch.randn((3, HIDDEN_SIZE), dtype=torch.bfloat16, device=device, generator=generator)
+    w1 = torch.randn(
+        (experts, 2 * INTERMEDIATE_SIZE, HIDDEN_SIZE),
+        dtype=torch.bfloat16,
+        device=device,
+        generator=generator,
+    )
+    w2 = torch.randn(
+        (experts, HIDDEN_SIZE, INTERMEDIATE_SIZE),
+        dtype=torch.bfloat16,
+        device=device,
+        generator=generator,
+    )
+    logits = torch.randn((3, experts), dtype=torch.bfloat16, device=device, generator=generator)
+    op = SonicMoE(config, prepare_sonic_bf16_weights(w1, w2, config))
+    frequency = torch.empty(experts, dtype=torch.int32, device=device)
+
+    op(x, logits, expert_frequency_out=frequency)
+    torch.cuda.synchronize()
+
+    expected_ids, _ = _topk_from_logits(logits, config)
+    expected = torch.bincount(expected_ids.flatten().long(), minlength=experts).to(torch.int32)
+    assert torch.equal(frequency, expected)
+
+
+@pytest.mark.parametrize("renormalize", (True, False), ids=("renorm", "full-softmax"))
+def test_sonic_moe_nonfinite_logits_keep_frequency_ids_in_range(renormalize):
+    config = _config(renormalize=renormalize)
+    x, w1, w2, router_logits = _make_case(tokens=1, seed=233)
+    router_logits[0, 1] = float("nan")
+    op = SonicMoE(config, prepare_sonic_bf16_weights(w1, w2, config))
+    frequency = torch.empty(config.num_experts, dtype=torch.int32, device=x.device)
+
+    op(x, router_logits, expert_frequency_out=frequency)
+    torch.cuda.synchronize()
+
+    assert torch.all(frequency >= 0)
+    assert torch.all(frequency <= 1)
+    assert int(frequency.sum()) == config.top_k
+
+
+def test_sonic_moe_logits_frequency_validation_and_aliasing():
+    config = _config()
+    x, w1, w2, router_logits = _make_case(tokens=7, seed=239)
+    prepared = prepare_sonic_bf16_weights(w1, w2, config)
+    op = SonicMoE(config, prepared)
+
+    with pytest.raises(TypeError, match="torch.Tensor"):
+        op(x, router_logits, expert_frequency_out=[0] * config.num_experts)
+    with pytest.raises(ValueError, match="shape"):
+        op(
+            x,
+            router_logits,
+            expert_frequency_out=torch.empty(config.num_experts - 1, dtype=torch.int32, device=x.device),
+        )
+    with pytest.raises(ValueError, match="contiguous int32"):
+        op(
+            x,
+            router_logits,
+            expert_frequency_out=torch.empty(config.num_experts, dtype=torch.int64, device=x.device),
+        )
+    with pytest.raises(ValueError, match="same ROCm device"):
+        op(
+            x,
+            router_logits,
+            expert_frequency_out=torch.empty(config.num_experts, dtype=torch.int32),
+        )
+    noncontiguous = torch.empty(config.num_experts * 2, dtype=torch.int32, device=x.device)[::2]
+    assert not noncontiguous.is_contiguous()
+    with pytest.raises(ValueError, match="contiguous int32"):
+        op(x, router_logits, expert_frequency_out=noncontiguous)
+
+    input_alias = router_logits.view(torch.int32).flatten()[: config.num_experts]
+    assert tuple(input_alias.shape) == (config.num_experts,)
+    with pytest.raises(ValueError, match="must not alias an input or output"):
+        op(x, router_logits, expert_frequency_out=input_alias)
+
+    out = torch.empty_like(x)
+    output_alias = out.view(torch.int32).flatten()[: config.num_experts]
+    with pytest.raises(ValueError, match="must not alias an input or output"):
+        op(x, router_logits, out=out, expert_frequency_out=output_alias)
+
+    workspace = op.reserve(x.shape[0])
+    with pytest.raises(ValueError, match="must not alias internal workspace storage"):
+        op(x, router_logits, expert_frequency_out=workspace.expert_frequency)
+
+
 def test_sonic_moe_uses_independent_workspaces_across_streams():
     config = _config()
     x_a, w1, w2, logits_a = _make_case(seed=37)

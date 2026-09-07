@@ -54,6 +54,7 @@ from kernels.moe.moe_sorting_kernel import (
     moe_softmax_sort_flydsl,
     moe_sorting_flydsl,
     moe_sorting_get_workspace_size,
+    topk_frequency_flydsl,
 )
 from kernels.moe.topk_gating_softmax_kernel import supports_topk_gating_layout
 from kernels.moe.sonic_backward import (
@@ -1231,6 +1232,40 @@ class SonicMoE:
             raise ValueError("out must start at the internal workspace output base address")
         return out
 
+    def _validate_expert_frequency_out(
+        self,
+        expert_frequency_out: torch.Tensor,
+        workspace: SonicMoEWorkspace,
+        output: torch.Tensor,
+        *read_tensors: torch.Tensor,
+    ) -> torch.Tensor:
+        """Validate a caller-owned dense expert-frequency output buffer."""
+
+        if not isinstance(expert_frequency_out, torch.Tensor):
+            raise TypeError("expert_frequency_out must be a torch.Tensor")
+        expected = (self.config.num_experts,)
+        if tuple(expert_frequency_out.shape) != expected:
+            raise ValueError(
+                f"expert_frequency_out must have shape {expected}, "
+                f"got {tuple(expert_frequency_out.shape)}"
+            )
+        if (
+            not expert_frequency_out.is_cuda
+            or expert_frequency_out.device != self.weights.device
+            or expert_frequency_out.dtype != torch.int32
+            or not expert_frequency_out.is_contiguous()
+        ):
+            raise ValueError("expert_frequency_out must be contiguous int32 on the same ROCm device")
+
+        frequency_storage = expert_frequency_out.untyped_storage().data_ptr()
+        if frequency_storage == output.untyped_storage().data_ptr() or any(
+            frequency_storage == tensor.untyped_storage().data_ptr() for tensor in read_tensors
+        ):
+            raise ValueError("expert_frequency_out must not alias an input or output")
+        if frequency_storage in workspace.storage_ptrs:
+            raise ValueError("expert_frequency_out must not alias internal workspace storage")
+        return expert_frequency_out
+
     def _run_grouped_gemms(
         self,
         hidden_states: torch.Tensor,
@@ -1337,22 +1372,33 @@ class SonicMoE:
         hidden_states: torch.Tensor,
         router_logits: torch.Tensor,
         out: torch.Tensor | None = None,
+        *,
+        expert_frequency_out: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Run router + grouped expert MLP from router logits.
 
         ``router_logits`` is ``[tokens, num_experts]`` in FP32/FP16/BF16.
+        When supplied, ``expert_frequency_out`` must be caller-owned contiguous
+        int32 storage with shape ``[num_experts]``.  It receives the exact
+        selected-route count without changing the returned output object.
         """
 
         if not hidden_states.is_cuda:
             raise ValueError("hidden_states must be on a ROCm device")
         with torch.cuda.device(hidden_states.device):
-            return self._forward_from_logits(hidden_states, router_logits, out)
+            return self._forward_from_logits(
+                hidden_states,
+                router_logits,
+                out,
+                expert_frequency_out,
+            )
 
     def _forward_from_logits(
         self,
         hidden_states: torch.Tensor,
         router_logits: torch.Tensor,
         out: torch.Tensor | None,
+        expert_frequency_out: torch.Tensor | None,
     ) -> torch.Tensor:
         tokens = self._validate_hidden(hidden_states)
         if not router_logits.is_cuda or router_logits.device != hidden_states.device:
@@ -1380,16 +1426,47 @@ class SonicMoE:
         # the PyTorch router only for counts without such a layout; expert sort
         # and both grouped GEMMs remain FlyDSL in that fallback.
         if not self.config.supports_flydsl_router:
+            output = out
+            frequency = None
+            if expert_frequency_out is not None:
+                workspace = self.reserve(tokens)
+                output = self._validate_out(
+                    out,
+                    workspace,
+                    hidden_states,
+                    router_logits,
+                    *self.weights.tensors,
+                )
+                frequency = self._validate_expert_frequency_out(
+                    expert_frequency_out,
+                    workspace,
+                    output,
+                    hidden_states,
+                    router_logits,
+                    *self.weights.tensors,
+                )
             probs = torch.softmax(router_logits.float(), dim=-1)
             topk_weights, topk_ids = torch.topk(probs, self.config.top_k, dim=-1)
             if self.config.renormalize:
                 topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
-            return self.forward_topk(
+            topk_ids = topk_ids.to(torch.int32)
+            if frequency is None:
+                return self.forward_topk(
+                    hidden_states,
+                    topk_ids,
+                    topk_weights.contiguous(),
+                    out=out,
+                )
+
+            result = self.forward_topk(
                 hidden_states,
-                topk_ids.to(torch.int32),
+                topk_ids,
                 topk_weights.contiguous(),
-                out=out,
+                out=output,
             )
+            topk_frequency_flydsl(topk_ids, frequency, self.config.num_experts)
+            frequency.record_stream(torch.cuda.current_stream(hidden_states.device))
+            return result
 
         workspace = self.reserve(tokens)
         output = self._validate_out(
@@ -1399,6 +1476,16 @@ class SonicMoE:
             router_logits,
             *self.weights.tensors,
         )
+        frequency = None
+        if expert_frequency_out is not None:
+            frequency = self._validate_expert_frequency_out(
+                expert_frequency_out,
+                workspace,
+                output,
+                hidden_states,
+                router_logits,
+                *self.weights.tensors,
+            )
         with workspace._launch_lock:
             moe_softmax_sort_flydsl(
                 router_logits,
@@ -1419,8 +1506,12 @@ class SonicMoE:
                     workspace.router_topk_expert_indices,
                 ),
                 direct_single_token=True,
+                expert_frequency_out=frequency,
             )
-            return self._run_grouped_gemms(hidden_states, workspace, output)
+            result = self._run_grouped_gemms(hidden_states, workspace, output)
+        if frequency is not None:
+            frequency.record_stream(torch.cuda.current_stream(hidden_states.device))
+        return result
 
     def forward_routes(
         self,
@@ -1507,33 +1598,16 @@ class SonicMoE:
 
         frequency = workspace.expert_frequency
         if expert_frequency_out is not None:
-            frequency = expert_frequency_out
-            expected_frequency = (self.config.num_experts,)
-            if tuple(frequency.shape) != expected_frequency:
-                raise ValueError(
-                    f"expert_frequency_out must have shape {expected_frequency}, " f"got {tuple(frequency.shape)}"
-                )
-            if (
-                not frequency.is_cuda
-                or frequency.device != hidden_states.device
-                or frequency.dtype != torch.int32
-                or not frequency.is_contiguous()
-            ):
-                raise ValueError("expert_frequency_out must be contiguous int32 on the same ROCm device")
-            frequency_storage = frequency.untyped_storage().data_ptr()
-            read_tensors = (
+            frequency = self._validate_expert_frequency_out(
+                expert_frequency_out,
+                workspace,
+                output,
                 hidden_states,
                 token_indices,
                 expert_indices,
                 route_weights,
                 *self.weights.tensors,
             )
-            if frequency_storage == output.untyped_storage().data_ptr() or any(
-                frequency_storage == tensor.untyped_storage().data_ptr() for tensor in read_tensors
-            ):
-                raise ValueError("expert_frequency_out must not alias an input or output")
-            if frequency_storage in workspace.storage_ptrs:
-                raise ValueError("expert_frequency_out must not alias internal workspace storage")
 
         assert workspace.sorting_workspace is not None
         with workspace._launch_lock:
