@@ -1135,10 +1135,18 @@ def _get_stage1_training_launcher(
     has_bias: bool,
     interleaved_w1: bool,
     device_index: int,
+    tile_n_override: int | None = None,
+    waves_per_eu_override: int | None = None,
 ):
     """Compile the BF16 fixed-K dual-output Stage-1 specialization."""
 
     del device_index
+    tile_n = config.tile_n if tile_n_override is None else tile_n_override
+    waves_per_eu = (
+        config.waves_per_eu
+        if waves_per_eu_override is None
+        else waves_per_eu_override
+    )
     return compile_gemm1_a16w4_port(
         BM=config.tile_m,
         SORTED_BM=config.route_tile_m,
@@ -1146,12 +1154,12 @@ def _get_stage1_training_launcher(
         D_INTER=config.intermediate_size,
         NE=config.num_experts,
         TOPK=config.top_k,
-        TILE_N=config.tile_n,
+        TILE_N=tile_n,
         TILE_K=config.tile_k,
         act=_GEMM1_ACTIVATIONS[config.activation],
         b_cache_mod=b_cache_mod,
         xcd_swizzle=config.stage1_xcd_swizzle,
-        waves_per_eu=config.waves_per_eu,
+        waves_per_eu=waves_per_eu,
         w_dtype="bf16",
         a_dtype="bf16",
         w_layout="standard",
@@ -1161,6 +1169,42 @@ def _get_stage1_training_launcher(
         store_route_preactivation=True,
         route_preactivation_interleaved=interleaved_w1,
     )
+
+
+def _training_stage1_tuning(
+    config: SonicMoEConfig,
+    tokens: int,
+    has_bias: bool,
+) -> tuple[int, int | None]:
+    """Select the measured gfx950 training-state Stage-1 specialization.
+
+    The ordinary throughput profile uses BN256.  Its extra route-state scatter
+    pushes this dual-output kernel to 512 total VGPRs and spills loop-carried
+    values to scratch.  BN128 with a two-wave occupancy target keeps the same
+    reduction order and route padding while cutting the dynamic scratch traffic
+    and improving the complete forward/backward step for this production
+    bucket.  Bias and user-retuned configurations retain their requested tiles.
+    """
+
+    if (
+        tokens == 4096
+        and config.hidden_size == 4096
+        and config.intermediate_size == 2048
+        and config.num_experts == 64
+        and config.top_k == 8
+        and config.tile_m == 128
+        and config.tile_n == 256
+        and config.tile_k == 64
+        and config.stage1_k_wave == 1
+        and config.stage1_b_cache_mod in (None, 0)
+        and config.stage1_xcd_swizzle == 0
+        and config.waves_per_eu is None
+        and config.activation == "swiglu"
+        and config.compute_dtype == "bf16"
+        and not has_bias
+    ):
+        return 128, 2
+    return config.tile_n, config.waves_per_eu
 
 
 @functools.lru_cache(maxsize=256)
@@ -1521,17 +1565,24 @@ class SonicMoE:
         if output_mode == "reduce" and workspace.route_output is None:
             raise RuntimeError("reduce stage2 output requires a fixed-top-k route workspace")
 
+        training_tile_n, training_waves_per_eu = _training_stage1_tuning(
+            cfg,
+            tokens,
+            self.weights.has_bias,
+        )
         stage1 = _get_stage1_training_launcher(
             cfg,
             _stage1_cache_mod(cfg, tokens),
             self.weights.has_bias,
             interleaved_w1,
             hidden_states.device.index or 0,
+            training_tile_n,
+            training_waves_per_eu,
         )
         grid1 = gemm1_a16w4_grid(
             cfg.tile_m,
             INTER=cfg.intermediate_size,
-            TILE_N=cfg.tile_n,
+            TILE_N=training_tile_n,
             max_m_blocks=workspace.stage1_max_m_blocks,
         )
         _run_compiled(

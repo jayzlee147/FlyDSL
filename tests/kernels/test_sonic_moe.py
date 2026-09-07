@@ -25,6 +25,7 @@ from kernels.moe.sonic import (
     _get_stage2_launcher,
     _quantize_mxfp4_weight,
     _stage2_stages,
+    _training_stage1_tuning,
     _validate_training_preactivation_extent,
     prepare_sonic_bf16_weights,
     prepare_sonic_fp16_weights,
@@ -352,6 +353,108 @@ def test_sonic_moe_inference_stage1_launcher_does_not_enable_dual_store(monkeypa
     finally:
         _get_stage1_launcher.cache_clear()
         _get_stage1_training_launcher.cache_clear()
+
+
+def test_sonic_moe_training_stage1_t4096_policy_is_targeted():
+    throughput = SonicMoEConfig(
+        hidden_size=4096,
+        intermediate_size=2048,
+        num_experts=64,
+        top_k=8,
+        tile_m=128,
+        tile_n=256,
+        tile_k=64,
+        down_tile_m=128,
+        down_tile_n=128,
+        down_tile_k=64,
+        stage1_k_wave=1,
+        stage2_xcd_swizzle=8,
+        renormalize=False,
+    )
+
+    assert _training_stage1_tuning(throughput, 4096, False) == (128, 2)
+    assert _training_stage1_tuning(throughput, 2048, False) == (256, None)
+    assert _training_stage1_tuning(throughput, 4096, True) == (256, None)
+    assert _training_stage1_tuning(replace(throughput, tile_n=128), 4096, False) == (
+        128,
+        None,
+    )
+    assert _training_stage1_tuning(replace(throughput, waves_per_eu=1), 4096, False) == (
+        256,
+        1,
+    )
+    assert _training_stage1_tuning(replace(throughput, stage1_b_cache_mod=2), 4096, False) == (
+        256,
+        None,
+    )
+    assert _training_stage1_tuning(replace(throughput, stage1_xcd_swizzle=1), 4096, False) == (
+        256,
+        None,
+    )
+
+
+def test_sonic_moe_training_stage1_launcher_accepts_private_overrides(monkeypatch):
+    import kernels.moe.sonic as sonic_module
+
+    config = _config()
+    compile_calls = []
+
+    def fake_compile(**kwargs):
+        compile_calls.append(kwargs)
+        return object()
+
+    monkeypatch.setattr(sonic_module, "compile_gemm1_a16w4_port", fake_compile)
+    _get_stage1_training_launcher.cache_clear()
+    try:
+        launcher = _get_stage1_training_launcher(
+            config,
+            2,
+            False,
+            False,
+            0,
+            64,
+            2,
+        )
+        assert launcher is _get_stage1_training_launcher(
+            config,
+            2,
+            False,
+            False,
+            0,
+            64,
+            2,
+        )
+        assert compile_calls[-1]["TILE_N"] == 64
+        assert compile_calls[-1]["waves_per_eu"] == 2
+    finally:
+        _get_stage1_training_launcher.cache_clear()
+
+
+def test_sonic_moe_training_stage1_private_override_is_numerically_exact(monkeypatch):
+    import kernels.moe.sonic as sonic_module
+
+    config = _config()
+    x, w1, w2, router_logits = _make_case(seed=313)
+    ids, weights = _topk_from_logits(router_logits, config)
+    prepared = prepare_sonic_bf16_weights(w1, w2, config)
+    op = SonicMoE(config, prepared)
+    expected_out = sonic_moe_reference(x, w1, w2, router_logits, config)
+    expected_state = _fixed_topk_preactivation_oracle(x, w1, ids)
+
+    monkeypatch.setattr(
+        sonic_module,
+        "_training_stage1_tuning",
+        lambda _config, _tokens, _has_bias: (64, 2),
+    )
+    output, state = op.forward_topk_training(x, ids, weights)
+
+    _assert_close(output, expected_out)
+    torch.testing.assert_close(
+        state.preactivation.float(),
+        expected_state.float(),
+        rtol=3e-2,
+        atol=5e-2,
+    )
 
 
 def test_sonic_moe_training_forward_rejects_unsupported_contracts():
