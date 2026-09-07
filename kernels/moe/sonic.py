@@ -56,11 +56,13 @@ from kernels.moe.moe_sorting_kernel import (
     moe_sorting_get_workspace_size,
     topk_frequency_flydsl,
 )
-from kernels.moe.topk_gating_softmax_kernel import supports_topk_gating_layout
 from kernels.moe.sonic_backward import (
     sonic_moe_backward as sonic_moe_backward,
+)
+from kernels.moe.sonic_backward import (
     sonic_moe_backward_routes as sonic_moe_backward_routes,
 )
+from kernels.moe.topk_gating_softmax_kernel import supports_topk_gating_layout
 
 _GFX950_LDS_BYTES = 160 * 1024
 _MAX_BUFFER_BYTE_OFFSET = 0xFFFFFFFF
@@ -1009,6 +1011,40 @@ def _stage2_cache_mod(config: SonicMoEConfig, tokens: int) -> int:
     return 0 if tokens <= 16 or tokens >= 2048 else 2
 
 
+def _stage2_stages(config: SonicMoEConfig, tokens: int) -> int:
+    """Select the measured gfx950 Stage-2 A-LDS pipeline depth.
+
+    The two-stage implementation is intentionally gated to the one production
+    bucket where paired AB/BA measurements showed a repeatable gain.  All other
+    shapes retain the established serial loop.  Route layout, weight-format,
+    bias, and actual output-mode checks live at the call site because they are
+    properties of the prepared invocation rather than
+    :class:`SonicMoEConfig` alone.
+    """
+
+    return (
+        2
+        if (
+            tokens == 4096
+            and config.hidden_size == 4096
+            and config.intermediate_size == 2048
+            and config.num_experts == 64
+            and config.top_k == 8
+            and config.stage2_tile_m == 128
+            and config.stage2_tile_n == 128
+            and config.stage2_tile_k == 64
+            and config.route_tile_m == 128
+            and config.stage2_xcd_swizzle == 8
+            and config.stage2_b_cache_mod in (None, 0)
+            and config.waves_per_eu is None
+            and not config.persistent_stage2
+            and config.stage2_output_mode == "atomic"
+            and config.compute_dtype == "bf16"
+        )
+        else 1
+    )
+
+
 @functools.lru_cache(maxsize=256)
 def _get_stage1_launcher(
     config: SonicMoEConfig,
@@ -1050,6 +1086,7 @@ def _get_stage2_launcher(
     weight_dtype: str,
     has_bias: bool,
     output_mode: str,
+    stages: int,
     device_index: int,
 ):
     # See _get_stage1_launcher: keep a distinct loaded function per device.
@@ -1072,6 +1109,7 @@ def _get_stage2_launcher(
         round_projection_bf16=True,
         output_mode=output_mode,
         TOPK=config.top_k,
+        stages=stages,
     )
 
 
@@ -1314,12 +1352,21 @@ class SonicMoE:
             stream,
         )
 
+        stage2_stages = _stage2_stages(cfg, tokens)
+        if (
+            workspace.routes is not None
+            or self.weights.weight_dtype != "bf16"
+            or self.weights.has_bias
+            or output_mode != "atomic"
+        ):
+            stage2_stages = 1
         stage2 = _get_stage2_launcher(
             cfg,
             _stage2_cache_mod(cfg, tokens),
             self.weights.weight_dtype,
             self.weights.has_bias,
             output_mode,
+            stage2_stages,
             hidden_states.device.index or 0,
         )
         grid2 = gemm2_a16w4_grid(

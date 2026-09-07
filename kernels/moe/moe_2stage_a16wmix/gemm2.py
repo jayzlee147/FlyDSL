@@ -34,6 +34,7 @@ from .utils import (
 # gfx950 CU count; caps the persistent gemm2 grid so high-expert launches (E896) do
 # not over-launch ~max_m_blocks empty CTAs.
 NUM_CU = 256
+_GFX950_LDS_BYTES = 160 * 1024
 
 
 # @flyc.jit is LOAD-BEARING: it AST-rewrites ``if token_id < i32_M`` into an scf.if.
@@ -230,6 +231,7 @@ def _gemm2_body_a16w4(
     TOPK=1,
     logical_dense_weight=False,
     store_sorted_projection=False,
+    stages=1,
 ):
     """A16W4/A16W16 stage2 body. K=inter_dim, N=model_dim.
 
@@ -252,6 +254,12 @@ def _gemm2_body_a16w4(
     K = INTER
     K_HALF = K // 2
     K_TILES_TOTAL = K // TILE_K
+    # The gfx950 path can overlap the next A direct-to-LDS copy and B register
+    # loads with the current tile's MFMA cluster.  Keep the historical serial
+    # loop for one-tile contractions and for gfx942's VGPR-staged A copy.
+    _PIPE = stages == 2 and K_TILES_TOTAL > 1 and not use_k16
+    A_LDS_STAGES = 2 if _PIPE else 1
+    A_SLOT_BYTES = BM * KH_TILE_BYTES
     m_repeat = BM // 16
     k_unroll = KH_TILE_BYTES // 64
     _k0_count = TILE_K // 128
@@ -359,13 +367,14 @@ def _gemm2_body_a16w4(
 
     s_x_i32_flat = fx.make_view(
         fx.recast_iter(fx.Int32, lds_raw_ptr),
-        fx.make_layout(BM * LDS_STRIDE // 2, 1),
+        fx.make_layout(A_LDS_STAGES * BM * LDS_STRIDE // 2, 1),
     )
     s_x_i32x4_tiles = fx.logical_divide(s_x_i32_flat, fx.make_layout(4, 1))
     a_copy_atom = fx.make_copy_atom(fx.UniversalCopy128b(), fx.Int32)
 
-    def dma_a_tile_to_lds(base_k):
+    def dma_a_tile_to_lds(base_k, slot=0):
         base_k_div4 = (base_k * fx.Int32(elem_bytes)) // fx.Int32(4)
+        slot_byte = fx.Int32(slot * A_SLOT_BYTES)
         for i in range_constexpr(num_x_loads):
             col_bytes = x_col_dw[i] * fx.Int32(4)
             # A-LDS bank-conflict XOR swizzle: LDS dest stays LINEAR (buffer_load_lds
@@ -374,7 +383,7 @@ def _gemm2_body_a16w4(
             col_sw = _a16w4_swizzle_xor16(x_row_local[i], col_bytes, fx.Int32(k_blocks16), enable=True)
             row_k_dw = x_row_base_div4[i] + base_k_div4
             global_byte = row_k_dw * fx.Int32(4) + col_sw
-            lds_byte = x_row_local[i] * fx.Int32(KH_TILE_BYTES) + col_bytes
+            lds_byte = slot_byte + x_row_local[i] * fx.Int32(KH_TILE_BYTES) + col_bytes
             if const_expr(use_k16):
                 # gfx942: buffer_load 16 B gmem->regs, then ds_write 16 B regs->LDS.
                 r = fx.make_rmem_tensor(fx.make_layout(4, 1), fx.Int32)
@@ -402,11 +411,11 @@ def _gemm2_body_a16w4(
         _ku_in = ku % 4
         return col_base_bytes_L + fx.Int32(_ku_in * 16 + _k0_blk * 256)
 
-    def lds_load_a(mi, ku):
+    def lds_load_a(mi, ku, slot=0):
         row = row_a_lds + fx.Int32(mi * 16)
         # Same XOR swizzle as the DMA write (16 B-multiple cols/mask keep alignment).
         col_swz_bytes = _a16w4_swizzle_xor16(row, _a_col_bytes_for_ku(ku), fx.Int32(k_blocks16), enable=True)
-        byte_off = row * fx.Int32(KH_TILE_BYTES) + col_swz_bytes
+        byte_off = fx.Int32(slot * A_SLOT_BYTES) + row * fx.Int32(KH_TILE_BYTES) + col_swz_bytes
         r = fx.make_rmem_tensor(fx.make_layout(4, 1), fx.Int32)
         fx.copy_atom_call(a_copy_atom, fx.slice(s_x_i32x4_tiles, (None, byte_off // fx.Int32(16))), r)
         return fx.Vector(fx.memref_load_vec(r)).bitcast(elem_dtype)
@@ -570,29 +579,100 @@ def _gemm2_body_a16w4(
         else:
             fx.gemm(mma_atom, acc, _a16_frag(a8), _a16_frag(b8), acc)
 
-    for kt in range_constexpr(K_TILES_TOTAL):
-        base_k = fx.Int32(kt * TILE_K)
-        dma_a_tile_to_lds(base_k)
+    def load_b_subtile(base_k, ni):
         if const_expr(_is_dense):
-            b_raw = [load_b_raw_bf16(base_k, n_blk_list[ni], n_intra_list[ni]) for ni in range_constexpr(num_acc_n)]
-            b_sc = None
+            return load_b_raw_bf16(base_k, n_blk_list[ni], n_intra_list[ni]), None
+        if const_expr(_is_int4):
+            b_sc = load_b_scale_int4(base_k, scale_n_list[ni])
         else:
-            b_raw = [load_b_raw(base_k, n_blk_list[ni], n_intra_list[ni]) for ni in range_constexpr(num_acc_n)]
-            if const_expr(_is_int4):
-                b_sc = [load_b_scale_int4(base_k, scale_n_list[ni]) for ni in range_constexpr(num_acc_n)]
-            else:
-                b_sc = [
-                    load_b_scale(base_k, scale_mni_list[ni], scale_np_list[ni]) for ni in range_constexpr(num_acc_n)
-                ]
-        gpu.barrier()
+            b_sc = load_b_scale(base_k, scale_mni_list[ni], scale_np_list[ni])
+        return load_b_raw(base_k, n_blk_list[ni], n_intra_list[ni]), b_sc
+
+    def load_b_tile(base_k):
+        return [load_b_subtile(base_k, ni) for ni in range_constexpr(num_acc_n)]
+
+    def preload_a(read_slot):
+        # Retire all current-slot LDS reads before issuing the next direct-to-LDS
+        # copy.  Besides making ping/pong reuse safe, each A fragment is then
+        # shared by every N subtile instead of being reloaded from LDS.
+        return [
+            [lds_load_a(mi, ku, slot=read_slot) for ku in range_constexpr(k_unroll)]
+            for mi in range_constexpr(m_repeat)
+        ]
+
+    def compute_b_subtile(b_subtile, a_frags, ni):
+        b_raw, b_sc = b_subtile
+        for ku in range_constexpr(k_unroll):
+            _bsc = None if const_expr(_is_dense) else b_sc[ku]
+            bb = upconvert_b(b_raw, ku, _bsc)
+            for mi in range_constexpr(m_repeat):
+                a8 = a_frags[mi][ku]
+                _mma(accm[mi][ni], a8, bb)
+
+    def compute_tile(b_tile, a_frags):
         for ni in range_constexpr(num_acc_n):
+            b_raw, b_sc = b_tile[ni]
             for ku in range_constexpr(k_unroll):
-                _bsc = None if const_expr(_is_dense) else b_sc[ni][ku]
-                bb = upconvert_b(b_raw[ni], ku, _bsc)
+                _bsc = None if const_expr(_is_dense) else b_sc[ku]
+                bb = upconvert_b(b_raw, ku, _bsc)
                 for mi in range_constexpr(m_repeat):
-                    a8 = lds_load_a(mi, ku)
-                    _mma(accm[mi][ni], a8, bb)
-        gpu.barrier()
+                    _mma(accm[mi][ni], a_frags[mi][ku], bb)
+
+    if const_expr(not _PIPE):
+        # Preserve the established serial path byte-for-byte for K_tiles==1 and
+        # for callers that leave ``stages`` at its backwards-compatible default.
+        for kt in range_constexpr(K_TILES_TOTAL):
+            base_k = fx.Int32(kt * TILE_K)
+            dma_a_tile_to_lds(base_k, slot=0)
+            if const_expr(_is_dense):
+                b_raw = [
+                    load_b_raw_bf16(base_k, n_blk_list[ni], n_intra_list[ni])
+                    for ni in range_constexpr(num_acc_n)
+                ]
+                b_sc = None
+            else:
+                b_raw = [load_b_raw(base_k, n_blk_list[ni], n_intra_list[ni]) for ni in range_constexpr(num_acc_n)]
+                if const_expr(_is_int4):
+                    b_sc = [load_b_scale_int4(base_k, scale_n_list[ni]) for ni in range_constexpr(num_acc_n)]
+                else:
+                    b_sc = [
+                        load_b_scale(base_k, scale_mni_list[ni], scale_np_list[ni])
+                        for ni in range_constexpr(num_acc_n)
+                    ]
+            gpu.barrier()
+            for ni in range_constexpr(num_acc_n):
+                for ku in range_constexpr(k_unroll):
+                    _bsc = None if const_expr(_is_dense) else b_sc[ni][ku]
+                    bb = upconvert_b(b_raw[ni], ku, _bsc)
+                    for mi in range_constexpr(m_repeat):
+                        a8 = lds_load_a(mi, ku, slot=0)
+                        _mma(accm[mi][ni], a8, bb)
+            gpu.barrier()
+    else:
+        # Two-stage gfx950 software pipeline.  Tile 0 is primed before the
+        # loop.  Each iteration snapshots the current A slot into registers,
+        # starts the next A DMA into the other slot, then rotates next-tile B
+        # fragments into registers released by the current N subtile.
+        dma_a_tile_to_lds(fx.Int32(0), slot=0)
+        b_cur = load_b_tile(fx.Int32(0))
+        for kt in range_constexpr(K_TILES_TOTAL):
+            cur_slot = kt % A_LDS_STAGES
+            rocdl.s_waitcnt(lgkmcnt=0)
+            gpu.barrier()
+            a_frags = preload_a(cur_slot)
+            if const_expr(kt + 1 < K_TILES_TOTAL):
+                next_k = fx.Int32((kt + 1) * TILE_K)
+                dma_a_tile_to_lds(next_k, slot=(kt + 1) % A_LDS_STAGES)
+                if const_expr(num_acc_n == 1):
+                    b_nxt = load_b_tile(next_k)
+                    compute_tile(b_cur, a_frags)
+                    b_cur = b_nxt
+                else:
+                    for ni in range_constexpr(num_acc_n):
+                        compute_b_subtile(b_cur[ni], a_frags, ni)
+                        b_cur[ni] = load_b_subtile(next_k, ni)
+            else:
+                compute_tile(b_cur, a_frags)
 
     # ---- epilogue: sorted projection, routing-weighted atomic scatter, or
     # fixed-slot store.  All modes use an LDS transpose for coalesced writes.
@@ -705,6 +785,7 @@ def compile_gemm2_a16w4_port(
     logical_dense_weight=False,
     store_sorted_projection=False,
     expert_grid=False,
+    stages=1,
 ):
     """A16W4/A16W16 grouped down-projection builder.
 
@@ -735,6 +816,9 @@ def compile_gemm2_a16w4_port(
     assert isinstance(logical_dense_weight, bool), "logical_dense_weight must be bool"
     assert isinstance(store_sorted_projection, bool), "store_sorted_projection must be bool"
     assert isinstance(expert_grid, bool), "expert_grid must be bool"
+    assert isinstance(stages, int) and not isinstance(stages, bool) and stages in (1, 2), (
+        f"stages must be the integer 1 or 2, got {stages!r}"
+    )
     assert output_mode in ("atomic", "reduce"), "output_mode must be 'atomic' or 'reduce'"
     assert isinstance(TOPK, int) and 0 < TOPK <= 255, "TOPK must be an integer in [1, 255]"
     assert not logical_dense_weight or w_dtype in ("bf16", "fp16"), (
@@ -750,6 +834,7 @@ def compile_gemm2_a16w4_port(
     # Arch-gate K=16 (gfx942) vs K=32 (gfx950); see a16wmix_use_k16.
     _use_k16 = a16wmix_use_k16()
     _K = D_INTER
+    _effective_stages = 2 if stages == 2 and (_K // TILE_K) > 1 and not _use_k16 else 1
     assert _K % TILE_K == 0, f"D_INTER (K) must be a multiple of {TILE_K}, got {_K}"
     assert N_OUT % TILE_N == 0, f"model_dim (N_OUT) must be a multiple of {TILE_N}, got {N_OUT}"
     assert BM % 16 == 0, f"BM must be a multiple of 16, got {BM}"
@@ -764,9 +849,14 @@ def compile_gemm2_a16w4_port(
 
     # A and epilogue accumulator staging use LDS in disjoint phases, so reserve
     # their maximum rather than their sum.
-    _a_bytes = BM * KH_TILE_BYTES
+    _a_bytes = _effective_stages * BM * KH_TILE_BYTES
     _acc_bytes = lds_acc_bytes_for(BM, TILE_N)
     _lds_bytes = max(_a_bytes, _acc_bytes)
+    assert _lds_bytes <= _GFX950_LDS_BYTES, (
+        f"gemm2 needs {_lds_bytes} LDS bytes, exceeding gfx950's "
+        f"{_GFX950_LDS_BYTES} bytes (BM={BM}, TILE_N={TILE_N}, TILE_K={TILE_K}, "
+        f"stages={_effective_stages})"
+    )
 
     _wd_tag = "" if w_dtype == "mxfp4" else f"_{w_dtype}"
     _ad_tag = "" if a_dtype == "bf16" else f"_a{a_dtype}"
@@ -794,6 +884,8 @@ def compile_gemm2_a16w4_port(
         _name += "_storesorted"
     if expert_grid:
         _name += "_egrid"
+    if _effective_stages > 1:
+        _name += f"_s{_effective_stages}"
 
     @fx.struct
     class SharedStorage:
@@ -876,6 +968,7 @@ def compile_gemm2_a16w4_port(
                 TOPK=TOPK,
                 logical_dense_weight=logical_dense_weight,
                 store_sorted_projection=store_sorted_projection,
+                stages=_effective_stages,
             )
 
         if const_expr(expert_grid):

@@ -3,6 +3,7 @@
 
 """Correctness and API-contract tests for gfx950 SonicMoE A16W16/A16W4."""
 
+import json
 import math
 import threading
 import weakref
@@ -20,6 +21,7 @@ from kernels.moe.sonic import (
     _get_stage1_launcher,
     _get_stage2_launcher,
     _quantize_mxfp4_weight,
+    _stage2_stages,
     prepare_sonic_bf16_weights,
     prepare_sonic_fp16_weights,
     prepare_sonic_mxfp4_weights,
@@ -1313,8 +1315,37 @@ def test_sonic_moe_autotuner_search_and_disk_cache(tmp_path):
     torch.cuda.synchronize()
     assert recovered.search_count == 1
     rewritten_cache = non_object_cache_file.read_text(encoding="utf-8")
-    assert '"version": 9' in rewritten_cache
+    assert '"version": 10' in rewritten_cache
     assert '"stage1_k_wave": 1' in rewritten_cache
+
+
+def test_sonic_moe_autotune_cache_separates_exact_pipeline_policy(monkeypatch, tmp_path):
+    """Keep exact-M generated-kernel policy separate inside one M bucket."""
+
+    config = _config()
+    _, w1, w2, router_logits = _make_case(seed=257)
+    tuner = SonicMoEAutotuner(
+        config,
+        prepare_sonic_bf16_weights(w1, w2, config),
+        candidates=(config,),
+        warmup=0,
+        rep=1,
+        cache_dir=tmp_path,
+    )
+    monkeypatch.setattr(
+        "kernels.moe.sonic_autotune._stage2_stages",
+        lambda _config, tokens: 2 if tokens == 4096 else 1,
+    )
+    x_4095 = torch.empty((4095, HIDDEN_SIZE), dtype=torch.bfloat16, device=w1.device)
+    x_4096 = torch.empty((4096, HIDDEN_SIZE), dtype=torch.bfloat16, device=w1.device)
+
+    identity_4095 = json.loads(tuner._cache_key(x_4095, router_logits))
+    identity_4096 = json.loads(tuner._cache_key(x_4096, router_logits))
+
+    assert identity_4095["tokens_bucket"] == identity_4096["tokens_bucket"] == 4096
+    assert identity_4095["stage2_pipeline_stages"] == [1]
+    assert identity_4096["stage2_pipeline_stages"] == [2]
+    assert identity_4095 != identity_4096
 
 
 def test_sonic_moe_router_and_multiphase_sort_fallback():
@@ -1709,6 +1740,92 @@ def test_sonic_moe_uses_independent_workspaces_across_streams():
     _assert_close(actual_a_again, expected_a)
 
 
+def test_sonic_moe_gfx950_stage2_pipeline_public_forward_and_mixed_streams(monkeypatch):
+    """Exercise the exact production pipeline cell beside its serial neighbor."""
+
+    import kernels.moe.sonic as sonic_module
+
+    device = _gfx950_device()
+    config = SonicMoEConfig(
+        hidden_size=4096,
+        intermediate_size=2048,
+        num_experts=64,
+        top_k=8,
+        tile_m=128,
+        tile_n=256,
+        tile_k=64,
+        down_tile_m=128,
+        down_tile_n=128,
+        down_tile_k=64,
+        stage2_xcd_swizzle=8,
+    )
+    generator = torch.Generator(device=device).manual_seed(263)
+    x_4096 = torch.randn((4096, 4096), dtype=torch.bfloat16, device=device, generator=generator)
+    logits_4096 = torch.randn((4096, 64), dtype=torch.bfloat16, device=device, generator=generator)
+    w1 = torch.randn((64, 4096, 4096), dtype=torch.bfloat16, device=device, generator=generator)
+    w2 = torch.randn((64, 4096, 2048), dtype=torch.bfloat16, device=device, generator=generator)
+    w1.mul_(1.0 / math.sqrt(4096))
+    w2.mul_(1.0 / math.sqrt(2048))
+    prepared = prepare_sonic_bf16_weights(w1, w2, config)
+    del w1, w2
+
+    op = SonicMoE(config, prepared, max_cached_workspaces=4)
+    x_2048 = x_4096[:2048]
+    logits_2048 = logits_4096[:2048]
+    serial_4096 = torch.empty_like(x_4096)
+    serial_2048 = torch.empty_like(x_2048)
+
+    # Establish independent public-forward baselines with the historical
+    # serial Stage-2 loop, while retaining the identical router and Stage 1.
+    with monkeypatch.context() as serial_patch:
+        serial_patch.setattr(sonic_module, "_stage2_stages", lambda _config, _tokens: 1)
+        op(x_4096, logits_4096, out=serial_4096)
+        op(x_2048, logits_2048, out=serial_2048)
+        torch.cuda.synchronize()
+
+    selected_stages = []
+    get_stage2_launcher = sonic_module._get_stage2_launcher
+
+    def tracking_get_stage2_launcher(config, b_cache_mod, weight_dtype, has_bias, output_mode, stages, device_index):
+        selected_stages.append((int(stages), int(torch.cuda.current_stream(device).cuda_stream)))
+        return get_stage2_launcher(
+            config,
+            b_cache_mod,
+            weight_dtype,
+            has_bias,
+            output_mode,
+            stages,
+            device_index,
+        )
+
+    monkeypatch.setattr(sonic_module, "_get_stage2_launcher", tracking_get_stage2_launcher)
+    pipeline_4096 = torch.empty_like(x_4096)
+    production_2048 = torch.empty_like(x_2048)
+    default_stream = torch.cuda.current_stream(device)
+    stream_4096 = torch.cuda.Stream(device=device)
+    stream_2048 = torch.cuda.Stream(device=device)
+    stream_4096.wait_stream(default_stream)
+    stream_2048.wait_stream(default_stream)
+
+    with torch.cuda.stream(stream_4096):
+        assert op(x_4096, logits_4096, out=pipeline_4096) is pipeline_4096
+        workspace_4096 = op.workspace
+    with torch.cuda.stream(stream_2048):
+        assert op(x_2048, logits_2048, out=production_2048) is production_2048
+        workspace_2048 = op.workspace
+    torch.cuda.synchronize()
+
+    assert workspace_4096 is not None and workspace_4096.routes is None
+    assert workspace_2048 is not None and workspace_2048.routes is None
+    assert workspace_4096 is not workspace_2048
+    assert workspace_4096.tokens == 4096
+    assert workspace_2048.tokens == 2048
+    assert [stages for stages, _stream in selected_stages] == [2, 1]
+    assert selected_stages[0][1] != selected_stages[1][1]
+    _assert_close(pipeline_4096, serial_4096)
+    _assert_close(production_2048, serial_2048)
+
+
 @pytest.mark.multi_gpu
 def test_sonic_moe_selects_input_device_and_restores_current_device():
     if torch.cuda.device_count() < 2:
@@ -2044,16 +2161,114 @@ def test_sonic_moe_stage2_launcher_cache_separates_output_modes(monkeypatch):
     monkeypatch.setattr("kernels.moe.sonic.compile_gemm2_a16w4_port", fake_compile_gemm2)
     _get_stage2_launcher.cache_clear()
     try:
-        atomic = _get_stage2_launcher(config, 0, "bf16", False, "atomic", 0)
-        assert _get_stage2_launcher(config, 0, "bf16", False, "atomic", 0) is atomic
-        reduce = _get_stage2_launcher(config, 0, "bf16", False, "reduce", 0)
-        assert _get_stage2_launcher(config, 0, "bf16", False, "reduce", 0) is reduce
+        atomic = _get_stage2_launcher(config, 0, "bf16", False, "atomic", 1, 0)
+        assert _get_stage2_launcher(config, 0, "bf16", False, "atomic", 1, 0) is atomic
+        reduce = _get_stage2_launcher(config, 0, "bf16", False, "reduce", 1, 0)
+        assert _get_stage2_launcher(config, 0, "bf16", False, "reduce", 1, 0) is reduce
 
         assert atomic is not reduce
         assert [call["output_mode"] for call in compile_calls] == ["atomic", "reduce"]
         assert [call["TOPK"] for call in compile_calls] == [TOP_K, TOP_K]
         assert [call["BM"] for call in compile_calls] == [config.stage2_tile_m] * 2
         assert [call["SORTED_BM"] for call in compile_calls] == [config.route_tile_m] * 2
+        assert _get_stage2_launcher.cache_info().currsize == 2
+    finally:
+        _get_stage2_launcher.cache_clear()
+
+
+def test_sonic_moe_stage2_pipeline_gate_is_exact():
+    tuned = SonicMoEConfig(
+        hidden_size=4096,
+        intermediate_size=2048,
+        num_experts=64,
+        top_k=8,
+        tile_m=128,
+        tile_n=256,
+        tile_k=64,
+        down_tile_m=128,
+        down_tile_n=128,
+        down_tile_k=64,
+        stage2_xcd_swizzle=8,
+    )
+
+    assert _stage2_stages(tuned, 4096) == 2
+    assert _stage2_stages(tuned, 4095) == 1
+    assert _stage2_stages(tuned, 8192) == 1
+    for fallback in (
+        replace(tuned, hidden_size=3584),
+        replace(tuned, intermediate_size=1024),
+        replace(tuned, num_experts=128),
+        replace(tuned, top_k=4),
+        replace(tuned, down_tile_m=64),
+        replace(tuned, down_tile_n=64),
+        replace(tuned, down_tile_k=128),
+        replace(tuned, tile_m=256),
+        replace(tuned, stage2_xcd_swizzle=1),
+        replace(tuned, stage2_b_cache_mod=2),
+        replace(tuned, waves_per_eu=1),
+        replace(tuned, persistent_stage2=True),
+        replace(tuned, stage2_output_mode="reduce"),
+        replace(tuned, compute_dtype="fp16"),
+    ):
+        assert _stage2_stages(fallback, 4096) == 1
+
+
+def test_sonic_moe_stage2_pipeline_gate_rejects_ragged_routes(monkeypatch):
+    """Flat route lists must retain the measured serial Stage-2 path."""
+
+    import kernels.moe.sonic as sonic_module
+
+    config = _config()
+    x, w1, w2, router_logits = _make_case(seed=269)
+    topk_ids, topk_weights = _topk_from_logits(router_logits, config)
+    op = SonicMoE(config, prepare_sonic_bf16_weights(w1, w2, config))
+    selected_stages = []
+    get_stage2_launcher = sonic_module._get_stage2_launcher
+
+    monkeypatch.setattr(sonic_module, "_stage2_stages", lambda _config, _tokens: 2)
+
+    def tracking_get_stage2_launcher(config, b_cache_mod, weight_dtype, has_bias, output_mode, stages, device_index):
+        selected_stages.append(stages)
+        return get_stage2_launcher(
+            config,
+            b_cache_mod,
+            weight_dtype,
+            has_bias,
+            output_mode,
+            stages,
+            device_index,
+        )
+
+    monkeypatch.setattr(sonic_module, "_get_stage2_launcher", tracking_get_stage2_launcher)
+    fixed = op.forward_topk(x, topk_ids, topk_weights)
+    ragged = op.forward_routes(
+        x,
+        torch.arange(TOKENS, dtype=torch.int32, device=x.device).repeat_interleave(TOP_K),
+        topk_ids.reshape(-1).contiguous(),
+        topk_weights.reshape(-1).contiguous(),
+    )
+    torch.cuda.synchronize()
+
+    assert selected_stages == [2, 1]
+    _assert_close(fixed, ragged)
+
+
+def test_sonic_moe_stage2_launcher_cache_separates_pipeline_depth(monkeypatch):
+    config = _config()
+    compile_calls = []
+
+    def fake_compile_gemm2(**kwargs):
+        compile_calls.append(kwargs)
+        return object()
+
+    monkeypatch.setattr("kernels.moe.sonic.compile_gemm2_a16w4_port", fake_compile_gemm2)
+    _get_stage2_launcher.cache_clear()
+    try:
+        serial = _get_stage2_launcher(config, 0, "bf16", False, "atomic", 1, 0)
+        pipeline = _get_stage2_launcher(config, 0, "bf16", False, "atomic", 2, 0)
+
+        assert serial is not pipeline
+        assert [call["stages"] for call in compile_calls] == [1, 2]
         assert _get_stage2_launcher.cache_info().currsize == 2
     finally:
         _get_stage2_launcher.cache_clear()
@@ -2077,7 +2292,7 @@ def test_sonic_moe_launchers_receive_independent_compute_and_route_tiles(monkeyp
     _get_stage2_launcher.cache_clear()
     try:
         _get_stage1_launcher(config, 0, "bf16", False, 0)
-        _get_stage2_launcher(config, 0, "bf16", False, "atomic", 0)
+        _get_stage2_launcher(config, 0, "bf16", False, "atomic", 1, 0)
         assert compile_calls["stage1"]["BM"] == 32
         assert compile_calls["stage1"]["SORTED_BM"] == 128
         assert compile_calls["stage1"]["k_wave"] == 2

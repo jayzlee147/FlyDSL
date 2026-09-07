@@ -21,9 +21,9 @@ from flydsl.runtime.device import get_rocm_arch
 from kernels.moe.moe_2stage_a16wmix.gemm1 import compile_gemm1_a16w4_port
 from kernels.moe.moe_2stage_a16wmix.gemm2 import compile_gemm2_a16w4_port
 from kernels.moe.moe_sorting_kernel import moe_softmax_sort_flydsl
-from kernels.moe.sonic import SonicMoE, SonicMoEConfig, SonicMoEWeights
+from kernels.moe.sonic import SonicMoE, SonicMoEConfig, SonicMoEWeights, _stage2_stages
 
-_CACHE_SCHEMA_VERSION = 9
+_CACHE_SCHEMA_VERSION = 10
 _DENSE_WEIGHT_DTYPES = frozenset({"bf16", "fp16"})
 _TUNING_FIELDS = (
     "tile_m",
@@ -317,6 +317,20 @@ class SonicMoEAutotuner:
         router_logits: torch.Tensor,
     ) -> str:
         props = torch.cuda.get_device_properties(hidden_states.device)
+        tokens = int(hidden_states.shape[0])
+        # The token bucket deliberately aliases nearby M values, but exact
+        # production policies may still select different generated kernels.
+        # Record the effective Stage-2 depth per candidate so a T4096 winner
+        # cannot be reused by a serial T3000/T4095 invocation in the same
+        # power-of-two bucket (or vice versa).
+        stage2_pipeline_stages = [
+            (
+                _stage2_stages(config, tokens)
+                if self.weights.weight_dtype == "bf16" and not self.weights.has_bias
+                else 1
+            )
+            for config in self.candidates
+        ]
         identity = {
             "schema": _CACHE_SCHEMA_VERSION,
             "arch": str(get_rocm_arch()),
@@ -331,7 +345,8 @@ class SonicMoEAutotuner:
             "has_bias": self.weights.has_bias,
             "hidden_dtype": str(hidden_states.dtype),
             "router_dtype": str(router_logits.dtype),
-            "tokens_bucket": _token_bucket(int(hidden_states.shape[0])),
+            "tokens_bucket": _token_bucket(tokens),
+            "stage2_pipeline_stages": stage2_pipeline_stages,
             "hidden_size": self.base_config.hidden_size,
             "intermediate_size": self.base_config.intermediate_size,
             "num_experts": self.base_config.num_experts,
