@@ -1977,6 +1977,10 @@ def _compile_moe_sorting_multiphase(
             safe_idx = mesh_row_i32_base + valid.select(word_idx, c_zero)
             buffer_ops.buffer_store(c_zero, ws_rsrc, valid.select(safe_idx, c_oob))
 
+        # ``gpu.barrier`` only synchronizes work-items; it does not drain VMEM.
+        # Every wave must finish clearing its part of the HBM mesh before any
+        # wave starts writing route bytes into that same row.
+        fly_rocdl.s_waitcnt(vmcnt=0)
         gpu.barrier()
 
         # ---- Phase 2: Scatter (scan all T*topk, filter by expert) ----
@@ -1998,6 +2002,10 @@ def _compile_moe_sorting_multiphase(
             if is_mine:
                 buffer_ops.buffer_store(val_i8, ws_rsrc, byte_offset, offset_is_bytes=True)
 
+        # Make every route-byte store globally visible before Phase 3 reads the
+        # mesh.  Without the VMEM wait a delayed clear/store from another wave
+        # can race the count load and leave count and mesh contents inconsistent.
+        fly_rocdl.s_waitcnt(vmcnt=0)
         gpu.barrier()
 
         # ---- Phase 3: Count non-zero bytes + warp/cross-wave reduce ----
@@ -2194,6 +2202,11 @@ def _compile_moe_sorting_multiphase(
             # Read my_start and my_end from cumsum LDS
             my_start = _lds_load_raw(cumsum_mr, my_expert)
             my_end = _lds_load_raw(cumsum_mr, my_expert + c_one)
+
+            # Step 3 reuses cumsum_mr in place.  Drain every wave's prefix
+            # loads before any thread overwrites that LDS with local indices.
+            fly_rocdl.s_waitcnt(lgkmcnt=0)
+            gpu.barrier()
 
             # Hoist before if/else: AST rewriter extracts branches into
             # separate functions, so variables must be defined in outer scope.

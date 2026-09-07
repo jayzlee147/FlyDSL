@@ -2130,6 +2130,111 @@ def test_sonic_moe_backward_forward_state_is_reusable_and_none_is_fallback():
     assert torch.equal(state.preactivation, state_snapshot)
 
 
+def test_sonic_moe_backward_e896_hot16_state_is_repeatable_in_reverse_order():
+    """Retained hot16 states stay bitwise stable across interleaved calls."""
+
+    tokens, hidden_size, intermediate_size, num_experts, topk = 128, 256, 128, 896, 16
+    config = _config(
+        hidden_size,
+        intermediate_size,
+        num_experts,
+        topk,
+        compute_dtype="bf16",
+        down_tile_m=128,
+    )
+    x_a, w1, w2, _, weights_a, grad_a = _make_case(
+        tokens,
+        hidden_size,
+        intermediate_size,
+        num_experts,
+        topk,
+        seed=112233,
+        dtype=torch.bfloat16,
+    )
+    topk_ids = torch.arange(topk, dtype=torch.int32, device=x_a.device).repeat(tokens, 1)
+
+    generator = torch.Generator(device=x_a.device).manual_seed(112239)
+    x_b = torch.randn(
+        (tokens, hidden_size),
+        dtype=torch.float32,
+        device=x_a.device,
+        generator=generator,
+    ).to(torch.bfloat16)
+    weights_b = torch.rand(
+        (tokens, topk),
+        dtype=torch.float32,
+        device=x_a.device,
+        generator=generator,
+    )
+    grad_b = torch.randn(
+        (tokens, hidden_size),
+        dtype=torch.float32,
+        device=x_a.device,
+        generator=generator,
+    ).to(torch.bfloat16)
+
+    def make_state(x):
+        preactivation = torch.einsum(
+            "th,eph->tep",
+            x.float(),
+            w1[:topk].float(),
+        ).to(torch.bfloat16)
+        stream = torch.cuda.current_stream(x.device)
+        ready_event = torch.cuda.Event()
+        ready_event.record(stream)
+        return SimpleNamespace(
+            preactivation=preactivation,
+            tokens=tokens,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            num_experts=num_experts,
+            top_k=topk,
+            activation=config.activation,
+            compute_dtype=config.compute_dtype,
+            interleaved_w1=False,
+            has_bias=False,
+            producer_stream=int(stream.cuda_stream),
+            ready_event=ready_event,
+        )
+
+    state_a = make_state(x_a)
+    state_b = make_state(x_b)
+    state_a_snapshot = state_a.preactivation.clone()
+    state_b_snapshot = state_b.preactivation.clone()
+
+    def run_and_capture(x, route_weights, grad_output, state):
+        gradients = sonic_moe_backward(
+            x,
+            w1,
+            w2,
+            topk_ids,
+            route_weights,
+            grad_output,
+            config,
+            forward_state=state,
+        )
+        torch.cuda.synchronize()
+        assert torch.count_nonzero(gradients[1][topk:]) == 0
+        assert torch.count_nonzero(gradients[2][topk:]) == 0
+        return (
+            gradients[0].clone(),
+            gradients[1][:topk].clone(),
+            gradients[2][:topk].clone(),
+            gradients[3].clone(),
+        )
+
+    reference_a = run_and_capture(x_a, weights_a, grad_a, state_a)
+    reference_b = run_and_capture(x_b, weights_b, grad_b, state_b)
+    repeated_b = run_and_capture(x_b, weights_b, grad_b, state_b)
+    repeated_a = run_and_capture(x_a, weights_a, grad_a, state_a)
+
+    for reference, repeated in ((reference_a, repeated_a), (reference_b, repeated_b)):
+        for expected_gradient, actual_gradient in zip(reference, repeated):
+            assert torch.equal(expected_gradient, actual_gradient)
+    assert torch.equal(state_a.preactivation, state_a_snapshot)
+    assert torch.equal(state_b.preactivation, state_b_snapshot)
+
+
 def test_sonic_moe_backward_forward_state_skips_grouped_w1_but_keeps_compact_queue(
     monkeypatch,
 ):

@@ -538,6 +538,59 @@ def test_moe_sorting_multiphase_full(T, E, topk):
     assert passed, f"MoE sorting (multiphase) failed for T={T}, E={E}, topk={topk}"
 
 
+def test_moe_sorting_multiphase_e896_hot16_is_repeatable():
+    """The 512-thread P23 path must not reuse LDS before prefix loads retire."""
+
+    T, E, topk, unit_size = 128, 896, 16, 64
+    topk_ids = torch.arange(topk, dtype=torch.int32, device="cuda").repeat(T, 1)
+    topk_weights = torch.arange(T * topk, dtype=torch.float32, device="cuda").reshape(T, topk)
+
+    max_padded = T * topk + E * unit_size - topk
+    max_blocks = (max_padded + unit_size - 1) // unit_size
+    sorted_ids = torch.empty(max_padded, dtype=torch.int32, device="cuda")
+    sorted_weights = torch.empty(max_padded, dtype=torch.float32, device="cuda")
+    sorted_expert_ids = torch.empty(max_blocks, dtype=torch.int32, device="cuda")
+    num_valid_ids = torch.empty(2, dtype=torch.int32, device="cuda")
+    moe_buf = torch.empty(4, dtype=torch.int32, device="cuda")
+
+    mesh_stride = ((T + unit_size - 1) // unit_size) * unit_size
+    workspace_elements = (E * mesh_stride + 3) // 4 + E + 1
+    workspace = torch.empty(workspace_elements, dtype=torch.int32, device="cuda")
+
+    expected_ids = torch.cat(
+        [torch.arange(T, dtype=torch.int32, device="cuda") | (expert << 24) for expert in range(topk)]
+    )
+    expected_weights = topk_weights.transpose(0, 1).contiguous().view(-1)
+    expected_expert_ids = torch.arange(topk, dtype=torch.int32, device="cuda").repeat_interleave(T // unit_size)
+    expected_num_valid = torch.tensor((T * topk, T), dtype=torch.int32, device="cuda")
+    sentinel = (topk << 24) | T
+
+    for _ in range(64):
+        sorted_ids.fill_(-1)
+        sorted_weights.fill_(float("nan"))
+        sorted_expert_ids.fill_(-1)
+        num_valid_ids.fill_(-1)
+        moe_sorting_flydsl(
+            topk_ids,
+            topk_weights,
+            sorted_ids,
+            sorted_weights,
+            sorted_expert_ids,
+            num_valid_ids,
+            moe_buf,
+            E,
+            unit_size=unit_size,
+            workspace=workspace,
+        )
+        torch.cuda.synchronize()
+
+        assert torch.equal(num_valid_ids, expected_num_valid)
+        assert torch.equal(sorted_ids[: T * topk], expected_ids)
+        assert torch.equal(sorted_weights[: T * topk], expected_weights)
+        assert torch.equal(sorted_expert_ids[: expected_expert_ids.numel()], expected_expert_ids)
+        assert torch.count_nonzero(sorted_ids[: T * topk] == sentinel) == 0
+
+
 def run_test_ep(T, E, topk, mask_ratio=0.5, unit_size=UNIT_SIZE):
     """Run MoE sorting test with expert_mask (EP mode)."""
     from kernels.moe.moe_sorting_kernel import BLOCK_SIZE, _compute_sub_tokens
