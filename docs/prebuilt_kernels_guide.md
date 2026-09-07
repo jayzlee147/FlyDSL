@@ -474,8 +474,8 @@ support dense BF16/FP16 weights, fixed-K or flat ragged
 routing, every supported activation, and optional expert bias. They independently
 re-sort routes and recompute the materialized pre-activation and projection, so
 they do not retain or alias an inference workspace across calls. The bring-up
-implementation uses a device-driven grouped MFMA kernel for BF16 SwiGLU W1
-recompute when every expert segment is bounded by 128 rows. The other five
+implementation uses device-driven grouped MFMA kernels for BF16 SwiGLU W1 and
+W2 recompute when every expert segment is bounded by 128 rows. The other four
 matrix products still use per-expert A16W16 GEMMs and one host synchronization
 to read expert frequencies. Its independent sort unit remains 64 rows because
 those generic GEMMs currently require contraction-K blocks aligned to 64;
@@ -597,6 +597,17 @@ routes. A balanced `T4096/E64` case has 512 rows per expert: forcing the short-M
 kernel made the full backward `30.66 ms`, whereas retaining the BM64 fallback
 measured `22.33 ms`. Later grouped kernels should use separate short- and long-M
 schedules rather than extending this threshold blindly.
+
+The matching W2 recompute specialization reads logical `[E, H, I]` weights and
+writes the unweighted projection directly by sorted row. Its measured
+`BM32/BN256/BK64` profile includes zeroing untouched projection padding: on the
+same `T128/H3584/I512/E896/K16` target it reduced this phase from `48.956 ms`
+to `0.667 ms` (`73.4x`), and reduced complete backward on top of grouped W1
+from about `251.0 ms` to `201.0 ms` (`1.249x`). At T1 the W2 phase measured
+`885.1 us` versus `24.4 us` (`36.3x`). The complete T1 backward measured
+`5.27 ms`, down from the original `6.99 ms`. The same conservative 128-row
+policy keeps the large-T BM64 path; the independently remeasured
+`T4096/H4096/I2048/E64/K8` full backward remained `22.28 ms`.
 
 Run the validated A16W4 path or let the shape-bucket tuner choose the tiles with:
 
