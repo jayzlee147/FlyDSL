@@ -9,7 +9,9 @@ This tool compares the current checkout against an explicitly loaded baseline
 T4096/H3584/I512/E896/K16 BF16 SwiGLU contract.  It deliberately exercises the
 public non-concatenated GLU layout: forward receives separated ``[gate | up]``
 weights, while backward consumes native interleaved ``[g0, u0, ...]`` weights
-and a retained forward state with the same interleaved layout.
+and a retained forward state with the same interleaved layout.  The launch
+audit also verifies that the candidate never reconstructs expert segments on
+the host, while the designated baseline still exercises that readback.
 
 Timing is refused unless ``--exclusive-gpu`` is supplied.  On a shared/busy
 machine use ``--correctness-only``; this still checks both routing regimes,
@@ -357,6 +359,7 @@ def _audit_launches(module, fn: Callable[[], tuple[torch.Tensor, ...]]):
 
     original_run = module._run_compiled
     original_gemm = module.gemm_a16w16
+    original_materialize = module._materialize_expert_segments
     compile_names = (
         "_compile_grouped_w1_recompute",
         "_compile_grouped_w2_recompute",
@@ -371,6 +374,7 @@ def _audit_launches(module, fn: Callable[[], tuple[torch.Tensor, ...]]):
         "grouped_w2_projection_launches": 0,
         "legacy_dx_gemm_launches": 0,
         "grouped_dx_launches": 0,
+        "host_segment_materializations": 0,
     }
     generic_gemms = []
 
@@ -419,8 +423,13 @@ def _audit_launches(module, fn: Callable[[], tuple[torch.Tensor, ...]]):
         )
         return original_gemm(a, b, *args, **kwargs)
 
+    def wrapped_materialize(*args, **kwargs):
+        counts["host_segment_materializations"] += 1
+        return original_materialize(*args, **kwargs)
+
     module._run_compiled = wrapped_run
     module.gemm_a16w16 = wrapped_gemm
+    module._materialize_expert_segments = wrapped_materialize
     module._compile_grouped_w1_recompute = tracking_compiler(
         "grouped_w1_projection", original_compilers["_compile_grouped_w1_recompute"]
     )
@@ -434,6 +443,7 @@ def _audit_launches(module, fn: Callable[[], tuple[torch.Tensor, ...]]):
     finally:
         module._run_compiled = original_run
         module.gemm_a16w16 = original_gemm
+        module._materialize_expert_segments = original_materialize
         for name, compiler in original_compilers.items():
             setattr(module, name, compiler)
 
@@ -448,6 +458,7 @@ def _audit_launches(module, fn: Callable[[], tuple[torch.Tensor, ...]]):
         "generic_gemm_zero": counts["generic_gemm_launches"] == 0,
         "projection_zero": counts["projection_launches"] == 0,
         "generic_dx_zero": counts["generic_dx_gemm_launches"] == 0,
+        "host_segment_materialization_zero": counts["host_segment_materializations"] == 0,
     }
     counts["generic_gemms"] = generic_gemms
     return gradients, counts
@@ -657,8 +668,23 @@ def main() -> None:
         "baseline_large_grouped_dx": baseline_module._use_large_grouped_dx_descriptor_queue(**policy_kwargs),
         "candidate_large_grouped_dx": candidate_module._use_large_grouped_dx_descriptor_queue(**policy_kwargs),
     }
+    policy_probe["candidate_hostless_retained_backward"] = candidate_module._use_hostless_grouped_backward(
+        flat_routes=False,
+        has_bias=False,
+        reuse_forward_preactivation=True,
+        use_large_grouped_dx=policy_probe["candidate_large_grouped_dx"],
+        use_grouped_w1=False,
+        use_grouped_w2=False,
+        use_grouped_dw2=True,
+        use_grouped_da=True,
+        use_grouped_dw1=True,
+        use_grouped_dx=True,
+        **{key: value for key, value in policy_kwargs.items() if key != "flat_routes"},
+    )
     policy_probe["passed"] = (
-        policy_probe["baseline_large_grouped_dx"] is False and policy_probe["candidate_large_grouped_dx"] is True
+        policy_probe["baseline_large_grouped_dx"] is False
+        and policy_probe["candidate_large_grouped_dx"] is True
+        and policy_probe["candidate_hostless_retained_backward"] is True
     )
     if not policy_probe["passed"]:
         raise RuntimeError(f"baseline/candidate policy split is not the intended E896 comparison: {policy_probe}")
@@ -787,6 +813,7 @@ def main() -> None:
             and candidate_launches["total_dx_launches"] == 1
             and baseline_launches["legacy_dx_gemm_launches"] > 0
             and baseline_launches["projection_launches"] > 0
+            and baseline_launches["host_segment_materializations"] > 0
         )
         case_report: dict[str, Any] = {
             "routing": routing_summary,
@@ -799,9 +826,15 @@ def main() -> None:
                     "candidate_generic_gemm_zero": candidate_launches["generic_gemm_launches"] == 0,
                     "candidate_projection_zero": candidate_launches["projection_launches"] == 0,
                     "candidate_legacy_dx_zero": candidate_launches["legacy_dx_gemm_launches"] == 0,
+                    "candidate_host_segment_materialization_zero": (
+                        candidate_launches["host_segment_materializations"] == 0
+                    ),
                     "candidate_single_grouped_dx": candidate_launches["grouped_dx_launches"] == 1,
                     "baseline_exercises_legacy_dx": baseline_launches["legacy_dx_gemm_launches"] > 0,
                     "baseline_exercises_projection": baseline_launches["projection_launches"] > 0,
+                    "baseline_exercises_host_segment_materialization": (
+                        baseline_launches["host_segment_materializations"] > 0
+                    ),
                     "passed": launch_topology_passed,
                 },
             },

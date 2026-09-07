@@ -35,6 +35,7 @@ from kernels.moe.sonic_backward import (
     _use_grouped_dx,
     _use_grouped_w1_recompute,
     _use_grouped_w2_recompute,
+    _use_hostless_grouped_backward,
 )
 
 pytestmark = [pytest.mark.l2_device, pytest.mark.rocm_lower]
@@ -50,6 +51,74 @@ _ACTIVATIONS = (
     "relu_sq",
 )
 _DTYPES = ((torch.bfloat16, "bf16"), (torch.float16, "fp16"))
+
+
+@pytest.mark.parametrize(
+    ("overrides", "expected"),
+    (
+        ({}, True),
+        ({"reuse_forward_preactivation": False}, False),
+        ({"use_large_grouped_dx": False}, False),
+        ({"tokens": 4095}, False),
+        ({"hidden_size": 4096}, False),
+        ({"intermediate_size": 1024}, False),
+        ({"num_experts": 895}, False),
+        ({"topk": 8}, False),
+        ({"flat_routes": True}, False),
+        ({"has_bias": True}, False),
+        ({"use_grouped_dw2": False}, False),
+        ({"use_grouped_da": False}, False),
+        ({"use_grouped_dw1": False}, False),
+        ({"use_grouped_dx": False}, False),
+    ),
+)
+def test_e896_retained_state_hostless_policy_is_narrow(overrides, expected):
+    """Only the fully grouped default adapter bucket skips the D2H readback."""
+
+    kwargs = {
+        "flat_routes": False,
+        "has_bias": False,
+        "tokens": 4096,
+        "hidden_size": 3584,
+        "intermediate_size": 512,
+        "num_experts": 896,
+        "topk": 16,
+        "reuse_forward_preactivation": True,
+        "use_large_grouped_dx": True,
+        # Retained state plus fused dA/dscore removes both projection GEMMs;
+        # their independent recompute policies are intentionally false here.
+        "use_grouped_w1": False,
+        "use_grouped_w2": False,
+        "use_grouped_dw2": True,
+        "use_grouped_da": True,
+        "use_grouped_dw1": True,
+        "use_grouped_dx": True,
+    }
+    kwargs.update(overrides)
+    assert _use_hostless_grouped_backward(**kwargs) is expected
+
+
+def test_short_hostless_policy_still_requires_grouped_projection_recompute():
+    kwargs = {
+        "flat_routes": False,
+        "has_bias": False,
+        "tokens": 128,
+        "hidden_size": 3584,
+        "intermediate_size": 512,
+        "num_experts": 64,
+        "topk": 8,
+        "reuse_forward_preactivation": False,
+        "use_large_grouped_dx": False,
+        "use_grouped_w1": True,
+        "use_grouped_w2": True,
+        "use_grouped_dw2": True,
+        "use_grouped_da": True,
+        "use_grouped_dw1": True,
+        "use_grouped_dx": True,
+    }
+    assert _use_hostless_grouped_backward(**kwargs)
+    kwargs["use_grouped_w1"] = False
+    assert not _use_hostless_grouped_backward(**kwargs)
 
 
 @pytest.mark.parametrize(
@@ -2396,11 +2465,17 @@ def test_sonic_moe_backward_decode_state_keeps_low_latency_row_kernels(monkeypat
 
 
 @pytest.mark.parametrize("interleaved_w1", (False, True), ids=("separate", "interleaved"))
+@pytest.mark.parametrize("routing", ("balanced", "hot16"))
 def test_sonic_moe_backward_forward_state_skips_generic_w1_and_keeps_large_dx_queue(
     monkeypatch,
     interleaved_w1,
+    routing,
 ):
-    tokens, hidden_size, intermediate_size, num_experts, topk = 4096, 256, 128, 4, 2
+    # Keep the production route count (8192) while shrinking only tensor widths
+    # and E.  E136 makes balanced routing cross the device guard at 33 active
+    # experts, while hot16 selects both the complementary sparse contraction
+    # profiles and the adaptive dense-all weight-gradient clear.
+    tokens, hidden_size, intermediate_size, num_experts, topk = 512, 256, 128, 136, 16
     config = _config(
         hidden_size,
         intermediate_size,
@@ -2409,15 +2484,21 @@ def test_sonic_moe_backward_forward_state_skips_generic_w1_and_keeps_large_dx_qu
         compute_dtype="bf16",
         down_tile_m=128,
     )
-    args = list(_make_case(
-        tokens,
-        hidden_size,
-        intermediate_size,
-        num_experts,
-        topk,
-        seed=691,
-        dtype=torch.bfloat16,
-    ))
+    args = list(
+        _make_case(
+            tokens,
+            hidden_size,
+            intermediate_size,
+            num_experts,
+            topk,
+            seed=691,
+            dtype=torch.bfloat16,
+        )
+    )
+    if routing == "hot16":
+        token = torch.arange(tokens, dtype=torch.int32, device=args[3].device)[:, None]
+        slot = torch.arange(topk, dtype=torch.int32, device=args[3].device)[None, :]
+        args[3] = ((token + slot) % 16).contiguous()
     if interleaved_w1:
         args[1] = _interleave_glu_rows(args[1])
     args = tuple(args)
@@ -2431,16 +2512,23 @@ def test_sonic_moe_backward_forward_state_skips_generic_w1_and_keeps_large_dx_qu
     original_builder = sonic_backward_module.build_compact_m_tile_descriptors
     original_fused_prepare = sonic_backward_module._compile_fused_forward_state_prepare
     original_fused_derivative = sonic_backward_module._compile_fused_activation_derivative_dscore_scale_dy
-    original_gemm = sonic_backward_module.gemm_a16w16
+    original_compile_da = sonic_backward_module._compile_grouped_da
+    original_grouped_tn = sonic_backward_module.grouped_tn_from_queue_flydsl
+    original_adaptive_zero = sonic_backward_module.zero_weight_grads_adaptive_flydsl
     builder_blocks = []
+    builder_emits_active_queue = []
     prepare_blocks = []
     derivative_blocks = []
+    da_profiles = []
+    tn_profiles = []
+    adaptive_zero_calls = 0
 
     def _schedule_block_m(call_args, call_kwargs):
         return call_kwargs.get("schedule_block_m", call_args[5] if len(call_args) > 5 else 16)
 
     def _tracked_builder(*builder_args, **builder_kwargs):
         builder_blocks.append(builder_kwargs["block_m"])
+        builder_emits_active_queue.append(builder_kwargs.get("active_expert_storage") is not None)
         return original_builder(*builder_args, **builder_kwargs)
 
     def _tracked_fused_prepare(*compile_args, **compile_kwargs):
@@ -2451,17 +2539,52 @@ def test_sonic_moe_backward_forward_state_skips_generic_w1_and_keeps_large_dx_qu
         derivative_blocks.append(_schedule_block_m(compile_args, compile_kwargs))
         return original_fused_derivative(*compile_args, **compile_kwargs)
 
-    def _guarded_gemm(a, b, *gemm_args, **gemm_kwargs):
-        if gemm_kwargs.get("layout") == "nt":
-            raise AssertionError("fused state path must skip generic W1/W2 projection recomputation")
-        return original_gemm(a, b, *gemm_args, **gemm_kwargs)
+    def _tracked_compile_da(*compile_args, **compile_kwargs):
+        def _argument(name, position, default):
+            return compile_kwargs.get(name, compile_args[position] if len(compile_args) > position else default)
+
+        da_profiles.append(
+            (
+                _argument("queue_direct", 9, False),
+                _argument("min_active_experts", 10, 0),
+                _argument("max_active_experts", 11, None),
+            )
+        )
+        return original_compile_da(*compile_args, **compile_kwargs)
+
+    def _tracked_grouped_tn(*tn_args, **tn_kwargs):
+        tn_profiles.append(
+            (
+                tn_kwargs.get("min_active_experts", 0),
+                tn_kwargs.get("max_active_experts"),
+            )
+        )
+        return original_grouped_tn(*tn_args, **tn_kwargs)
+
+    def _tracked_adaptive_zero(*zero_args, **zero_kwargs):
+        nonlocal adaptive_zero_calls
+        adaptive_zero_calls += 1
+        return original_adaptive_zero(*zero_args, **zero_kwargs)
 
     def _unexpected_legacy_kernel(*_args, **_kwargs):
         raise AssertionError("large retained-state path must use exact-row fused kernels")
 
+    def _unexpected_generic_gemm(*_args, **_kwargs):
+        raise AssertionError("large retained-state hostless path must keep every contraction grouped")
+
+    def _unexpected_host_segments(*_args, **_kwargs):
+        raise AssertionError("large retained-state hostless path must not read frequencies on the host")
+
     monkeypatch.setattr(
         sonic_backward_module,
         "_use_large_grouped_dx_descriptor_queue",
+        lambda **_kwargs: True,
+    )
+    # Exercise the hostless long-shape mechanics at a tractable numerical-test
+    # size; the separate pure policy test pins production admission to E896.
+    monkeypatch.setattr(
+        sonic_backward_module,
+        "_use_hostless_grouped_backward",
         lambda **_kwargs: True,
     )
     monkeypatch.setattr(
@@ -2478,6 +2601,17 @@ def test_sonic_moe_backward_forward_state_skips_generic_w1_and_keeps_large_dx_qu
         sonic_backward_module,
         "_compile_fused_activation_derivative_dscore_scale_dy",
         _tracked_fused_derivative,
+    )
+    monkeypatch.setattr(sonic_backward_module, "_compile_grouped_da", _tracked_compile_da)
+    monkeypatch.setattr(
+        sonic_backward_module,
+        "grouped_tn_from_queue_flydsl",
+        _tracked_grouped_tn,
+    )
+    monkeypatch.setattr(
+        sonic_backward_module,
+        "zero_weight_grads_adaptive_flydsl",
+        _tracked_adaptive_zero,
     )
     monkeypatch.setattr(sonic_backward_module, "_compile_gather", _unexpected_legacy_kernel)
     monkeypatch.setattr(
@@ -2505,7 +2639,17 @@ def test_sonic_moe_backward_forward_state_skips_generic_w1_and_keeps_large_dx_qu
         "_compile_score_backward",
         _unexpected_legacy_kernel,
     )
-    monkeypatch.setattr(sonic_backward_module, "gemm_a16w16", _guarded_gemm)
+    monkeypatch.setattr(
+        sonic_backward_module,
+        "_materialize_expert_segments",
+        _unexpected_host_segments,
+    )
+    monkeypatch.setattr(
+        sonic_backward_module,
+        "build_active_expert_queue_flydsl",
+        _unexpected_legacy_kernel,
+    )
+    monkeypatch.setattr(sonic_backward_module, "gemm_a16w16", _unexpected_generic_gemm)
     actual = sonic_moe_backward(
         *args,
         config,
@@ -2520,8 +2664,12 @@ def test_sonic_moe_backward_forward_state_skips_generic_w1_and_keeps_large_dx_qu
     torch.cuda.synchronize()
 
     assert builder_blocks == [64]
+    assert builder_emits_active_queue == [True]
     assert prepare_blocks == [64]
     assert derivative_blocks == [64]
+    assert da_profiles == [(True, 0, 32), (False, 33, None)]
+    assert tn_profiles == [(0, 32), (33, None), (0, None)]
+    assert adaptive_zero_calls == 1
     for actual_gradient, expected_gradient in zip(actual, expected):
         torch.testing.assert_close(
             actual_gradient.float(),

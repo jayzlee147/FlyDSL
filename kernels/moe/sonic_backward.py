@@ -324,6 +324,13 @@ _LARGE_GROUPED_DX_SHAPES = frozenset(
         (4096, 3584, 512, 896, 16),
     }
 )
+# The first long-token hostless rollout stays narrower than the large-dX
+# policy.  In particular, the E64/H4096 bucket has not yet been audited for
+# distribution-independent dA/dW scheduling without the legacy frequency
+# readback.  The default ROCm adapter bucket below has a retained-state dataflow
+# in which every contraction and row transform already consumes a device queue
+# or device-resident extent.
+_HOSTLESS_LARGE_STATE_SHAPES = frozenset({(4096, 3584, 512, 896, 16)})
 
 # Weight gradients are output-stationary TN contractions.  BM/BN128 with BK32
 # is the measured throughput winner once an expert can own multiple rows;
@@ -529,6 +536,12 @@ def _use_hostless_grouped_backward(
     flat_routes: bool,
     has_bias: bool,
     tokens: int,
+    hidden_size: int,
+    intermediate_size: int,
+    num_experts: int,
+    topk: int,
+    reuse_forward_preactivation: bool,
+    use_large_grouped_dx: bool,
     use_grouped_w1: bool,
     use_grouped_w2: bool,
     use_grouped_dw2: bool,
@@ -536,26 +549,28 @@ def _use_hostless_grouped_backward(
     use_grouped_dw1: bool,
     use_grouped_dx: bool,
 ) -> bool:
-    """Select the fully device-dispatched short fixed-K backward.
+    """Select a fully device-dispatched fixed-K backward.
 
     Every matrix contraction must already have a grouped implementation.  The
     remaining row kernels can then consume the sorter extent directly, so no
-    host-side expert-frequency reconstruction is necessary.  Keep the first
-    rollout deliberately bounded to decode and the tuned T64/T128 regime;
-    larger shapes retain the established fallback until their row scheduling
-    has been profiled independently.
+    host-side expert-frequency reconstruction is necessary.  The short path
+    recomputes W1/W2 and therefore requires both grouped projections.  The
+    strict long-shape path instead requires retained W1 state and the fused
+    dA/dscore dataflow, so neither projection is part of its backward graph.
+    Keep that rollout limited to the audited default E896 adapter bucket.
     """
 
+    short_grouped = tokens <= 128 and use_grouped_w1 and use_grouped_w2
+    shape = (tokens, hidden_size, intermediate_size, num_experts, topk)
+    retained_large_grouped = reuse_forward_preactivation and use_large_grouped_dx and shape in _HOSTLESS_LARGE_STATE_SHAPES
     return (
         not flat_routes
         and not has_bias
-        and tokens <= 128
-        and use_grouped_w1
-        and use_grouped_w2
         and use_grouped_dw2
         and use_grouped_da
         and use_grouped_dw1
         and use_grouped_dx
+        and (short_grouped or retained_large_grouped)
     )
 
 
@@ -2961,6 +2976,12 @@ def _sonic_moe_backward_impl(
         flat_routes=flat_routes,
         has_bias=has_bias,
         tokens=tokens,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+        num_experts=num_experts,
+        topk=topk,
+        reuse_forward_preactivation=reuse_forward_preactivation,
+        use_large_grouped_dx=use_large_grouped_dx,
         use_grouped_w1=use_grouped_w1,
         use_grouped_w2=use_grouped_w2,
         use_grouped_dw2=use_grouped_dw2,
@@ -2989,7 +3010,7 @@ def _sonic_moe_backward_impl(
     # If even the maximum possible active set falls below the measured
     # selective-clear crossover, a normal dense memset is unconditionally the
     # best choice.  This route-count test is host-known and distribution
-    # independent; all ambiguous short-route cases select on device later.
+    # independent; all ambiguous hostless cases select on device later.
     hostless_dense_weight_zero = use_hostless_grouped and routes * _INACTIVE_WEIGHT_GRAD_ZERO_ACTIVE_RATIO < num_experts
     device = hidden_states.device
     device_index = device.index or 0
@@ -3310,11 +3331,11 @@ def _sonic_moe_backward_impl(
                     stream,
                 )
 
-        # The fully grouped BF16/SwiGLU short path never reconstructs expert
-        # segments on the host.  Fixed-K routing bounds each expert by the
-        # token count, while row kernels read the exact padded extent from the
-        # sorter's device-resident ``num_valid_ids[0]`` value.  All fallback
-        # contracts retain the original frequency readback and segment loop.
+        # Fully grouped BF16/SwiGLU paths never reconstruct expert segments on
+        # the host.  Fixed-K routing bounds each expert by the token count,
+        # while row kernels read a device queue or the exact padded extent from
+        # ``num_valid_ids[0]``.  All fallback contracts retain the original
+        # frequency readback and segment loop.
         if use_hostless_grouped:
             frequencies = None
             segments: list[tuple[int, int, int]] = []
