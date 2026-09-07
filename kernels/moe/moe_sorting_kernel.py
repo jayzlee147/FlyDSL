@@ -178,9 +178,9 @@ def _lds_store_raw(raw_ptr, val, idx):
 # returns a CompiledFunction whose __call__ skips inspect.Signature.bind,
 # _make_cache_key, and dict lookup, reducing dispatch from ~70 us to ~5 us.
 # ---------------------------------------------------------------------------
-_oneshot_cf_cache = {}  # (num_experts, topk, max_tokens, unit_size, has_mask, device) -> CompiledFunction
+_oneshot_cf_cache = {}  # sorting constexprs + moe_buf rank + device -> CompiledFunction
 _oneshot_fused_cf_cache = {}  # fused oneshot constexprs + device -> CompiledFunction
-_multiphase_cf_cache = {}  # (num_experts, topk, unit_size, kernel_name, *constexpr_vals) -> CompiledFunction
+_multiphase_cf_cache = {}  # sorting constexprs + moe_buf rank + kernel name -> CompiledFunction
 _dummy_mask_cache = {}  # (device, stream) -> torch.Tensor(1, dtype=i32, value=1)
 
 # Caches for moe_softmax_sort_flydsl's unfused fallback path.
@@ -2155,7 +2155,12 @@ def moe_sorting_flydsl(
             moe_buf_elems,
             n_grid_blocks,
         )
-        cache_key = (num_experts, topk, max_tokens, unit_size, has_mask, device.index)
+        # ``moe_buf_i32`` is a rank-2 view of the forward output, while the
+        # standalone backward passes a rank-1 scratch tensor.  Tensor extents
+        # are dynamic in FlyDSL's ABI cache signature, but rank is not: sharing
+        # a CompiledFunction across the two ranks makes its C-ABI argument fill
+        # read a nonexistent shape entry.  Keep those dispatches distinct.
+        cache_key = (num_experts, topk, max_tokens, unit_size, has_mask, moe_buf_i32.ndim, device.index)
         _launch_cached(
             _oneshot_cf_cache,
             cache_key,
@@ -2177,7 +2182,7 @@ def moe_sorting_flydsl(
         stream = torch.cuda.current_stream(device)
         n_zero_blocks = min((moe_buf_elems + BLOCK_SIZE - 1) // BLOCK_SIZE, num_cu * target_occupancy)
         k4_grid = num_experts + n_zero_blocks
-        base_key = (num_experts, topk, unit_size, has_mask, device.index)
+        base_key = (num_experts, topk, unit_size, has_mask, moe_buf_i32.ndim, device.index)
 
         if M <= 2048:
             p0v2_args = (

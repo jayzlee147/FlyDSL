@@ -9,7 +9,14 @@ import pytest
 import torch
 
 from flydsl.runtime.device import get_rocm_arch
-from kernels.moe.sonic import SonicMoEConfig, sonic_moe_backward, sonic_moe_backward_routes
+from kernels.moe.moe_sorting_kernel import _multiphase_cf_cache, _oneshot_cf_cache
+from kernels.moe.sonic import (
+    SonicMoE,
+    SonicMoEConfig,
+    prepare_sonic_bf16_weights,
+    sonic_moe_backward,
+    sonic_moe_backward_routes,
+)
 
 pytestmark = [pytest.mark.l2_device, pytest.mark.rocm_lower]
 
@@ -395,6 +402,47 @@ def test_sonic_moe_backward_matches_a16_reference(
     # The intentionally unused expert must receive exact zero weight grads.
     assert torch.count_nonzero(actual[1][-1]) == 0
     assert torch.count_nonzero(actual[2][-1]) == 0
+
+
+@pytest.mark.parametrize("tokens", (65, 129), ids=("oneshot", "multiphase"))
+def test_sonic_moe_forward_then_backward_separates_sorter_tensor_ranks(tokens):
+    """Forward and backward use rank-2/rank-1 sorter scratch buffers."""
+
+    hidden_size, intermediate_size, num_experts, topk = 128, 64, 4, 2
+    config = _config(
+        hidden_size,
+        intermediate_size,
+        num_experts,
+        topk,
+        tile_m=64,
+    )
+    args = _make_case(
+        tokens,
+        hidden_size,
+        intermediate_size,
+        num_experts,
+        topk,
+        seed=271 + tokens,
+    )
+    x, w1, w2, topk_ids, topk_weights, _ = args
+
+    _oneshot_cf_cache.clear()
+    _multiphase_cf_cache.clear()
+    op = SonicMoE(config, prepare_sonic_bf16_weights(w1, w2, config))
+    op.forward_topk(x, topk_ids, topk_weights)
+
+    actual = sonic_moe_backward(*args, config)
+    expected = _backward_reference(*args)
+    torch.cuda.synchronize()
+
+    for actual_gradient, expected_gradient in zip(actual[:3], expected[:3]):
+        torch.testing.assert_close(
+            actual_gradient.float(),
+            expected_gradient.float(),
+            rtol=3e-2,
+            atol=5e-2,
+        )
+    torch.testing.assert_close(actual[3], expected[3], rtol=2e-3, atol=2e-2)
 
 
 @pytest.mark.parametrize("activation_name", _ACTIVATIONS)
