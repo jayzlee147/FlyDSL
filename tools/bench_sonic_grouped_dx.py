@@ -16,6 +16,10 @@ Examples (run from the repository root):
   PYTHONPATH=. python tools/bench_sonic_grouped_dx.py \
       --cases t1 t4096 --config 16,128,64,2 --grid-caps 256 512 1024 0
 
+  PYTHONPATH=. python tools/bench_sonic_grouped_dx.py \
+      --cases t4096-e896-balanced t4096-e896-hot16 \
+      --config 64,256,64,4 --grid-caps 1024 --check
+
 Set ``--dump-dir /tmp/dx-isa`` in a fresh process to dump final ``.s`` files.
 The JSON rows also contain compiler-reported VGPR, SGPR, LDS, and spill counts.
 """
@@ -53,6 +57,12 @@ CASES = {
     "t128-balanced": Case("t128-balanced", 128, 3584, 512, 896, 16, "balanced"),
     "t128-hot16": Case("t128-hot16", 128, 3584, 512, 896, 16, "hot16"),
     "t4096": Case("t4096", 4096, 4096, 2048, 64, 8, "balanced"),
+    "t4096-e896-balanced": Case(
+        "t4096-e896-balanced", 4096, 3584, 512, 896, 16, "balanced"
+    ),
+    "t4096-e896-hot16": Case(
+        "t4096-e896-hot16", 4096, 3584, 512, 896, 16, "hot16"
+    ),
 }
 
 CURRENT_CONFIGS = {
@@ -62,6 +72,8 @@ CURRENT_CONFIGS = {
     # This case is intentionally experimental: production currently keeps the
     # general per-expert GEMM for long segments.
     "t4096": (16, 128, 64, 2),
+    "t4096-e896-balanced": (64, 256, 64, 4),
+    "t4096-e896-hot16": (64, 256, 64, 4),
 }
 
 

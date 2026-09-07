@@ -315,7 +315,15 @@ _GROUPED_DX_DENSE_EXPERTS = 256
 _LARGE_GROUPED_DX_BM = 64
 _LARGE_GROUPED_DX_BN = 256
 _LARGE_GROUPED_DX_N_WAVES = 4
-_LARGE_GROUPED_DX_SHAPE = (4096, 4096, 2048, 64, 8)
+_LARGE_GROUPED_DX_SHAPES = frozenset(
+    {
+        # Dense prefill/training bucket used by the standalone FlyDSL tests.
+        (4096, 4096, 2048, 64, 8),
+        # Default SonicMoE ROCm adapter bucket.  Without the device queue this
+        # shape falls back to one dX GEMM launch per active expert (up to 896).
+        (4096, 3584, 512, 896, 16),
+    }
+)
 
 # Weight gradients are output-stationary TN contractions.  BM/BN128 with BK32
 # is the measured throughput winner once an expert can own multiple rows;
@@ -400,7 +408,8 @@ def _use_large_grouped_dx_descriptor_queue(
     introduces a routing-statistics readback.
     """
 
-    return not flat_routes and (tokens, hidden_size, intermediate_size, num_experts, topk) == _LARGE_GROUPED_DX_SHAPE
+    shape = (tokens, hidden_size, intermediate_size, num_experts, topk)
+    return not flat_routes and shape in _LARGE_GROUPED_DX_SHAPES
 
 
 def _use_compact_w1_descriptor_queue(

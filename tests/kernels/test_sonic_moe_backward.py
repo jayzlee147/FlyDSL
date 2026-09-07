@@ -386,7 +386,10 @@ def test_grouped_w1_compact_queue_policy(tokens, expected_compact):
         ("bf16", "swiglu", 3584, 512, 128, 64, 8, True, True, True),
         ("bf16", "swiglu", 3584, 512, 1, 64, 8, True, False, False),
         ("bf16", "swiglu", 3584, 512, 4096, 64, 8, False, False, False),
+        ("bf16", "swiglu", 3584, 512, 4096, 896, 16, False, False, True),
         ("bf16", "swiglu", 4096, 2048, 4096, 64, 8, False, False, True),
+        ("bf16", "swiglu", 3584, 512, 4095, 896, 16, False, False, False),
+        ("bf16", "swiglu", 3584, 512, 4096, 895, 16, False, False, False),
         ("bf16", "swiglu", 4096, 2048, 4096, 65, 8, False, False, False),
         ("bf16", "swiglu", 4096, 2048, 4096, 64, 8, True, False, False),
         ("fp16", "swiglu", 3584, 512, 64, 64, 8, False, True, False),
@@ -2392,8 +2395,10 @@ def test_sonic_moe_backward_decode_state_keeps_low_latency_row_kernels(monkeypat
         )
 
 
+@pytest.mark.parametrize("interleaved_w1", (False, True), ids=("separate", "interleaved"))
 def test_sonic_moe_backward_forward_state_skips_generic_w1_and_keeps_large_dx_queue(
     monkeypatch,
+    interleaved_w1,
 ):
     tokens, hidden_size, intermediate_size, num_experts, topk = 4096, 256, 128, 4, 2
     config = _config(
@@ -2404,7 +2409,7 @@ def test_sonic_moe_backward_forward_state_skips_generic_w1_and_keeps_large_dx_qu
         compute_dtype="bf16",
         down_tile_m=128,
     )
-    args = _make_case(
+    args = list(_make_case(
         tokens,
         hidden_size,
         intermediate_size,
@@ -2412,8 +2417,17 @@ def test_sonic_moe_backward_forward_state_skips_generic_w1_and_keeps_large_dx_qu
         topk,
         seed=691,
         dtype=torch.bfloat16,
+    ))
+    if interleaved_w1:
+        args[1] = _interleave_glu_rows(args[1])
+    args = tuple(args)
+    state = _make_forward_state(
+        args[0],
+        args[1],
+        args[3],
+        config,
+        interleaved_w1=interleaved_w1,
     )
-    state = _make_forward_state(args[0], args[1], args[3], config)
     original_builder = sonic_backward_module.build_compact_m_tile_descriptors
     original_fused_prepare = sonic_backward_module._compile_fused_forward_state_prepare
     original_fused_derivative = sonic_backward_module._compile_fused_activation_derivative_dscore_scale_dy
@@ -2492,8 +2506,17 @@ def test_sonic_moe_backward_forward_state_skips_generic_w1_and_keeps_large_dx_qu
         _unexpected_legacy_kernel,
     )
     monkeypatch.setattr(sonic_backward_module, "gemm_a16w16", _guarded_gemm)
-    actual = sonic_moe_backward(*args, config, forward_state=state)
-    expected = _backward_reference(*args, reassociate_da_dscore=True)
+    actual = sonic_moe_backward(
+        *args,
+        config,
+        interleaved_w1=interleaved_w1,
+        forward_state=state,
+    )
+    expected = _backward_reference(
+        *args,
+        interleaved_w1=interleaved_w1,
+        reassociate_da_dscore=True,
+    )
     torch.cuda.synchronize()
 
     assert builder_blocks == [64]
