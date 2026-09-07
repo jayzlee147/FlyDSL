@@ -621,39 +621,30 @@ def _gemm1_body_a16w4(
             scale_n_up = [expert_off + col_g_list[ni] + inter_i32 for ni in range_constexpr(num_acc_n)]
 
     # ---- B tile load + compute helpers ----------------------------------------
-    def load_b_tile(base_k):
+    def load_b_subtile(base_k, ni):
         if const_expr(_is_dense):
             # Raw dense A16 W: no scale; loaded fragments are MMA operands.
             return (
-                [load_b_raw_bf16(base_k, n_blk_gate[ni], n_intra_gate[ni]) for ni in range_constexpr(num_acc_n)],
-                (
-                    [load_b_raw_bf16(base_k, n_blk_up[ni], n_intra_up[ni]) for ni in range_constexpr(num_acc_n)]
-                    if _is_glu
-                    else None
-                ),
+                load_b_raw_bf16(base_k, n_blk_gate[ni], n_intra_gate[ni]),
+                load_b_raw_bf16(base_k, n_blk_up[ni], n_intra_up[ni]) if _is_glu else None,
                 None,
                 None,
             )
         if const_expr(_is_int4):
-            g_sc = [load_b_scale_int4(base_k, scale_n_gate[ni]) for ni in range_constexpr(num_acc_n)]
-            u_sc = [load_b_scale_int4(base_k, scale_n_up[ni]) for ni in range_constexpr(num_acc_n)] if _is_glu else None
+            g_sc = load_b_scale_int4(base_k, scale_n_gate[ni])
+            u_sc = load_b_scale_int4(base_k, scale_n_up[ni]) if _is_glu else None
         else:
-            g_sc = [load_b_scale(base_k, scale_mni_gate[ni], scale_np_gate[ni]) for ni in range_constexpr(num_acc_n)]
-            u_sc = (
-                [load_b_scale(base_k, scale_mni_up[ni], scale_np_up[ni]) for ni in range_constexpr(num_acc_n)]
-                if _is_glu
-                else None
-            )
+            g_sc = load_b_scale(base_k, scale_mni_gate[ni], scale_np_gate[ni])
+            u_sc = load_b_scale(base_k, scale_mni_up[ni], scale_np_up[ni]) if _is_glu else None
         return (
-            [load_b_raw(base_k, n_blk_gate[ni], n_intra_gate[ni]) for ni in range_constexpr(num_acc_n)],
-            (
-                [load_b_raw(base_k, n_blk_up[ni], n_intra_up[ni]) for ni in range_constexpr(num_acc_n)]
-                if _is_glu
-                else None
-            ),
+            load_b_raw(base_k, n_blk_gate[ni], n_intra_gate[ni]),
+            load_b_raw(base_k, n_blk_up[ni], n_intra_up[ni]) if _is_glu else None,
             g_sc,
             u_sc,
         )
+
+    def load_b_tile(base_k):
+        return [load_b_subtile(base_k, ni) for ni in range_constexpr(num_acc_n)]
 
     def preload_a(read_slot):
         # Read ALL current-tile A-LDS fragments up front, before the next tile's A-DMA
@@ -663,31 +654,34 @@ def _gemm1_body_a16w4(
             [lds_load_a(mi, ku, slot=read_slot) for ku in range_constexpr(k_unroll)] for mi in range_constexpr(m_repeat)
         ]
 
-    def compute_tile(b_tile, a_frags):
-        g_raw, u_raw, g_sc, u_sc = b_tile
-        for ni in range_constexpr(num_acc_n):
-            for ku in range_constexpr(k_unroll):
-                if const_expr(_acc_scale_int4):
-                    # unscaled dequant + per-group accumulator scaling (decode BM16).
-                    gb = _int4_nibble_to_bf16x8_raw(fx.Int32(_raw(g_raw[ni][ku // 4][ku % 4])), use_k16=use_k16)
-                    if _is_glu:
-                        ub = _int4_nibble_to_bf16x8_raw(fx.Int32(_raw(u_raw[ni][ku // 4][ku % 4])), use_k16=use_k16)
-                    for mi in range_constexpr(m_repeat):
-                        a8 = a_frags[mi][ku]
-                        _mma_scaled_add(acc_gate[mi][ni], a8, gb, g_sc[ni][ku])
-                        if _is_glu:
-                            _mma_scaled_add(acc_up[mi][ni], a8, ub, u_sc[ni][ku])
-                    continue
-                _gsc = None if const_expr(_is_dense) else g_sc[ni][ku]
-                gb = upconvert_b(g_raw[ni], ku, _gsc)
+    def compute_b_subtile(b_subtile, a_frags, ni):
+        g_raw, u_raw, g_sc, u_sc = b_subtile
+        for ku in range_constexpr(k_unroll):
+            if const_expr(_acc_scale_int4):
+                # unscaled dequant + per-group accumulator scaling (decode BM16).
+                gb = _int4_nibble_to_bf16x8_raw(fx.Int32(_raw(g_raw[ku // 4][ku % 4])), use_k16=use_k16)
                 if _is_glu:
-                    _usc = None if const_expr(_is_dense) else u_sc[ni][ku]
-                    ub = upconvert_b(u_raw[ni], ku, _usc)
+                    ub = _int4_nibble_to_bf16x8_raw(fx.Int32(_raw(u_raw[ku // 4][ku % 4])), use_k16=use_k16)
                 for mi in range_constexpr(m_repeat):
                     a8 = a_frags[mi][ku]
-                    _mma(acc_gate[mi][ni], a8, gb)
+                    _mma_scaled_add(acc_gate[mi][ni], a8, gb, g_sc[ku])
                     if _is_glu:
-                        _mma(acc_up[mi][ni], a8, ub)
+                        _mma_scaled_add(acc_up[mi][ni], a8, ub, u_sc[ku])
+                continue
+            _gsc = None if const_expr(_is_dense) else g_sc[ku]
+            gb = upconvert_b(g_raw, ku, _gsc)
+            if _is_glu:
+                _usc = None if const_expr(_is_dense) else u_sc[ku]
+                ub = upconvert_b(u_raw, ku, _usc)
+            for mi in range_constexpr(m_repeat):
+                a8 = a_frags[mi][ku]
+                _mma(acc_gate[mi][ni], a8, gb)
+                if _is_glu:
+                    _mma(acc_up[mi][ni], a8, ub)
+
+    def compute_tile(b_tile, a_frags):
+        for ni in range_constexpr(num_acc_n):
+            compute_b_subtile(b_tile[ni], a_frags, ni)
 
     # ---- main K loop (ISA-aligned software pipeline) --------------------------
     # k-group global K base = wave_k_id * klen (0 at k_wave=1). Loop runs K_TILES_TOTAL.
@@ -716,11 +710,24 @@ def _gemm1_body_a16w4(
             # so they overlap the MFMA cluster.
             a_frags = preload_a(cur_slot)
             if const_expr(kt + 1 < K_TILES_TOTAL):
-                dma_x_tile_to_lds(k_base + fx.Int32((kt + 1) * TILE_K), slot=(kt + 1) % A_LDS_STAGES)
-                b_nxt = load_b_tile(k_base + fx.Int32((kt + 1) * TILE_K))
-            compute_tile(b_cur, a_frags)
-            if const_expr(kt + 1 < K_TILES_TOTAL):
-                b_cur = b_nxt
+                next_k = k_base + fx.Int32((kt + 1) * TILE_K)
+                dma_x_tile_to_lds(next_k, slot=(kt + 1) % A_LDS_STAGES)
+                if const_expr(num_acc_n == 1):
+                    # With no following N-subtile to hide the load behind, retain
+                    # the original whole-tile prefetch/compute order.
+                    b_nxt = load_b_tile(next_k)
+                    compute_tile(b_cur, a_frags)
+                    b_cur = b_nxt
+                else:
+                    # Rotate B at N-subtile granularity: once b_cur[ni] has fed its
+                    # MFMAs, its VGPRs can be reused immediately for b_nxt[ni].
+                    # This retains the one-tile prefetch distance while avoiding
+                    # simultaneous whole-tile current/next B register lifetimes.
+                    for ni in range_constexpr(num_acc_n):
+                        compute_b_subtile(b_cur[ni], a_frags, ni)
+                        b_cur[ni] = load_b_subtile(next_k, ni)
+            else:
+                compute_tile(b_cur, a_frags)
 
     # ---- k_wave slice-K reduce (aiter mixed_moe LDS-reduce): each wave stores its
     # nm = num_acc_n*m_repeat vec4-f32 acc-slots to a per-wave LDS region, then sums its

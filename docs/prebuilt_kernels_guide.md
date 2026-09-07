@@ -388,6 +388,12 @@ The hidden size must be divisible by `stage1_k_wave * tile_k`, and the
 constructor rejects combinations whose A buffers or reduction scratch exceed
 gfx950's 160 KiB LDS limit.
 
+For multi-subtile N shapes, the Stage-1 K loop rotates the next B fragments into
+the registers released immediately after each current N subtile is consumed.
+This preserves one-tile prefetching while avoiding simultaneous whole-tile
+current/next B lifetimes. Single-subtile shapes retain the original prefetch
+order because there is no following N work available to hide a delayed load.
+
 Weights are preshuffled once during preparation. Workspaces and compiled launchers
 are reused. Expert counts with an exact single-wave layout use the FlyDSL router;
 this includes the production E=896 shape (`VPT=14`, 64 threads per token).
@@ -570,6 +576,12 @@ PYTHONPATH=. python examples/06-sonicMoE.py \
 Add `--stage1-k-wave 2` to benchmark a legal slice-K variant of the same shape.
 `--stage1-k-wave 4` is also available for tile shapes whose larger reduction
 scratch fits in LDS.
+
+For the command above, a same-device MI355X run with a fixed seed and 7x100
+warm-cache measurements reduced median end-to-end latency from `2021.448 us` to
+`1871.134 us` after Stage 1 adopted N-subtile B-register rotation (`1.080x`).
+Useful BF16 MoE throughput increased from approximately `815.9` to
+`881.4 TFLOP/s`; routing, padding (`36,480` rows), and Stage 2 were unchanged.
 
 Run the validated A16W4 path or let the shape-bucket tuner choose the tiles with:
 
