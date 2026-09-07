@@ -20,9 +20,11 @@ from kernels.moe.sonic import (
 )
 from kernels.moe.sonic_backward import (
     _grouped_da_tuning,
+    _grouped_dw2_tuning,
     _grouped_dx_tuning,
     _grouped_w1_tuning,
     _use_grouped_da,
+    _use_grouped_dw2,
     _use_grouped_dx,
     _use_grouped_w1_recompute,
     _use_grouped_w2_recompute,
@@ -119,6 +121,39 @@ def test_grouped_w2_policy_keeps_unsupported_contracts_on_legacy(
         routes=2048,
         flat_routes=False,
     )
+
+
+@pytest.mark.parametrize(
+    ("compute_dtype", "hidden_size", "intermediate_size", "expected"),
+    (
+        ("bf16", 3584, 512, True),
+        ("bf16", 128, 64, True),
+        ("fp16", 3584, 512, False),
+        ("bf16", 3552, 512, False),
+        ("bf16", 3584, 480, False),
+    ),
+)
+def test_grouped_dw2_policy(compute_dtype, hidden_size, intermediate_size, expected):
+    assert (
+        _use_grouped_dw2(
+            compute_dtype=compute_dtype,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+        )
+        is expected
+    )
+
+
+@pytest.mark.parametrize(
+    ("max_expert_rows", "hidden_size", "intermediate_size", "expected"),
+    (
+        (1, 3584, 512, (256, 128, 32, 0, 4, 2)),
+        (2, 3584, 512, (256, 256, 32, 0, 4, 4)),
+        (128, 128, 64, (128, 64, 32, 0, 2, 2)),
+    ),
+)
+def test_grouped_dw2_tuning(max_expert_rows, hidden_size, intermediate_size, expected):
+    assert _grouped_dw2_tuning(max_expert_rows, hidden_size, intermediate_size) == expected
 
 
 @pytest.mark.parametrize(
@@ -614,10 +649,31 @@ def test_sonic_moe_backward_t1_keeps_expert_grid_without_descriptor_builder(monk
     def _unexpected_builder(*_args, **_kwargs):
         raise AssertionError("T1 must not build compact W1 descriptors")
 
+    def _unexpected_active_builder(*_args, **_kwargs):
+        raise AssertionError("T1 dW2 must consume sorter metadata directly")
+
+    original_metadata_tn = sonic_backward_module.grouped_tn_from_metadata_flydsl
+    metadata_tn_calls = 0
+
+    def _tracked_metadata_tn(*tn_args, **tn_kwargs):
+        nonlocal metadata_tn_calls
+        metadata_tn_calls += 1
+        return original_metadata_tn(*tn_args, **tn_kwargs)
+
     monkeypatch.setattr(
         sonic_backward_module,
         "build_compact_m_tile_descriptors",
         _unexpected_builder,
+    )
+    monkeypatch.setattr(
+        sonic_backward_module,
+        "build_active_expert_queue_flydsl",
+        _unexpected_active_builder,
+    )
+    monkeypatch.setattr(
+        sonic_backward_module,
+        "grouped_tn_from_metadata_flydsl",
+        _tracked_metadata_tn,
     )
     actual = sonic_moe_backward(*args, config)
     expected = _backward_reference(*args)
@@ -629,6 +685,7 @@ def test_sonic_moe_backward_t1_keeps_expert_grid_without_descriptor_builder(monk
             rtol=3e-2,
             atol=5e-2,
         )
+    assert metadata_tn_calls == 1
     torch.testing.assert_close(actual[3], expected[3], rtol=5e-4, atol=5e-4)
 
 
@@ -724,16 +781,26 @@ def test_sonic_moe_backward_grouped_w1_spans_sort_blocks_with_bias(monkeypatch):
 
     original_builder = sonic_backward_module.build_compact_m_tile_descriptors
     builder_calls = 0
+    emitted_active_queue = False
 
     def _tracked_builder(*builder_args, **builder_kwargs):
-        nonlocal builder_calls
+        nonlocal builder_calls, emitted_active_queue
         builder_calls += 1
+        emitted_active_queue = builder_kwargs.get("active_expert_storage") is not None
         return original_builder(*builder_args, **builder_kwargs)
+
+    def _unexpected_active_builder(*_args, **_kwargs):
+        raise AssertionError("compact W1 and dW2 must share one active-expert queue")
 
     monkeypatch.setattr(
         sonic_backward_module,
         "build_compact_m_tile_descriptors",
         _tracked_builder,
+    )
+    monkeypatch.setattr(
+        sonic_backward_module,
+        "build_active_expert_queue_flydsl",
+        _unexpected_active_builder,
     )
     actual = sonic_moe_backward(*args, config, b1=b1, b2=b2)
     expected = _backward_reference(*args, b1=b1, b2=b2)
@@ -741,6 +808,7 @@ def test_sonic_moe_backward_grouped_w1_spans_sort_blocks_with_bias(monkeypatch):
 
     # W1 recompute and dX share one counter-first BM16 queue.
     assert builder_calls == 1
+    assert emitted_active_queue
 
     for actual_gradient, expected_gradient in zip(actual, expected):
         if actual_gradient.dtype == torch.float32:

@@ -10,13 +10,13 @@ inference workspace. Re-sorting and recomputing the two forward intermediates
 makes retained graphs and overlapping forward calls safe.
 
 The implementation is entirely FlyDSL on device.  Short-route BF16 SwiGLU W1
-preactivation, W2 projection, and dA contractions use device-driven grouped
-gfx950 MFMA kernels; the remaining matrix products use the general A16W16 GEMM.
-Small FlyDSL kernels implement routing metadata, gather/scatter, activation
-derivatives, and the top-K reduction. The bring-up path still performs one host
-synchronization to dispatch the three remaining GEMMs per active expert; later
-grouped kernels can remove that synchronization without changing the public
-API.
+preactivation, W2 projection, dA, and BF16 dW2 contractions use device-driven
+grouped gfx950 MFMA kernels; the remaining matrix products use the general
+A16W16 GEMM. Small FlyDSL kernels implement routing metadata, gather/scatter,
+activation derivatives, and the top-K reduction. The bring-up path still
+performs one host synchronization to dispatch the remaining dW1 GEMM per active
+expert; later grouped kernels can remove that synchronization without changing
+the public API.
 """
 
 import functools
@@ -53,6 +53,13 @@ from kernels.moe.sonic_grouped_scheduler import (
     build_compact_m_tile_descriptors,
     fixed_compact_m_tile_descriptor_upper_bound,
     ragged_compact_m_tile_descriptor_upper_bound,
+)
+from kernels.moe.sonic_grouped_tn import (
+    active_expert_descriptor_capacity,
+    active_expert_queue_elements,
+    build_active_expert_queue_flydsl,
+    grouped_tn_from_metadata_flydsl,
+    grouped_tn_from_queue_flydsl,
 )
 
 if TYPE_CHECKING:
@@ -127,6 +134,31 @@ _GROUPED_W2_MAX_EXPERT_ROWS = 128
 # the remaining dW contractions, so profile selection adds no synchronization.
 _GROUPED_DA_BN = 64
 _GROUPED_DA_MAX_EXPERT_ROWS = 4096
+
+# Weight-gradient TN contractions are output-stationary: each CTA owns one
+# output tile and reduces all rows for one expert before a single BF16 store.
+# BK32 is the measured short/ragged-row winner on gfx950.  Exact resource
+# bounds make the unused portion of the final K tile read as zero without
+# loading the sorter's full 64-row padding.
+_GROUPED_DW2_BK = 32
+
+
+def _grouped_dw2_tuning(
+    max_expert_rows: int,
+    hidden_size: int,
+    intermediate_size: int,
+) -> tuple[int, int, int, int, int, int]:
+    """Return ``(BM, BN, BK, K-pad, M-waves, N-waves)`` for dW2."""
+
+    block_m = next(tile for tile in (256, 128, 64) if hidden_size % tile == 0)
+    block_n = next(tile for tile in (256, 128, 64) if intermediate_size % tile == 0)
+    # Decode has only one useful row per expert.  Doubling N tiles exposes
+    # enough independent CTAs to fill 256 CUs and beats BN256 for H3584/I512.
+    if max_expert_rows <= 1 and block_n == 256:
+        block_n = 128
+    m_waves = 4 if block_m == 256 else 2
+    n_waves = 4 if block_n == 256 else 2
+    return block_m, block_n, _GROUPED_DW2_BK, 0, m_waves, n_waves
 
 
 def _grouped_da_tuning(max_expert_rows: int, hidden_size: int) -> tuple[int, int, int, int, int]:
@@ -362,6 +394,21 @@ def _use_grouped_w2_recompute(
         and hidden_size % _GROUPED_W2_BN == 0
         and intermediate_size % _GROUPED_W2_BK == 0
         and max_expert_rows <= _GROUPED_W2_MAX_EXPERT_ROWS
+    )
+
+
+def _use_grouped_dw2(
+    *,
+    compute_dtype: str,
+    hidden_size: int,
+    intermediate_size: int,
+) -> bool:
+    """Return whether the gfx950 grouped BF16 dW2 contraction is legal."""
+
+    return (
+        compute_dtype == "bf16"
+        and hidden_size % 64 == 0
+        and intermediate_size % 64 == 0
     )
 
 
@@ -1547,6 +1594,11 @@ def _sonic_moe_backward_impl(
         routes=routes,
         flat_routes=flat_routes,
     )
+    use_grouped_dw2 = _use_grouped_dw2(
+        compute_dtype=compute_dtype,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+    )
     use_grouped_da = _use_grouped_da(
         compute_dtype=compute_dtype,
         activation=activation_name,
@@ -1614,6 +1666,19 @@ def _sonic_moe_backward_impl(
     )
     sorter_dummy = torch.empty(4, dtype=torch.int32, device=device)
     expert_frequency = torch.empty(num_experts, dtype=torch.int32, device=device)
+    active_expert_capacity = active_expert_descriptor_capacity(routes, num_experts)
+    # The compact W1 builder can emit this queue in its existing two launches.
+    # Other routing regimes select metadata-direct or standalone construction
+    # after the already-required frequency readback below.
+    active_expert_storage = (
+        torch.empty(
+            active_expert_queue_elements(routes, num_experts),
+            dtype=torch.int32,
+            device=device,
+        )
+        if use_grouped_dw2 and use_compact_w1
+        else None
+    )
     if use_compact_w1:
         if flat_routes:
             compact_w1_bound = ragged_compact_m_tile_descriptor_upper_bound(
@@ -1757,6 +1822,12 @@ def _sonic_moe_backward_impl(
                     block_m=grouped_w1_bm,
                     sorted_block_m=sort_unit,
                     descriptor_capacity=compact_w1_bound,
+                    active_expert_storage=active_expert_storage,
+                    active_expert_capacity=(
+                        active_expert_capacity
+                        if active_expert_storage is not None
+                        else None
+                    ),
                     stream=stream,
                 )
             grouped_w1 = _compile_grouped_w1_recompute(
@@ -1808,6 +1879,27 @@ def _sonic_moe_backward_impl(
                 segments.append((expert, offset, padded))
                 offset += padded
         padded_rows = offset
+        max_expert_rows = max(int(count) for count in frequencies)
+
+        # One sorter block per active expert is itself a valid schedule and is
+        # the lowest-latency path.  Compact W1 regimes already produced the
+        # shared queue above; long/non-compact regimes build it once here for
+        # both weight-gradient TN contractions.
+        use_dw2_metadata_direct = use_grouped_dw2 and active_expert_storage is None and max_expert_rows <= sort_unit
+        if use_grouped_dw2 and not use_dw2_metadata_direct and active_expert_storage is None:
+            active_expert_storage = torch.empty(
+                active_expert_queue_elements(routes, num_experts),
+                dtype=torch.int32,
+                device=device,
+            )
+            build_active_expert_queue_flydsl(
+                expert_frequency,
+                sorted_expert_ids,
+                num_valid_ids,
+                routes=routes,
+                queue_storage=active_expert_storage,
+                stream=stream,
+            )
 
         gather = _compile_gather(hidden_size, compute_dtype, device_index)
         gather_work = padded_rows * (hidden_size // 4)
@@ -1857,6 +1949,42 @@ def _sonic_moe_backward_impl(
             padded_rows,
             stream,
         )
+
+        if use_grouped_dw2:
+            dw2_bm, dw2_bn, dw2_bk, dw2_k_padding, dw2_mw, dw2_nw = _grouped_dw2_tuning(
+                max_expert_rows,
+                hidden_size,
+                intermediate_size,
+            )
+            grouped_dw2_kwargs = {
+                "block_m": dw2_bm,
+                "block_n": dw2_bn,
+                "block_k": dw2_bk,
+                "k_padding": dw2_k_padding,
+                "m_waves": dw2_mw,
+                "n_waves": dw2_nw,
+                "stream": stream,
+            }
+            if use_dw2_metadata_direct:
+                grouped_tn_from_metadata_flydsl(
+                    dy,
+                    activation,
+                    expert_frequency,
+                    sorted_expert_ids,
+                    num_valid_ids,
+                    dw2,
+                    **grouped_dw2_kwargs,
+                )
+            else:
+                assert active_expert_storage is not None
+                grouped_tn_from_queue_flydsl(
+                    dy,
+                    activation,
+                    expert_frequency,
+                    active_expert_storage,
+                    dw2,
+                    **grouped_dw2_kwargs,
+                )
 
         if use_grouped_da:
             grouped_da_bm, grouped_da_bn, grouped_da_bk, grouped_da_mw, grouped_da_nw = _grouped_da_tuning(
@@ -1938,14 +2066,15 @@ def _sonic_moe_backward_impl(
                     stream=stream,
                     layout="nn",
                 )
-            gemm_a16w16(
-                dy[start:end].transpose(0, 1),
-                activation[start:end],
-                out=dw2[expert],
-                user_kwargs=_GEMM_KWARGS,
-                stream=stream,
-                layout="tn",
-            )
+            if not use_grouped_dw2:
+                gemm_a16w16(
+                    dy[start:end].transpose(0, 1),
+                    activation[start:end],
+                    out=dw2[expert],
+                    user_kwargs=_GEMM_KWARGS,
+                    stream=stream,
+                    layout="tn",
+                )
 
         activation_derivative = _compile_activation_derivative(
             intermediate_size,
