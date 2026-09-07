@@ -130,6 +130,74 @@ def _weighted_a16_epilog(
                     )
 
 
+@flyc.jit
+def _sorted_a16_epilog(
+    lds_acc_base_i32,
+    accm,
+    arg_out,
+    arg_stids,
+    m_row,
+    n_block_idx,
+    wave,
+    lane,
+    i32_M,
+    BM,
+    N_OUT,
+    BN,
+    out_dtype,
+):
+    """Transpose MFMA accumulators and store an unweighted sorted BF16 row."""
+
+    elem_dtype = fx.Float16 if const_expr(out_dtype == "fp16") else fx.BFloat16
+    _kMChunks = kmchunks_for(BM)
+    M_REPS = BM // 8
+    _n_per_wave = BN // 4
+    num_acc_n = _n_per_wave // 16
+    _s_count = BN // 64
+    lane_div_16 = lane // fx.Int32(16)
+    lane_mod_16 = lane % fx.Int32(16)
+    lds_base = _lds_ptr3(lds_acc_base_i32, fx.Int32(0))
+
+    tx_i32 = fx.Int32(gpu.thread_id("x"))
+    m_lane = tx_i32 // fx.Int32(32)
+    n_lane = tx_i32 % fx.Int32(32)
+    col_start = n_lane * fx.Int32(2)
+    stids_base = _global_base_ptr1(arg_stids)
+    out_base = _global_base_ptr1(arg_out)
+
+    packed = []
+    for mr in range_constexpr(M_REPS):
+        sorted_pos = m_row + fx.Int32(mr * 8) + m_lane
+        packed.append(llvm.load(T.i32, _gep1(stids_base, sorted_pos * fx.Int32(4)), invariant=True))
+
+    for i in range_constexpr(_kMChunks):
+        row_base = fx.Int32(i * 16) + lane_div_16 * fx.Int32(4)
+        for J in range_constexpr(num_acc_n):
+            col = wave * fx.Int32(_n_per_wave) + fx.Int32(J * 16) + lane_mod_16
+            vec = Vec(accm[i][J])
+            for v in range_constexpr(4):
+                idx = (row_base + fx.Int32(v)) * fx.Int32(BN) + col
+                llvm.StoreOp(_raw(vec[v]), _gep3(lds_base, idx * fx.Int32(4)))
+
+    gpu.barrier()
+
+    for mr in range_constexpr(M_REPS):
+        row_in_block = fx.Int32(mr * 8) + m_lane
+        sorted_pos = m_row + row_in_block
+        token_id = packed[mr] & fx.Int32(0x00FFFFFF)
+        if token_id < i32_M:
+            row_base_addr = (
+                fx.Int64(sorted_pos) * fx.Int64(N_OUT)
+                + fx.Int64(n_block_idx * fx.Int32(BN) + col_start)
+            )
+            for s in range_constexpr(_s_count):
+                idx0 = row_in_block * fx.Int32(BN) + col_start + fx.Int32(s * 64)
+                v2 = Vec(llvm.load(T.vec(2, T.f32), _gep3(lds_base, idx0 * fx.Int32(4))))
+                packed_out = v2.to(elem_dtype)
+                off = (row_base_addr + fx.Int64(s * 64)) * fx.Int64(2)
+                llvm.StoreOp(_raw(packed_out), _gep1(out_base, off), alignment=4)
+
+
 def _gemm2_body_a16w4(
     lds_raw_ptr,
     arg_a,
@@ -160,6 +228,8 @@ def _gemm2_body_a16w4(
     round_projection_bf16=False,
     output_mode="atomic",
     TOPK=1,
+    logical_dense_weight=False,
+    store_sorted_projection=False,
 ):
     """A16W4/A16W16 stage2 body. K=inter_dim, N=model_dim.
 
@@ -167,7 +237,9 @@ def _gemm2_body_a16w4(
     mxfp4/int4 (BF16 activation only) or matching dense BF16/FP16. Output either
     uses packed A16 atomic-fadd routing-weighted scatter to [tokens, model_dim],
     or ordinary weighted A16 stores to [tokens, TOPK, model_dim] for a following
-    FP32 top-k reduction.
+    FP32 top-k reduction.  The backward recompute specialization consumes the
+    public row-major ``[E, N_OUT, INTER]`` weight directly and stores the
+    unweighted BF16 projection by sorted row.
     """
     _is_int4 = w_dtype == "int4"
     _is_dense = w_dtype in ("bf16", "fp16")
@@ -373,12 +445,20 @@ def _gemm2_body_a16w4(
                 _k0_blk = ku // 4
                 bf_k0 = base_k0 + fx.Int32(_k0_blk * 4) + lane_div_16
                 bf_klane = fx.Int32(ku % 4)
-            elem_idx = fx.Int32(
-                crd2idx(
-                    [fx.Int64(n_blk), fx.Int64(bf_k0), fx.Int64(bf_klane), fx.Int64(n_intra), fx.Int64(0)],
-                    layout_b_bf16,
+            if const_expr(logical_dense_weight):
+                # Public backward W2 is contiguous [E, N_OUT, INTER].  The
+                # preshuffle coordinates map to eight naturally contiguous K
+                # values in one logical output row.
+                logical_n = n_blk * fx.Int32(16) + n_intra
+                logical_k = bf_k0 * fx.Int32(32) + bf_klane * fx.Int32(8)
+                elem_idx = logical_n * fx.Int32(K) + logical_k
+            else:
+                elem_idx = fx.Int32(
+                    crd2idx(
+                        [fx.Int64(n_blk), fx.Int64(bf_k0), fx.Int64(bf_klane), fx.Int64(n_intra), fx.Int64(0)],
+                        layout_b_bf16,
+                    )
                 )
-            )
             # elem_idx is a bf16-elem offset; dword index = elem_idx*2/4, tile index = /4.
             r = fx.make_rmem_tensor(w_reg_lay, fx.Int32)
             fx.copy(w_copy_atom, fx.slice(w_tiles, (None, elem_idx // fx.Int32(8))), r)
@@ -514,10 +594,8 @@ def _gemm2_body_a16w4(
                     _mma(accm[mi][ni], a8, bb)
         gpu.barrier()
 
-    # ---- epilogue: routing-weighted atomic scatter or fixed-slot store. K-loop
-    # done, so the A-LDS region (offset 0) is reused for f32 accumulator staging.
-    gpu.barrier()
-    lds_acc_base_i32 = fx.Int32(fx.ptrtoint(lds_raw_ptr))
+    # ---- epilogue: sorted projection, routing-weighted atomic scatter, or
+    # fixed-slot store.  All modes use an LDS transpose for coalesced writes.
     if const_expr(has_bias):
         bias_base = _global_base_ptr1(fx.Int64(arg_bias) + fx.Int64(e) * fx.Int64(N_OUT * 2))
         bias_values = []
@@ -531,6 +609,11 @@ def _gemm2_body_a16w4(
             )
             bias_values.append(fx.Float32(elem_dtype(bias_raw)))
 
+    # Both epilogues transpose accumulator ownership through LDS for coalesced
+    # vec2 stores.  Sorted mode skips route weights and atomics after the same
+    # proven MFMA-fragment mapping.
+    gpu.barrier()
+    lds_acc_base_i32 = fx.Int32(fx.ptrtoint(lds_raw_ptr))
     accm_v = []
     for i in range_constexpr(m_repeat):
         row = []
@@ -541,30 +624,50 @@ def _gemm2_body_a16w4(
                     [vec[v] + bias_values[J] for v in range_constexpr(4)],
                     fx.Float32,
                 )
-            if const_expr(round_projection_bf16):
+            if const_expr(round_projection_bf16 and not store_sorted_projection):
                 # Legacy Sonic stores grouped-GEMM output in BF16 before the
                 # FP32 route-score reduction reloads it.
                 vec = vec.to(elem_dtype).to(fx.Float32)
             row.append(vec.ir_value())
         accm_v.append(row)
-    _weighted_a16_epilog(
-        lds_acc_base_i32,
-        accm_v,
-        arg_out,
-        arg_stids,
-        arg_sweights,
-        m_row,
-        n_block_idx,
-        wave,
-        lane,
-        i32_M,
-        BM,
-        N_OUT,
-        TILE_N,
-        a_dtype,
-        output_mode,
-        TOPK,
-    )
+    if const_expr(store_sorted_projection):
+        _sorted_a16_epilog(
+            lds_acc_base_i32,
+            accm_v,
+            arg_out,
+            arg_stids,
+            m_row,
+            n_block_idx,
+            wave,
+            lane,
+            i32_M,
+            BM,
+            N_OUT,
+            TILE_N,
+            a_dtype,
+        )
+        # Expert-grid may immediately reuse this LDS region for its next M
+        # subtile.  Ensure every lane finished the transpose read first.
+        gpu.barrier()
+    else:
+        _weighted_a16_epilog(
+            lds_acc_base_i32,
+            accm_v,
+            arg_out,
+            arg_stids,
+            arg_sweights,
+            m_row,
+            n_block_idx,
+            wave,
+            lane,
+            i32_M,
+            BM,
+            N_OUT,
+            TILE_N,
+            a_dtype,
+            output_mode,
+            TOPK,
+        )
 
 
 def gemm2_a16w4_grid(BM, *, N_OUT, TILE_N, max_m_blocks, persist=False):
@@ -599,6 +702,9 @@ def compile_gemm2_a16w4_port(
     round_projection_bf16=False,
     output_mode="atomic",
     TOPK=1,
+    logical_dense_weight=False,
+    store_sorted_projection=False,
+    expert_grid=False,
 ):
     """A16W4/A16W16 grouped down-projection builder.
 
@@ -626,14 +732,32 @@ def compile_gemm2_a16w4_port(
         assert a_dtype == "bf16", "quantized weights currently require a_dtype='bf16'"
     assert isinstance(has_bias, bool), "has_bias must be bool"
     assert isinstance(round_projection_bf16, bool), "round_projection_bf16 must be bool"
+    assert isinstance(logical_dense_weight, bool), "logical_dense_weight must be bool"
+    assert isinstance(store_sorted_projection, bool), "store_sorted_projection must be bool"
+    assert isinstance(expert_grid, bool), "expert_grid must be bool"
     assert output_mode in ("atomic", "reduce"), "output_mode must be 'atomic' or 'reduce'"
     assert isinstance(TOPK, int) and 0 < TOPK <= 255, "TOPK must be an integer in [1, 255]"
+    assert not logical_dense_weight or w_dtype in ("bf16", "fp16"), (
+        "logical_dense_weight is valid only for dense A16 weights"
+    )
+    assert not store_sorted_projection or logical_dense_weight, (
+        "store_sorted_projection requires logical dense weights"
+    )
+    assert not expert_grid or store_sorted_projection, (
+        "expert_grid requires the backward sorted-projection mode"
+    )
+    assert not expert_grid or not persist, "expert_grid and persistent route-grid scheduling are mutually exclusive"
     # Arch-gate K=16 (gfx942) vs K=32 (gfx950); see a16wmix_use_k16.
     _use_k16 = a16wmix_use_k16()
     _K = D_INTER
     assert _K % TILE_K == 0, f"D_INTER (K) must be a multiple of {TILE_K}, got {_K}"
     assert N_OUT % TILE_N == 0, f"model_dim (N_OUT) must be a multiple of {TILE_N}, got {N_OUT}"
     assert BM % 16 == 0, f"BM must be a multiple of 16, got {BM}"
+    assert TILE_N % 64 == 0, f"TILE_N must be a multiple of 64, got {TILE_N}"
+    assert (BM * TILE_K) % 2048 == 0, (
+        "BM * TILE_K must be a multiple of 2048 A16 elements for the "
+        f"256-thread direct-to-LDS copy, got BM={BM}, TILE_K={TILE_K}"
+    )
     assert SORTED_BM % BM == 0, f"SORTED_BM ({SORTED_BM}) must be a multiple of BM ({BM})"
     _num_n_blocks = N_OUT // TILE_N
     KH_TILE_BYTES = TILE_K * 2
@@ -664,6 +788,12 @@ def compile_gemm2_a16w4_port(
         _name += "_biasv1"
     if round_projection_bf16:
         _name += "_projbf16v1"
+    if logical_dense_weight:
+        _name += "_logicalw"
+    if store_sorted_projection:
+        _name += "_storesorted"
+    if expert_grid:
+        _name += "_egrid"
 
     @fx.struct
     class SharedStorage:
@@ -744,9 +874,38 @@ def compile_gemm2_a16w4_port(
                 round_projection_bf16=round_projection_bf16,
                 output_mode=output_mode,
                 TOPK=TOPK,
+                logical_dense_weight=logical_dense_weight,
+                store_sorted_projection=store_sorted_projection,
             )
 
-        if const_expr(persist):
+        if const_expr(expert_grid):
+            # Backward-only device-driven schedule.  One workgroup owns an
+            # (expert, N-tile) pair and loops over ceil(real_rows/BM) tiles.
+            # A fixed-trip lower_bound finds the expert's first SORTED_BM block
+            # without copying prefix sums back to the host.
+            expert_bound = fx.Int32(NE * _num_n_blocks)
+            if bx_i32 < expert_bound:
+                expert = bx_i32 // fx.Int32(_num_n_blocks)
+                n_block = bx_i32 % fx.Int32(_num_n_blocks)
+                frequency = rocdl.readfirstlane(T.i32, _raw(_global_i32_at(arg_bscale, expert)))
+                if frequency > fx.Int32(0):
+                    lo = fx.Int32(0)
+                    hi = cumsum0 // fx.Int32(SORTED_BM)
+                    for _ in range_constexpr(25):
+                        searching = lo < hi
+                        mid = (lo + hi) // fx.Int32(2)
+                        safe_mid = searching.select(mid, fx.Int32(0))
+                        mid_expert = fx.Int32(_global_i32_at(arg_eids, safe_mid))
+                        move_right = searching & (mid_expert < expert)
+                        lo = move_right.select(mid + fx.Int32(1), lo)
+                        move_left = searching & (mid_expert >= expert)
+                        hi = move_left.select(mid, hi)
+                    first_m_block = lo * fx.Int32(SORTED_BM // BM)
+                    num_m_blocks = (frequency + fx.Int32(BM - 1)) // fx.Int32(BM)
+                    for subtile in range(0, num_m_blocks, 1):
+                        tile = (first_m_block + fx.Int32(subtile)) * fx.Int32(_num_n_blocks) + n_block
+                        _run_tile(tile)
+        elif const_expr(persist):
             # Persistent CU-limited grid (~NUM_CU CTAs): each CTA does tile bx_i32 then
             # strides by grid size over [0, bound); _xcd_np maps every visited index, so
             # each tile runs once (same mapping as non-persistent). Loop-top barrier

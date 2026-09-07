@@ -9,13 +9,14 @@ activations and optional expert bias are supported. It does not reuse the
 inference workspace. Re-sorting and recomputing the two forward intermediates
 makes retained graphs and overlapping forward calls safe.
 
-The implementation is entirely FlyDSL on device.  BF16 SwiGLU W1
-preactivation recompute uses a device-driven grouped gfx950 MFMA kernel; the
-remaining matrix products use the general A16W16 GEMM.  Small FlyDSL kernels
-implement routing metadata, gather/scatter, activation derivatives, and the
-top-K reduction.  The bring-up path still performs one host synchronization to
-dispatch the five remaining GEMMs per active expert; later grouped kernels can
-remove that synchronization without changing the public API.
+The implementation is entirely FlyDSL on device.  Short-route BF16 SwiGLU W1
+preactivation and W2 projection recomputes use device-driven grouped gfx950
+MFMA kernels; the remaining matrix products use the general A16W16 GEMM. Small
+FlyDSL kernels implement routing metadata, gather/scatter, activation
+derivatives, and the top-K reduction. The bring-up path still performs one host
+synchronization to dispatch the four remaining GEMMs per active expert; later
+grouped kernels can remove that synchronization without changing the public
+API.
 """
 
 import functools
@@ -42,6 +43,7 @@ from kernels.moe.moe_2stage_a16wmix.gemm1 import (
     _tanh_f32,
     compile_gemm1_a16w4_port,
 )
+from kernels.moe.moe_2stage_a16wmix.gemm2 import compile_gemm2_a16w4_port
 from kernels.moe.moe_gemm_2stage.moe_reduce import compile_moe_reduction
 from kernels.moe.moe_ragged_sorting_kernel import moe_ragged_sorting_flydsl
 from kernels.moe.moe_sorting_kernel import moe_sorting_flydsl, moe_sorting_get_workspace_size
@@ -92,6 +94,16 @@ _GROUPED_W1_K_WAVE = 4
 # limit the existing BM64 GEMM has enough M work to amortize host dispatch and
 # is substantially faster (for example, balanced T4096/E64 has 512 rows/expert).
 _GROUPED_W1_MAX_EXPERT_ROWS = 128
+
+# W2 recompute has the opposite aspect ratio (K=intermediate, N=hidden).  Keep
+# its policy independent so gfx950 tuning can evolve without coupling the two
+# kernels. BM32/BN256/BK64 is the measured balanced-routing winner for the
+# production I=512 contraction on MI350, while remaining within 1 us of the
+# best decode profile.
+_GROUPED_W2_BM = 32
+_GROUPED_W2_BN = 256
+_GROUPED_W2_BK = 64
+_GROUPED_W2_MAX_EXPERT_ROWS = 128
 
 
 def _use_grouped_w1_recompute(
@@ -151,6 +163,63 @@ def _compile_grouped_w1_recompute(
         has_bias=has_bias,
         logical_dense_weight=True,
         store_preactivation=True,
+        expert_grid=True,
+    )
+
+
+def _use_grouped_w2_recompute(
+    *,
+    compute_dtype: str,
+    activation: str,
+    hidden_size: int,
+    intermediate_size: int,
+    tokens: int,
+    routes: int,
+    flat_routes: bool,
+) -> bool:
+    """Return whether the short-M grouped W2 projection is applicable."""
+
+    max_expert_rows = routes if flat_routes else tokens
+    return (
+        compute_dtype == "bf16"
+        and activation == "swiglu"
+        and hidden_size % _GROUPED_W2_BN == 0
+        and intermediate_size % _GROUPED_W2_BK == 0
+        and max_expert_rows <= _GROUPED_W2_MAX_EXPERT_ROWS
+    )
+
+
+@functools.lru_cache(maxsize=64)
+def _compile_grouped_w2_recompute(
+    hidden_size: int,
+    intermediate_size: int,
+    num_experts: int,
+    topk: int,
+    has_bias: bool,
+    device_index: int,
+):
+    """Build grouped raw-W2 sorted projection recompute for BF16 SwiGLU."""
+
+    del device_index
+    return compile_gemm2_a16w4_port(
+        BM=_GROUPED_W2_BM,
+        SORTED_BM=_BACKWARD_SORT_UNIT,
+        NE=num_experts,
+        N_OUT=hidden_size,
+        D_INTER=intermediate_size,
+        TILE_N=_GROUPED_W2_BN,
+        TILE_K=_GROUPED_W2_BK,
+        xcd_swizzle=0,
+        b_cache_mod=0,
+        w_dtype="bf16",
+        a_dtype="bf16",
+        persist=False,
+        has_bias=has_bias,
+        round_projection_bf16=False,
+        output_mode="atomic",
+        TOPK=topk,
+        logical_dense_weight=True,
+        store_sorted_projection=True,
         expert_grid=True,
     )
 
@@ -1242,6 +1311,15 @@ def _sonic_moe_backward_impl(
         routes=routes,
         flat_routes=flat_routes,
     )
+    use_grouped_w2 = _use_grouped_w2_recompute(
+        compute_dtype=compute_dtype,
+        activation=activation_name,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+        tokens=tokens,
+        routes=routes,
+        flat_routes=flat_routes,
+    )
     device = hidden_states.device
     device_index = device.index or 0
     with torch.cuda.device(device):
@@ -1289,7 +1367,10 @@ def _sonic_moe_backward_impl(
     x_sorted = torch.empty((max_padded, hidden_size), dtype=hidden_states.dtype, device=device)
     dout_sorted = torch.empty_like(x_sorted)
     dy = torch.empty_like(x_sorted)
-    projection = torch.empty_like(x_sorted)
+    # The expert-grid W2 kernel intentionally skips most sorter padding.  Score
+    # reduction reads projection before checking the route sentinel, so keep
+    # every untouched padded row finite.
+    projection = torch.zeros_like(x_sorted) if use_grouped_w2 else torch.empty_like(x_sorted)
     # Expert-grid W1 writes ceil(real_rows/BM)*BM rows instead of every
     # SORTED_BM-padded row.  Zero-initialize the untouched suffix: gather makes
     # padded x/dout zero, so its dy/da/dz and therefore dW/db contributions
@@ -1416,8 +1497,8 @@ def _sonic_moe_backward_impl(
             )
 
         # One explicit synchronization is accepted in this bring-up path.  It
-        # determines active expert slices for the five remaining per-expert
-        # GEMMs; grouped W1 above does not consume this host data.
+        # determines active expert slices for the remaining per-expert GEMMs;
+        # grouped recompute kernels do not consume this host data.
         frequencies = expert_frequency.cpu().tolist()
         segments: list[tuple[int, int, int]] = []
         offset = 0
@@ -1477,20 +1558,49 @@ def _sonic_moe_backward_impl(
             stream,
         )
 
+        if use_grouped_w2:
+            grouped_w2 = _compile_grouped_w2_recompute(
+                hidden_size,
+                intermediate_size,
+                num_experts,
+                topk,
+                has_bias,
+                device_index,
+            )
+            grouped_w2_grid = num_experts * (hidden_size // _GROUPED_W2_BN)
+            dummy_ptr = w2_arg.data_ptr()
+            _run_compiled(
+                grouped_w2,
+                activation.data_ptr(),
+                w2_arg.data_ptr(),
+                expert_frequency.data_ptr(),
+                dummy_ptr if b2_arg is None else b2_arg.data_ptr(),
+                sorted_expert_ids.data_ptr(),
+                num_valid_ids.data_ptr(),
+                sorted_token_ids.data_ptr(),
+                sorted_weights.data_ptr(),
+                tokens,
+                max_blocks,
+                int(grouped_w2_grid),
+                projection.data_ptr(),
+                stream,
+            )
+
         # Recompute the down projection for ds, and use the materialized A16
         # dy for both da and dW2.  The A16 materialization is this backward
         # implementation's explicit numerical contract.
         for expert, start, rows in segments:
             end = start + rows
-            gemm_a16w16(
-                activation[start:end],
-                w2_arg[expert].transpose(0, 1),
-                out=projection[start:end],
-                bias=None if b2_arg is None else b2_arg[expert],
-                user_kwargs=_GEMM_KWARGS,
-                stream=stream,
-                layout="nt",
-            )
+            if not use_grouped_w2:
+                gemm_a16w16(
+                    activation[start:end],
+                    w2_arg[expert].transpose(0, 1),
+                    out=projection[start:end],
+                    bias=None if b2_arg is None else b2_arg[expert],
+                    user_kwargs=_GEMM_KWARGS,
+                    stream=stream,
+                    layout="nt",
+                )
             gemm_a16w16(
                 dy[start:end],
                 w2_arg[expert],

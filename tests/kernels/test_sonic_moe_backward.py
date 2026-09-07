@@ -17,7 +17,7 @@ from kernels.moe.sonic import (
     sonic_moe_backward,
     sonic_moe_backward_routes,
 )
-from kernels.moe.sonic_backward import _use_grouped_w1_recompute
+from kernels.moe.sonic_backward import _use_grouped_w1_recompute, _use_grouped_w2_recompute
 
 pytestmark = [pytest.mark.l2_device, pytest.mark.rocm_lower]
 
@@ -37,8 +37,10 @@ _DTYPES = ((torch.bfloat16, "bf16"), (torch.float16, "fp16"))
 @pytest.mark.parametrize(
     ("tokens", "routes", "flat_routes", "expected"),
     (
+        (1, 16, False, True),
         (128, 2048, False, True),
         (129, 2064, False, False),
+        (4096, 32768, False, False),
         (16, 128, True, True),
         (16, 129, True, False),
     ),
@@ -55,6 +57,58 @@ def test_grouped_w1_policy_bounds_worst_case_expert_rows(tokens, routes, flat_ro
             flat_routes=flat_routes,
         )
         is expected
+    )
+
+
+@pytest.mark.parametrize(
+    ("tokens", "routes", "flat_routes", "expected"),
+    (
+        (1, 16, False, True),
+        (128, 2048, False, True),
+        (129, 2064, False, False),
+        (4096, 32768, False, False),
+        (16, 128, True, True),
+        (16, 129, True, False),
+    ),
+)
+def test_grouped_w2_policy_bounds_worst_case_expert_rows(tokens, routes, flat_routes, expected):
+    assert (
+        _use_grouped_w2_recompute(
+            compute_dtype="bf16",
+            activation="swiglu",
+            hidden_size=3584,
+            intermediate_size=512,
+            tokens=tokens,
+            routes=routes,
+            flat_routes=flat_routes,
+        )
+        is expected
+    )
+
+
+@pytest.mark.parametrize(
+    ("compute_dtype", "activation", "hidden_size", "intermediate_size"),
+    (
+        ("fp16", "swiglu", 3584, 512),
+        ("bf16", "geglu", 3584, 512),
+        ("bf16", "swiglu", 3552, 512),
+        ("bf16", "swiglu", 3584, 480),
+    ),
+)
+def test_grouped_w2_policy_keeps_unsupported_contracts_on_legacy(
+    compute_dtype,
+    activation,
+    hidden_size,
+    intermediate_size,
+):
+    assert not _use_grouped_w2_recompute(
+        compute_dtype=compute_dtype,
+        activation=activation,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+        tokens=128,
+        routes=2048,
+        flat_routes=False,
     )
 
 
