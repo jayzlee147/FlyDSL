@@ -15,6 +15,8 @@ from kernels.moe.sonic_grouped_tn import (
     build_active_expert_queue_flydsl,
     grouped_dw2_flydsl,
     grouped_dw2_tuning,
+    grouped_tn_grid_cap,
+    grouped_tn_launch_grid,
     grouped_tn_from_metadata_flydsl,
     grouped_tn_from_queue_flydsl,
     zero_inactive_weight_grads_flydsl,
@@ -332,9 +334,61 @@ def test_grouped_dw2_policy_helpers():
     assert active_expert_queue_elements(16, 896) == 33
     assert grouped_dw2_tuning(3584, 512) == (256, 256, 32, 0, 4, 4)
     assert grouped_dw2_tuning(128, 64) == (128, 64, 32, 0, 2, 2)
+    assert grouped_tn_grid_cap(256, 256, 32, 2, 4, 4) == 256
+    assert grouped_tn_grid_cap(256, 128, 32, 2, 4, 2) == 512
+    assert grouped_tn_grid_cap(128, 256, 32, 2, 2, 4) == 512
+    assert grouped_tn_grid_cap(128, 128, 32, 2, 2, 2) == 1024
+    assert grouped_tn_grid_cap(128, 128, 32, 3, 2, 2) == 768
+    assert grouped_tn_launch_grid(3, 256, 256, 128, 128, 32, 2, 2, 2) == 12
     with pytest.raises(ValueError):
         active_expert_descriptor_capacity(-1, 8)
     with pytest.raises(TypeError):
         active_expert_descriptor_capacity(1.0, 8)
     with pytest.raises(ValueError):
         grouped_dw2_tuning(96, 64)
+
+
+@pytest.mark.parametrize("stages", (3, 4))
+def test_grouped_tn_deep_pipeline_handles_short_and_long_expert_segments(stages):
+    frequencies = [1, 33, 65]
+    lhs, rhs, frequency, sorted_experts, num_valid, segments = _make_sorted_inputs(
+        frequencies,
+        128,
+        64,
+        seed=427 + stages,
+    )
+    queue = build_active_expert_queue_flydsl(
+        frequency,
+        sorted_experts,
+        num_valid,
+        routes=sum(frequencies),
+    )
+    output = torch.zeros(
+        (len(frequencies), 128, 64),
+        dtype=torch.bfloat16,
+        device=lhs.device,
+    )
+    expected = torch.zeros_like(output)
+    for expert, start, rows in segments:
+        expected[expert] = (
+            lhs[start : start + rows].float().transpose(0, 1)
+            @ rhs[start : start + rows].float()
+        ).to(torch.bfloat16)
+
+    grouped_tn_from_queue_flydsl(
+        lhs,
+        rhs,
+        frequency,
+        queue,
+        output,
+        block_m=128,
+        block_n=64,
+        block_k=32,
+        k_padding=0,
+        m_waves=2,
+        n_waves=2,
+        stages=stages,
+    )
+    torch.cuda.synchronize()
+
+    torch.testing.assert_close(output.float(), expected.float(), rtol=3e-2, atol=5e-2)

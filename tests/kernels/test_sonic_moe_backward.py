@@ -21,6 +21,7 @@ from kernels.moe.sonic import (
 from kernels.moe.sonic_backward import (
     _grouped_da_tuning,
     _grouped_dw1_tuning,
+    _grouped_dw2_stages,
     _grouped_dw2_tuning,
     _grouped_dx_tuning,
     _grouped_w1_tuning,
@@ -204,15 +205,45 @@ def test_grouped_dw2_policy(compute_dtype, hidden_size, intermediate_size, expec
 
 
 @pytest.mark.parametrize(
-    ("max_expert_rows", "hidden_size", "intermediate_size", "expected"),
     (
-        (1, 3584, 512, (256, 128, 32, 0, 4, 2)),
-        (2, 3584, 512, (256, 256, 32, 0, 4, 4)),
-        (128, 128, 64, (128, 64, 32, 0, 2, 2)),
+        "max_expert_rows",
+        "active_experts",
+        "hidden_size",
+        "intermediate_size",
+        "expected",
+    ),
+    (
+        (1, 16, 3584, 512, (128, 128, 32, 0, 2, 2)),
+        (3, 896, 3584, 512, (128, 256, 32, 0, 2, 4)),
+        (128, 16, 3584, 512, (128, 128, 32, 0, 2, 2)),
+        (74, 896, 3584, 512, (256, 256, 32, 0, 4, 4)),
+        (128, 4, 128, 64, (128, 64, 32, 0, 2, 2)),
     ),
 )
-def test_grouped_dw2_tuning(max_expert_rows, hidden_size, intermediate_size, expected):
-    assert _grouped_dw2_tuning(max_expert_rows, hidden_size, intermediate_size) == expected
+def test_grouped_dw2_tuning(
+    max_expert_rows,
+    active_experts,
+    hidden_size,
+    intermediate_size,
+    expected,
+):
+    assert (
+        _grouped_dw2_tuning(
+            max_expert_rows,
+            hidden_size,
+            intermediate_size,
+            active_experts=active_experts,
+        )
+        == expected
+    )
+
+
+@pytest.mark.parametrize(
+    ("max_expert_rows", "expected"),
+    ((1, 2), (63, 2), (64, 3), (4096, 3)),
+)
+def test_grouped_dw2_pipeline_depth(max_expert_rows, expected):
+    assert _grouped_dw2_stages(max_expert_rows) == expected
 
 
 @pytest.mark.parametrize(

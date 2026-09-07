@@ -142,24 +142,46 @@ _GROUPED_DA_MAX_EXPERT_ROWS = 4096
 # bounds make the unused portion of the final K tile read as zero without
 # loading the sorter's full 64-row padding.
 _GROUPED_DW2_BK = 32
+_GROUPED_DW2_PIPELINE_THRESHOLD = 64
+_GROUPED_DW2_SPARSE_EXPERTS = 32
 
 
 def _grouped_dw2_tuning(
     max_expert_rows: int,
     hidden_size: int,
     intermediate_size: int,
+    *,
+    active_experts: int | None = None,
 ) -> tuple[int, int, int, int, int, int]:
     """Return ``(BM, BN, BK, K-pad, M-waves, N-waves)`` for dW2."""
 
     block_m = next(tile for tile in (256, 128, 64) if hidden_size % tile == 0)
     block_n = next(tile for tile in (256, 128, 64) if intermediate_size % tile == 0)
-    # Decode has only one useful row per expert.  Doubling N tiles exposes
-    # enough independent CTAs to fill 256 CUs and beats BN256 for H3584/I512.
-    if max_expert_rows <= 1 and block_n == 256:
+    # Resource-aware persistent grids let smaller output tiles expose useful
+    # second/third/fourth resident CTAs on gfx950.  Decode and sparse short-K
+    # routes prefer 128x128; a dense 2-4 row/expert batch benefits from twice
+    # as many M tiles while retaining BN256's contiguous output stores.
+    supports_128 = hidden_size % 128 == 0 and intermediate_size % 128 == 0
+    sparse_short = (
+        active_experts is not None
+        and active_experts <= _GROUPED_DW2_SPARSE_EXPERTS
+        and max_expert_rows <= 128
+    )
+    if supports_128 and (max_expert_rows <= 1 or sparse_short):
+        block_m = 128
         block_n = 128
+    elif max_expert_rows <= 4 and hidden_size % 128 == 0 and intermediate_size % 256 == 0:
+        block_m = 128
+        block_n = 256
     m_waves = 4 if block_m == 256 else 2
     n_waves = 4 if block_n == 256 else 2
     return block_m, block_n, _GROUPED_DW2_BK, 0, m_waves, n_waves
+
+
+def _grouped_dw2_stages(max_expert_rows: int) -> int:
+    """Use triple buffering only once an expert spans multiple K tiles."""
+
+    return 3 if max_expert_rows >= _GROUPED_DW2_PIPELINE_THRESHOLD else 2
 
 
 def _grouped_da_tuning(max_expert_rows: int, hidden_size: int) -> tuple[int, int, int, int, int]:
@@ -2048,6 +2070,7 @@ def _sonic_moe_backward_impl(
                 max_expert_rows,
                 hidden_size,
                 intermediate_size,
+                active_experts=len(segments),
             )
             grouped_dw2_kwargs = {
                 "block_m": dw2_bm,
@@ -2056,6 +2079,7 @@ def _sonic_moe_backward_impl(
                 "k_padding": dw2_k_padding,
                 "m_waves": dw2_mw,
                 "n_waves": dw2_nw,
+                "stages": _grouped_dw2_stages(max_expert_rows),
                 "stream": stream,
             }
             if use_tn_metadata_direct:

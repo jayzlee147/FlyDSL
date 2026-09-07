@@ -43,7 +43,8 @@ from kernels.gemm.gemm_a16w16_gfx950_utils import (
 _BLOCK_THREADS = 256
 _SORTED_BLOCK_M = 64
 _NUM_CU = 256
-_PERSIST_THRESHOLD = _NUM_CU * 4
+_MAX_RESIDENT_THREADS_PER_CU = 1024
+_LDS_BYTES_PER_CU = 163840
 _MAX_SIGNED_I32 = (1 << 31) - 1
 _MAX_BUFFER_BYTES = (1 << 32) - 1
 _ZERO_VECTOR_ELEMENTS = GFX950_DMA_BYTES // 2
@@ -370,6 +371,56 @@ def zero_inactive_weight_grads_flydsl(
     dw1.record_stream(stream)
     dw2.record_stream(stream)
     return dw1, dw2
+def grouped_tn_grid_cap(
+    block_m: int,
+    block_n: int,
+    block_k: int,
+    stages: int,
+    m_waves: int,
+    n_waves: int,
+) -> int:
+    """Return a gfx950 persistent-grid cap derived from tile resources.
+
+    Grouped TN is output-stationary, so a CTA retains its FP32 accumulator
+    registers until it has reduced the complete expert segment.  The useful
+    resident-CTA count is therefore constrained by both its wave footprint
+    and the larger of its staged A/B storage and C-shuffle storage.
+    """
+
+    values = (block_m, block_n, block_k, stages, m_waves, n_waves)
+    if min(values) <= 0:
+        raise ValueError("grouped TN grid tuning values must be positive")
+    block_threads = m_waves * n_waves * GFX950_WAVE_SIZE
+    lds_ab_bytes = stages * (block_m + block_n) * block_k * 2
+    lds_c_bytes = block_m * block_n * 2
+    lds_bytes = max(lds_ab_bytes, lds_c_bytes)
+    resident_by_threads = _MAX_RESIDENT_THREADS_PER_CU // block_threads
+    resident_by_lds = _LDS_BYTES_PER_CU // lds_bytes
+    resident_ctas = max(1, min(resident_by_threads, resident_by_lds))
+    return _NUM_CU * resident_ctas
+
+
+def grouped_tn_launch_grid(
+    schedule_capacity: int,
+    output_m: int,
+    output_n: int,
+    block_m: int,
+    block_n: int,
+    block_k: int,
+    stages: int,
+    m_waves: int,
+    n_waves: int,
+) -> int:
+    """Return the host-known persistent launch bound for grouped TN."""
+
+    if schedule_capacity < 0:
+        raise ValueError("schedule_capacity must be non-negative")
+    output_tiles = (output_m // block_m) * (output_n // block_n)
+    max_work = schedule_capacity * output_tiles
+    return min(
+        max_work,
+        grouped_tn_grid_cap(block_m, block_n, block_k, stages, m_waves, n_waves),
+    )
 
 
 @functools.lru_cache(maxsize=128)
@@ -385,6 +436,7 @@ def compile_grouped_tn(
     n_waves: int,
     device_index: int,
     metadata_direct: bool = False,
+    stages: int = 2,
 ):
     """Compile the persistent grouped TN consumer for a prebuilt queue.
 
@@ -398,7 +450,6 @@ def compile_grouped_tn(
     """
 
     del device_index
-    stages = 2
     mma_m = 16
     mma_n = 16
     mma_k = 32
@@ -416,10 +467,12 @@ def compile_grouped_tn(
     num_m_tiles = output_m // block_m
     num_n_tiles = output_n // block_n
     output_tiles_per_expert = num_m_tiles * num_n_tiles
-    if min(output_m, output_n, num_experts, block_m, block_n, block_k, m_waves, n_waves) <= 0:
+    if min(output_m, output_n, num_experts, block_m, block_n, block_k, stages, m_waves, n_waves) <= 0:
         raise ValueError("grouped TN dimensions and tuning values must be positive")
     if block_k not in (32, 64):
         raise ValueError("grouped TN block_k must be 32 or 64")
+    if stages not in (2, 3, 4):
+        raise ValueError("grouped TN stages must be 2, 3, or 4")
     if k_padding not in (0, 32, 64):
         raise ValueError("grouped TN k_padding must be 0, 32, or 64")
     if k_padding and k_padding % block_k:
@@ -456,7 +509,7 @@ def compile_grouped_tn(
     @flyc.kernel(
         name=(
             f"sonic_grouped_tn_bf16_m{output_m}_n{output_n}_e{num_experts}"
-            f"_bm{block_m}_bn{block_n}_bk{block_k}_kp{k_padding}_w{m_waves}x{n_waves}"
+            f"_bm{block_m}_bn{block_n}_bk{block_k}_s{stages}_kp{k_padding}_w{m_waves}x{n_waves}"
             f"_md{int(metadata_direct)}"
         ),
         known_block_size=[block_threads, 1, 1],
@@ -693,16 +746,23 @@ def compile_grouped_tn(
                         traversal_order=fx.GemmTraversalOrder.KNM,
                     )
 
-            load_b(fx.Int32(0), 0)
-            load_a(fx.Int32(0), 0)
+            for stage in range_constexpr(stages - 1):
+                load_b(fx.Int32(stage), stage)
+                load_a(fx.Int32(stage), stage)
             rocdl.sched_barrier(0)
-            main_loop_end = k_tiles - fx.Int32(1)
+            raw_main_loop_end = k_tiles - fx.Int32(stages - 1)
+            main_loop_end = raw_main_loop_end
+            if const_expr(stages > 2):
+                main_loop_end = (raw_main_loop_end > fx.Int32(0)).select(
+                    raw_main_loop_end,
+                    fx.Int32(0),
+                )
             for k_tile in range(fx.Int32(0), main_loop_end, fx.Int32(1)):
                 current_stage = k_tile % fx.Int32(stages)
                 write_stage = (current_stage + fx.Int32(stages - 1)) % fx.Int32(stages)
-                __barrier(0)
-                load_b(k_tile + fx.Int32(1), write_stage)
-                load_a(k_tile + fx.Int32(1), write_stage)
+                __barrier((stages - 2) * (ldg_a_iters + ldg_b_iters))
+                load_b(k_tile + fx.Int32(stages - 1), write_stage)
+                load_a(k_tile + fx.Int32(stages - 1), write_stage)
                 compute_stage(current_stage)
                 rocdl.sched_vmem(ldg_a_iters + ldg_b_iters)
                 for _ in range_constexpr(k_mma_iters):
@@ -712,8 +772,15 @@ def compile_grouped_tn(
                         rocdl.sched_mfma(mma_n_iters)
                 rocdl.sched_barrier(0)
 
-            __barrier(0)
-            compute_stage(main_loop_end % fx.Int32(stages))
+            current_stage = main_loop_end % fx.Int32(stages)
+            for drain in range_constexpr(stages - 1):
+                __barrier((stages - 2 - drain) * (ldg_a_iters + ldg_b_iters))
+                if const_expr(stages == 2):
+                    compute_stage(current_stage)
+                else:
+                    if fx.Int32(drain) < k_tiles:
+                        compute_stage(current_stage)
+                current_stage = (current_stage + fx.Int32(1)) % fx.Int32(stages)
 
             frag_c_out = fx.make_fragment_like(frag_c, fx.BFloat16)
             frag_c_out.store(frag_c.load().to(fx.BFloat16))
@@ -871,6 +938,7 @@ def grouped_tn_from_queue_flydsl(
     k_padding: int | None = None,
     m_waves: int | None = None,
     n_waves: int | None = None,
+    stages: int = 2,
     stream: torch.cuda.Stream | None = None,
 ) -> torch.Tensor:
     """Consume a prebuilt active-expert queue for one grouped TN contraction.
@@ -919,9 +987,17 @@ def grouped_tn_from_queue_flydsl(
     k_padding = default_k_padding if k_padding is None else k_padding
     m_waves = default_m_waves if m_waves is None else m_waves
     n_waves = default_n_waves if n_waves is None else n_waves
-    output_tiles = (output_m // block_m) * (output_n // block_n)
-    max_work = capacity * output_tiles
-    grid = min(max_work, _NUM_CU) if max_work > _PERSIST_THRESHOLD else max_work
+    grid = grouped_tn_launch_grid(
+        capacity,
+        output_m,
+        output_n,
+        block_m,
+        block_n,
+        block_k,
+        stages,
+        m_waves,
+        n_waves,
+    )
     if stream is None:
         stream = torch.cuda.current_stream(lhs_rows.device)
     launcher = compile_grouped_tn(
@@ -936,6 +1012,7 @@ def grouped_tn_from_queue_flydsl(
         n_waves,
         lhs_rows.device.index or 0,
         False,
+        stages,
     )
     _run_compiled(
         launcher,
@@ -966,6 +1043,7 @@ def grouped_tn_from_metadata_flydsl(
     k_padding: int | None = None,
     m_waves: int | None = None,
     n_waves: int | None = None,
+    stages: int = 2,
     stream: torch.cuda.Stream | None = None,
 ) -> torch.Tensor:
     """Run grouped TN directly from one-block-per-expert sorter metadata.
@@ -1028,9 +1106,17 @@ def grouped_tn_from_metadata_flydsl(
     k_padding = default_k_padding if k_padding is None else k_padding
     m_waves = default_m_waves if m_waves is None else m_waves
     n_waves = default_n_waves if n_waves is None else n_waves
-    output_tiles = (output_m // block_m) * (output_n // block_n)
-    max_work = int(sorted_expert_ids.numel()) * output_tiles
-    grid = min(max_work, _NUM_CU) if max_work > _PERSIST_THRESHOLD else max_work
+    grid = grouped_tn_launch_grid(
+        int(sorted_expert_ids.numel()),
+        output_m,
+        output_n,
+        block_m,
+        block_n,
+        block_k,
+        stages,
+        m_waves,
+        n_waves,
+    )
     if stream is None:
         stream = torch.cuda.current_stream(lhs_rows.device)
     launcher = compile_grouped_tn(
@@ -1045,6 +1131,7 @@ def grouped_tn_from_metadata_flydsl(
         n_waves,
         lhs_rows.device.index or 0,
         True,
+        stages,
     )
     _run_compiled(
         launcher,
@@ -1078,6 +1165,7 @@ def grouped_tn_flydsl(
     k_padding: int | None = None,
     m_waves: int | None = None,
     n_waves: int | None = None,
+    stages: int = 2,
     stream: torch.cuda.Stream | None = None,
 ) -> torch.Tensor:
     """Build a queue and compute one standalone grouped TN contraction."""
@@ -1107,6 +1195,7 @@ def grouped_tn_flydsl(
         k_padding=k_padding,
         m_waves=m_waves,
         n_waves=n_waves,
+        stages=stages,
         stream=stream,
     )
 
@@ -1142,6 +1231,8 @@ __all__ = [
     "compile_inactive_weight_grad_zero",
     "grouped_dw2_flydsl",
     "grouped_dw2_tuning",
+    "grouped_tn_grid_cap",
+    "grouped_tn_launch_grid",
     "grouped_tn_from_metadata_flydsl",
     "grouped_tn_from_queue_flydsl",
     "grouped_tn_flydsl",
