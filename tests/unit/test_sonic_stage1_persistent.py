@@ -196,11 +196,15 @@ def test_stage1_persistent_enters_autotune_fingerprint() -> None:
 
 
 def test_e896_acceptance_profiles_report_actual_stage1_launch_grid() -> None:
-    assert {"stage1-persistent", "m80-stage1-persistent"} <= PROFILE_BY_NAME.keys()
-    for name in ("stage1-persistent", "m80-stage1-persistent"):
+    assert {
+        "stage1-persistent",
+        "m80-stage1-persistent",
+        "m80-full-candidate",
+    } <= PROFILE_BY_NAME.keys()
+    for name in ("stage1-persistent", "m80-stage1-persistent", "m80-full-candidate"):
         config = _resolved_profile_config(name)
         assert config["persistent_stage1"] is True
-        assert config["persistent_stage2"] is False
+        assert config["persistent_stage2"] is (name == "m80-full-candidate")
         for case in ("balanced", "hot16"):
             stage1 = _static_topology(config, case)["stage1"]
             assert stage1["persistent"] is True

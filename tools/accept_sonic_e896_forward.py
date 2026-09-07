@@ -270,6 +270,13 @@ PROFILES = (
         {"stage2_pipeline_stages": 2},
     ),
     Profile(
+        "m80-pipeline2",
+        "3-pipeline",
+        "m80-equal",
+        "Combine the low-padding BM80 geometry with a two-stage Stage-2 A-LDS pipeline.",
+        {"stage2_pipeline_stages": 2},
+    ),
+    Profile(
         "bn256-bk64-pipeline2",
         "3-pipeline",
         "bn256-bk64",
@@ -296,6 +303,18 @@ PROFILES = (
         {"stage1_b_cache_mod": 2, "stage2_b_cache_mod": 2},
     ),
     Profile(
+        "m80-xcd8-cached",
+        "4-locality",
+        "m80-equal",
+        "Apply eight-XCD distribution and explicit weight caching to the low-padding BM80 geometry.",
+        {
+            "stage1_xcd_swizzle": 8,
+            "stage2_xcd_swizzle": 8,
+            "stage1_b_cache_mod": 0,
+            "stage2_b_cache_mod": 0,
+        },
+    ),
+    Profile(
         "stage1-persistent",
         "5-persistent",
         "baseline",
@@ -308,6 +327,20 @@ PROFILES = (
         "m80-equal",
         "Combine distribution-aware BM80 with the Stage-1 persistent route grid.",
         {"persistent_stage1": True},
+    ),
+    Profile(
+        "stage2-persistent",
+        "5-persistent",
+        "baseline",
+        "Isolate the Stage-2 persistent route grid on the baseline geometry.",
+        {"persistent_stage2": True},
+    ),
+    Profile(
+        "m80-stage2-persistent",
+        "5-persistent",
+        "m80-equal",
+        "Combine distribution-aware BM80 with the Stage-2 persistent route grid.",
+        {"persistent_stage2": True},
     ),
     Profile(
         "persistent",
@@ -330,6 +363,17 @@ PROFILES = (
         "Combine BN256/BK64, XCD/cache, persistence, and the two-stage pipeline.",
         {"stage2_pipeline_stages": 2},
     ),
+    Profile(
+        "m80-full-candidate",
+        "7-combined",
+        "m80-xcd8-cached",
+        "Combine low-padding BM80, XCD/cache policy, both persistent grids, and Stage-2 pipelining.",
+        {
+            "persistent_stage1": True,
+            "persistent_stage2": True,
+            "stage2_pipeline_stages": 2,
+        },
+    ),
 )
 
 PROFILE_BY_NAME = {profile.name: profile for profile in PROFILES}
@@ -346,16 +390,20 @@ SUITES = {
         "m128-equal",
         "bn256-bk64",
         "pipeline2",
+        "m80-pipeline2",
     ),
     "locality": (
         "xcd8-cached",
         "non-temporal",
+        "m80-xcd8-cached",
         "stage1-persistent",
         "persistent",
     ),
     "persistent": (
         "stage1-persistent",
         "m80-stage1-persistent",
+        "stage2-persistent",
+        "m80-stage2-persistent",
         "persistent",
     ),
     "output": ("reduce-output",),
@@ -2239,6 +2287,16 @@ def _self_test_payload(repo: Path) -> dict[str, Any]:
         "dirty_tree_content_is_hashed": bool(source_identity["git"]["working_tree_content_sha256"]),
         "m80_balanced_padding": (records["m80-equal"]["topology"]["balanced"]["actual_padded_rows"] == 71680),
         "m80_hot16_padding": (records["m80-equal"]["topology"]["hot16"]["actual_padded_rows"] == 66560),
+        "m80_full_candidate_combines_both_persistent_grids": all(
+            records["m80-full-candidate"]["topology"][case][stage]["persistent"]
+            and records["m80-full-candidate"]["topology"][case][stage]["launch_grid"]
+            == GFX950_PERSISTENT_GRID_CAP
+            for case in ROUTING_CASES
+            for stage in ("stage1", "stage2")
+        ),
+        "m80_full_candidate_uses_two_stage_pipeline": (
+            records["m80-full-candidate"]["effective"]["stage2_pipeline_stages"] == 2
+        ),
         "distribution_aware_m_tiles_direct_to_lds": all(
             (records[name]["config"]["tile_m"] * records[name]["config"]["tile_k"]) % 2048 == 0
             and (records[name]["config"]["down_tile_m"] * records[name]["config"]["down_tile_k"]) % 2048 == 0
