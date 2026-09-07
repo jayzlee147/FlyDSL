@@ -32,6 +32,11 @@ from .utils import (
     a16wmix_use_k16,
 )
 
+# gfx950 exposes 256 compute units.  Route-grid persistence is deliberately a
+# compile-time opt-in so the established one-CTA-per-tile kernels remain
+# byte-for-byte unchanged unless a caller explicitly selects this schedule.
+NUM_CU = 256
+
 
 def _silu_mul_batch(gs, us):
     e = [fx.Float32(rocdl.exp2(T.f32, _raw(g * fx.Float32(-LOG2E)))) for g in gs]
@@ -962,10 +967,20 @@ def _gemm1_body_a16w4(
                     buffer_ops.buffer_store(yb, _raw(out_rsrc), _raw(out_idx), mask=valid)
 
 
-def gemm1_a16w4_grid(BM, *, INTER, TILE_N, max_m_blocks):
-    """Flattened grid for a16w4 gemm1: (m-blocks) x (inter/tile_n) n-blocks."""
+def gemm1_a16w4_grid(BM, *, INTER, TILE_N, max_m_blocks, persist=False):
+    """Return the actual flattened launch grid for a16w4 gemm1.
+
+    The ordinary route-grid schedule launches one CTA for every workspace-
+    capacity ``(m-block, n-block)`` tile.  The persistent opt-in caps a launch
+    with more than four waves of CU-level work to one CTA per gfx950 CU; each
+    CTA then grid-strides over the device-produced real-work bound.
+    """
+
     num_n_blocks = INTER // TILE_N
-    return int(max_m_blocks) * num_n_blocks
+    total_work = int(max_m_blocks) * num_n_blocks
+    if persist and total_work > NUM_CU * 4:
+        return min(total_work, NUM_CU)
+    return total_work
 
 
 def compile_gemm1_a16w4_port(
@@ -994,6 +1009,7 @@ def compile_gemm1_a16w4_port(
     route_preactivation_interleaved=False,
     expert_grid=False,
     compact_grid=False,
+    persist=False,
 ):
     """A16W4/A16W16 fused stage1 builder.
 
@@ -1027,6 +1043,11 @@ def compile_gemm1_a16w4_port(
     queue from ``arg_bscale``.  Entry zero is the live descriptor count and the
     remaining int32 entries are real-M-tile indices.  This is valid only for
     logical dense weights, where the scale argument is unused.
+
+    ``persist`` is a forward route-grid-only schedule.  Its CU-limited launch
+    reads the actual padded-row count from ``arg_cumsum`` and grid-strides over
+    exactly those tiles.  It is mutually exclusive with the backward
+    ``expert_grid`` and ``compact_grid`` schedules.
 
     ``store_route_preactivation`` is a forward-training-only dual-output
     specialization.  The regular activation output remains sorted for stage 2,
@@ -1064,7 +1085,10 @@ def compile_gemm1_a16w4_port(
     assert isinstance(route_preactivation_interleaved, bool), "route_preactivation_interleaved must be bool"
     assert isinstance(expert_grid, bool), "expert_grid must be bool"
     assert isinstance(compact_grid, bool), "compact_grid must be bool"
-    assert not (expert_grid and compact_grid), "expert_grid and compact_grid are mutually exclusive"
+    assert isinstance(persist, bool), "persist must be bool"
+    assert sum((expert_grid, compact_grid, persist)) <= 1, (
+        "expert_grid, compact_grid, and persistent route-grid scheduling are mutually exclusive"
+    )
     assert not (
         store_preactivation and store_route_preactivation
     ), "exclusive stored-preactivation output cannot be combined with the forward dual output"
@@ -1146,12 +1170,13 @@ def compile_gemm1_a16w4_port(
     )
     _expert_grid_tag = "_egrid" if expert_grid else ""
     _compact_grid_tag = "_cgrid" if compact_grid else ""
+    _persist_tag = "_persist" if persist else ""
     _sorted_tag = f"_sbm{SORTED_BM}" if SORTED_BM != BM else ""
     name_suffix = (
         f"a16w4{_wd_tag}{_ad_tag}{_wl_tag}_h{_K}_i{_INTER}_ne{NE}_bm{BM}"
         f"{_sorted_tag}_tn{TILE_N}_tk{TILE_K}{_act_tag}{_bcm_tag}{_xcd_tag}"
         f"{_wpe_tag}{_kw_tag}{_round_tag}{_bias_tag}{_logical_w_tag}{_preact_tag}{_route_preact_tag}"
-        f"{_expert_grid_tag}{_compact_grid_tag}"
+        f"{_expert_grid_tag}{_compact_grid_tag}{_persist_tag}"
     )
 
     @fx.struct
@@ -1295,6 +1320,30 @@ def compile_gemm1_a16w4_port(
                     for subtile in range(0, num_m_blocks, 1):
                         tile = (first_m_block + fx.Int32(subtile)) * fx.Int32(NUM_N_BLOCKS) + expert_n_block
                         _run_body(tile)
+        elif const_expr(persist):
+            # CU-limited persistent route grid.  ``bound`` comes from the
+            # sorter-produced num_valid_ids on device, not the conservative
+            # host workspace capacity used to choose the launch grid.  The
+            # logical grid-stride indices partition [0, bound) exactly once;
+            # optional XCD swizzling is a bijection applied independently to
+            # every visited logical tile.
+            grid_nb = fx.Int32(gpu.grid_dim.x)
+            if bx_i32 < bound:
+                if const_expr(_SW > 0):
+                    _tile = _xcd(bx_i32)
+                else:
+                    _tile = bx_i32
+                _run_body(_tile)
+            for iv in range(bx_i32 + grid_nb, bound, gpu.grid_dim.x):
+                # Some Stage-1 paths leave the final A-LDS/partial-reduction
+                # phase without a trailing barrier.  Synchronize all four
+                # waves before the next tile starts overwriting shared memory.
+                gpu.barrier()
+                if const_expr(_SW > 0):
+                    _tile = _xcd(fx.Int32(iv))
+                else:
+                    _tile = fx.Int32(iv)
+                _run_body(_tile)
         else:
             if bx_i32 < bound:
                 if const_expr(_SW > 0):

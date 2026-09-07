@@ -81,6 +81,9 @@ _COMPUTE_DTYPES = {
 _SUPPORTED_ACTIVATIONS = frozenset({"swiglu", "geglu", "reglu", "gelu_tanh_approx", "relu", "silu", "relu_sq"})
 _SUPPORTED_STAGE2_OUTPUT_MODES = frozenset({"atomic", "reduce"})
 _GLU_ACTIVATIONS = frozenset({"swiglu", "geglu", "reglu"})
+_STAGE1_PERSISTENT_TOKENS = 4096
+_STAGE1_PERSISTENT_SHAPE = (3584, 512, 896, 16)
+_STAGE1_PERSISTENT_TILE_MS = frozenset({64, 80, 96, 112})
 _GEMM1_ACTIVATIONS = {
     # gemm1's historical ``silu`` spelling means the fused SwiGLU epilogue.
     "swiglu": "silu",
@@ -146,8 +149,14 @@ class SonicMoEConfig:
     compute_dtype: str = "bf16"
     # Appended to preserve the positional ABI of every pre-existing field.
     stage2_pipeline_stages: int | None = None
+    persistent_stage1: bool = False
 
     def __post_init__(self) -> None:
+        if not isinstance(self.persistent_stage1, bool):
+            raise TypeError(
+                "persistent_stage1 must be bool, got "
+                f"{type(self.persistent_stage1).__name__}"
+            )
         if not isinstance(self.stage2_output_mode, str):
             raise TypeError(
                 "stage2_output_mode must be a string, got " f"{type(self.stage2_output_mode).__name__}"
@@ -254,6 +263,30 @@ class SonicMoEConfig:
             )
         if self.stage1_xcd_swizzle < 0 or self.stage2_xcd_swizzle < 0:
             raise ValueError("XCD swizzle values must be non-negative")
+        if self.persistent_stage1:
+            static_shape = (
+                self.hidden_size,
+                self.intermediate_size,
+                self.num_experts,
+                self.top_k,
+            )
+            if static_shape != _STAGE1_PERSISTENT_SHAPE:
+                raise ValueError(
+                    "persistent_stage1 is currently restricted to the validated "
+                    "gfx950 H3584/I512/E896/K16 production shape, got "
+                    f"H{self.hidden_size}/I{self.intermediate_size}/"
+                    f"E{self.num_experts}/K{self.top_k}"
+                )
+            if self.tile_m not in _STAGE1_PERSISTENT_TILE_MS:
+                raise ValueError(
+                    "persistent_stage1 requires a validated Stage-1 BM in "
+                    f"{sorted(_STAGE1_PERSISTENT_TILE_MS)}, got {self.tile_m}"
+                )
+            if self.activation != "swiglu" or self.compute_dtype != "bf16":
+                raise ValueError(
+                    "persistent_stage1 currently requires BF16 SwiGLU, got "
+                    f"activation={self.activation!r}, compute_dtype={self.compute_dtype!r}"
+                )
 
         # Fail before JIT compilation if a tile cannot fit the gfx950 160 KiB LDS.
         stage1_k_tiles_per_wave = self.hidden_size // stage1_k_span
@@ -1128,6 +1161,26 @@ def _stage2_stages(config: SonicMoEConfig, tokens: int) -> int:
     return 2 if tokens == 4096 and config.stage2_auto_pipeline_eligible else 1
 
 
+def _validate_stage1_persistent_runtime(
+    config: SonicMoEConfig,
+    tokens: int,
+    arch: object,
+) -> None:
+    """Enforce the exact runtime bucket audited for Stage-1 persistence."""
+
+    if not config.persistent_stage1:
+        return
+    if tokens != _STAGE1_PERSISTENT_TOKENS:
+        raise ValueError(
+            "persistent_stage1 is currently restricted to T4096, got "
+            f"tokens={tokens}"
+        )
+    if not str(arch).startswith("gfx950"):
+        raise RuntimeError(
+            "persistent_stage1 requires gfx950, got " f"{arch!r}"
+        )
+
+
 @functools.lru_cache(maxsize=256)
 def _get_stage1_launcher(
     config: SonicMoEConfig,
@@ -1157,6 +1210,7 @@ def _get_stage1_launcher(
         a_dtype=config.compute_dtype,
         w_layout="standard",
         k_wave=config.stage1_k_wave,
+        persist=config.persistent_stage1,
         round_preact_bf16=True,
         has_bias=has_bias,
     )
@@ -1198,6 +1252,7 @@ def _get_stage1_training_launcher(
         a_dtype="bf16",
         w_layout="standard",
         k_wave=config.stage1_k_wave,
+        persist=config.persistent_stage1,
         round_preact_bf16=True,
         has_bias=has_bias,
         store_route_preactivation=True,
@@ -1326,6 +1381,10 @@ class SonicMoE:
             _validate_mxfp4_resource_limits(config)
         else:
             _validate_dense_resource_limits(config)
+        if config.persistent_stage1 and weights.weight_dtype != "bf16":
+            raise ValueError(
+                "persistent_stage1 is currently validated only for dense BF16 weights"
+            )
         _validate_prepared_weight_storage(weights, config)
         if isinstance(max_cached_workspaces, bool) or not isinstance(max_cached_workspaces, int):
             raise TypeError("max_cached_workspaces must be an integer")
@@ -1398,6 +1457,7 @@ class SonicMoE:
         arch = get_rocm_arch()
         if not str(arch).startswith("gfx95"):
             raise RuntimeError(f"SonicMoE CDNA4 forward requires gfx95*, got {arch!r}")
+        _validate_stage1_persistent_runtime(self.config, tokens, arch)
         return tokens
 
     def _validate_training_hidden(self, hidden_states: torch.Tensor) -> int:
@@ -1499,6 +1559,7 @@ class SonicMoE:
             INTER=cfg.intermediate_size,
             TILE_N=cfg.tile_n,
             max_m_blocks=workspace.stage1_max_m_blocks,
+            persist=cfg.persistent_stage1,
         )
         _run_compiled(
             stage1,
@@ -1619,6 +1680,7 @@ class SonicMoE:
             INTER=cfg.intermediate_size,
             TILE_N=training_tile_n,
             max_m_blocks=workspace.stage1_max_m_blocks,
+            persist=cfg.persistent_stage1,
         )
         _run_compiled(
             stage1,

@@ -23,7 +23,7 @@ from kernels.moe.moe_2stage_a16wmix.gemm2 import compile_gemm2_a16w4_port
 from kernels.moe.moe_sorting_kernel import moe_softmax_sort_flydsl
 from kernels.moe.sonic import SonicMoE, SonicMoEConfig, SonicMoEWeights, _stage2_stages
 
-_CACHE_SCHEMA_VERSION = 11
+_CACHE_SCHEMA_VERSION = 12
 _DENSE_WEIGHT_DTYPES = frozenset({"bf16", "fp16"})
 _TUNING_FIELDS = (
     "tile_m",
@@ -38,6 +38,7 @@ _TUNING_FIELDS = (
     "stage1_k_wave",
     "stage2_xcd_swizzle",
     "waves_per_eu",
+    "persistent_stage1",
     "persistent_stage2",
     "stage2_pipeline_stages",
 )
@@ -132,6 +133,7 @@ def default_sonic_moe_candidates(
             candidate.stage1_k_wave,
             candidate.stage2_xcd_swizzle,
             candidate.waves_per_eu,
+            candidate.persistent_stage1,
             candidate.persistent_stage2,
             candidate.stage2_pipeline_stages,
         )
@@ -348,6 +350,12 @@ class SonicMoEAutotuner:
             "hidden_dtype": str(hidden_states.dtype),
             "router_dtype": str(router_logits.dtype),
             "tokens_bucket": _token_bucket(tokens),
+            # Stage-1 persistence is deliberately validated only for exact
+            # T4096.  Do not let the surrounding power-of-two bucket reuse its
+            # winner for a neighboring token count.
+            "persistent_stage1_exact_tokens": (
+                tokens if any(config.persistent_stage1 for config in self.candidates) else None
+            ),
             "stage2_pipeline_stages": stage2_pipeline_stages,
             "hidden_size": self.base_config.hidden_size,
             "intermediate_size": self.base_config.intermediate_size,

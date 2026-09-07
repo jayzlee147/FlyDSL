@@ -154,6 +154,7 @@ BASE_CONFIG: dict[str, Any] = {
     "stage1_k_wave": 1,
     "stage2_xcd_swizzle": 1,
     "waves_per_eu": None,
+    "persistent_stage1": False,
     "persistent_stage2": False,
     "stage2_pipeline_stages": None,
     "stage2_output_mode": "atomic",
@@ -295,6 +296,20 @@ PROFILES = (
         {"stage1_b_cache_mod": 2, "stage2_b_cache_mod": 2},
     ),
     Profile(
+        "stage1-persistent",
+        "5-persistent",
+        "baseline",
+        "Cap only the Stage-1 launch and consume the sorter-produced real-work bound on device.",
+        {"persistent_stage1": True},
+    ),
+    Profile(
+        "m80-stage1-persistent",
+        "5-persistent",
+        "m80-equal",
+        "Combine distribution-aware BM80 with the Stage-1 persistent route grid.",
+        {"persistent_stage1": True},
+    ),
+    Profile(
         "persistent",
         "5-persistent",
         "xcd8-cached",
@@ -332,7 +347,17 @@ SUITES = {
         "bn256-bk64",
         "pipeline2",
     ),
-    "locality": ("xcd8-cached", "non-temporal", "persistent"),
+    "locality": (
+        "xcd8-cached",
+        "non-temporal",
+        "stage1-persistent",
+        "persistent",
+    ),
+    "persistent": (
+        "stage1-persistent",
+        "m80-stage1-persistent",
+        "persistent",
+    ),
     "output": ("reduce-output",),
     "extended": CANDIDATE_NAMES,
 }
@@ -508,6 +533,10 @@ def _validate_static_config(name: str, config: dict[str, Any]) -> None:
         errors.append("BM * BK must cover integral 4096-byte direct-to-LDS rounds")
     if route_m % bm1 or route_m % bm2:
         errors.append("route M must be divisible by both GEMM M tiles")
+    if not isinstance(config["persistent_stage1"], bool):
+        errors.append("persistent_stage1 must be bool")
+    if config["persistent_stage1"] and bm1 not in (64, 80, 96, 112):
+        errors.append("persistent_stage1 BM must be one of 64/80/96/112")
 
     lds = _static_lds_usage(config)
     if lds["stage1_total_bytes"] > GFX950_LDS_BYTES:
@@ -552,7 +581,11 @@ def _static_topology(config: dict[str, Any], case: str) -> dict[str, Any]:
     capacity_stage2_m_blocks = capacity_padded_rows // bm2
     active_stage1_workgroups = active_stage1_m_blocks * (INTERMEDIATE // bn1)
     active_stage2_workgroups = active_stage2_m_blocks * (HIDDEN // bn2)
-    stage1_launch_grid = capacity_stage1_m_blocks * (INTERMEDIATE // bn1)
+    stage1_full_grid = capacity_stage1_m_blocks * (INTERMEDIATE // bn1)
+    if config["persistent_stage1"] and stage1_full_grid > GFX950_PERSISTENT_GRID_CAP * 4:
+        stage1_launch_grid = min(stage1_full_grid, GFX950_PERSISTENT_GRID_CAP)
+    else:
+        stage1_launch_grid = stage1_full_grid
     stage2_full_grid = capacity_stage2_m_blocks * (HIDDEN // bn2)
     if config["persistent_stage2"] and stage2_full_grid > GFX950_PERSISTENT_GRID_CAP * 4:
         stage2_launch_grid = min(stage2_full_grid, GFX950_PERSISTENT_GRID_CAP)
@@ -573,7 +606,9 @@ def _static_topology(config: dict[str, Any], case: str) -> dict[str, Any]:
             "active_m_blocks": active_stage1_m_blocks,
             "active_logical_workgroups": active_stage1_workgroups,
             "capacity_m_blocks": capacity_stage1_m_blocks,
+            "full_launch_grid": stage1_full_grid,
             "launch_grid": stage1_launch_grid,
+            "persistent": bool(config["persistent_stage1"]),
         },
         "stage2": {
             "active_m_blocks": active_stage2_m_blocks,
@@ -1257,7 +1292,10 @@ def _runtime_topology(sonic, config, workspace, case: str, api: str) -> dict[str
         training_tile_n, _ = sonic._training_stage1_tuning(config, TOKENS, False)
     active_stage1 = actual_padded // config.tile_m * (INTERMEDIATE // training_tile_n)
     active_stage2 = actual_padded // config.stage2_tile_m * (HIDDEN // config.stage2_tile_n)
-    stage1_grid = workspace.stage1_max_m_blocks * (INTERMEDIATE // training_tile_n)
+    stage1_full_grid = workspace.stage1_max_m_blocks * (INTERMEDIATE // training_tile_n)
+    stage1_grid = stage1_full_grid
+    if config.persistent_stage1 and stage1_full_grid > GFX950_PERSISTENT_GRID_CAP * 4:
+        stage1_grid = min(stage1_full_grid, GFX950_PERSISTENT_GRID_CAP)
     stage2_full_grid = workspace.stage2_max_m_blocks * (HIDDEN // config.stage2_tile_n)
     stage2_grid = stage2_full_grid
     if config.persistent_stage2 and stage2_full_grid > GFX950_PERSISTENT_GRID_CAP * 4:
@@ -1289,7 +1327,9 @@ def _runtime_topology(sonic, config, workspace, case: str, api: str) -> dict[str
             "effective_tile_n": training_tile_n,
             "active_logical_workgroups": active_stage1,
             "capacity_m_blocks": workspace.stage1_max_m_blocks,
+            "full_launch_grid": stage1_full_grid,
             "launch_grid": stage1_grid,
+            "persistent": config.persistent_stage1,
         },
         "stage2": {
             "active_logical_workgroups": active_stage2,
@@ -1321,6 +1361,7 @@ def _config_dict(config) -> dict[str, Any]:
         "stage1_k_wave": config.stage1_k_wave,
         "stage2_xcd_swizzle": config.stage2_xcd_swizzle,
         "waves_per_eu": config.waves_per_eu,
+        "persistent_stage1": config.persistent_stage1,
         "persistent_stage2": config.persistent_stage2,
         "stage2_pipeline_stages": config.stage2_pipeline_stages,
         "stage2_output_mode": config.stage2_output_mode,

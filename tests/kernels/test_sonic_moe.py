@@ -1781,7 +1781,7 @@ def test_sonic_moe_autotuner_search_and_disk_cache(tmp_path):
     torch.cuda.synchronize()
     assert recovered.search_count == 1
     rewritten_cache = non_object_cache_file.read_text(encoding="utf-8")
-    assert '"version": 11' in rewritten_cache
+    assert '"version": 12' in rewritten_cache
     assert '"stage1_k_wave": 1' in rewritten_cache
 
 
