@@ -20,10 +20,12 @@ from kernels.moe.sonic import (
 )
 from kernels.moe.sonic_backward import (
     _grouped_da_tuning,
+    _grouped_dw1_tuning,
     _grouped_dw2_tuning,
     _grouped_dx_tuning,
     _grouped_w1_tuning,
     _use_grouped_da,
+    _use_grouped_dw1,
     _use_grouped_dw2,
     _use_grouped_dx,
     _use_grouped_w1_recompute,
@@ -43,6 +45,63 @@ _ACTIVATIONS = (
     "relu_sq",
 )
 _DTYPES = ((torch.bfloat16, "bf16"), (torch.float16, "fp16"))
+
+
+@pytest.mark.parametrize(
+    ("max_expert_rows", "hidden_size", "intermediate_size", "expected"),
+    (
+        (1, 3584, 512, (64, 64, 32, 0, 2, 2)),
+        (2, 3584, 512, (128, 128, 32, 0, 2, 2)),
+        (4096, 4096, 2048, (128, 128, 32, 0, 2, 2)),
+        (128, 192, 64, (128, 64, 32, 0, 2, 2)),
+    ),
+)
+def test_grouped_dw1_tuning(max_expert_rows, hidden_size, intermediate_size, expected):
+    assert (
+        _grouped_dw1_tuning(max_expert_rows, hidden_size, intermediate_size)
+        == expected
+    )
+
+
+@pytest.mark.parametrize(
+    (
+        "compute_dtype",
+        "activation",
+        "tokens",
+        "routes",
+        "flat_routes",
+        "expected",
+    ),
+    (
+        ("bf16", "swiglu", 1, 16, False, True),
+        ("bf16", "swiglu", 4096, 32768, False, True),
+        ("bf16", "swiglu", 4097, 32776, False, False),
+        ("bf16", "swiglu", 128, 4096, True, True),
+        ("bf16", "swiglu", 128, 4097, True, False),
+        ("fp16", "swiglu", 128, 2048, False, False),
+        ("bf16", "geglu", 128, 2048, False, False),
+    ),
+)
+def test_grouped_dw1_policy(
+    compute_dtype,
+    activation,
+    tokens,
+    routes,
+    flat_routes,
+    expected,
+):
+    assert (
+        _use_grouped_dw1(
+            compute_dtype=compute_dtype,
+            activation=activation,
+            hidden_size=3584,
+            intermediate_size=512,
+            tokens=tokens,
+            routes=routes,
+            flat_routes=flat_routes,
+        )
+        is expected
+    )
 
 
 @pytest.mark.parametrize(
@@ -685,7 +744,7 @@ def test_sonic_moe_backward_t1_keeps_expert_grid_without_descriptor_builder(monk
             rtol=3e-2,
             atol=5e-2,
         )
-    assert metadata_tn_calls == 1
+    assert metadata_tn_calls == 2
     torch.testing.assert_close(actual[3], expected[3], rtol=5e-4, atol=5e-4)
 
 
@@ -806,7 +865,8 @@ def test_sonic_moe_backward_grouped_w1_spans_sort_blocks_with_bias(monkeypatch):
     expected = _backward_reference(*args, b1=b1, b2=b2)
     torch.cuda.synchronize()
 
-    # W1 recompute and dX share one counter-first BM16 queue.
+    # W1 recompute and dX share one BM16 queue; the same builder also emits
+    # the active-expert queue consumed by grouped dW1 and dW2.
     assert builder_calls == 1
     assert emitted_active_queue
 
@@ -1244,10 +1304,12 @@ def test_sonic_moe_backward_routes_grouped_dx_reuses_compact_queue(monkeypatch):
 
     original_builder = sonic_backward_module.build_compact_m_tile_descriptors
     builder_calls = 0
+    active_queue_shared = False
 
     def _tracked_builder(*builder_args, **builder_kwargs):
-        nonlocal builder_calls
+        nonlocal active_queue_shared, builder_calls
         builder_calls += 1
+        active_queue_shared = builder_kwargs.get("active_expert_storage") is not None
         return original_builder(*builder_args, **builder_kwargs)
 
     monkeypatch.setattr(
@@ -1281,6 +1343,7 @@ def test_sonic_moe_backward_routes_grouped_dx_reuses_compact_queue(monkeypatch):
     torch.cuda.synchronize()
 
     assert builder_calls == 1
+    assert active_queue_shared
     for actual_gradient, expected_gradient in zip(actual, expected):
         if actual_gradient.dtype == torch.float32:
             rtol, atol = 2e-3, 4e-3

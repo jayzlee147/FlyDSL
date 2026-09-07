@@ -205,6 +205,47 @@ def test_grouped_tn_consumes_single_block_metadata_without_builder():
             assert torch.count_nonzero(output[expert]) == 0
 
 
+def test_grouped_tn_uses_64_bit_output_base_for_last_production_expert():
+    device = _gfx950_device()
+    num_experts = 896
+    output_m = 1024
+    output_n = 3584
+    generator = torch.Generator(device=device).manual_seed(425)
+    lhs = torch.zeros((64, output_m), dtype=torch.bfloat16, device=device)
+    rhs = torch.zeros((64, output_n), dtype=torch.bfloat16, device=device)
+    lhs[0].normal_(std=0.1, generator=generator)
+    rhs[0].normal_(std=0.1, generator=generator)
+    frequency = torch.zeros(num_experts, dtype=torch.int32, device=device)
+    frequency[-1] = 1
+    sorted_experts = torch.tensor([num_experts - 1], dtype=torch.int32, device=device)
+    num_valid = torch.tensor([64, 1], dtype=torch.int32, device=device)
+    output = torch.zeros(
+        (num_experts, output_m, output_n),
+        dtype=torch.bfloat16,
+        device=device,
+    )
+
+    grouped_tn_from_metadata_flydsl(
+        lhs,
+        rhs,
+        frequency,
+        sorted_experts,
+        num_valid,
+        output,
+        block_m=64,
+        block_n=64,
+        block_k=32,
+        k_padding=0,
+        m_waves=2,
+        n_waves=2,
+    )
+    torch.cuda.synchronize()
+
+    expected = lhs[:1].float().transpose(0, 1) @ rhs[:1].float()
+    torch.testing.assert_close(output[-1].float(), expected, rtol=3e-2, atol=5e-2)
+    assert torch.count_nonzero(output[0]) == 0
+
+
 def test_grouped_tn_empty_routes_are_an_exact_noop():
     device = _gfx950_device()
     lhs = torch.empty((0, 64), dtype=torch.bfloat16, device=device)

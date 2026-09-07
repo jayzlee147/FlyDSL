@@ -47,6 +47,15 @@ _PERSIST_THRESHOLD = _NUM_CU * 4
 _MAX_SIGNED_I32 = (1 << 31) - 1
 
 
+def _global_bf16_ptr(address):
+    pointer_type = fx.PointerType.get(
+        fx.BFloat16.ir_type,
+        address_space=fx.AddressSpace.Global,
+        alignment=GFX950_DMA_BYTES,
+    )
+    return fx.inttoptr(pointer_type, fx.Int64(address))
+
+
 def active_expert_descriptor_capacity(routes: int, num_experts: int) -> int:
     """Return a tight host-known upper bound on active expert descriptors."""
 
@@ -324,9 +333,9 @@ def compile_grouped_tn(
         smem_a = storage.ab.a.peek().ptr
         smem_b = storage.ab.b.peek().ptr
         smem_c = storage.c.peek().ptr
-        out_buf = fx.rocdl.make_buffer_tensor(output, max_size=True)
         lhs_base_addr = fx.Int64(fx.ptrtoint(fx.get_iter(lhs_rows)))
         rhs_base_addr = fx.Int64(fx.ptrtoint(fx.get_iter(rhs_rows)))
+        output_base_addr = fx.Int64(fx.ptrtoint(fx.get_iter(output)))
         frequency_rsrc = buffer_ops.create_buffer_resource(expert_frequency, max_size=True)
 
         a_read_atom = fx.make_copy_atom(fx.rocdl.cdna4.LDSReadTrans16_64b(), fx.BFloat16)
@@ -415,9 +424,19 @@ def compile_grouped_tn(
             block_m_offset = block_m_index * fx.Int32(block_m)
             block_n_offset = block_n_index * fx.Int32(block_n)
 
-            expert_out = fx.make_view(
-                fx.get_iter(out_buf) + expert * fx.Int32(output_m * output_n),
-                fx.make_layout((output_m, output_n), (output_n, 1)),
+            output_addr = output_base_addr + fx.Int64(expert) * fx.Int64(
+                output_m * output_n * in_data_bytes
+            )
+            output_rsrc = buffer_ops.create_buffer_resource_from_addr(
+                _raw(output_addr),
+                num_records_bytes=output_m * output_n * in_data_bytes,
+            )
+            expert_out = fx.rocdl.make_buffer_tensor(
+                fx.make_view(
+                    _global_bf16_ptr(output_addr),
+                    fx.make_layout((output_m, output_n), (output_n, 1)),
+                ),
+                max_size=False,
             )
             g_c = fx.flat_divide(expert_out, (block_m, block_n))[
                 None,
@@ -553,11 +572,8 @@ def compile_grouped_tn(
                         smem_c + local_row * fx.Int32(block_n) + local_col,
                         result_type=fx.Vector.make_type(cshuffle_vec_size, fx.BFloat16),
                     )
-                    output_offset = (
-                        (expert * fx.Int32(output_m) + global_row) * fx.Int32(output_n)
-                        + global_col
-                    )
-                    fx.ptr_store(value, fx.get_iter(out_buf) + output_offset)
+                    output_offset = global_row * fx.Int32(output_n) + global_col
+                    buffer_ops.buffer_store(value, output_rsrc, output_offset)
 
         if bid < work_bound:
             run_output_tile(bid)

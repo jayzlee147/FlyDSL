@@ -183,6 +183,50 @@ _GROUPED_DX_STAGES = 2
 _GROUPED_DX_GRID_CAP = 1024
 _GROUPED_DX_DENSE_EXPERTS = 256
 
+# Weight gradients are output-stationary TN contractions.  BM/BN128 with BK32
+# is the measured throughput winner once an expert can own multiple rows;
+# decode prefers BM/BN64 because its output tile count exposes more parallelism
+# without increasing per-CTA work.  Exact-frequency buffer resources suppress
+# sorter-padding traffic in both profiles.
+_GROUPED_DW1_BLOCK_K = 32
+_GROUPED_DW1_MAX_EXPERT_ROWS = 4096
+
+
+def _grouped_dw1_tuning(
+    max_expert_rows: int,
+    hidden_size: int,
+    intermediate_size: int,
+) -> tuple[int, int, int, int, int, int]:
+    """Return ``(BM, BN, BK, K-pad, M-waves, N-waves)`` for grouped dW1."""
+
+    preferred_tile = 64 if max_expert_rows <= 1 else 128
+    output_m = 2 * intermediate_size
+    block_m = preferred_tile if output_m % preferred_tile == 0 else 64
+    block_n = preferred_tile if hidden_size % preferred_tile == 0 else 64
+    return (block_m, block_n, _GROUPED_DW1_BLOCK_K, 0, 2, 2)
+
+
+def _use_grouped_dw1(
+    *,
+    compute_dtype: str,
+    activation: str,
+    hidden_size: int,
+    intermediate_size: int,
+    tokens: int,
+    routes: int,
+    flat_routes: bool,
+) -> bool:
+    """Select gfx950's output-stationary grouped dW1 contraction."""
+
+    max_expert_rows = routes if flat_routes else tokens
+    return (
+        compute_dtype == "bf16"
+        and activation == "swiglu"
+        and hidden_size % 64 == 0
+        and (2 * intermediate_size) % 64 == 0
+        and max_expert_rows <= _GROUPED_DW1_MAX_EXPERT_ROWS
+    )
+
 
 def _grouped_dx_tuning(active_experts: int, hidden_size: int) -> tuple[int, int]:
     """Return ``(BN, n_waves)`` for the observed expert distribution."""
@@ -1608,6 +1652,15 @@ def _sonic_moe_backward_impl(
         routes=routes,
         flat_routes=flat_routes,
     )
+    use_grouped_dw1 = _use_grouped_dw1(
+        compute_dtype=compute_dtype,
+        activation=activation_name,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+        tokens=tokens,
+        routes=routes,
+        flat_routes=flat_routes,
+    )
     grouped_w1_bm, grouped_w1_bn, _, _, compact_w1_grid = _grouped_w1_tuning(
         tokens=tokens,
         hidden_size=hidden_size,
@@ -1676,7 +1729,7 @@ def _sonic_moe_backward_impl(
             dtype=torch.int32,
             device=device,
         )
-        if use_grouped_dw2 and use_compact_w1
+        if (use_grouped_dw1 or use_grouped_dw2) and use_compact_w1
         else None
     )
     if use_compact_w1:
@@ -1704,7 +1757,6 @@ def _sonic_moe_backward_impl(
         compact_w1_storage = None
         compact_w1_descriptors = None
         compact_w1_total = None
-
     x_sorted = torch.empty((max_padded, hidden_size), dtype=hidden_states.dtype, device=device)
     dout_sorted = torch.empty_like(x_sorted)
     dy = torch.empty_like(x_sorted)
@@ -1885,8 +1937,16 @@ def _sonic_moe_backward_impl(
         # the lowest-latency path.  Compact W1 regimes already produced the
         # shared queue above; long/non-compact regimes build it once here for
         # both weight-gradient TN contractions.
-        use_dw2_metadata_direct = use_grouped_dw2 and active_expert_storage is None and max_expert_rows <= sort_unit
-        if use_grouped_dw2 and not use_dw2_metadata_direct and active_expert_storage is None:
+        use_tn_metadata_direct = (
+            (use_grouped_dw1 or use_grouped_dw2)
+            and active_expert_storage is None
+            and max_expert_rows <= sort_unit
+        )
+        if (
+            (use_grouped_dw1 or use_grouped_dw2)
+            and not use_tn_metadata_direct
+            and active_expert_storage is None
+        ):
             active_expert_storage = torch.empty(
                 active_expert_queue_elements(routes, num_experts),
                 dtype=torch.int32,
@@ -1965,7 +2025,7 @@ def _sonic_moe_backward_impl(
                 "n_waves": dw2_nw,
                 "stream": stream,
             }
-            if use_dw2_metadata_direct:
+            if use_tn_metadata_direct:
                 grouped_tn_from_metadata_flydsl(
                     dy,
                     activation,
@@ -2091,6 +2151,49 @@ def _sonic_moe_backward_impl(
             stream,
         )
 
+        if use_grouped_dw1:
+            (
+                grouped_dw1_bm,
+                grouped_dw1_bn,
+                grouped_dw1_bk,
+                grouped_dw1_k_padding,
+                grouped_dw1_m_waves,
+                grouped_dw1_n_waves,
+            ) = _grouped_dw1_tuning(
+                max(int(count) for count in frequencies),
+                hidden_size,
+                intermediate_size,
+            )
+            grouped_dw1_kwargs = {
+                "block_m": grouped_dw1_bm,
+                "block_n": grouped_dw1_bn,
+                "block_k": grouped_dw1_bk,
+                "k_padding": grouped_dw1_k_padding,
+                "m_waves": grouped_dw1_m_waves,
+                "n_waves": grouped_dw1_n_waves,
+                "stream": stream,
+            }
+            if use_tn_metadata_direct:
+                grouped_tn_from_metadata_flydsl(
+                    dz,
+                    x_sorted,
+                    expert_frequency,
+                    sorted_expert_ids,
+                    num_valid_ids,
+                    dw1,
+                    **grouped_dw1_kwargs,
+                )
+            else:
+                assert active_expert_storage is not None
+                grouped_tn_from_queue_flydsl(
+                    dz,
+                    x_sorted,
+                    expert_frequency,
+                    active_expert_storage,
+                    dw1,
+                    **grouped_dw1_kwargs,
+                )
+
         if use_grouped_dx:
             # The compact queue rounds real expert rows to BM16.  Gather makes
             # padded dOut zero, so activation backward materializes zero dZ in
@@ -2152,14 +2255,15 @@ def _sonic_moe_backward_impl(
         )
         for expert, start, rows in segments:
             end = start + rows
-            gemm_a16w16(
-                dz[start:end].transpose(0, 1),
-                x_sorted[start:end],
-                out=dw1[expert],
-                user_kwargs=_GEMM_KWARGS,
-                stream=stream,
-                layout="tn",
-            )
+            if not use_grouped_dw1:
+                gemm_a16w16(
+                    dz[start:end].transpose(0, 1),
+                    x_sorted[start:end],
+                    out=dw1[expert],
+                    user_kwargs=_GEMM_KWARGS,
+                    stream=stream,
+                    layout="tn",
+                )
             if not use_grouped_dx:
                 gemm_a16w16(
                     dz[start:end],
