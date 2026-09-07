@@ -2123,6 +2123,100 @@ def test_sonic_moe_backward_forward_state_skips_grouped_w1_but_keeps_compact_que
     assert builder_blocks == [16]
 
 
+def test_sonic_moe_backward_compact_state_fuses_live_row_prepare(monkeypatch):
+    """Compact retained-state backward must bypass padded row materialization."""
+
+    tokens, hidden_size, intermediate_size, num_experts, topk = 128, 256, 128, 64, 4
+    config = _config(
+        hidden_size,
+        intermediate_size,
+        num_experts,
+        topk,
+        compute_dtype="bf16",
+        down_tile_m=128,
+    )
+    args = _make_case(
+        tokens,
+        hidden_size,
+        intermediate_size,
+        num_experts,
+        topk,
+        seed=687,
+        dtype=torch.bfloat16,
+    )
+    state = _make_forward_state(args[0], args[1], args[3], config)
+
+    def _unexpected_legacy_kernel(*_args, **_kwargs):
+        raise AssertionError("compact retained-state path must use exact-row kernels")
+
+    monkeypatch.setattr(sonic_backward_module, "_compile_gather", _unexpected_legacy_kernel)
+    monkeypatch.setattr(
+        sonic_backward_module,
+        "_compile_activation_prepare_from_forward_state",
+        _unexpected_legacy_kernel,
+    )
+    monkeypatch.setattr(
+        sonic_backward_module,
+        "_compile_activation_derivative",
+        _unexpected_legacy_kernel,
+    )
+    actual = sonic_moe_backward(*args, config, forward_state=state)
+    expected = _backward_reference(*args)
+    torch.cuda.synchronize()
+
+    for actual_gradient, expected_gradient in zip(actual, expected):
+        torch.testing.assert_close(
+            actual_gradient.float(),
+            expected_gradient.float(),
+            rtol=3e-2,
+            atol=5e-2,
+        )
+
+
+def test_sonic_moe_backward_decode_state_keeps_low_latency_row_kernels(monkeypatch):
+    """T1 avoids the compact fused kernel because its queue is not available."""
+
+    tokens, hidden_size, intermediate_size, num_experts, topk = 1, 256, 128, 4, 2
+    config = _config(
+        hidden_size,
+        intermediate_size,
+        num_experts,
+        topk,
+        compute_dtype="bf16",
+        down_tile_m=128,
+    )
+    args = _make_case(
+        tokens,
+        hidden_size,
+        intermediate_size,
+        num_experts,
+        topk,
+        seed=689,
+        dtype=torch.bfloat16,
+    )
+    state = _make_forward_state(args[0], args[1], args[3], config)
+
+    def _unexpected_fused_kernel(*_args, **_kwargs):
+        raise AssertionError("decode must retain its measured low-latency row path")
+
+    monkeypatch.setattr(
+        sonic_backward_module,
+        "_compile_fused_forward_state_prepare",
+        _unexpected_fused_kernel,
+    )
+    actual = sonic_moe_backward(*args, config, forward_state=state)
+    expected = _backward_reference(*args)
+    torch.cuda.synchronize()
+
+    for actual_gradient, expected_gradient in zip(actual, expected):
+        torch.testing.assert_close(
+            actual_gradient.float(),
+            expected_gradient.float(),
+            rtol=3e-2,
+            atol=5e-2,
+        )
+
+
 def test_sonic_moe_backward_forward_state_skips_generic_w1_and_keeps_large_dx_queue(
     monkeypatch,
 ):

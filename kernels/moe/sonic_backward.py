@@ -1234,6 +1234,171 @@ def _compile_activation_prepare_from_forward_state(
 
 
 @functools.lru_cache(maxsize=128)
+def _compile_fused_forward_state_prepare(
+    hidden_size: int,
+    intermediate_size: int,
+    topk: int,
+    interleaved_w1: bool,
+    device_index: int,
+):
+    """Gather the exact live rows and prepare retained-state backward inputs.
+
+    This specialization is restricted to the fully grouped BF16 SwiGLU
+    fixed-K path.  It avoids walking every 64-row sorter pad, never
+    materializes a sorted copy of ``grad_output``, and combines the remaining
+    hidden-state gather with activation and routed-gradient preparation.
+
+    It consumes the existing counter-first BM16 W1/dX descriptor queue.  The
+    schedule touches real routes plus at most the final BM16 tail; the
+    independently zeroed ``dZ`` buffer continues to provide that tail's dX
+    contract.
+    """
+
+    del device_index
+    elem_dtype = fx.BFloat16
+    projection_size = 2 * intermediate_size
+    projection_column_stride = 2 if interleaved_w1 else 1
+    up_column_offset = 1 if interleaved_w1 else intermediate_size
+    compact_block_m = _COMPACT_W1_BM
+
+    @flyc.kernel(known_block_size=[_BLOCK_THREADS, 1, 1])
+    def fused_prepare_kernel(
+        hidden_states: fx.Tensor,
+        grad_output: fx.Tensor,
+        route_preactivation: fx.Tensor,
+        x_sorted: fx.Tensor,
+        activation: fx.Tensor,
+        dy: fx.Tensor,
+        sorted_weights: fx.Tensor,
+        sorted_token_ids: fx.Tensor,
+        schedule: fx.Tensor,
+        i32_tokens: fx.Int32,
+    ):
+        tid = gpu.thread_idx.x
+        x_rsrc = buffer_ops.create_buffer_resource(hidden_states, max_size=True)
+        dout_rsrc = buffer_ops.create_buffer_resource(grad_output, max_size=True)
+        route_preact_rsrc = buffer_ops.create_buffer_resource(route_preactivation, max_size=True)
+        x_sorted_rsrc = buffer_ops.create_buffer_resource(x_sorted, max_size=True)
+        activation_rsrc = buffer_ops.create_buffer_resource(activation, max_size=True)
+        dy_rsrc = buffer_ops.create_buffer_resource(dy, max_size=True)
+        weights_rsrc = buffer_ops.create_buffer_resource(sorted_weights, max_size=True)
+        ids_rsrc = buffer_ops.create_buffer_resource(sorted_token_ids, max_size=True)
+
+        def prepare_real_row(row):
+            packed = fx.Int32(buffer_ops.buffer_load(ids_rsrc, row, vec_width=1, dtype=T.i32))
+            token = packed & fx.Int32(_TOKEN_MASK)
+            slot = (packed >> fx.Int32(24)) & fx.Int32(0xFF)
+            if (token < i32_tokens) & (slot < fx.Int32(topk)):
+                route_weight = fx.Float32(
+                    buffer_ops.buffer_load(weights_rsrc, row, vec_width=1, dtype=T.f32)
+                )
+                source_base = token * fx.Int32(hidden_size)
+                destination_base = row * fx.Int32(hidden_size)
+                for base in range_constexpr(0, hidden_size, _BLOCK_THREADS):
+                    column = tid + fx.Int32(base)
+                    if column < fx.Int32(hidden_size):
+                        source = source_base + column
+                        destination = destination_base + column
+                        x_value = buffer_ops.buffer_load(
+                            x_rsrc,
+                            source,
+                            vec_width=1,
+                            dtype=elem_dtype,
+                        )
+                        dout_value = buffer_ops.buffer_load(
+                            dout_rsrc,
+                            source,
+                            vec_width=1,
+                            dtype=elem_dtype,
+                        ).extf(T.f32)
+                        buffer_ops.buffer_store(x_value, x_sorted_rsrc, destination)
+                        buffer_ops.buffer_store(
+                            fx.Float32(dout_value * route_weight).to(elem_dtype),
+                            dy_rsrc,
+                            destination,
+                        )
+
+                route_row = token * fx.Int32(topk) + slot
+                route_base = route_row * fx.Int32(projection_size)
+                activation_base = row * fx.Int32(intermediate_size)
+                for base in range_constexpr(0, intermediate_size, _BLOCK_THREADS):
+                    column = tid + fx.Int32(base)
+                    if column < fx.Int32(intermediate_size):
+                        relative_gate = column * fx.Int32(projection_column_stride)
+                        gate = buffer_ops.buffer_load(
+                            route_preact_rsrc,
+                            route_base + relative_gate,
+                            vec_width=1,
+                            dtype=elem_dtype,
+                        ).extf(T.f32)
+                        up = buffer_ops.buffer_load(
+                            route_preact_rsrc,
+                            route_base + relative_gate + fx.Int32(up_column_offset),
+                            vec_width=1,
+                            dtype=elem_dtype,
+                        ).extf(T.f32)
+                        activation_f32 = _activation_f32(gate, up, "swiglu")
+                        buffer_ops.buffer_store(
+                            fx.Float32(activation_f32).to(elem_dtype),
+                            activation_rsrc,
+                            activation_base + column,
+                        )
+
+        schedule_rsrc = buffer_ops.create_buffer_resource(schedule, max_size=True)
+        total_tiles = fx.Int32(
+            buffer_ops.buffer_load(schedule_rsrc, fx.Int32(0), vec_width=1, dtype=T.i32)
+        )
+        total_rows = total_tiles * fx.Int32(compact_block_m)
+        for task_value in range(gpu.block_idx.x, total_rows, gpu.grid_dim.x):
+            task = fx.Int32(task_value)
+            descriptor_index = task // fx.Int32(compact_block_m)
+            local_row = task % fx.Int32(compact_block_m)
+            descriptor = fx.Int32(
+                buffer_ops.buffer_load(
+                    schedule_rsrc,
+                    descriptor_index + fx.Int32(1),
+                    vec_width=1,
+                    dtype=T.i32,
+                )
+            )
+            prepare_real_row(descriptor * fx.Int32(compact_block_m) + local_row)
+
+    @flyc.jit
+    def launch(
+        hidden_states: fx.Tensor,
+        grad_output: fx.Tensor,
+        route_preactivation: fx.Tensor,
+        x_sorted: fx.Tensor,
+        activation: fx.Tensor,
+        dy: fx.Tensor,
+        sorted_weights: fx.Tensor,
+        sorted_token_ids: fx.Tensor,
+        schedule: fx.Tensor,
+        i32_tokens: fx.Int32,
+        i32_grid: fx.Int32,
+        stream: fx.Stream = fx.Stream(None),
+    ):
+        fused_prepare_kernel(
+            hidden_states,
+            grad_output,
+            route_preactivation,
+            x_sorted,
+            activation,
+            dy,
+            sorted_weights,
+            sorted_token_ids,
+            schedule,
+            i32_tokens,
+        ).launch(
+            grid=(i32_grid, 1, 1),
+            block=(_BLOCK_THREADS, 1, 1),
+            stream=stream,
+        )
+
+    return launch
+
+
+@functools.lru_cache(maxsize=128)
 def _compile_activation_derivative(
     intermediate_size: int,
     activation_name: str,
@@ -1328,6 +1493,131 @@ def _compile_activation_derivative(
             i32_padded_rows,
         ).launch(
             grid=(i32_padded_rows, 1, 1),
+            block=(_BLOCK_THREADS, 1, 1),
+            stream=stream,
+        )
+
+    return launch
+
+
+@functools.lru_cache(maxsize=128)
+def _compile_activation_derivative_from_forward_state(
+    intermediate_size: int,
+    topk: int,
+    interleaved_w1: bool,
+    device_index: int,
+):
+    """Differentiate SwiGLU directly from compact route-order forward state."""
+
+    del device_index
+    elem_dtype = fx.BFloat16
+    projection_size = 2 * intermediate_size
+    projection_column_stride = 2 if interleaved_w1 else 1
+    up_column_offset = 1 if interleaved_w1 else intermediate_size
+    compact_block_m = _COMPACT_W1_BM
+
+    @flyc.kernel(known_block_size=[_BLOCK_THREADS, 1, 1])
+    def derivative_from_state_kernel(
+        route_preactivation: fx.Tensor,
+        da: fx.Tensor,
+        dz: fx.Tensor,
+        sorted_token_ids: fx.Tensor,
+        schedule: fx.Tensor,
+        i32_tokens: fx.Int32,
+    ):
+        tid = gpu.thread_idx.x
+        route_preact_rsrc = buffer_ops.create_buffer_resource(route_preactivation, max_size=True)
+        da_rsrc = buffer_ops.create_buffer_resource(da, max_size=True)
+        dz_rsrc = buffer_ops.create_buffer_resource(dz, max_size=True)
+        ids_rsrc = buffer_ops.create_buffer_resource(sorted_token_ids, max_size=True)
+
+        def differentiate_real_row(row):
+            packed = fx.Int32(buffer_ops.buffer_load(ids_rsrc, row, vec_width=1, dtype=T.i32))
+            token = packed & fx.Int32(_TOKEN_MASK)
+            slot = (packed >> fx.Int32(24)) & fx.Int32(0xFF)
+            if (token < i32_tokens) & (slot < fx.Int32(topk)):
+                route_row = token * fx.Int32(topk) + slot
+                route_base = route_row * fx.Int32(projection_size)
+                sorted_base = row * fx.Int32(projection_size)
+                activation_base = row * fx.Int32(intermediate_size)
+                for base in range_constexpr(0, intermediate_size, _BLOCK_THREADS):
+                    column = tid + fx.Int32(base)
+                    if column < fx.Int32(intermediate_size):
+                        relative_gate = column * fx.Int32(projection_column_stride)
+                        gate = buffer_ops.buffer_load(
+                            route_preact_rsrc,
+                            route_base + relative_gate,
+                            vec_width=1,
+                            dtype=elem_dtype,
+                        ).extf(T.f32)
+                        up = buffer_ops.buffer_load(
+                            route_preact_rsrc,
+                            route_base + relative_gate + fx.Int32(up_column_offset),
+                            vec_width=1,
+                            dtype=elem_dtype,
+                        ).extf(T.f32)
+                        da_value = buffer_ops.buffer_load(
+                            da_rsrc,
+                            activation_base + column,
+                            vec_width=1,
+                            dtype=elem_dtype,
+                        ).extf(T.f32)
+                        dz_gate, dz_up = _activation_backward_f32(
+                            gate,
+                            up,
+                            da_value,
+                            "swiglu",
+                        )
+                        buffer_ops.buffer_store(
+                            fx.Float32(dz_gate).to(elem_dtype),
+                            dz_rsrc,
+                            sorted_base + relative_gate,
+                        )
+                        buffer_ops.buffer_store(
+                            fx.Float32(dz_up).to(elem_dtype),
+                            dz_rsrc,
+                            sorted_base + relative_gate + fx.Int32(up_column_offset),
+                        )
+
+        schedule_rsrc = buffer_ops.create_buffer_resource(schedule, max_size=True)
+        total_tiles = fx.Int32(
+            buffer_ops.buffer_load(schedule_rsrc, fx.Int32(0), vec_width=1, dtype=T.i32)
+        )
+        total_rows = total_tiles * fx.Int32(compact_block_m)
+        for task_value in range(gpu.block_idx.x, total_rows, gpu.grid_dim.x):
+            task = fx.Int32(task_value)
+            descriptor_index = task // fx.Int32(compact_block_m)
+            local_row = task % fx.Int32(compact_block_m)
+            descriptor = fx.Int32(
+                buffer_ops.buffer_load(
+                    schedule_rsrc,
+                    descriptor_index + fx.Int32(1),
+                    vec_width=1,
+                    dtype=T.i32,
+                )
+            )
+            differentiate_real_row(descriptor * fx.Int32(compact_block_m) + local_row)
+
+    @flyc.jit
+    def launch(
+        route_preactivation: fx.Tensor,
+        da: fx.Tensor,
+        dz: fx.Tensor,
+        sorted_token_ids: fx.Tensor,
+        schedule: fx.Tensor,
+        i32_tokens: fx.Int32,
+        i32_grid: fx.Int32,
+        stream: fx.Stream = fx.Stream(None),
+    ):
+        derivative_from_state_kernel(
+            route_preactivation,
+            da,
+            dz,
+            sorted_token_ids,
+            schedule,
+            i32_tokens,
+        ).launch(
+            grid=(i32_grid, 1, 1),
             block=(_BLOCK_THREADS, 1, 1),
             stream=stream,
         )
@@ -1444,6 +1734,7 @@ def _compile_score_backward(
     compute_dtype: str,
     device_index: int,
     device_padded_rows: bool = False,
+    token_major_dout: bool = False,
 ):
     """Compile ``ds = dot(dout, materialized_down_projection)``."""
 
@@ -1484,16 +1775,18 @@ def _compile_score_backward(
             for base in range_constexpr(0, hidden_size, _BLOCK_THREADS):
                 column = tid + fx.Int32(base)
                 if column < fx.Int32(hidden_size):
-                    offset = row * fx.Int32(hidden_size) + column
+                    projection_offset = row * fx.Int32(hidden_size) + column
+                    dout_row = token if const_expr(token_major_dout) else row
+                    dout_offset = dout_row * fx.Int32(hidden_size) + column
                     dout_value = buffer_ops.buffer_load(
                         dout_rsrc,
-                        offset,
+                        dout_offset,
                         vec_width=1,
                         dtype=elem_dtype,
                     ).extf(T.f32)
                     projected = buffer_ops.buffer_load(
                         projection_rsrc,
-                        offset,
+                        projection_offset,
                         vec_width=1,
                         dtype=elem_dtype,
                     ).extf(T.f32)
@@ -2316,6 +2609,12 @@ def _sonic_moe_backward_impl(
         use_grouped_dw1=use_grouped_dw1,
         use_grouped_dx=use_grouped_dx,
     )
+    # The exact-row queue pays off once the BM16 compact schedule already
+    # exists.  Decode has only ~18 us of gather/prepare work and is faster on
+    # the original one-row kernels, so keep that latency path unchanged.
+    use_fused_forward_state_prepare = (
+        reuse_forward_preactivation and use_hostless_grouped and use_compact_w1
+    )
     # If even the maximum possible active set falls below the measured
     # selective-clear crossover, a normal dense memset is unconditionally the
     # best choice.  This route-count test is host-known and distribution
@@ -2418,7 +2717,9 @@ def _sonic_moe_backward_impl(
         large_dx_total = None
         large_dx_descriptors = None
     x_sorted = torch.empty((max_padded, hidden_size), dtype=hidden_states.dtype, device=device)
-    dout_sorted = torch.empty_like(x_sorted)
+    # The retained-state hostless path reads token-major grad_output directly
+    # in both dy preparation and dscore, avoiding a large padded sorted copy.
+    dout_sorted = None if use_fused_forward_state_prepare else torch.empty_like(x_sorted)
     dy = torch.empty_like(x_sorted)
     # The expert-grid W2 kernel intentionally skips most sorter padding.  Score
     # reduction reads projection before checking the route sentinel, so keep
@@ -2430,12 +2731,23 @@ def _sonic_moe_backward_impl(
     # SORTED_BM-padded row.  Zero-initialize the untouched suffix: gather makes
     # padded x/dout zero, so its dy/da/dz and therefore dW/db contributions
     # remain exactly zero while all activation inputs stay finite.
-    preactivation = torch.empty(
-        (max_padded, projection_size),
-        dtype=hidden_states.dtype,
-        device=device,
+    # The same fast path differentiates directly from compact route-order
+    # state, so it does not allocate or write a padded sorted preactivation.
+    preactivation = (
+        None
+        if use_fused_forward_state_prepare
+        else torch.empty(
+            (max_padded, projection_size),
+            dtype=hidden_states.dtype,
+            device=device,
+        )
     )
-    if not reuse_forward_preactivation and use_grouped_w1 and not use_hostless_grouped:
+    if (
+        preactivation is not None
+        and not reuse_forward_preactivation
+        and use_grouped_w1
+        and not use_hostless_grouped
+    ):
         preactivation.zero_()
     activation = torch.empty((max_padded, intermediate_size), dtype=hidden_states.dtype, device=device)
     # Grouped dA writes real expert rows only.  The derivative and dW1/db1
@@ -2446,7 +2758,12 @@ def _sonic_moe_backward_impl(
     # zeroing dZ supplies its at-most-15-row BM16 tails.  The legacy long-token
     # path differentiates every sorter-padded row; its zero dA therefore
     # materializes the complete zero BM64 tail needed by large grouped dX.
-    dz = torch.zeros_like(preactivation) if use_hostless_grouped else torch.empty_like(preactivation)
+    dz_factory = torch.zeros if use_hostless_grouped else torch.empty
+    dz = dz_factory(
+        (max_padded, projection_size),
+        dtype=hidden_states.dtype,
+        device=device,
+    )
     dx_sorted = torch.empty_like(x_sorted)
     dx_routes = (
         None if flat_routes else torch.empty((tokens, topk, hidden_size), dtype=hidden_states.dtype, device=device)
@@ -2568,6 +2885,7 @@ def _sonic_moe_backward_impl(
                     stream=stream,
                 )
             if not reuse_forward_preactivation:
+                assert preactivation is not None
                 grouped_w1 = _compile_grouped_w1_recompute(
                     hidden_size,
                     intermediate_size,
@@ -2669,33 +2987,36 @@ def _sonic_moe_backward_impl(
                 stream=stream,
             )
 
-        gather = _compile_gather(
-            hidden_size,
-            compute_dtype,
-            device_index,
-            use_hostless_grouped,
-        )
-        gather_work = (max_padded if use_hostless_grouped else padded_rows) * (hidden_size // 4)
-        gather_grid = max(1, (gather_work + _BLOCK_THREADS - 1) // _BLOCK_THREADS)
-        if use_hostless_grouped:
-            gather_grid = min(_HOSTLESS_ROW_GRID_CAP, gather_grid)
-        _run_compiled(
-            gather,
-            x_arg,
-            dout_arg,
-            sorted_token_ids,
-            x_sorted,
-            dout_sorted,
-            num_valid_ids,
-            tokens,
-            padded_rows,
-            gather_grid,
-            stream,
-        )
+        if not use_fused_forward_state_prepare:
+            assert dout_sorted is not None
+            gather = _compile_gather(
+                hidden_size,
+                compute_dtype,
+                device_index,
+                use_hostless_grouped,
+            )
+            gather_work = (max_padded if use_hostless_grouped else padded_rows) * (hidden_size // 4)
+            gather_grid = max(1, (gather_work + _BLOCK_THREADS - 1) // _BLOCK_THREADS)
+            if use_hostless_grouped:
+                gather_grid = min(_HOSTLESS_ROW_GRID_CAP, gather_grid)
+            _run_compiled(
+                gather,
+                x_arg,
+                dout_arg,
+                sorted_token_ids,
+                x_sorted,
+                dout_sorted,
+                num_valid_ids,
+                tokens,
+                padded_rows,
+                gather_grid,
+                stream,
+            )
 
         # Other activation/dtype combinations retain the original per-expert
         # preactivation path.
         if not use_grouped_w1 and not reuse_forward_preactivation:
+            assert preactivation is not None
             for expert, start, rows in segments:
                 end = start + rows
                 gemm_a16w16(
@@ -2710,6 +3031,8 @@ def _sonic_moe_backward_impl(
 
         activation_grid = min(_HOSTLESS_ROW_GRID_CAP, max_padded) if use_hostless_grouped else padded_rows
         if forward_state_data is None:
+            assert preactivation is not None
+            assert dout_sorted is not None
             activation_prepare = _compile_activation_prepare(
                 hidden_size,
                 intermediate_size,
@@ -2737,28 +3060,59 @@ def _sonic_moe_backward_impl(
             route_preactivation.record_stream(stream)
             if int(stream.cuda_stream) != producer_stream:
                 stream.wait_event(ready_event)
-            activation_prepare = _compile_activation_prepare_from_forward_state(
-                hidden_size,
-                intermediate_size,
-                topk,
-                interleaved_w1,
-                device_index,
-                use_hostless_grouped,
-            )
-            _run_compiled(
-                activation_prepare,
-                route_preactivation,
-                preactivation,
-                activation,
-                dout_sorted,
-                dy,
-                sorted_weights,
-                sorted_token_ids,
-                num_valid_ids,
-                tokens,
-                activation_grid,
-                stream,
-            )
+            if use_fused_forward_state_prepare:
+                fused_prepare = _compile_fused_forward_state_prepare(
+                    hidden_size,
+                    intermediate_size,
+                    topk,
+                    interleaved_w1,
+                    device_index,
+                )
+                assert compact_w1_storage is not None
+                state_prepare_grid = min(
+                    _HOSTLESS_ROW_GRID_CAP,
+                    max(1, compact_w1_bound * _COMPACT_W1_BM),
+                )
+                _run_compiled(
+                    fused_prepare,
+                    x_arg,
+                    dout_arg,
+                    route_preactivation,
+                    x_sorted,
+                    activation,
+                    dy,
+                    sorted_weights,
+                    sorted_token_ids,
+                    compact_w1_storage,
+                    tokens,
+                    state_prepare_grid,
+                    stream,
+                )
+            else:
+                assert preactivation is not None
+                assert dout_sorted is not None
+                activation_prepare = _compile_activation_prepare_from_forward_state(
+                    hidden_size,
+                    intermediate_size,
+                    topk,
+                    interleaved_w1,
+                    device_index,
+                    use_hostless_grouped,
+                )
+                _run_compiled(
+                    activation_prepare,
+                    route_preactivation,
+                    preactivation,
+                    activation,
+                    dout_sorted,
+                    dy,
+                    sorted_weights,
+                    sorted_token_ids,
+                    num_valid_ids,
+                    tokens,
+                    activation_grid,
+                    stream,
+                )
 
         if use_grouped_dw2:
             if use_hostless_grouped and not use_tn_metadata_direct:
@@ -2973,25 +3327,52 @@ def _sonic_moe_backward_impl(
                     layout="tn",
                 )
 
-        activation_derivative = _compile_activation_derivative(
-            intermediate_size,
-            activation_name,
-            compute_dtype,
-            interleaved_w1,
-            device_index,
-            use_hostless_grouped,
-        )
-        _run_compiled(
-            activation_derivative,
-            preactivation,
-            da,
-            dz,
-            sorted_token_ids,
-            num_valid_ids,
-            tokens,
-            (min(_HOSTLESS_ROW_GRID_CAP, max_padded) if use_hostless_grouped else padded_rows),
-            stream,
-        )
+        if use_fused_forward_state_prepare:
+            assert forward_state_data is not None
+            route_preactivation = forward_state_data[0]
+            derivative_from_state = _compile_activation_derivative_from_forward_state(
+                intermediate_size,
+                topk,
+                interleaved_w1,
+                device_index,
+            )
+            assert compact_w1_storage is not None
+            derivative_grid = min(
+                _HOSTLESS_ROW_GRID_CAP,
+                max(1, compact_w1_bound * _COMPACT_W1_BM),
+            )
+            _run_compiled(
+                derivative_from_state,
+                route_preactivation,
+                da,
+                dz,
+                sorted_token_ids,
+                compact_w1_storage,
+                tokens,
+                derivative_grid,
+                stream,
+            )
+        else:
+            assert preactivation is not None
+            activation_derivative = _compile_activation_derivative(
+                intermediate_size,
+                activation_name,
+                compute_dtype,
+                interleaved_w1,
+                device_index,
+                use_hostless_grouped,
+            )
+            _run_compiled(
+                activation_derivative,
+                preactivation,
+                da,
+                dz,
+                sorted_token_ids,
+                num_valid_ids,
+                tokens,
+                (min(_HOSTLESS_ROW_GRID_CAP, max_padded) if use_hostless_grouped else padded_rows),
+                stream,
+            )
 
         if use_grouped_dw1:
             (
@@ -3163,6 +3544,7 @@ def _sonic_moe_backward_impl(
         if flat_routes:
             assert sorted_route_ids is not None
             assert dx_accum is not None
+            assert dout_sorted is not None
             route_score_backward = _compile_route_score_backward(
                 hidden_size,
                 compute_dtype,
@@ -3209,10 +3591,11 @@ def _sonic_moe_backward_impl(
                 compute_dtype,
                 device_index,
                 use_hostless_grouped,
+                use_fused_forward_state_prepare,
             )
             _run_compiled(
                 score_backward,
-                dout_sorted,
+                dout_arg if use_fused_forward_state_prepare else dout_sorted,
                 projection,
                 sorted_token_ids,
                 droute_weights,

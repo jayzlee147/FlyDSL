@@ -392,6 +392,12 @@ route IDs, and W1 layout), is immutable, and may be reused with
 `retain_graph=True`.  FP16, non-SwiGLU, ragged routing, and unsupported layout
 combinations continue through the standalone backward path or are rejected
 explicitly.  Passing `forward_state=None` always selects that tested fallback.
+For the no-bias 64--128-token hostless specialization, backward also reuses its
+BM16 device work queue to touch only live route rows while jointly gathering
+`x`, reconstructing activation, and preparing `dy`.  It reads compact state in
+the derivative and token-major `grad_output` in dscore, eliminating the padded
+`dout_sorted` and sorted-preactivation workspaces.  Decode keeps the original
+row kernels because their measured latency is lower.
 
 For GLU backward, both entry points also accept ``interleaved_w1=True``. In
 that mode each expert's raw W1 rows, optional B1 entries, and returned

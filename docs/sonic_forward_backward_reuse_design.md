@@ -1,9 +1,10 @@
 # SonicMoE forward-state reuse for backward
 
-Status: phase 1 implemented and measured on gfx950.  Forward now saves compact
-route-order BF16 preactivation and backward can consume it to skip W1
-recomputation.  Routing-metadata reuse and fused dA/dscore remain follow-up
-work.
+Status: phase 1 and the first gfx950 exact-row consumer are implemented and
+measured.  Forward saves compact route-order BF16 preactivation; backward can
+consume it to skip W1 recomputation and, on the compact hostless path, avoid
+BM64-padded gather/state materialization.  Routing-metadata reuse and fused
+dA/dscore remain follow-up work.
 
 ## Summary
 
@@ -105,6 +106,27 @@ T1/T128-balanced/T128-hot16/T4096 versus Triton's
 9.562/19.150/10.798/15.684 ms, or 5.52x/3.53x/5.06x/1.97x faster.  Triton already
 retains routing metadata while this FlyDSL phase still re-sorts, so metadata
 reuse remains a material opportunity rather than an accounting advantage.
+
+### gfx950 compact-row preparation
+
+The no-bias BF16/SwiGLU fixed-K path for 64--128 tokens already builds a BM16
+device descriptor queue for W1/dX.  Backward now reuses that queue to fuse the
+live-row hidden-state gather, activation reconstruction, and routed `dy`
+preparation.  It reads `grad_output` directly in token order for both `dy` and
+`dscore`, and the activation derivative reads the compact route-order state
+directly.  Consequently this path does not allocate or materialize the padded
+`dout_sorted[P64,H]` or `preactivation[P64,2I]` tensors.  Legacy, bias, ragged,
+long-token, and standalone paths are unchanged.
+
+For balanced `T128/H3584/I512/E896/K16`, only 2,048 routes are real while the
+BM64 sorter extent is 57,344 rows.  The two removed tensors account for
+528,482,304 bytes (504 MiB) of allocation, and the old gather plus state
+prepare plus derivative measured about 0.69 ms.  With the compact-row path,
+the 11-pair event median for retained-state backward is 4.809 ms, down from the
+phase-1 5.424 ms (11.3%); full adapter forward plus backward is 6.143 ms, down
+from 6.761 ms (9.1%).  T1 deliberately keeps the original row kernels because
+its corresponding work is only about 18 us and the descriptor queue is not
+built there.
 
 ## Standalone baseline data flow and redundant work
 
@@ -483,23 +505,27 @@ lifetime contract is what guarantees correctness.
    compact route-order A16 preactivation while preserving the existing
    activation/output path.  Backward validates the state, skips W1 recompute,
    and retains `forward_state=None` as the tested standalone fallback.
-2. **Metadata state (next).** Make forward emit invocation-owned routing
+2. **Exact-row state consumers (complete for compact hostless).** Reuse the
+   existing BM16 device queue to fuse gather/activation/`dy`, read state
+   directly in the derivative, and remove the padded sorted dout/preactivation
+   tensors.  Decode keeps its measured lower-latency row kernels.
+3. **Metadata state (next).** Make forward emit invocation-owned routing
    metadata and frequency, then skip backward histogram/sorting.  Reconcile
    forward's B16/B128 and backward's B64 layouts without a host readback.
-3. **Variable sort-unit consumers.** Parameterize grouped dA/dX/dW schedulers by
+4. **Variable sort-unit consumers.** Parameterize grouped dA/dX/dW schedulers by
    the state sort unit and add direct-slot T1 scheduling.  Remove assumptions
    that every saved layout is ascending BM64.
-4. **Fused dA/dscore.** Compute unscaled `dout @ W2`, form dA and score partials
+5. **Fused dA/dscore.** Compute unscaled `dout @ W2`, form dA and score partials
    in its epilogue, and add the bias contribution.  Delete projection allocation
    and W2 recompute from this path.  Keep saved-projection mode as a numerical
    oracle until tolerances and performance are established.
-5. **Policy tuning.** Compare preactivation-only with saved activation.  Measure
+6. **Policy tuning.** Compare preactivation-only with saved activation.  Measure
    the extra forward stores, forward latency, backward latency, peak allocated
    memory, and full forward+backward time on T1, T128 balanced/hot16, and T4096.
-6. **Compact state.** Emit exact-R expert offsets/mappings and teach grouped
+7. **Compact state.** Emit exact-R expert offsets/mappings and teach grouped
    backward kernels the varlen layout.  This is highest priority for E896 sparse
    routing, where padded-state residency dominates.
-7. **Capture mode.** Remove host frequency decisions, provide preallocated
+8. **Capture mode.** Remove host frequency decisions, provide preallocated
    graph slots, and enable only paired forward+backward capture first.
 
 Each step should be separately guarded so `forward_state=None` remains a tested
