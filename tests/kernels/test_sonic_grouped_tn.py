@@ -15,6 +15,7 @@ from kernels.moe.sonic_grouped_tn import (
     build_active_expert_queue_flydsl,
     grouped_dw2_flydsl,
     grouped_dw2_tuning,
+    grouped_tn_from_metadata_flydsl,
     grouped_tn_from_queue_flydsl,
 )
 
@@ -159,6 +160,49 @@ def test_grouped_tn_reuses_prebuilt_active_expert_queue():
     descriptors = queue[1 : 1 + 2 * live_count].view(-1, 2).cpu().tolist()
     assert sorted(descriptors) == sorted([expert, start] for expert, start, _ in segments)
     torch.testing.assert_close(first.float(), second.float(), rtol=0, atol=0)
+
+
+def test_grouped_tn_consumes_single_block_metadata_without_builder():
+    frequencies = [0, 1, 0, 7, 63]
+    dy, activation, frequency, sorted_experts, num_valid, segments = _make_sorted_inputs(
+        frequencies,
+        128,
+        64,
+        seed=423,
+    )
+    output = torch.zeros(
+        (len(frequencies), 128, 64),
+        dtype=torch.bfloat16,
+        device=dy.device,
+    )
+    expected = torch.zeros_like(output)
+    for expert, start, rows in segments:
+        expected[expert] = (
+            dy[start : start + rows].float().transpose(0, 1)
+            @ activation[start : start + rows].float()
+        ).to(torch.bfloat16)
+
+    returned = grouped_tn_from_metadata_flydsl(
+        dy,
+        activation,
+        frequency,
+        sorted_experts,
+        num_valid,
+        output,
+        block_m=128,
+        block_n=64,
+        block_k=32,
+        k_padding=0,
+        m_waves=2,
+        n_waves=2,
+    )
+    torch.cuda.synchronize()
+
+    assert returned is output
+    torch.testing.assert_close(output.float(), expected.float(), rtol=3e-2, atol=5e-2)
+    for expert, count in enumerate(frequencies):
+        if count == 0:
+            assert torch.count_nonzero(output[expert]) == 0
 
 
 def test_grouped_tn_empty_routes_are_an_exact_noop():

@@ -10,11 +10,12 @@ The backward sorter lays every non-empty expert out as one or more contiguous
 
 A small device builder emits one ``(expert, first_sorted_row)`` descriptor per
 active expert.  Its public queue ABI is ``[count, expert0, row0, ...]`` so dW2
-and dW1 can consume the same queue without rebuilding it.  The GEMM grid is
-persistent and walks output tiles from that queue, so no output tile performs
-a lower-bound search and no expert metadata is copied to the host.  Inputs and
-output are BF16; each tile accumulates all of an expert's padded route rows in
-FP32 before one BF16 materialization.
+and dW1 can consume the same queue without rebuilding it.  Decode can bypass
+the builder and consume the sorter's one-block-per-expert metadata directly.
+The GEMM grid is persistent and walks output tiles from either schedule, so no
+output tile performs a lower-bound search and no expert metadata is copied to
+the host.  Inputs and output are BF16; each tile accumulates all of an expert's
+route rows in FP32 before one BF16 materialization.
 """
 
 import functools
@@ -23,7 +24,7 @@ import torch
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl.expr import gpu, range_constexpr, rocdl
+from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import T
 from flydsl.expr.utils.arith import _to_raw as _raw
 from kernels.common import buffer_ops
@@ -208,6 +209,7 @@ def compile_grouped_tn(
     m_waves: int,
     n_waves: int,
     device_index: int,
+    metadata_direct: bool = False,
 ):
     """Compile the persistent grouped TN consumer for a prebuilt queue.
 
@@ -215,7 +217,9 @@ def compile_grouped_tn(
     tune the MFMA reduction tile independently from the number of materialized
     sorter rows.  ``k_padding=0`` means the logical reduction bound is the
     actual expert frequency; physical loads still round to ``block_k`` and are
-    safe because sorter padding is zero-filled.
+    safe because sorter padding is zero-filled.  ``metadata_direct`` treats
+    the schedule tensor as sorter expert IDs and is valid when every active
+    expert occupies one 64-row sorter block (the fixed-K T1 fast path).
     """
 
     del device_index
@@ -278,6 +282,7 @@ def compile_grouped_tn(
         name=(
             f"sonic_grouped_tn_bf16_m{output_m}_n{output_n}_e{num_experts}"
             f"_bm{block_m}_bn{block_n}_bk{block_k}_kp{k_padding}_w{m_waves}x{n_waves}"
+            f"_md{int(metadata_direct)}"
         ),
         known_block_size=[block_threads, 1, 1],
     )
@@ -285,18 +290,34 @@ def compile_grouped_tn(
         lhs_rows: fx.Tensor,
         rhs_rows: fx.Tensor,
         expert_frequency: fx.Tensor,
-        queue_storage: fx.Tensor,
+        schedule_storage: fx.Tensor,
+        num_valid_ids: fx.Tensor,
         output: fx.Tensor,
         tiled_mma: fx.TiledMma,
     ):
         tid = gpu.thread_idx.x
         bid = gpu.block_idx.x
         grid_size = gpu.grid_dim.x
-        storage_rsrc = buffer_ops.create_buffer_resource(queue_storage, max_size=True)
-        descriptor_count = rocdl.readfirstlane(
-            T.i32,
-            _raw(buffer_ops.buffer_load(storage_rsrc, fx.Int32(0), vec_width=1, dtype=T.i32)),
-        )
+        storage_rsrc = buffer_ops.create_buffer_resource(schedule_storage, max_size=True)
+        if const_expr(metadata_direct):
+            valid_rsrc = buffer_ops.create_buffer_resource(num_valid_ids, max_size=True)
+            padded_rows = rocdl.readfirstlane(
+                T.i32,
+                _raw(buffer_ops.buffer_load(valid_rsrc, fx.Int32(0), vec_width=1, dtype=T.i32)),
+            )
+            descriptor_count = padded_rows // fx.Int32(_SORTED_BLOCK_M)
+        else:
+            descriptor_count = rocdl.readfirstlane(
+                T.i32,
+                _raw(
+                    buffer_ops.buffer_load(
+                        storage_rsrc,
+                        fx.Int32(0),
+                        vec_width=1,
+                        dtype=T.i32,
+                    )
+                ),
+            )
         work_bound = descriptor_count * fx.Int32(output_tiles_per_expert)
 
         storage = fx.SharedAllocator().allocate(SharedStorage)
@@ -325,22 +346,43 @@ def compile_grouped_tn(
         def run_output_tile(work_index):
             descriptor_index = work_index // fx.Int32(output_tiles_per_expert)
             output_tile = work_index % fx.Int32(output_tiles_per_expert)
-            descriptor_offset = fx.Int32(1) + descriptor_index * fx.Int32(2)
-            expert = rocdl.readfirstlane(
-                T.i32,
-                _raw(buffer_ops.buffer_load(storage_rsrc, descriptor_offset, vec_width=1, dtype=T.i32)),
-            )
-            first_sorted_row = rocdl.readfirstlane(
-                T.i32,
-                _raw(
-                    buffer_ops.buffer_load(
-                        storage_rsrc,
-                        descriptor_offset + fx.Int32(1),
-                        vec_width=1,
-                        dtype=T.i32,
-                    )
-                ),
-            )
+            if const_expr(metadata_direct):
+                expert = rocdl.readfirstlane(
+                    T.i32,
+                    _raw(
+                        buffer_ops.buffer_load(
+                            storage_rsrc,
+                            descriptor_index,
+                            vec_width=1,
+                            dtype=T.i32,
+                        )
+                    ),
+                )
+                first_sorted_row = descriptor_index * fx.Int32(_SORTED_BLOCK_M)
+            else:
+                descriptor_offset = fx.Int32(1) + descriptor_index * fx.Int32(2)
+                expert = rocdl.readfirstlane(
+                    T.i32,
+                    _raw(
+                        buffer_ops.buffer_load(
+                            storage_rsrc,
+                            descriptor_offset,
+                            vec_width=1,
+                            dtype=T.i32,
+                        )
+                    ),
+                )
+                first_sorted_row = rocdl.readfirstlane(
+                    T.i32,
+                    _raw(
+                        buffer_ops.buffer_load(
+                            storage_rsrc,
+                            descriptor_offset + fx.Int32(1),
+                            vec_width=1,
+                            dtype=T.i32,
+                        )
+                    ),
+                )
             frequency = rocdl.readfirstlane(
                 T.i32,
                 _raw(buffer_ops.buffer_load(frequency_rsrc, expert, vec_width=1, dtype=T.i32)),
@@ -528,7 +570,8 @@ def compile_grouped_tn(
         lhs_rows: fx.Tensor,
         rhs_rows: fx.Tensor,
         expert_frequency: fx.Tensor,
-        queue_storage: fx.Tensor,
+        schedule_storage: fx.Tensor,
+        num_valid_ids: fx.Tensor,
         output: fx.Tensor,
         i32_grid: fx.Int32,
         stream: fx.Stream = fx.Stream(None),
@@ -547,7 +590,8 @@ def compile_grouped_tn(
             lhs_rows,
             rhs_rows,
             expert_frequency,
-            queue_storage,
+            schedule_storage,
+            num_valid_ids,
             output,
             tiled_mma,
         ).launch(
@@ -709,6 +753,7 @@ def grouped_tn_from_queue_flydsl(
         m_waves,
         n_waves,
         lhs_rows.device.index or 0,
+        False,
     )
     _run_compiled(
         launcher,
@@ -716,11 +761,122 @@ def grouped_tn_from_queue_flydsl(
         rhs_rows,
         expert_frequency,
         queue_storage,
+        queue_storage,
         output,
         grid,
         stream,
     )
     queue_storage.record_stream(stream)
+    return output
+
+
+def grouped_tn_from_metadata_flydsl(
+    lhs_rows: torch.Tensor,
+    rhs_rows: torch.Tensor,
+    expert_frequency: torch.Tensor,
+    sorted_expert_ids: torch.Tensor,
+    num_valid_ids: torch.Tensor,
+    output: torch.Tensor,
+    *,
+    block_m: int | None = None,
+    block_n: int | None = None,
+    block_k: int | None = None,
+    k_padding: int | None = None,
+    m_waves: int | None = None,
+    n_waves: int | None = None,
+    stream: torch.cuda.Stream | None = None,
+) -> torch.Tensor:
+    """Run grouped TN directly from one-block-per-expert sorter metadata.
+
+    This is the builder-free fixed-K T1 path.  Callers must guarantee every
+    non-empty expert has at most ``_SORTED_BLOCK_M`` rows; otherwise repeated
+    expert IDs would race while writing the same output tile.
+    """
+
+    if lhs_rows.ndim != 2 or rhs_rows.ndim != 2 or output.ndim != 3:
+        raise ValueError("expected lhs_rows[P,M], rhs_rows[P,N], and output[E,M,N]")
+    num_experts, output_m, output_n = (int(value) for value in output.shape)
+    if tuple(lhs_rows.shape) != (int(rhs_rows.shape[0]), output_m):
+        raise ValueError("lhs_rows and rhs_rows must share P and match output M")
+    if int(rhs_rows.shape[1]) != output_n:
+        raise ValueError("rhs_rows width must match output N")
+    tensors = (
+        lhs_rows,
+        rhs_rows,
+        expert_frequency,
+        sorted_expert_ids,
+        num_valid_ids,
+        output,
+    )
+    if any(tensor.device != lhs_rows.device for tensor in tensors):
+        raise ValueError("grouped TN tensors must share one device")
+    if (
+        lhs_rows.dtype != torch.bfloat16
+        or rhs_rows.dtype != torch.bfloat16
+        or output.dtype != torch.bfloat16
+    ):
+        raise TypeError("grouped TN currently requires BF16 inputs and output")
+    if any(
+        tensor.dtype != torch.int32
+        for tensor in (expert_frequency, sorted_expert_ids, num_valid_ids)
+    ):
+        raise TypeError("grouped TN metadata must use int32")
+    if not all(tensor.is_contiguous() for tensor in tensors):
+        raise ValueError("grouped TN tensors must be contiguous")
+    if tuple(expert_frequency.shape) != (num_experts,):
+        raise ValueError("expert_frequency must have shape [E]")
+    if sorted_expert_ids.ndim != 1:
+        raise ValueError("sorted_expert_ids must be one-dimensional")
+    if num_valid_ids.ndim != 1 or num_valid_ids.numel() < 1:
+        raise ValueError("num_valid_ids must contain the padded row count")
+    if sorted_expert_ids.numel() == 0:
+        return output
+
+    (
+        default_bm,
+        default_bn,
+        default_bk,
+        default_k_padding,
+        default_m_waves,
+        default_n_waves,
+    ) = grouped_tn_tuning(output_m, output_n)
+    block_m = default_bm if block_m is None else block_m
+    block_n = default_bn if block_n is None else block_n
+    block_k = default_bk if block_k is None else block_k
+    k_padding = default_k_padding if k_padding is None else k_padding
+    m_waves = default_m_waves if m_waves is None else m_waves
+    n_waves = default_n_waves if n_waves is None else n_waves
+    output_tiles = (output_m // block_m) * (output_n // block_n)
+    max_work = int(sorted_expert_ids.numel()) * output_tiles
+    grid = min(max_work, _NUM_CU) if max_work > _PERSIST_THRESHOLD else max_work
+    if stream is None:
+        stream = torch.cuda.current_stream(lhs_rows.device)
+    launcher = compile_grouped_tn(
+        output_m,
+        output_n,
+        num_experts,
+        block_m,
+        block_n,
+        block_k,
+        k_padding,
+        m_waves,
+        n_waves,
+        lhs_rows.device.index or 0,
+        True,
+    )
+    _run_compiled(
+        launcher,
+        lhs_rows,
+        rhs_rows,
+        expert_frequency,
+        sorted_expert_ids,
+        num_valid_ids,
+        output,
+        grid,
+        stream,
+    )
+    sorted_expert_ids.record_stream(stream)
+    num_valid_ids.record_stream(stream)
     return output
 
 
@@ -803,6 +959,7 @@ __all__ = [
     "compile_grouped_tn",
     "grouped_dw2_flydsl",
     "grouped_dw2_tuning",
+    "grouped_tn_from_metadata_flydsl",
     "grouped_tn_from_queue_flydsl",
     "grouped_tn_flydsl",
     "grouped_tn_tuning",

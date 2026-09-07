@@ -24,7 +24,7 @@ import torch
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl.expr import gpu, range_constexpr
+from flydsl.expr import const_expr, gpu, range_constexpr
 from flydsl.expr.typing import T
 from kernels.common import buffer_ops
 from kernels.common.mem_ops import atomic_add
@@ -162,7 +162,7 @@ def compile_compact_m_tile_descriptor_builder(
         if gpu.thread_idx.x == fx.Int32(0):
             total_rsrc = buffer_ops.create_buffer_resource(total_tiles, max_size=True)
             buffer_ops.buffer_store(fx.Int32(0), total_rsrc, fx.Int32(0))
-            if emit_active_experts:
+            if const_expr(emit_active_experts):
                 active_rsrc = buffer_ops.create_buffer_resource(
                     active_expert_storage,
                     max_size=True,
@@ -214,7 +214,7 @@ def compile_compact_m_tile_descriptor_builder(
                     buffer_ops.buffer_load(expert_ids_rsrc, safe_lo, vec_width=1, dtype=T.i32)
                 )
                 if in_metadata & (found_expert == expert):
-                    if emit_active_experts:
+                    if const_expr(emit_active_experts):
                         active_slot = atomic_add(
                             active_expert_storage,
                             fx.Int32(0),
