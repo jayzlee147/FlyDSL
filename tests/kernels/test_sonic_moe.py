@@ -216,6 +216,7 @@ def test_sonic_moe_training_forward_state_matches_route_order_gemm(interleaved_w
     assert state.activation == "swiglu"
     assert state.compute_dtype == "bf16"
     assert state.interleaved_w1 is interleaved_w1
+    assert state.has_bias is has_bias
     assert state.producer_stream == int(torch.cuda.current_stream(x.device).cuda_stream)
     assert state.ready_event.query()
     assert op.workspace is not None

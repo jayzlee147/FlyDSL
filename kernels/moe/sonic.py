@@ -378,6 +378,7 @@ class SonicMoEForwardState:
     activation: str
     compute_dtype: str
     interleaved_w1: bool
+    has_bias: bool
     producer_stream: int
     ready_event: torch.cuda.Event
 
@@ -2101,6 +2102,7 @@ class SonicMoE:
             activation=self.config.activation,
             compute_dtype=self.config.compute_dtype,
             interleaved_w1=interleaved_w1,
+            has_bias=self.weights.has_bias,
             producer_stream=int(stream.cuda_stream),
             ready_event=ready_event,
         )
