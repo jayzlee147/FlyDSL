@@ -927,6 +927,7 @@ def compile_gemm1_a16w4_port(
     logical_dense_weight=False,
     store_preactivation=False,
     expert_grid=False,
+    compact_grid=False,
 ):
     """A16W4/A16W16 fused stage1 builder.
 
@@ -951,6 +952,11 @@ def compile_gemm1_a16w4_port(
     ``SORTED_BM`` is the route-sort padding and expert-metadata granularity. It
     defaults to ``BM`` for compatibility and may be a multiple of ``BM`` when
     stage 1 subdivides route tiles shared with a larger stage-2 M tile.
+
+    ``compact_grid`` is a backward-only schedule consuming a device-built work
+    queue from ``arg_bscale``.  Entry zero is the live descriptor count and the
+    remaining int32 entries are real-M-tile indices.  This is valid only for
+    logical dense weights, where the scale argument is unused.
     """
     SORTED_BM = BM if SORTED_BM is None else SORTED_BM
     assert w_dtype in ("mxfp4", "int4", "bf16", "fp16"), (
@@ -972,6 +978,8 @@ def compile_gemm1_a16w4_port(
     assert isinstance(logical_dense_weight, bool), "logical_dense_weight must be bool"
     assert isinstance(store_preactivation, bool), "store_preactivation must be bool"
     assert isinstance(expert_grid, bool), "expert_grid must be bool"
+    assert isinstance(compact_grid, bool), "compact_grid must be bool"
+    assert not (expert_grid and compact_grid), "expert_grid and compact_grid are mutually exclusive"
     _K = D_HIDDEN
     _INTER = D_INTER
     _is_glu = act in ("silu", "swiglu", "geglu", "reglu", "situv2")
@@ -982,6 +990,9 @@ def compile_gemm1_a16w4_port(
     )
     assert not expert_grid or logical_dense_weight, (
         "expert_grid requires logical dense weights because arg_bscale carries expert frequencies"
+    )
+    assert not compact_grid or logical_dense_weight, (
+        "compact_grid requires logical dense weights because arg_bscale carries the descriptor queue"
     )
     assert _K % TILE_K == 0, f"D_HIDDEN (K) must be a multiple of {TILE_K}, got {_K}"
     assert _K % (k_wave * TILE_K) == 0, f"D_HIDDEN (K) must be a multiple of k_wave*TILE_K, got {_K}, k_wave={k_wave}"
@@ -1033,11 +1044,13 @@ def compile_gemm1_a16w4_port(
     _logical_w_tag = "_logicalw" if logical_dense_weight else ""
     _preact_tag = "_storepreact" if store_preactivation else ""
     _expert_grid_tag = "_egrid" if expert_grid else ""
+    _compact_grid_tag = "_cgrid" if compact_grid else ""
     _sorted_tag = f"_sbm{SORTED_BM}" if SORTED_BM != BM else ""
     name_suffix = (
         f"a16w4{_wd_tag}{_ad_tag}{_wl_tag}_h{_K}_i{_INTER}_ne{NE}_bm{BM}"
         f"{_sorted_tag}_tn{TILE_N}_tk{TILE_K}{_act_tag}{_bcm_tag}{_xcd_tag}"
-        f"{_wpe_tag}{_kw_tag}{_round_tag}{_bias_tag}{_logical_w_tag}{_preact_tag}{_expert_grid_tag}"
+        f"{_wpe_tag}{_kw_tag}{_round_tag}{_bias_tag}{_logical_w_tag}{_preact_tag}"
+        f"{_expert_grid_tag}{_compact_grid_tag}"
     )
 
     @fx.struct
@@ -1132,7 +1145,23 @@ def compile_gemm1_a16w4_port(
                 store_preactivation=store_preactivation,
             )
 
-        if const_expr(expert_grid):
+        if const_expr(compact_grid):
+            # A preceding device kernel compacts exactly the real M tiles.  The
+            # host launches the safe descriptor-capacity bound; excess CTAs
+            # read the device count and exit without touching the work queue.
+            descriptor_index = bx_i32 // fx.Int32(NUM_N_BLOCKS)
+            compact_n_block = bx_i32 % fx.Int32(NUM_N_BLOCKS)
+            descriptor_count = rocdl.readfirstlane(
+                T.i32,
+                _raw(_global_i32_at(arg_bscale, fx.Int32(0))),
+            )
+            if descriptor_index < descriptor_count:
+                m_block = rocdl.readfirstlane(
+                    T.i32,
+                    _raw(_global_i32_at(arg_bscale, descriptor_index + fx.Int32(1))),
+                )
+                _run_body(m_block * fx.Int32(NUM_N_BLOCKS) + compact_n_block)
+        elif const_expr(expert_grid):
             # Backward-only device-driven schedule.  One workgroup owns an
             # (expert, N-tile) pair and loops over just ceil(real_rows/BM)
             # compute tiles.  A fixed-iteration lower_bound finds the expert's
@@ -1140,7 +1169,7 @@ def compile_gemm1_a16w4_port(
             expert_bound = fx.Int32(NE * NUM_N_BLOCKS)
             if bx_i32 < expert_bound:
                 expert = bx_i32 // fx.Int32(NUM_N_BLOCKS)
-                n_block = bx_i32 % fx.Int32(NUM_N_BLOCKS)
+                expert_n_block = bx_i32 % fx.Int32(NUM_N_BLOCKS)
                 frequency = rocdl.readfirstlane(T.i32, _raw(_global_i32_at(arg_bscale, expert)))
                 if frequency > fx.Int32(0):
                     lo = fx.Int32(0)
@@ -1159,7 +1188,7 @@ def compile_gemm1_a16w4_port(
                     first_m_block = lo * fx.Int32(SORTED_BM // BM)
                     num_m_blocks = (frequency + fx.Int32(BM - 1)) // fx.Int32(BM)
                     for subtile in range(0, num_m_blocks, 1):
-                        tile = (first_m_block + fx.Int32(subtile)) * fx.Int32(NUM_N_BLOCKS) + n_block
+                        tile = (first_m_block + fx.Int32(subtile)) * fx.Int32(NUM_N_BLOCKS) + expert_n_block
                         _run_body(tile)
         else:
             if bx_i32 < bound:

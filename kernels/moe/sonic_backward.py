@@ -47,6 +47,11 @@ from kernels.moe.moe_2stage_a16wmix.gemm2 import compile_gemm2_a16w4_port
 from kernels.moe.moe_gemm_2stage.moe_reduce import compile_moe_reduction
 from kernels.moe.moe_ragged_sorting_kernel import moe_ragged_sorting_flydsl
 from kernels.moe.moe_sorting_kernel import moe_sorting_flydsl, moe_sorting_get_workspace_size
+from kernels.moe.sonic_grouped_scheduler import (
+    build_compact_m_tile_descriptors,
+    fixed_compact_m_tile_descriptor_upper_bound,
+    ragged_compact_m_tile_descriptor_upper_bound,
+)
 
 if TYPE_CHECKING:
     from kernels.moe.sonic import SonicMoEConfig
@@ -87,6 +92,14 @@ _GROUPED_W1_BM = 16
 _GROUPED_W1_BN = 64
 _GROUPED_W1_BK = 64
 _GROUPED_W1_K_WAVE = 4
+# At the fixed-K policy boundary, a compact real-M-tile queue exposes long
+# expert segments as independent CTAs.  BN128 halves the queue grid, while two
+# K waves retain enough N parallelism for the production H3584/I512 shape.
+_COMPACT_W1_MIN_TOKENS = 64
+_COMPACT_W1_BM = 16
+_COMPACT_W1_BN = 128
+_COMPACT_W1_BK = 64
+_COMPACT_W1_K_WAVE = 2
 # This BM16/k-wave4 specialization is tuned for short expert segments.  Fixed-K
 # routing guarantees at most one edge per (token, expert), so ``tokens`` is a
 # distribution-independent upper bound.  Ragged routing permits duplicates and
@@ -106,6 +119,51 @@ _GROUPED_W2_BK = 64
 _GROUPED_W2_MAX_EXPERT_ROWS = 128
 
 
+def _use_compact_w1_descriptor_queue(
+    *,
+    tokens: int,
+    hidden_size: int,
+    intermediate_size: int,
+) -> bool:
+    """Select the no-readback real-M-tile queue when its tuning is legal."""
+
+    return (
+        tokens >= _COMPACT_W1_MIN_TOKENS
+        and hidden_size % (_COMPACT_W1_K_WAVE * _COMPACT_W1_BK) == 0
+        and intermediate_size % _COMPACT_W1_BN == 0
+    )
+
+
+def _grouped_w1_tuning(
+    *,
+    tokens: int,
+    hidden_size: int,
+    intermediate_size: int,
+) -> tuple[int, int, int, int, bool]:
+    """Return ``(BM, BN, BK, k_wave, compact_grid)`` for grouped W1."""
+
+    compact_grid = _use_compact_w1_descriptor_queue(
+        tokens=tokens,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+    )
+    if compact_grid:
+        return (
+            _COMPACT_W1_BM,
+            _COMPACT_W1_BN,
+            _COMPACT_W1_BK,
+            _COMPACT_W1_K_WAVE,
+            True,
+        )
+    return (
+        _GROUPED_W1_BM,
+        _GROUPED_W1_BN,
+        _GROUPED_W1_BK,
+        _GROUPED_W1_K_WAVE,
+        False,
+    )
+
+
 def _use_grouped_w1_recompute(
     *,
     compute_dtype: str,
@@ -119,11 +177,17 @@ def _use_grouped_w1_recompute(
     """Return whether the short-M grouped W1 specialization is applicable."""
 
     max_expert_rows = routes if flat_routes else tokens
+    bm, bn, bk, k_wave, _ = _grouped_w1_tuning(
+        tokens=tokens,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+    )
     return (
         compute_dtype == "bf16"
         and activation == "swiglu"
-        and hidden_size % (_GROUPED_W1_K_WAVE * _GROUPED_W1_BK) == 0
-        and intermediate_size % _GROUPED_W1_BN == 0
+        and hidden_size % (k_wave * bk) == 0
+        and intermediate_size % bn == 0
+        and _BACKWARD_SORT_UNIT % bm == 0
         and max_expert_rows <= _GROUPED_W1_MAX_EXPERT_ROWS
     )
 
@@ -135,6 +199,7 @@ def _compile_grouped_w1_recompute(
     num_experts: int,
     topk: int,
     has_bias: bool,
+    compact_grid: bool,
     device_index: int,
 ):
     """Build grouped raw-W1 preactivation recompute for BF16 SwiGLU.
@@ -144,26 +209,41 @@ def _compile_grouped_w1_recompute(
     """
 
     del device_index
+    if compact_grid:
+        bm, bn, bk, k_wave = (
+            _COMPACT_W1_BM,
+            _COMPACT_W1_BN,
+            _COMPACT_W1_BK,
+            _COMPACT_W1_K_WAVE,
+        )
+    else:
+        bm, bn, bk, k_wave = (
+            _GROUPED_W1_BM,
+            _GROUPED_W1_BN,
+            _GROUPED_W1_BK,
+            _GROUPED_W1_K_WAVE,
+        )
     return compile_gemm1_a16w4_port(
-        BM=_GROUPED_W1_BM,
+        BM=bm,
         SORTED_BM=_BACKWARD_SORT_UNIT,
         D_HIDDEN=hidden_size,
         D_INTER=intermediate_size,
         NE=num_experts,
         TOPK=topk,
-        TILE_N=_GROUPED_W1_BN,
-        TILE_K=_GROUPED_W1_BK,
+        TILE_N=bn,
+        TILE_K=bk,
         act="swiglu",
         b_cache_mod=0,
         w_dtype="bf16",
         a_dtype="bf16",
         w_layout="standard",
-        k_wave=_GROUPED_W1_K_WAVE,
+        k_wave=k_wave,
         round_preact_bf16=False,
         has_bias=has_bias,
         logical_dense_weight=True,
         store_preactivation=True,
-        expert_grid=True,
+        expert_grid=not compact_grid,
+        compact_grid=compact_grid,
     )
 
 
@@ -1320,6 +1400,12 @@ def _sonic_moe_backward_impl(
         routes=routes,
         flat_routes=flat_routes,
     )
+    grouped_w1_bm, grouped_w1_bn, _, _, compact_w1_grid = _grouped_w1_tuning(
+        tokens=tokens,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+    )
+    use_compact_w1 = use_grouped_w1 and compact_w1_grid
     device = hidden_states.device
     device_index = device.index or 0
     with torch.cuda.device(device):
@@ -1363,6 +1449,31 @@ def _sonic_moe_backward_impl(
     )
     sorter_dummy = torch.empty(4, dtype=torch.int32, device=device)
     expert_frequency = torch.empty(num_experts, dtype=torch.int32, device=device)
+    if use_compact_w1:
+        if flat_routes:
+            compact_w1_bound = ragged_compact_m_tile_descriptor_upper_bound(
+                routes,
+                num_experts,
+                grouped_w1_bm,
+            )
+        else:
+            compact_w1_bound = fixed_compact_m_tile_descriptor_upper_bound(
+                tokens,
+                num_experts,
+                topk,
+                grouped_w1_bm,
+            )
+        # Entry zero stores the device-produced live count.  Keeping the count
+        # at a fixed offset lets one compiled GEMM specialization serve every
+        # host-known descriptor-capacity bound.
+        compact_w1_storage = torch.empty(compact_w1_bound + 1, dtype=torch.int32, device=device)
+        compact_w1_total = compact_w1_storage[:1]
+        compact_w1_descriptors = compact_w1_storage[1:]
+    else:
+        compact_w1_bound = 0
+        compact_w1_storage = None
+        compact_w1_descriptors = None
+        compact_w1_total = None
 
     x_sorted = torch.empty((max_padded, hidden_size), dtype=hidden_states.dtype, device=device)
     dout_sorted = torch.empty_like(x_sorted)
@@ -1371,7 +1482,7 @@ def _sonic_moe_backward_impl(
     # reduction reads projection before checking the route sentinel, so keep
     # every untouched padded row finite.
     projection = torch.zeros_like(x_sorted) if use_grouped_w2 else torch.empty_like(x_sorted)
-    # Expert-grid W1 writes ceil(real_rows/BM)*BM rows instead of every
+    # Grouped W1 writes ceil(real_rows/BM)*BM rows instead of every
     # SORTED_BM-padded row.  Zero-initialize the untouched suffix: gather makes
     # padded x/dout zero, so its dy/da/dz and therefore dW/db contributions
     # remain exactly zero while all activation inputs stay finite.
@@ -1466,21 +1577,42 @@ def _sonic_moe_backward_impl(
         # required to recompute preactivation.  Keep the generic fallback for
         # non-SwiGLU/FP16 shapes until their epilogues are enabled here.
         if use_grouped_w1:
+            if use_compact_w1:
+                assert compact_w1_descriptors is not None
+                assert compact_w1_total is not None
+                build_compact_m_tile_descriptors(
+                    expert_frequency,
+                    sorted_expert_ids,
+                    num_valid_ids,
+                    compact_w1_descriptors,
+                    compact_w1_total,
+                    block_m=grouped_w1_bm,
+                    sorted_block_m=sort_unit,
+                    descriptor_capacity=compact_w1_bound,
+                    stream=stream,
+                )
             grouped_w1 = _compile_grouped_w1_recompute(
                 hidden_size,
                 intermediate_size,
                 num_experts,
                 topk,
                 has_bias,
+                use_compact_w1,
                 device_index,
             )
-            grouped_w1_grid = num_experts * (intermediate_size // _GROUPED_W1_BN)
+            grouped_w1_grid = (
+                compact_w1_bound if use_compact_w1 else num_experts
+            ) * (intermediate_size // grouped_w1_bn)
             dummy_ptr = w1_arg.data_ptr()
             _run_compiled(
                 grouped_w1,
                 x_arg.data_ptr(),
                 w1_arg.data_ptr(),
-                expert_frequency.data_ptr(),
+                (
+                    compact_w1_storage.data_ptr()
+                    if compact_w1_storage is not None
+                    else expert_frequency.data_ptr()
+                ),
                 dummy_ptr if b1_arg is None else b1_arg.data_ptr(),
                 sorted_expert_ids.data_ptr(),
                 num_valid_ids.data_ptr(),

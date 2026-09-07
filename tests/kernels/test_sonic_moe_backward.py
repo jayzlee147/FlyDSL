@@ -9,6 +9,7 @@ import pytest
 import torch
 
 from flydsl.runtime.device import get_rocm_arch
+from kernels.moe import sonic_backward as sonic_backward_module
 from kernels.moe.moe_sorting_kernel import _multiphase_cf_cache, _oneshot_cf_cache
 from kernels.moe.sonic import (
     SonicMoE,
@@ -17,7 +18,11 @@ from kernels.moe.sonic import (
     sonic_moe_backward,
     sonic_moe_backward_routes,
 )
-from kernels.moe.sonic_backward import _use_grouped_w1_recompute, _use_grouped_w2_recompute
+from kernels.moe.sonic_backward import (
+    _grouped_w1_tuning,
+    _use_grouped_w1_recompute,
+    _use_grouped_w2_recompute,
+)
 
 pytestmark = [pytest.mark.l2_device, pytest.mark.rocm_lower]
 
@@ -109,6 +114,22 @@ def test_grouped_w2_policy_keeps_unsupported_contracts_on_legacy(
         tokens=128,
         routes=2048,
         flat_routes=False,
+    )
+
+
+@pytest.mark.parametrize(
+    ("tokens", "expected_compact"),
+    ((1, False), (63, False), (64, True), (128, True)),
+)
+def test_grouped_w1_compact_queue_policy(tokens, expected_compact):
+    bm, bn, bk, k_wave, compact = _grouped_w1_tuning(
+        tokens=tokens,
+        hidden_size=3584,
+        intermediate_size=512,
+    )
+    assert compact is expected_compact
+    assert (bm, bn, bk, k_wave) == (
+        (16, 128, 64, 2) if expected_compact else (16, 64, 64, 4)
     )
 
 
@@ -430,6 +451,41 @@ def _backward_routes_reference(
         dx_fp32.index_add_(0, token_indices.long(), dx_routes.float())
     result = (dx_fp32.to(x.dtype), dw1, dw2, droute_weights)
     return (*result, db1, db2) if has_bias else result
+
+
+def test_sonic_moe_backward_t1_keeps_expert_grid_without_descriptor_builder(monkeypatch):
+    """The latency-critical T1 grouped W1 path must not launch queue builders."""
+
+    tokens, hidden_size, intermediate_size, num_experts, topk = 1, 256, 128, 4, 2
+    config = _config(
+        hidden_size,
+        intermediate_size,
+        num_experts,
+        topk,
+        compute_dtype="bf16",
+        down_tile_m=128,
+    )
+    args = _make_case(
+        tokens,
+        hidden_size,
+        intermediate_size,
+        num_experts,
+        topk,
+        seed=197,
+        dtype=torch.bfloat16,
+    )
+
+    def _unexpected_builder(*_args, **_kwargs):
+        raise AssertionError("T1 must not build compact W1 descriptors")
+
+    monkeypatch.setattr(
+        sonic_backward_module,
+        "build_compact_m_tile_descriptors",
+        _unexpected_builder,
+    )
+    actual = sonic_moe_backward(*args, config)
+    torch.cuda.synchronize()
+    assert actual[0].shape == args[0].shape
 
 
 @pytest.mark.parametrize(
