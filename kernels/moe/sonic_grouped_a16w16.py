@@ -53,6 +53,8 @@ def compile_sonic_grouped_a16w16_nn(
     sorted_block_m: int = 64,
     compact_grid: bool = True,
     device_index: int = 0,
+    min_active_experts: int = 0,
+    max_active_experts: int | None = None,
 ):
     """Compile a BF16 grouped NN GEMM with a device-derived M schedule.
 
@@ -60,12 +62,23 @@ def compile_sonic_grouped_a16w16_nn(
     non-compact mode consumes sorter metadata blocks directly and is intended
     for fixed-K T1, where each active expert has exactly one real M tile.
     ``device_index`` participates in the cache key because loaded code objects
-    are tied to a ROCm device.
+    are tied to a ROCm device.  The optional inclusive active-expert interval
+    is read from ``arg_cumsum[0]`` in compact mode and permits mutually
+    exclusive gfx950 launch profiles without copying routing statistics to the
+    host.  Unguarded calls retain the original launcher ABI and metadata use.
     """
 
     del device_index
     if min(contraction_size, output_size, num_experts, block_m, block_n, block_k, stages, n_waves) <= 0:
         raise ValueError("grouped A16 GEMM dimensions and tuning values must be positive")
+    if not isinstance(min_active_experts, int) or min_active_experts < 0:
+        raise ValueError("min_active_experts must be a non-negative int")
+    if max_active_experts is not None and (
+        not isinstance(max_active_experts, int) or max_active_experts < min_active_experts
+    ):
+        raise ValueError("max_active_experts must be None or at least min_active_experts")
+    if (min_active_experts > 0 or max_active_experts is not None) and not compact_grid:
+        raise ValueError("active-expert guards require compact_grid=True")
     if block_m % 16 or sorted_block_m % block_m:
         raise ValueError("block_m must be a multiple of 16 that divides sorted_block_m")
     if output_size % block_n:
@@ -129,6 +142,7 @@ def compile_sonic_grouped_a16w16_nn(
         f"sonic_grouped_nn_bf16_k{contraction_size}_n{output_size}_e{num_experts}"
         f"_bm{block_m}_bn{block_n}_bk{block_k}_s{stages}_nw{n_waves}"
         f"_{'compact' if compact_grid else 'metadata'}"
+        f"_amin{min_active_experts}_amax{max_active_experts}"
     )
 
     @fx.struct
@@ -410,6 +424,19 @@ def compile_sonic_grouped_a16w16_nn(
                 )
                 m_block = metadata_block * fx.Int32(sorted_block_m // block_m)
                 _run_tile(m_block, n_block, expert)
+
+        if const_expr(min_active_experts > 0 or max_active_experts is not None):
+            active_count = cumsum0
+            if const_expr(min_active_experts > 0):
+                work_count = (active_count >= fx.Int32(min_active_experts)).select(
+                    work_count,
+                    fx.Int32(0),
+                )
+            if const_expr(max_active_experts is not None):
+                work_count = (active_count <= fx.Int32(max_active_experts)).select(
+                    work_count,
+                    fx.Int32(0),
+                )
 
         if block_id < work_count:
             _run_work(block_id)

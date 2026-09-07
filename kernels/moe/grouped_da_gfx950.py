@@ -12,7 +12,7 @@ CDNA4 ``LDSReadTrans16_64b`` operations.
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl.expr import gpu, range_constexpr, rocdl
+from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import T
 from kernels.common import buffer_ops
 from kernels.gemm.gemm_a16w16_gfx950 import async_load_to_lds
@@ -285,11 +285,28 @@ def compile_grouped_da_gfx950(
     m_waves: int = 1,
     n_waves: int = 4,
     waves_per_eu: int | None = None,
+    queue_direct: bool = False,
+    min_active_experts: int = 0,
+    max_active_experts: int | None = None,
 ):
-    """Compile a grouped BF16 ``dY @ W2`` launcher for gfx950."""
+    """Compile a grouped BF16 ``dY @ W2`` launcher for gfx950.
+
+    ``queue_direct=True`` consumes the counter-first
+    ``[count, (expert, first_row)...]`` active queue through
+    ``arg_active_count`` and skips the expert-grid scan and metadata binary
+    search.  The optional inclusive active-expert interval is evaluated from
+    the same device pointer.  Disjoint specializations can consequently select
+    BM32 for balanced routing and BM64 for hot routing without a host readback.
+    """
 
     if min(hidden_size, intermediate_size, num_experts) <= 0:
         raise ValueError("hidden_size, intermediate_size, and num_experts must be positive")
+    if not isinstance(min_active_experts, int) or min_active_experts < 0:
+        raise ValueError("min_active_experts must be a non-negative int")
+    if max_active_experts is not None and (
+        not isinstance(max_active_experts, int) or max_active_experts < min_active_experts
+    ):
+        raise ValueError("max_active_experts must be None or at least min_active_experts")
     if block_m % (m_waves * 16) != 0:
         raise ValueError("block_m must be divisible by m_waves * 16")
     if block_n % (n_waves * 16) != 0:
@@ -324,6 +341,8 @@ def compile_grouped_da_gfx950(
     name = (
         f"grouped_da_bf16_gfx950_h{hidden_size}_i{intermediate_size}_e{num_experts}"
         f"_bm{block_m}_bn{block_n}_bk{block_k}_s{stages}_w{m_waves}x{n_waves}"
+        f"_q{int(queue_direct)}"
+        f"_amin{min_active_experts}_amax{max_active_experts}"
     )
 
     @fx.struct
@@ -343,6 +362,7 @@ def compile_grouped_da_gfx950(
         arg_frequency: fx.Int64,
         arg_expert_ids: fx.Int64,
         arg_cumsum: fx.Int64,
+        arg_active_count: fx.Int64,
         arg_da: fx.Int64,
     ):
         storage = fx.SharedAllocator().allocate(SharedStorage)
@@ -359,48 +379,105 @@ def compile_grouped_da_gfx950(
             fx.make_tile(None, None, fx.make_layout((8, 4), (1, 8))),
         )
 
-        expert_bound = fx.Int32(num_experts * num_n_blocks)
-        if block_id < expert_bound:
-            expert = block_id // fx.Int32(num_n_blocks)
-            n_block = block_id % fx.Int32(num_n_blocks)
-            frequency = rocdl.readfirstlane(T.i32, _raw(_global_i32_at(arg_frequency, expert)))
-            if frequency > fx.Int32(0):
-                lo = fx.Int32(0)
-                hi = cumsum0 // fx.Int32(sorted_block_size)
-                for _ in range_constexpr(25):
-                    searching = lo < hi
-                    mid = (lo + hi) // fx.Int32(2)
-                    safe_mid = searching.select(mid, fx.Int32(0))
-                    mid_expert = fx.Int32(_global_i32_at(arg_expert_ids, safe_mid))
-                    move_right = searching & (mid_expert < expert)
-                    lo = move_right.select(mid + fx.Int32(1), lo)
-                    move_left = searching & (mid_expert >= expert)
-                    hi = move_left.select(mid, hi)
-                first_sorted_row = lo * fx.Int32(sorted_block_size)
-                num_m_blocks = (frequency + fx.Int32(block_m - 1)) // fx.Int32(block_m)
-                for m_block in range(0, num_m_blocks, 1):
-                    _grouped_da_body(
-                        smem_a,
-                        smem_b,
-                        smem_c,
-                        tiled_mma,
-                        arg_dy,
-                        arg_w2,
-                        arg_da,
-                        expert,
-                        first_sorted_row,
-                        fx.Int32(m_block),
-                        n_block,
-                        frequency,
-                        BM=block_m,
-                        BN=block_n,
-                        BK=block_k,
-                        HIDDEN=hidden_size,
-                        INTER=intermediate_size,
-                        STAGES=stages,
-                        M_WAVES=m_waves,
-                        N_WAVES=n_waves,
-                    )
+        active_count = fx.Int32(0)
+        if const_expr(queue_direct or min_active_experts > 0 or max_active_experts is not None):
+            active_count = rocdl.readfirstlane(
+                T.i32,
+                _raw(_global_i32_at(arg_active_count, fx.Int32(0))),
+            )
+
+        def run_expert_tile(expert, n_block, first_sorted_row, frequency):
+            num_m_blocks = (frequency + fx.Int32(block_m - 1)) // fx.Int32(block_m)
+            for m_block in range(0, num_m_blocks, 1):
+                _grouped_da_body(
+                    smem_a,
+                    smem_b,
+                    smem_c,
+                    tiled_mma,
+                    arg_dy,
+                    arg_w2,
+                    arg_da,
+                    expert,
+                    first_sorted_row,
+                    fx.Int32(m_block),
+                    n_block,
+                    frequency,
+                    BM=block_m,
+                    BN=block_n,
+                    BK=block_k,
+                    HIDDEN=hidden_size,
+                    INTER=intermediate_size,
+                    STAGES=stages,
+                    M_WAVES=m_waves,
+                    N_WAVES=n_waves,
+                )
+
+        if const_expr(queue_direct):
+            work_bound = active_count * fx.Int32(num_n_blocks)
+            if const_expr(min_active_experts > 0):
+                work_bound = (active_count >= fx.Int32(min_active_experts)).select(
+                    work_bound,
+                    fx.Int32(0),
+                )
+            if const_expr(max_active_experts is not None):
+                work_bound = (active_count <= fx.Int32(max_active_experts)).select(
+                    work_bound,
+                    fx.Int32(0),
+                )
+
+            def run_queue_work(work):
+                descriptor = work // fx.Int32(num_n_blocks)
+                n_block = work % fx.Int32(num_n_blocks)
+                descriptor_offset = fx.Int32(1) + descriptor * fx.Int32(2)
+                expert = rocdl.readfirstlane(
+                    T.i32,
+                    _raw(_global_i32_at(arg_active_count, descriptor_offset)),
+                )
+                first_sorted_row = rocdl.readfirstlane(
+                    T.i32,
+                    _raw(_global_i32_at(arg_active_count, descriptor_offset + fx.Int32(1))),
+                )
+                frequency = rocdl.readfirstlane(
+                    T.i32,
+                    _raw(_global_i32_at(arg_frequency, expert)),
+                )
+                run_expert_tile(expert, n_block, first_sorted_row, frequency)
+
+            grid_size = fx.Int32(gpu.grid_dim.x)
+            if block_id < work_bound:
+                run_queue_work(block_id)
+            for work in range(block_id + grid_size, work_bound, grid_size):
+                run_queue_work(fx.Int32(work))
+        else:
+            expert_bound = fx.Int32(num_experts * num_n_blocks)
+            if const_expr(min_active_experts > 0):
+                expert_bound = (active_count >= fx.Int32(min_active_experts)).select(
+                    expert_bound,
+                    fx.Int32(0),
+                )
+            if const_expr(max_active_experts is not None):
+                expert_bound = (active_count <= fx.Int32(max_active_experts)).select(
+                    expert_bound,
+                    fx.Int32(0),
+                )
+            if block_id < expert_bound:
+                expert = block_id // fx.Int32(num_n_blocks)
+                n_block = block_id % fx.Int32(num_n_blocks)
+                frequency = rocdl.readfirstlane(T.i32, _raw(_global_i32_at(arg_frequency, expert)))
+                if frequency > fx.Int32(0):
+                    lo = fx.Int32(0)
+                    hi = cumsum0 // fx.Int32(sorted_block_size)
+                    for _ in range_constexpr(25):
+                        searching = lo < hi
+                        mid = (lo + hi) // fx.Int32(2)
+                        safe_mid = searching.select(mid, fx.Int32(0))
+                        mid_expert = fx.Int32(_global_i32_at(arg_expert_ids, safe_mid))
+                        move_right = searching & (mid_expert < expert)
+                        lo = move_right.select(mid + fx.Int32(1), lo)
+                        move_left = searching & (mid_expert >= expert)
+                        hi = move_left.select(mid, hi)
+                    first_sorted_row = lo * fx.Int32(sorted_block_size)
+                    run_expert_tile(expert, n_block, first_sorted_row, frequency)
 
     @flyc.jit
     def launch_grouped_da(
@@ -409,6 +486,7 @@ def compile_grouped_da_gfx950(
         arg_frequency: fx.Int64,
         arg_expert_ids: fx.Int64,
         arg_cumsum: fx.Int64,
+        arg_active_count: fx.Int64,
         arg_da: fx.Int64,
         i32_grid: fx.Int32,
         stream: fx.Stream,
@@ -419,6 +497,7 @@ def compile_grouped_da_gfx950(
             arg_frequency,
             arg_expert_ids,
             arg_cumsum,
+            arg_active_count,
             arg_da,
             value_attrs={"rocdl.waves_per_eu": waves_per_eu} if waves_per_eu else None,
         ).launch(

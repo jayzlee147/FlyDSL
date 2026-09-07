@@ -61,6 +61,7 @@ from kernels.moe.sonic_grouped_tn import (
     grouped_tn_from_metadata_flydsl,
     grouped_tn_from_queue_flydsl,
     zero_inactive_weight_grads_flydsl,
+    zero_weight_grads_adaptive_flydsl,
 )
 
 if TYPE_CHECKING:
@@ -131,8 +132,8 @@ _GROUPED_W2_MAX_EXPERT_ROWS = 128
 # dA consumes public row-major W2 directly: [M, H] @ [H, I] -> [M, I].  The
 # NN-specialized kernel transposes B in LDS and uses CDNA4 LDSReadTrans16_64b
 # before MFMA.  Three measured gfx950 profiles cover decode, sparse short-M,
-# and long/hot expert segments.  The backward already reads frequencies for
-# the remaining dW contractions, so profile selection adds no synchronization.
+# and long/hot expert segments.  Legacy fallbacks reuse their existing host
+# frequency read; the short hostless path dispatches from the device queue.
 _GROUPED_DA_BN = 64
 _GROUPED_DA_MAX_EXPERT_ROWS = 4096
 
@@ -197,9 +198,10 @@ def _grouped_da_tuning(max_expert_rows: int, hidden_size: int) -> tuple[int, int
 # dX has the row-major NN shape ``[M, 2I] @ [2I, H]``.  BM16 avoids doing the
 # sorter's full 64-row padding.  BN128/2 waves wins for decode and hot routing;
 # BN256/4 waves reduces weight traffic when hundreds of experts are active.
-# The frequency readback already required by dW selects between them without a
-# new synchronization.  A persistent four-workgroup-per-CU launch bound (1024
-# on MI350/MI355X) keeps large descriptor grids resident without a long tail.
+# Legacy fallbacks reuse their frequency readback, while the short hostless
+# path selects between guarded variants from the device queue.  A persistent
+# four-workgroup-per-CU launch bound (1024 on MI350/MI355X) keeps large
+# descriptor grids resident without a long tail.
 _GROUPED_DX_BM = 16
 _GROUPED_DX_BK = 64
 _GROUPED_DX_STAGES = 2
@@ -215,8 +217,8 @@ _GROUPED_DW1_BLOCK_K = 32
 _GROUPED_DW1_MAX_EXPERT_ROWS = 4096
 # The custom inactive-only fill wins once at least one eighth of the production
 # expert set is live.  Below that point nearly the whole 9.9-GiB pair is still
-# written and torch's dense memset is faster.  The decision reuses the host
-# frequency readback already required by this backward implementation.
+# written and torch's dense memset is faster.  Legacy paths reuse their host
+# frequency readback; hostless paths select from the device queue count.
 _INACTIVE_WEIGHT_GRAD_ZERO_ACTIVE_RATIO = 8
 
 # Device-sized row kernels use a host-known allocation bound only to size the
@@ -416,6 +418,8 @@ def _compile_grouped_dx(
     n_waves: int,
     compact_grid: bool,
     device_index: int,
+    min_active_experts: int = 0,
+    max_active_experts: int | None = None,
 ):
     """Build the gfx950 grouped ``dZ @ W1`` specialization."""
 
@@ -431,6 +435,8 @@ def _compile_grouped_dx(
         sorted_block_m=_BACKWARD_SORT_UNIT,
         compact_grid=compact_grid,
         device_index=device_index,
+        min_active_experts=min_active_experts,
+        max_active_experts=max_active_experts,
     )
 
 
@@ -559,6 +565,9 @@ def _compile_grouped_da(
     m_waves: int,
     n_waves: int,
     device_index: int,
+    queue_direct: bool = False,
+    min_active_experts: int = 0,
+    max_active_experts: int | None = None,
 ):
     """Build the grouped raw-W2 dA contraction for BF16 SwiGLU."""
 
@@ -574,6 +583,9 @@ def _compile_grouped_da(
         stages=2,
         m_waves=m_waves,
         n_waves=n_waves,
+        queue_direct=queue_direct,
+        min_active_experts=min_active_experts,
+        max_active_experts=max_active_experts,
     )
 
 
@@ -1985,6 +1997,14 @@ def _sonic_moe_backward_impl(
         use_grouped_dw1=use_grouped_dw1,
         use_grouped_dx=use_grouped_dx,
     )
+    # If even the maximum possible active set falls below the measured
+    # selective-clear crossover, a normal dense memset is unconditionally the
+    # best choice.  This route-count test is host-known and distribution
+    # independent; all ambiguous short-route cases select on device later.
+    hostless_dense_weight_zero = (
+        use_hostless_grouped
+        and routes * _INACTIVE_WEIGHT_GRAD_ZERO_ACTIVE_RATIO < num_experts
+    )
     device = hidden_states.device
     device_index = device.index or 0
     with torch.cuda.device(device):
@@ -2113,7 +2133,11 @@ def _sonic_moe_backward_impl(
     # The grouped pair is initialized from routing metadata below, before its
     # first contraction; every other path retains eager zero initialization.
     grouped_weight_grads = use_grouped_dw1 and use_grouped_dw2
-    weight_grad_factory = torch.empty_like if grouped_weight_grads else torch.zeros_like
+    weight_grad_factory = (
+        torch.zeros_like
+        if not grouped_weight_grads or hostless_dense_weight_zero
+        else torch.empty_like
+    )
     dw1 = weight_grad_factory(w1, memory_format=torch.contiguous_format)
     dw2 = weight_grad_factory(w2, memory_format=torch.contiguous_format)
     droute_weights = torch.empty_like(route_weights, memory_format=torch.contiguous_format)
@@ -2262,10 +2286,24 @@ def _sonic_moe_backward_impl(
 
         if grouped_weight_grads:
             if use_hostless_grouped:
-                # Temporary shape-only choice; the follow-up device policy
-                # replaces this without reintroducing a frequency readback.
-                dw1.zero_()
-                dw2.zero_()
+                if not hostless_dense_weight_zero:
+                    active_count_storage = (
+                        active_expert_storage
+                        if active_expert_storage is not None
+                        else num_valid_ids
+                    )
+                    active_count_divisor = (
+                        1 if active_expert_storage is not None else sort_unit
+                    )
+                    zero_weight_grads_adaptive_flydsl(
+                        expert_frequency,
+                        active_count_storage,
+                        dw1,
+                        dw2,
+                        active_count_divisor=active_count_divisor,
+                        dense_active_ratio=_INACTIVE_WEIGHT_GRAD_ZERO_ACTIVE_RATIO,
+                        stream=stream,
+                    )
             else:
                 active_experts = len(segments)
                 selective_weight_grad_zero = (
@@ -2383,70 +2421,159 @@ def _sonic_moe_backward_impl(
         )
 
         if use_grouped_dw2:
-            dw2_bm, dw2_bn, dw2_bk, dw2_k_padding, dw2_mw, dw2_nw = _grouped_dw2_tuning(
-                max_expert_rows,
-                hidden_size,
-                intermediate_size,
-                active_experts=len(segments),
-            )
-            grouped_dw2_kwargs = {
-                "block_m": dw2_bm,
-                "block_n": dw2_bn,
-                "block_k": dw2_bk,
-                "k_padding": dw2_k_padding,
-                "m_waves": dw2_mw,
-                "n_waves": dw2_nw,
-                "stages": _grouped_dw2_stages(max_expert_rows),
-                "stream": stream,
-            }
-            if use_tn_metadata_direct:
-                grouped_tn_from_metadata_flydsl(
-                    dy,
-                    activation,
-                    expert_frequency,
-                    sorted_expert_ids,
-                    num_valid_ids,
-                    dw2,
-                    **grouped_dw2_kwargs,
+            if use_hostless_grouped and not use_tn_metadata_direct:
+                # The queue count is already produced by compact W1.  Launch
+                # disjoint sparse/dense profiles so hot routing retains the
+                # BM128/BN128 triple-buffered kernel while balanced routing
+                # keeps the BM128/BN256 two-stage profile, without a D2H read.
+                sparse_dw2 = _grouped_dw2_tuning(
+                    max_expert_rows,
+                    hidden_size,
+                    intermediate_size,
+                    active_experts=_GROUPED_DW2_SPARSE_EXPERTS,
+                )
+                balanced_dw2 = _grouped_dw2_tuning(
+                    min(max_expert_rows, 4),
+                    hidden_size,
+                    intermediate_size,
+                )
+                grouped_dw2_profiles = (
+                    (*sparse_dw2, _grouped_dw2_stages(max_expert_rows), 0, _GROUPED_DW2_SPARSE_EXPERTS),
+                    (
+                        *balanced_dw2,
+                        _grouped_dw2_stages(min(max_expert_rows, 4)),
+                        _GROUPED_DW2_SPARSE_EXPERTS + 1,
+                        None,
+                    ),
                 )
             else:
-                assert active_expert_storage is not None
-                grouped_tn_from_queue_flydsl(
-                    dy,
-                    activation,
-                    expert_frequency,
-                    active_expert_storage,
-                    dw2,
-                    **grouped_dw2_kwargs,
+                grouped_dw2_profiles = (
+                    (
+                        *_grouped_dw2_tuning(
+                            max_expert_rows,
+                            hidden_size,
+                            intermediate_size,
+                            active_experts=len(segments),
+                        ),
+                        _grouped_dw2_stages(max_expert_rows),
+                        0,
+                        None,
+                    ),
                 )
 
+            for (
+                dw2_bm,
+                dw2_bn,
+                dw2_bk,
+                dw2_k_padding,
+                dw2_mw,
+                dw2_nw,
+                dw2_stages,
+                min_active_experts,
+                max_active_experts,
+            ) in grouped_dw2_profiles:
+                grouped_dw2_kwargs = {
+                    "block_m": dw2_bm,
+                    "block_n": dw2_bn,
+                    "block_k": dw2_bk,
+                    "k_padding": dw2_k_padding,
+                    "m_waves": dw2_mw,
+                    "n_waves": dw2_nw,
+                    "stages": dw2_stages,
+                    "stream": stream,
+                }
+                if use_tn_metadata_direct:
+                    grouped_tn_from_metadata_flydsl(
+                        dy,
+                        activation,
+                        expert_frequency,
+                        sorted_expert_ids,
+                        num_valid_ids,
+                        dw2,
+                        **grouped_dw2_kwargs,
+                    )
+                else:
+                    assert active_expert_storage is not None
+                    grouped_tn_from_queue_flydsl(
+                        dy,
+                        activation,
+                        expert_frequency,
+                        active_expert_storage,
+                        dw2,
+                        min_active_experts=min_active_experts,
+                        max_active_experts=max_active_experts,
+                        **grouped_dw2_kwargs,
+                    )
+
         if use_grouped_da:
-            grouped_da_bm, grouped_da_bn, grouped_da_bk, grouped_da_mw, grouped_da_nw = _grouped_da_tuning(
-                max_expert_rows, hidden_size
-            )
-            grouped_da = _compile_grouped_da(
-                hidden_size,
-                intermediate_size,
-                num_experts,
+            if use_hostless_grouped and active_expert_storage is not None:
+                grouped_da_profiles = (
+                    (
+                        *_grouped_da_tuning(max_expert_rows, hidden_size),
+                        True,
+                        0,
+                        _GROUPED_DW2_SPARSE_EXPERTS,
+                    ),
+                    (
+                        *_grouped_da_tuning(min(max_expert_rows, 2), hidden_size),
+                        False,
+                        _GROUPED_DW2_SPARSE_EXPERTS + 1,
+                        None,
+                    ),
+                )
+                active_count_ptr = active_expert_storage.data_ptr()
+            else:
+                grouped_da_profiles = (
+                    (*_grouped_da_tuning(max_expert_rows, hidden_size), False, 0, None),
+                )
+                # Unguarded specializations do not dereference this argument.
+                active_count_ptr = expert_frequency.data_ptr()
+
+            for (
                 grouped_da_bm,
                 grouped_da_bn,
                 grouped_da_bk,
                 grouped_da_mw,
                 grouped_da_nw,
-                device_index,
-            )
-            grouped_da_grid = num_experts * (intermediate_size // grouped_da_bn)
-            _run_compiled(
-                grouped_da,
-                dy.data_ptr(),
-                w2_arg.data_ptr(),
-                expert_frequency.data_ptr(),
-                sorted_expert_ids.data_ptr(),
-                num_valid_ids.data_ptr(),
-                da.data_ptr(),
-                int(grouped_da_grid),
-                stream,
-            )
+                grouped_da_queue_direct,
+                min_active_experts,
+                max_active_experts,
+            ) in grouped_da_profiles:
+                grouped_da = _compile_grouped_da(
+                    hidden_size,
+                    intermediate_size,
+                    num_experts,
+                    grouped_da_bm,
+                    grouped_da_bn,
+                    grouped_da_bk,
+                    grouped_da_mw,
+                    grouped_da_nw,
+                    device_index,
+                    grouped_da_queue_direct,
+                    min_active_experts,
+                    max_active_experts,
+                )
+                if grouped_da_queue_direct:
+                    guarded_capacity = active_expert_capacity
+                    if max_active_experts is not None:
+                        guarded_capacity = min(guarded_capacity, max_active_experts)
+                    grouped_da_grid = guarded_capacity * (
+                        intermediate_size // grouped_da_bn
+                    )
+                else:
+                    grouped_da_grid = num_experts * (intermediate_size // grouped_da_bn)
+                _run_compiled(
+                    grouped_da,
+                    dy.data_ptr(),
+                    w2_arg.data_ptr(),
+                    expert_frequency.data_ptr(),
+                    sorted_expert_ids.data_ptr(),
+                    num_valid_ids.data_ptr(),
+                    active_count_ptr,
+                    da.data_ptr(),
+                    int(grouped_da_grid),
+                    stream,
+                )
 
         if use_grouped_w2:
             grouped_w2 = _compile_grouped_w2_recompute(
@@ -2581,58 +2708,78 @@ def _sonic_moe_backward_impl(
             # padded dOut zero, so activation backward materializes zero dZ in
             # the final partial tile; writing all 16 rows is therefore safe.
             # Unsort/scatter subsequently reads only non-sentinel route rows.
-            active_experts = (
-                min(routes, num_experts)
-                if use_hostless_grouped
-                else len(segments)
-            )
-            grouped_dx_bn, grouped_dx_n_waves = _grouped_dx_tuning(
-                active_experts,
-                hidden_size,
-            )
-            grouped_dx = _compile_grouped_dx(
-                hidden_size,
-                intermediate_size,
-                num_experts,
-                grouped_dx_bn,
-                grouped_dx_n_waves,
-                use_compact_w1,
-                device_index,
-            )
-            grouped_dx_m_tiles = (
-                (
-                    compact_w1_bound
+            if use_hostless_grouped and active_expert_storage is not None:
+                sparse_dx = _grouped_dx_tuning(0, hidden_size)
+                dense_dx = _grouped_dx_tuning(_GROUPED_DX_DENSE_EXPERTS, hidden_size)
+                if sparse_dx == dense_dx:
+                    grouped_dx_profiles = ((*sparse_dx, 0, None),)
+                else:
+                    grouped_dx_profiles = (
+                        (*sparse_dx, 0, _GROUPED_DX_DENSE_EXPERTS - 1),
+                        (*dense_dx, _GROUPED_DX_DENSE_EXPERTS, None),
+                    )
+                grouped_dx_m_tiles = compact_w1_bound
+            else:
+                active_experts = (
+                    min(routes, num_experts)
                     if use_hostless_grouped
-                    else sum(
+                    else len(segments)
+                )
+                grouped_dx_profiles = (
+                    (*_grouped_dx_tuning(active_experts, hidden_size), 0, None),
+                )
+                grouped_dx_m_tiles = (
+                    sum(
                         (int(count) + _GROUPED_DX_BM - 1) // _GROUPED_DX_BM
                         for count in frequencies
                     )
+                    if use_compact_w1
+                    else active_experts
                 )
-                if use_compact_w1
-                else active_experts
-            )
-            grouped_dx_grid = max(
-                1,
-                min(
-                    _GROUPED_DX_GRID_CAP,
-                    grouped_dx_m_tiles * (hidden_size // grouped_dx_bn),
-                ),
-            )
-            _run_compiled(
-                grouped_dx,
-                dz.data_ptr(),
-                w1_arg.data_ptr(),
-                (
-                    compact_w1_storage.data_ptr()
-                    if compact_w1_storage is not None
-                    else expert_frequency.data_ptr()
-                ),
-                sorted_expert_ids.data_ptr(),
-                num_valid_ids.data_ptr(),
-                dx_sorted.data_ptr(),
-                grouped_dx_grid,
-                stream,
-            )
+
+            for (
+                grouped_dx_bn,
+                grouped_dx_n_waves,
+                min_active_experts,
+                max_active_experts,
+            ) in grouped_dx_profiles:
+                grouped_dx = _compile_grouped_dx(
+                    hidden_size,
+                    intermediate_size,
+                    num_experts,
+                    grouped_dx_bn,
+                    grouped_dx_n_waves,
+                    use_compact_w1,
+                    device_index,
+                    min_active_experts,
+                    max_active_experts,
+                )
+                grouped_dx_grid = max(
+                    1,
+                    min(
+                        _GROUPED_DX_GRID_CAP,
+                        grouped_dx_m_tiles * (hidden_size // grouped_dx_bn),
+                    ),
+                )
+                _run_compiled(
+                    grouped_dx,
+                    dz.data_ptr(),
+                    w1_arg.data_ptr(),
+                    (
+                        compact_w1_storage.data_ptr()
+                        if compact_w1_storage is not None
+                        else expert_frequency.data_ptr()
+                    ),
+                    sorted_expert_ids.data_ptr(),
+                    (
+                        active_expert_storage.data_ptr()
+                        if min_active_experts > 0 or max_active_experts is not None
+                        else num_valid_ids.data_ptr()
+                    ),
+                    dx_sorted.data_ptr(),
+                    grouped_dx_grid,
+                    stream,
+                )
 
         # Each expert owns a disjoint output slice, so no atomics or
         # cross-expert reductions are needed for dW1 or routed dX.

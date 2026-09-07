@@ -216,6 +216,9 @@ def compile_inactive_weight_grad_zero(
     dw2_expert_elements: int,
     num_experts: int,
     device_index: int,
+    adaptive: bool = False,
+    active_count_divisor: int = 1,
+    dense_active_ratio: int = 8,
 ):
     """Compile an expert-local zero fill for grouped BF16 weight gradients.
 
@@ -228,6 +231,10 @@ def compile_inactive_weight_grad_zero(
     del device_index
     if min(dw1_expert_elements, dw2_expert_elements, num_experts) <= 0:
         raise ValueError("weight-gradient slab sizes and num_experts must be positive")
+    if active_count_divisor <= 0:
+        raise ValueError("active_count_divisor must be positive")
+    if dense_active_ratio <= 0:
+        raise ValueError("dense_active_ratio must be positive")
     if dw1_expert_elements % _ZERO_VECTOR_ELEMENTS:
         raise ValueError("dW1 expert slabs must have 128-bit size alignment")
     if dw2_expert_elements % _ZERO_VECTOR_ELEMENTS:
@@ -243,22 +250,70 @@ def compile_inactive_weight_grad_zero(
         name=(
             f"sonic_zero_inactive_weight_grads_e{num_experts}"
             f"_v{dw1_vectors}x{dw2_vectors}"
+            f"_a{int(adaptive)}d{active_count_divisor}r{dense_active_ratio}"
         ),
         known_block_size=[_ZERO_BLOCK_THREADS, 1, 1],
     )
     def zero_inactive_weight_grads_kernel(
         expert_frequency: fx.Tensor,
+        active_count_storage: fx.Tensor,
         dw1_base: fx.Int64,
         dw2_base: fx.Int64,
     ):
         expert = fx.Int32(gpu.block_idx.x)
         tid = fx.Int32(gpu.thread_idx.x)
-        frequency_rsrc = buffer_ops.create_buffer_resource(expert_frequency, max_size=True)
-        frequency = rocdl.readfirstlane(
-            T.i32,
-            _raw(buffer_ops.buffer_load(frequency_rsrc, expert, vec_width=1, dtype=T.i32)),
-        )
-        if frequency == fx.Int32(0):
+        should_clear = fx.Int32(0)
+        if const_expr(adaptive):
+            active_rsrc = buffer_ops.create_buffer_resource(active_count_storage, max_size=True)
+            active_count = rocdl.readfirstlane(
+                T.i32,
+                _raw(
+                    buffer_ops.buffer_load(
+                        active_rsrc,
+                        fx.Int32(0),
+                        vec_width=1,
+                        dtype=T.i32,
+                    )
+                ),
+            ) // fx.Int32(active_count_divisor)
+            dense_clear = (
+                active_count * fx.Int32(dense_active_ratio) < fx.Int32(num_experts)
+            )
+            if dense_clear:
+                # All expert CTAs take the same branch.  Clearing active slabs
+                # too preserves contiguous write traffic; grouped TN replaces
+                # every active element later in the stream.
+                should_clear = fx.Int32(1)
+            else:
+                frequency_rsrc = buffer_ops.create_buffer_resource(
+                    expert_frequency,
+                    max_size=True,
+                )
+                frequency = rocdl.readfirstlane(
+                    T.i32,
+                    _raw(
+                        buffer_ops.buffer_load(
+                            frequency_rsrc,
+                            expert,
+                            vec_width=1,
+                            dtype=T.i32,
+                        )
+                    ),
+                )
+                should_clear = (frequency == fx.Int32(0)).select(
+                    fx.Int32(1), fx.Int32(0)
+                )
+        else:
+            frequency_rsrc = buffer_ops.create_buffer_resource(expert_frequency, max_size=True)
+            frequency = rocdl.readfirstlane(
+                T.i32,
+                _raw(buffer_ops.buffer_load(frequency_rsrc, expert, vec_width=1, dtype=T.i32)),
+            )
+            should_clear = (frequency == fx.Int32(0)).select(
+                fx.Int32(1), fx.Int32(0)
+            )
+
+        if should_clear != fx.Int32(0):
             # Do not form a descriptor over the full dense tensor: dW1 can be
             # larger than 4 GiB, while the AMD buffer offset is only 32 bits.
             # The i64 expert base plus exact expert-local resource keeps both
@@ -300,12 +355,14 @@ def compile_inactive_weight_grad_zero(
     @flyc.jit
     def launch(
         expert_frequency: fx.Tensor,
+        active_count_storage: fx.Tensor,
         dw1_base: fx.Int64,
         dw2_base: fx.Int64,
         stream: fx.Stream = fx.Stream(None),
     ):
         zero_inactive_weight_grads_kernel(
             expert_frequency,
+            active_count_storage,
             dw1_base,
             dw2_base,
         ).launch(
@@ -363,6 +420,7 @@ def zero_inactive_weight_grads_flydsl(
     _run_compiled(
         launcher,
         expert_frequency,
+        expert_frequency,
         dw1.data_ptr(),
         dw2.data_ptr(),
         stream,
@@ -371,6 +429,91 @@ def zero_inactive_weight_grads_flydsl(
     dw1.record_stream(stream)
     dw2.record_stream(stream)
     return dw1, dw2
+
+
+def zero_weight_grads_adaptive_flydsl(
+    expert_frequency: torch.Tensor,
+    active_count_storage: torch.Tensor,
+    dw1: torch.Tensor,
+    dw2: torch.Tensor,
+    *,
+    active_count_divisor: int = 1,
+    dense_active_ratio: int = 8,
+    stream: torch.cuda.Stream | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Choose dense-all or inactive-only dW clearing from a device count.
+
+    ``active_count_storage[0] / active_count_divisor`` is the live expert
+    count.  Sparse routing clears every slab with contiguous expert-local
+    stores; sufficiently dense routing skips slabs that grouped TN overwrites.
+    The choice is uniform across the grid and never synchronizes with the host.
+    """
+
+    if active_count_storage.ndim != 1 or active_count_storage.numel() < 1:
+        raise ValueError("active_count_storage must contain a device count")
+    if active_count_storage.device != expert_frequency.device:
+        raise ValueError("active_count_storage must share expert_frequency's device")
+    if active_count_storage.dtype != torch.int32 or not active_count_storage.is_contiguous():
+        raise TypeError("active_count_storage must be contiguous int32")
+    if not isinstance(active_count_divisor, int) or active_count_divisor <= 0:
+        raise ValueError("active_count_divisor must be a positive int")
+    if not isinstance(dense_active_ratio, int) or dense_active_ratio <= 0:
+        raise ValueError("dense_active_ratio must be a positive int")
+
+    # Reuse the public helper's validation invariants without launching its
+    # non-adaptive specialization.
+    if expert_frequency.ndim != 1:
+        raise ValueError("expert_frequency must have shape [E]")
+    num_experts = int(expert_frequency.numel())
+    if num_experts <= 0:
+        raise ValueError("expert_frequency must contain at least one expert")
+    if dw1.ndim != 3 or dw2.ndim != 3:
+        raise ValueError("dw1 and dw2 must be dense three-dimensional expert weights")
+    if int(dw1.shape[0]) != num_experts or int(dw2.shape[0]) != num_experts:
+        raise ValueError("weight gradients and expert_frequency must have the same E")
+    tensors = (expert_frequency, active_count_storage, dw1, dw2)
+    if any(tensor.device != expert_frequency.device for tensor in tensors):
+        raise ValueError("adaptive-zero tensors must share one device")
+    if expert_frequency.dtype != torch.int32:
+        raise TypeError("expert_frequency must use int32")
+    if dw1.dtype != torch.bfloat16 or dw2.dtype != torch.bfloat16:
+        raise TypeError("adaptive weight-gradient zero currently requires BF16 outputs")
+    if not all(tensor.is_contiguous() for tensor in tensors):
+        raise ValueError("adaptive-zero tensors must be contiguous")
+    dw1_expert_elements = int(dw1.numel()) // num_experts
+    dw2_expert_elements = int(dw2.numel()) // num_experts
+    if dw1_expert_elements % _ZERO_VECTOR_ELEMENTS:
+        raise ValueError("dW1 expert slabs must have 128-bit size alignment")
+    if dw2_expert_elements % _ZERO_VECTOR_ELEMENTS:
+        raise ValueError("dW2 expert slabs must have 128-bit size alignment")
+    if max(dw1_expert_elements, dw2_expert_elements) * 2 > _MAX_BUFFER_BYTES:
+        raise ValueError("each expert-local weight-gradient slab must fit one BRSRC")
+    if stream is None:
+        stream = torch.cuda.current_stream(expert_frequency.device)
+    launcher = compile_inactive_weight_grad_zero(
+        dw1_expert_elements,
+        dw2_expert_elements,
+        num_experts,
+        expert_frequency.device.index or 0,
+        True,
+        active_count_divisor,
+        dense_active_ratio,
+    )
+    _run_compiled(
+        launcher,
+        expert_frequency,
+        active_count_storage,
+        dw1.data_ptr(),
+        dw2.data_ptr(),
+        stream,
+    )
+    expert_frequency.record_stream(stream)
+    active_count_storage.record_stream(stream)
+    dw1.record_stream(stream)
+    dw2.record_stream(stream)
+    return dw1, dw2
+
+
 def grouped_tn_grid_cap(
     block_m: int,
     block_n: int,
@@ -437,6 +580,8 @@ def compile_grouped_tn(
     device_index: int,
     metadata_direct: bool = False,
     stages: int = 2,
+    min_active_experts: int = 0,
+    max_active_experts: int | None = None,
 ):
     """Compile the persistent grouped TN consumer for a prebuilt queue.
 
@@ -447,6 +592,10 @@ def compile_grouped_tn(
     safe because sorter padding is zero-filled.  ``metadata_direct`` treats
     the schedule tensor as sorter expert IDs and is valid when every active
     expert occupies one 64-row sorter block (the fixed-K T1 fast path).
+    ``min_active_experts`` and ``max_active_experts`` optionally guard a
+    specialization with the device-resident queue count.  Two disjoint
+    guarded launches can therefore select different gfx950 tile profiles
+    without synchronizing the routing distribution back to the host.
     """
 
     del device_index
@@ -469,6 +618,12 @@ def compile_grouped_tn(
     output_tiles_per_expert = num_m_tiles * num_n_tiles
     if min(output_m, output_n, num_experts, block_m, block_n, block_k, stages, m_waves, n_waves) <= 0:
         raise ValueError("grouped TN dimensions and tuning values must be positive")
+    if not isinstance(min_active_experts, int) or min_active_experts < 0:
+        raise ValueError("min_active_experts must be a non-negative int")
+    if max_active_experts is not None and (
+        not isinstance(max_active_experts, int) or max_active_experts < min_active_experts
+    ):
+        raise ValueError("max_active_experts must be None or at least min_active_experts")
     if block_k not in (32, 64):
         raise ValueError("grouped TN block_k must be 32 or 64")
     if stages not in (2, 3, 4):
@@ -511,6 +666,7 @@ def compile_grouped_tn(
             f"sonic_grouped_tn_bf16_m{output_m}_n{output_n}_e{num_experts}"
             f"_bm{block_m}_bn{block_n}_bk{block_k}_s{stages}_kp{k_padding}_w{m_waves}x{n_waves}"
             f"_md{int(metadata_direct)}"
+            f"_amin{min_active_experts}_amax{max_active_experts}"
         ),
         known_block_size=[block_threads, 1, 1],
     )
@@ -547,6 +703,16 @@ def compile_grouped_tn(
                 ),
             )
         work_bound = descriptor_count * fx.Int32(output_tiles_per_expert)
+        if const_expr(min_active_experts > 0):
+            work_bound = (descriptor_count >= fx.Int32(min_active_experts)).select(
+                work_bound,
+                fx.Int32(0),
+            )
+        if const_expr(max_active_experts is not None):
+            work_bound = (descriptor_count <= fx.Int32(max_active_experts)).select(
+                work_bound,
+                fx.Int32(0),
+            )
 
         storage = fx.SharedAllocator().allocate(SharedStorage)
         smem_a = storage.ab.a.peek().ptr
@@ -939,13 +1105,17 @@ def grouped_tn_from_queue_flydsl(
     m_waves: int | None = None,
     n_waves: int | None = None,
     stages: int = 2,
+    min_active_experts: int = 0,
+    max_active_experts: int | None = None,
     stream: torch.cuda.Stream | None = None,
 ) -> torch.Tensor:
     """Consume a prebuilt active-expert queue for one grouped TN contraction.
 
     Both inputs use the same sorter-padded row dimension.  ``output`` must
     already be zero so empty experts retain exact-zero gradients.  Optional
-    tuning arguments let dW1 and dW2 select independent output/K tiles.
+    tuning arguments let dW1 and dW2 select independent output/K tiles.  An
+    optional inclusive active-expert interval makes the launch a no-op when
+    ``queue_storage[0]`` falls outside it.
     """
 
     if lhs_rows.ndim != 2 or rhs_rows.ndim != 2 or output.ndim != 3:
@@ -1013,6 +1183,8 @@ def grouped_tn_from_queue_flydsl(
         lhs_rows.device.index or 0,
         False,
         stages,
+        min_active_experts,
+        max_active_experts,
     )
     _run_compiled(
         launcher,
@@ -1238,4 +1410,5 @@ __all__ = [
     "grouped_tn_flydsl",
     "grouped_tn_tuning",
     "zero_inactive_weight_grads_flydsl",
+    "zero_weight_grads_adaptive_flydsl",
 ]

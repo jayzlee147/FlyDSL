@@ -20,6 +20,7 @@ from kernels.moe.sonic_grouped_tn import (
     grouped_tn_from_metadata_flydsl,
     grouped_tn_from_queue_flydsl,
     zero_inactive_weight_grads_flydsl,
+    zero_weight_grads_adaptive_flydsl,
 )
 
 
@@ -165,6 +166,74 @@ def test_grouped_tn_reuses_prebuilt_active_expert_queue():
     torch.testing.assert_close(first.float(), second.float(), rtol=0, atol=0)
 
 
+@pytest.mark.parametrize("active_experts", (32, 33))
+def test_grouped_tn_active_count_guards_are_mutually_exclusive(active_experts):
+    num_experts = 40
+    frequencies = [1] * active_experts + [0] * (num_experts - active_experts)
+    lhs, rhs, frequency, sorted_experts, num_valid, segments = _make_sorted_inputs(
+        frequencies,
+        128,
+        64,
+        seed=521 + active_experts,
+    )
+    queue = build_active_expert_queue_flydsl(
+        frequency,
+        sorted_experts,
+        num_valid,
+        routes=active_experts,
+    )
+    low_output = torch.zeros(
+        (num_experts, 128, 64),
+        dtype=torch.bfloat16,
+        device=lhs.device,
+    )
+    high_output = torch.zeros_like(low_output)
+
+    grouped_tn_from_queue_flydsl(
+        lhs,
+        rhs,
+        frequency,
+        queue,
+        low_output,
+        block_m=128,
+        block_n=64,
+        block_k=32,
+        k_padding=0,
+        m_waves=2,
+        n_waves=2,
+        max_active_experts=32,
+    )
+    grouped_tn_from_queue_flydsl(
+        lhs,
+        rhs,
+        frequency,
+        queue,
+        high_output,
+        block_m=64,
+        block_n=64,
+        block_k=32,
+        k_padding=0,
+        m_waves=2,
+        n_waves=2,
+        min_active_experts=33,
+    )
+    torch.cuda.synchronize()
+
+    expected = torch.zeros_like(low_output)
+    for expert, start, rows in segments:
+        expected[expert] = (
+            lhs[start : start + rows].float().transpose(0, 1)
+            @ rhs[start : start + rows].float()
+        ).to(torch.bfloat16)
+    selected, rejected = (
+        (low_output, high_output)
+        if active_experts == 32
+        else (high_output, low_output)
+    )
+    torch.testing.assert_close(selected.float(), expected.float(), rtol=3e-2, atol=5e-2)
+    assert torch.count_nonzero(rejected) == 0
+
+
 def test_grouped_tn_consumes_single_block_metadata_without_builder():
     frequencies = [0, 1, 0, 7, 63]
     dy, activation, frequency, sorted_experts, num_valid, segments = _make_sorted_inputs(
@@ -270,6 +339,35 @@ def test_inactive_weight_grad_zero_preserves_active_expert_slabs():
     for expert in (1, 3):
         assert torch.all(dw1[expert] == 7)
         assert torch.all(dw2[expert] == 9)
+
+
+@pytest.mark.parametrize("active_experts", (1, 2), ids=("dense-all", "inactive-only"))
+def test_adaptive_weight_grad_zero_selects_device_count_branch(active_experts):
+    device = _gfx950_device()
+    frequency = torch.tensor([1, 1, 0, 0], dtype=torch.int32, device=device)
+    active_count = torch.tensor([active_experts], dtype=torch.int32, device=device)
+    dw1 = torch.full((4, 128, 64), 7.0, dtype=torch.bfloat16, device=device)
+    dw2 = torch.full((4, 64, 64), 9.0, dtype=torch.bfloat16, device=device)
+
+    zero_weight_grads_adaptive_flydsl(
+        frequency,
+        active_count,
+        dw1,
+        dw2,
+        dense_active_ratio=2,
+    )
+    torch.cuda.synchronize()
+
+    if active_experts == 1:
+        assert torch.count_nonzero(dw1) == 0
+        assert torch.count_nonzero(dw2) == 0
+    else:
+        for expert in (0, 1):
+            assert torch.all(dw1[expert] == 7)
+            assert torch.all(dw2[expert] == 9)
+        for expert in (2, 3):
+            assert torch.count_nonzero(dw1[expert]) == 0
+            assert torch.count_nonzero(dw2[expert]) == 0
 
 
 def test_inactive_weight_grad_zero_uses_64_bit_last_expert_base():
