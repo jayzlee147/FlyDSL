@@ -1393,6 +1393,73 @@ class SonicMoE:
                 expert_frequency_out,
             )
 
+    def _launch_prevalidated_logits(
+        self,
+        hidden_states: torch.Tensor,
+        router_logits: torch.Tensor,
+        workspace: SonicMoEWorkspace,
+        output: torch.Tensor,
+        expert_frequency_out: torch.Tensor | None,
+        dtype_str: str,
+    ) -> torch.Tensor:
+        """Enqueue a validated native-router call while preserving workspace serialization."""
+
+        with workspace._launch_lock:
+            moe_softmax_sort_flydsl(
+                router_logits,
+                workspace.sorted_token_ids,
+                workspace.sorted_weights,
+                workspace.sorted_expert_ids,
+                workspace.num_valid_ids,
+                output,
+                self.config.num_experts,
+                self.config.top_k,
+                dtype_str,
+                unit_size=self.config.route_tile_m,
+                renormalize=self.config.renormalize,
+                workspace=workspace.sorting_workspace,
+                topk_scratch=(
+                    workspace.router_topk_weights,
+                    workspace.router_topk_ids,
+                    workspace.router_topk_expert_indices,
+                ),
+                direct_single_token=True,
+                expert_frequency_out=expert_frequency_out,
+            )
+            result = self._run_grouped_gemms(hidden_states, workspace, output)
+        if expert_frequency_out is not None:
+            expert_frequency_out.record_stream(torch.cuda.current_stream(hidden_states.device))
+        return result
+
+    def _forward_from_logits_prevalidated(
+        self,
+        hidden_states: torch.Tensor,
+        router_logits: torch.Tensor,
+        out: torch.Tensor,
+        expert_frequency_out: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Internal trusted fast path for the SonicMoE compatibility adapter.
+
+        The caller must already have established the full public ``__call__``
+        contract: tensors are correctly shaped, typed, contiguous, aligned,
+        non-aliasing, gradient-free, on this operator's gfx95 device, and the
+        config supports the native FlyDSL router.  ``out`` is mandatory and
+        remains caller-owned.  This method deliberately skips those duplicate
+        Python checks, but retains current-stream workspace selection, launch
+        serialization, and frequency lifetime tracking.
+        """
+
+        tokens = int(hidden_states.shape[0])
+        workspace = self.reserve(tokens)
+        return self._launch_prevalidated_logits(
+            hidden_states,
+            router_logits,
+            workspace,
+            out,
+            expert_frequency_out,
+            _SUPPORTED_ROUTER_DTYPES[router_logits.dtype],
+        )
+
     def _forward_from_logits(
         self,
         hidden_states: torch.Tensor,
@@ -1486,32 +1553,14 @@ class SonicMoE:
                 router_logits,
                 *self.weights.tensors,
             )
-        with workspace._launch_lock:
-            moe_softmax_sort_flydsl(
-                router_logits,
-                workspace.sorted_token_ids,
-                workspace.sorted_weights,
-                workspace.sorted_expert_ids,
-                workspace.num_valid_ids,
-                output,
-                self.config.num_experts,
-                self.config.top_k,
-                dtype_str,
-                unit_size=self.config.route_tile_m,
-                renormalize=self.config.renormalize,
-                workspace=workspace.sorting_workspace,
-                topk_scratch=(
-                    workspace.router_topk_weights,
-                    workspace.router_topk_ids,
-                    workspace.router_topk_expert_indices,
-                ),
-                direct_single_token=True,
-                expert_frequency_out=frequency,
-            )
-            result = self._run_grouped_gemms(hidden_states, workspace, output)
-        if frequency is not None:
-            frequency.record_stream(torch.cuda.current_stream(hidden_states.device))
-        return result
+        return self._launch_prevalidated_logits(
+            hidden_states,
+            router_logits,
+            workspace,
+            output,
+            frequency,
+            dtype_str,
+        )
 
     def forward_routes(
         self,

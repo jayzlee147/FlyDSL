@@ -1486,6 +1486,59 @@ def test_sonic_moe_logits_frequency_matches_selected_routes(tokens, renormalize)
     _assert_close(out, expected)
 
 
+@pytest.mark.parametrize("renormalize", (True, False), ids=("renorm", "full-softmax"))
+def test_sonic_moe_prevalidated_logits_matches_public_path(renormalize):
+    """The adapter-only entry preserves ownership and public-path results."""
+
+    config = _config(renormalize=renormalize)
+    x, w1, w2, router_logits = _make_case(tokens=1, seed=227)
+    op = SonicMoE(config, prepare_sonic_bf16_weights(w1, w2, config))
+    public_out = torch.empty_like(x)
+    trusted_out = torch.empty_like(x)
+    public_frequency = torch.empty(
+        config.num_experts,
+        dtype=torch.int32,
+        device=x.device,
+    )
+    trusted_frequency = torch.empty_like(public_frequency)
+
+    public_result = op(
+        x,
+        router_logits,
+        out=public_out,
+        expert_frequency_out=public_frequency,
+    )
+    trusted_result = op._forward_from_logits_prevalidated(
+        x,
+        router_logits,
+        trusted_out,
+        trusted_frequency,
+    )
+    torch.cuda.synchronize()
+
+    assert public_result is public_out
+    assert trusted_result is trusted_out
+    assert torch.equal(trusted_frequency, public_frequency)
+    _assert_close(trusted_out, public_out)
+
+
+def test_sonic_moe_public_call_validates_before_prevalidated_launch(monkeypatch):
+    """Extracting the trusted launcher must not weaken the public contract."""
+
+    config = _config()
+    x, w1, w2, router_logits = _make_case(tokens=1, seed=228)
+    op = SonicMoE(config, prepare_sonic_bf16_weights(w1, w2, config))
+
+    def launch_must_not_run(*args, **kwargs):
+        raise AssertionError("invalid public inputs must be rejected before launch")
+
+    monkeypatch.setattr(op, "_launch_prevalidated_logits", launch_must_not_run)
+    with pytest.raises(TypeError, match="hidden_states must use"):
+        op(x.float(), router_logits)
+    with pytest.raises(ValueError, match="router_logits must have shape"):
+        op(x, router_logits[:, :-1])
+
+
 def test_sonic_moe_logits_frequency_is_fully_overwritten_between_calls():
     config = _config()
     x, w1, w2, router_logits = _make_case(tokens=1, seed=229)
