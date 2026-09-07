@@ -339,6 +339,16 @@ weights = prepare_sonic_bf16_weights(w1, w2, cfg, b1=b1, b2=b2)
 op = SonicMoE(cfg, weights)
 out = op(hidden_states_bf16, router_logits_bf16)
 
+# The fixed-K BF16 SwiGLU training path can retain the exact route-order
+# preactivation produced by this invocation and reuse it in backward.  This
+# avoids the backward W1 recomputation while inference keeps using
+# ``forward_topk``/``__call__`` without allocating training state.
+out, forward_state = op.forward_topk_training(
+    hidden_states_bf16,
+    topk_ids_i32,
+    topk_scores_f32,
+)
+
 # Dense FP16 uses the same logical layouts and native FP16 MFMA.
 cfg_fp16 = replace(cfg, compute_dtype="fp16")
 weights_fp16 = prepare_sonic_fp16_weights(w1_fp16, w2_fp16, cfg_fp16)
@@ -357,6 +367,7 @@ dx, dw1, dw2, droute_scores, db1, db2 = sonic_moe_backward(
     cfg,
     b1=b1,
     b2=b2,
+    forward_state=forward_state,
 )
 
 # Flat routes preserve one score-gradient destination per original edge,
@@ -374,6 +385,13 @@ dx, dw1, dw2, droute_scores, db1, db2 = sonic_moe_backward_routes(
     b2=b2,
 )
 ```
+
+`forward_topk_training` currently supports dense BF16 SwiGLU with fixed-K
+routes.  The state is tied to the exact forward invocation (including W1, B1,
+route IDs, and W1 layout), is immutable, and may be reused with
+`retain_graph=True`.  FP16, non-SwiGLU, ragged routing, and unsupported layout
+combinations continue through the standalone backward path or are rejected
+explicitly.  Passing `forward_state=None` always selects that tested fallback.
 
 For GLU backward, both entry points also accept ``interleaved_w1=True``. In
 that mode each expert's raw W1 rows, optional B1 entries, and returned

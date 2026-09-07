@@ -1,12 +1,15 @@
 # SonicMoE forward-state reuse for backward
 
-Status: design proposal.  This document does not describe an implemented API.
+Status: phase 1 implemented and measured on gfx950.  Forward now saves compact
+route-order BF16 preactivation and backward can consume it to skip W1
+recomputation.  Routing-metadata reuse and fused dA/dscore remain follow-up
+work.
 
 ## Summary
 
-The current compatibility path treats `SonicMoE.forward_topk` as an inference
-operation and invokes the standalone backward later.  Consequently backward
-sorts the routes again and materializes both matrix products again:
+The standalone compatibility path treats `SonicMoE.forward_topk` as an
+inference operation and invokes backward later.  Consequently standalone
+backward sorts the routes again and materializes both matrix products again:
 
 1. W1 is recomputed into A16 preactivation, then the activation is materialized.
 2. W2 is recomputed into an unweighted A16 projection solely for the route-score
@@ -34,7 +37,76 @@ This is the same high-level lifetime choice as upstream SonicMoE: its
 reconstructs/fuses the activation and score-gradient work.  It does not retain
 the down projection.
 
-## Current data flow and the redundant work
+## Implemented phase 1
+
+The BF16 SwiGLU fixed-K training path now exposes:
+
+```python
+output, state = operator.forward_topk_training(
+    x,
+    topk_ids,
+    topk_weights,
+    interleaved_w1=interleaved_w1,
+)
+
+gradients = sonic_moe_backward(
+    x, w1, w2, topk_ids, topk_weights, grad_output, config,
+    b1=b1, b2=b2, interleaved_w1=interleaved_w1,
+    forward_state=state,
+)
+```
+
+Stage 1 keeps its existing sorted activation output for Stage 2 and scatters
+the exact rounded gate/up values into an invocation-owned contiguous BF16
+`[T, K, 2I]` tensor.  Backward independently sorts routes, gathers that compact
+state into its sorter order while regenerating activation and `dy`, and skips
+both grouped and generic W1 recomputation.  `forward_state=None` retains the
+standalone implementation.  FP16, non-SwiGLU, ragged routing, and unsupported
+training-forward combinations continue to use an explicit fallback.
+
+The state is immutable and includes shape/layout/dtype, bias-presence, producer
+stream, and ready-event metadata.  It never aliases the reusable forward
+workspace.  The adapter saves the state tensor through `save_for_backward`, so
+version checks, saved-tensor hooks, `retain_graph=True`, and tensor lifetime keep
+their PyTorch semantics.  Graph capture remains explicitly rejected.
+
+The implementation structurally validates a supplied state.  Semantic source
+identity remains the same-invocation hot-path precondition: a state must be
+paired with the exact `x`, W1, B1, and route IDs that produced it.  Proving that
+identity in the low-level API would require retaining or hashing large inputs
+or adding synchronization.
+
+### Eager performance
+
+The table uses an AMD Instinct MI355X (`gfx950`), PyTorch
+`2.13.0+rocm7.14.0`, BF16, real expert-major `MoE` leaf parameters exposed
+through the public `permute(1, 2, 0)` views, two warmups, and 11 AB plus 11 BA
+pairs.  JIT and weight preparation are excluded.  The baseline is the same
+tree with only the training-state call disabled.  “Full” starts from fixed
+route IDs/scores and includes adapter forward plus backward; it excludes router
+logits and top-k.  Times are event medians.
+
+| Bucket | Compact state | Forward baseline/state | Backward baseline/state | Full baseline/state | Full reduction |
+|---|---:|---:|---:|---:|---:|
+| T1, H3584/I512/E896/K16 | 32 KiB | 0.118 / 0.151 ms | 1.765 / 1.733 ms | 1.874 / 1.849 ms | 1.31% |
+| T128 balanced, H3584/I512/E896/K16 | 4 MiB | 1.509 / 1.545 ms | 6.567 / 5.424 ms | 7.860 / 6.761 ms | 13.98% |
+| T128 hot16, H3584/I512/E896/K16 | 4 MiB | 0.243 / 0.256 ms | 2.211 / 2.132 ms | 2.344 / 2.288 ms | 2.38% |
+| T4096, H4096/I2048/E64/K8 | 256 MiB | 1.645 / 2.305 ms | 11.453 / 7.948 ms | 12.995 / 10.095 ms | 22.32% |
+
+The forward store is deliberately visible in these numbers: it costs about
+0.66 ms for the 256 MiB T4096 state, but removing W1 from backward saves about
+3.51 ms.  Across all four buckets, the complete eager step is faster.  Relative
+L2 differences versus the standalone recompute path are at most `3.91e-4`, and
+the largest gradient absolute difference is `2.39e-7`.
+
+Against the ROCm Triton retained-forward backward on the same device and
+module-view layout, FlyDSL's state path measures 1.733/5.424/2.132/7.948 ms for
+T1/T128-balanced/T128-hot16/T4096 versus Triton's
+9.562/19.150/10.798/15.684 ms, or 5.52x/3.53x/5.06x/1.97x faster.  Triton already
+retains routing metadata while this FlyDSL phase still re-sorts, so metadata
+reuse remains a material opportunity rather than an accounting advantage.
+
+## Standalone baseline data flow and redundant work
 
 The compatibility autograd function currently does the following:
 
@@ -407,12 +479,13 @@ lifetime contract is what guarantees correctness.
 
 ## Implementation sequence
 
-1. **Metadata state.** Add the training entry points and `forward_state=None`
-   backward compatibility.  Make forward emit invocation-owned metadata and
-   frequency.  Validate state signature/layout and skip backward sorting.
-2. **Dual stage-1 epilogue.** Save exact A16 preactivation while preserving the
-   existing activation and output numerics.  Skip W1 recompute.  Start with the
-   BF16 SwiGLU padded layout and retain standalone fallback elsewhere.
+1. **Dual stage-1 epilogue (complete).** The training entry point saves exact
+   compact route-order A16 preactivation while preserving the existing
+   activation/output path.  Backward validates the state, skips W1 recompute,
+   and retains `forward_state=None` as the tested standalone fallback.
+2. **Metadata state (next).** Make forward emit invocation-owned routing
+   metadata and frequency, then skip backward histogram/sorting.  Reconcile
+   forward's B16/B128 and backward's B64 layouts without a host readback.
 3. **Variable sort-unit consumers.** Parameterize grouped dA/dX/dW schedulers by
    the state sort unit and add direct-slot T1 scheduling.  Remove assumptions
    that every saved layout is ascending BM64.
@@ -465,7 +538,8 @@ fallback and inference performance is unchanged.
 - No training saved tensor aliases `SonicMoEWorkspace` storage.
 - Overlapping forwards and re-entrant backward are deterministic within the
   existing fixed/ragged reduction guarantees.
-- The default optimized BF16 SwiGLU path launches neither W1 recompute nor W2
+- The implemented phase-1 BF16 SwiGLU state path launches no W1 recompute.
+- After fused dA/dscore lands, the optimized path also launches no W2
   projection recompute.
 - Inference entry points and their workspace reuse remain unchanged.
 - Standalone backward without a state remains available and numerically tested.
