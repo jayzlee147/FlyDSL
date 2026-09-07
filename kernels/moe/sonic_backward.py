@@ -85,6 +85,35 @@ _GROUPED_W1_BM = 16
 _GROUPED_W1_BN = 64
 _GROUPED_W1_BK = 64
 _GROUPED_W1_K_WAVE = 4
+# This BM16/k-wave4 specialization is tuned for short expert segments.  Fixed-K
+# routing guarantees at most one edge per (token, expert), so ``tokens`` is a
+# distribution-independent upper bound.  Ragged routing permits duplicates and
+# therefore uses the total route count as its conservative bound.  Above this
+# limit the existing BM64 GEMM has enough M work to amortize host dispatch and
+# is substantially faster (for example, balanced T4096/E64 has 512 rows/expert).
+_GROUPED_W1_MAX_EXPERT_ROWS = 128
+
+
+def _use_grouped_w1_recompute(
+    *,
+    compute_dtype: str,
+    activation: str,
+    hidden_size: int,
+    intermediate_size: int,
+    tokens: int,
+    routes: int,
+    flat_routes: bool,
+) -> bool:
+    """Return whether the short-M grouped W1 specialization is applicable."""
+
+    max_expert_rows = routes if flat_routes else tokens
+    return (
+        compute_dtype == "bf16"
+        and activation == "swiglu"
+        and hidden_size % (_GROUPED_W1_K_WAVE * _GROUPED_W1_BK) == 0
+        and intermediate_size % _GROUPED_W1_BN == 0
+        and max_expert_rows <= _GROUPED_W1_MAX_EXPERT_ROWS
+    )
 
 
 @functools.lru_cache(maxsize=64)
@@ -1204,11 +1233,14 @@ def _sonic_moe_backward_impl(
     sort_unit = _BACKWARD_SORT_UNIT
     projection_size = intermediate_size * (2 if activation_name in _GLU_ACTIVATIONS else 1)
     has_bias = b1 is not None
-    use_grouped_w1 = (
-        compute_dtype == "bf16"
-        and activation_name == "swiglu"
-        and hidden_size % (_GROUPED_W1_K_WAVE * _GROUPED_W1_BK) == 0
-        and intermediate_size % _GROUPED_W1_BN == 0
+    use_grouped_w1 = _use_grouped_w1_recompute(
+        compute_dtype=compute_dtype,
+        activation=activation_name,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+        tokens=tokens,
+        routes=routes,
+        flat_routes=flat_routes,
     )
     device = hidden_states.device
     device_index = device.index or 0

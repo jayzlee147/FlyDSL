@@ -474,12 +474,14 @@ support dense BF16/FP16 weights, fixed-K or flat ragged
 routing, every supported activation, and optional expert bias. They independently
 re-sort routes and recompute the materialized pre-activation and projection, so
 they do not retain or alias an inference workspace across calls. The bring-up
-implementation uses per-expert A16W16 GEMMs and one host synchronization to read
-expert frequencies. Its independent sort unit remains 64 rows because those
-generic GEMMs currently require contraction-K blocks aligned to 64; forward
-`route_tile_m` tuning does not alter that invariant. Activation, routing,
-reduction, and every tensor calculation remain FlyDSL device kernels. The
-`dout * route_score` input is rounded to the selected A16 dtype before the
+implementation uses a device-driven grouped MFMA kernel for BF16 SwiGLU W1
+recompute when every expert segment is bounded by 128 rows. The other five
+matrix products still use per-expert A16W16 GEMMs and one host synchronization
+to read expert frequencies. Its independent sort unit remains 64 rows because
+those generic GEMMs currently require contraction-K blocks aligned to 64;
+forward `route_tile_m` tuning does not alter that invariant. Activation,
+routing, reduction, and every tensor calculation remain FlyDSL device kernels.
+The `dout * route_score` input is rounded to the selected A16 dtype before the
 backward GEMMs, so this is not bitwise parity with a legacy FP32-scaled Triton
 grouped GEMM.
 
@@ -582,6 +584,19 @@ warm-cache measurements reduced median end-to-end latency from `2021.448 us` to
 `1871.134 us` after Stage 1 adopted N-subtile B-register rotation (`1.080x`).
 Useful BF16 MoE throughput increased from approximately `815.9` to
 `881.4 TFLOP/s`; routing, padding (`36,480` rows), and Stage 2 were unchanged.
+
+The first backward grouped specialization reuses the gfx950 Stage-1 MFMA body
+with logical `[E, 2I, H]` weights, a raw preactivation store, and a device-side
+expert grid. For `T=128, H=3584, I=512, E=896, top_k=16`, paired warm-cache
+measurements reduced W1 recompute from `48.595 ms` to `1.196 ms` (`40.62x`) and
+the complete backward from `299.630 ms` to `253.449 ms` (`1.182x`). Empty
+experts do not launch matrix work, and 65-row and bias cases are covered by the
+backward tests. The `BM16/BN64/BK64/k_wave4` policy is intentionally limited to
+fixed-K calls with at most 128 tokens, or ragged calls with at most 128 total
+routes. A balanced `T4096/E64` case has 512 rows per expert: forcing the short-M
+kernel made the full backward `30.66 ms`, whereas retaining the BM64 fallback
+measured `22.33 ms`. Later grouped kernels should use separate short- and long-M
+schedules rather than extending this threshold blindly.
 
 Run the validated A16W4 path or let the shape-bucket tuner choose the tiles with:
 

@@ -17,6 +17,7 @@ from kernels.moe.sonic import (
     sonic_moe_backward,
     sonic_moe_backward_routes,
 )
+from kernels.moe.sonic_backward import _use_grouped_w1_recompute
 
 pytestmark = [pytest.mark.l2_device, pytest.mark.rocm_lower]
 
@@ -31,6 +32,30 @@ _ACTIVATIONS = (
     "relu_sq",
 )
 _DTYPES = ((torch.bfloat16, "bf16"), (torch.float16, "fp16"))
+
+
+@pytest.mark.parametrize(
+    ("tokens", "routes", "flat_routes", "expected"),
+    (
+        (128, 2048, False, True),
+        (129, 2064, False, False),
+        (16, 128, True, True),
+        (16, 129, True, False),
+    ),
+)
+def test_grouped_w1_policy_bounds_worst_case_expert_rows(tokens, routes, flat_routes, expected):
+    assert (
+        _use_grouped_w1_recompute(
+            compute_dtype="bf16",
+            activation="swiglu",
+            hidden_size=3584,
+            intermediate_size=512,
+            tokens=tokens,
+            routes=routes,
+            flat_routes=flat_routes,
+        )
+        is expected
+    )
 
 
 def _gfx950_device():
