@@ -391,6 +391,10 @@ def test_sonic_moe_training_stage1_t4096_policy_is_targeted():
         256,
         None,
     )
+    assert _training_stage1_tuning(replace(throughput, down_tile_m=256), 4096, False) == (
+        256,
+        None,
+    )
 
 
 def test_sonic_moe_training_stage1_launcher_accepts_private_overrides(monkeypatch):

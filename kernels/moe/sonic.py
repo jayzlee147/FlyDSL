@@ -1195,6 +1195,7 @@ def _training_stage1_tuning(
         and config.tile_m == 128
         and config.tile_n == 256
         and config.tile_k == 64
+        and config.route_tile_m == 128
         and config.stage1_k_wave == 1
         and config.stage1_b_cache_mod in (None, 0)
         and config.stage1_xcd_swizzle == 0
