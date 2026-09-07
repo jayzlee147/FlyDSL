@@ -586,17 +586,29 @@ Useful BF16 MoE throughput increased from approximately `815.9` to
 `881.4 TFLOP/s`; routing, padding (`36,480` rows), and Stage 2 were unchanged.
 
 The first backward grouped specialization reuses the gfx950 Stage-1 MFMA body
-with logical `[E, 2I, H]` weights, a raw preactivation store, and a device-side
-expert grid. For `T=128, H=3584, I=512, E=896, top_k=16`, paired warm-cache
+with logical `[E, 2I, H]` weights and a raw preactivation store. T1 uses a
+device-side expert grid directly. Short-route calls with at least 64 tokens
+first build a compact device queue of real M tiles, then launch each tile as an
+independent CTA; neither schedule reads expert frequencies back to the host.
+For `T=128, H=3584, I=512, E=896, top_k=16`, paired warm-cache
 measurements reduced W1 recompute from `48.595 ms` to `1.196 ms` (`40.62x`) and
 the complete backward from `299.630 ms` to `253.449 ms` (`1.182x`). Empty
 experts do not launch matrix work, and 65-row and bias cases are covered by the
-backward tests. The `BM16/BN64/BK64/k_wave4` policy is intentionally limited to
-fixed-K calls with at most 128 tokens, or ragged calls with at most 128 total
-routes. A balanced `T4096/E64` case has 512 rows per expert: forcing the short-M
-kernel made the full backward `30.66 ms`, whereas retaining the BM64 fallback
-measured `22.33 ms`. Later grouped kernels should use separate short- and long-M
+backward tests. The T1 expert-grid profile is `BM16/BN64/BK64/k_wave4`; the
+compact profile is described below. Both are intentionally limited to fixed-K
+calls with at most 128 tokens, or ragged calls with at most 128 total routes. A
+balanced `T4096/E64` case has 512 rows per expert: forcing the short-M kernel
+made the full backward `30.66 ms`, whereas retaining the BM64 fallback measured
+`22.33 ms`. Later grouped kernels should use separate short- and long-M
 schedules rather than extending this threshold blindly.
+
+The compact W1 profile uses `BM16/BN128/BK64/k_wave2`; its two-launch descriptor
+builder costs about `12-14 us` on MI355X. Including that cost, it changed W1
+latency from `156.32` to `76.16 us` for T64 with 16 hot experts, from `305.40`
+to `120.84 us` for the corresponding T128 skew, and from `1127.73` to
+`1108.45 us` for balanced T128 routing. The host launches a proven-safe upper
+bound, while a device counter and compact descriptors suppress empty work and
+expose a hot expert's M tiles to separate CTAs.
 
 The matching W2 recompute specialization reads logical `[E, H, I]` weights and
 writes the unweighted projection directly by sorted row. Its measured
