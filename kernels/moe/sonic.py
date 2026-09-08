@@ -365,21 +365,56 @@ class SonicMoEConfig:
     def stage2_auto_pipeline_eligible(self) -> bool:
         """Whether this config matches the token-independent part of the auto gate."""
 
-        return (
-            self.hidden_size == 4096
-            and self.intermediate_size == 2048
-            and self.num_experts == 64
-            and self.top_k == 8
-            and self.stage2_tile_m == 128
-            and self.stage2_tile_n == 128
-            and self.stage2_tile_k == 64
-            and self.route_tile_m == 128
-            and self.stage2_xcd_swizzle == 8
-            and self.stage2_b_cache_mod in (None, 0)
+        common = (
+            self.stage2_b_cache_mod in (None, 0)
             and self.waves_per_eu is None
             and not self.persistent_stage2
             and self.stage2_output_mode == "atomic"
             and self.compute_dtype == "bf16"
+        )
+        if not common:
+            return False
+
+        return (
+            (
+                self.hidden_size == 4096
+                and self.intermediate_size == 2048
+                and self.num_experts == 64
+                and self.top_k == 8
+                and (self.tile_m, self.tile_n, self.tile_k) == (128, 256, 64)
+                and (self.stage2_tile_m, self.stage2_tile_n, self.stage2_tile_k)
+                == (128, 128, 64)
+                and self.stage1_xcd_swizzle == 0
+                and self.stage2_xcd_swizzle == 8
+                and not self.stage1_write_padded_rows
+                and not self.stage1_lds_swizzle
+            )
+            or (
+                self.hidden_size == 2048
+                and self.intermediate_size == 768
+                and self.num_experts == 128
+                and self.top_k == 8
+                and (self.tile_m, self.tile_n, self.tile_k) == (128, 192, 64)
+                and (self.stage2_tile_m, self.stage2_tile_n, self.stage2_tile_k)
+                == (64, 256, 128)
+                and self.stage1_xcd_swizzle == 8
+                and self.stage2_xcd_swizzle == 0
+                and self.stage1_write_padded_rows
+                and not self.stage1_lds_swizzle
+            )
+            or (
+                self.hidden_size == 4096
+                and self.intermediate_size == 14336
+                and self.num_experts == 8
+                and self.top_k == 2
+                and (self.tile_m, self.tile_n, self.tile_k) == (128, 256, 64)
+                and (self.stage2_tile_m, self.stage2_tile_n, self.stage2_tile_k)
+                == (128, 128, 64)
+                and self.stage1_xcd_swizzle == 8
+                and self.stage2_xcd_swizzle == 8
+                and not self.stage1_write_padded_rows
+                and not self.stage1_lds_swizzle
+            )
         )
 
     @property

@@ -787,7 +787,10 @@ def test_sonic_moe_stage1_lds_swizzle_single_k_tile_matches_reference():
     _assert_close(actual, expected)
 
 
-@pytest.mark.parametrize("stage1_tile_m,stage2_tile_m", ((32, 128), (64, 128), (48, 64)))
+@pytest.mark.parametrize(
+    "stage1_tile_m,stage2_tile_m",
+    ((32, 128), (64, 128), (128, 64), (48, 64)),
+)
 def test_sonic_moe_independent_stage_tile_m_matches_fixed_and_ragged_reference(
     stage1_tile_m,
     stage2_tile_m,
@@ -2607,6 +2610,51 @@ def test_sonic_moe_default_candidates_include_curated_gfx950_dense_profiles(weig
     )
 
 
+@pytest.mark.parametrize(
+    ("config", "expected"),
+    (
+        (
+            SonicMoEConfig(
+                hidden_size=2048,
+                intermediate_size=768,
+                num_experts=128,
+                top_k=8,
+            ),
+            (128, 192, 64, 64, 256, 128, 8, 0, None, True),
+        ),
+        (
+            SonicMoEConfig(
+                hidden_size=4096,
+                intermediate_size=14336,
+                num_experts=8,
+                top_k=2,
+            ),
+            (128, 256, 64, 128, 128, 64, 8, 8, None, False),
+        ),
+    ),
+    ids=("e128-prefill", "e8-prefill"),
+)
+def test_sonic_moe_default_candidates_include_measured_prefill_profiles(config, expected):
+    candidates = default_sonic_moe_candidates(config, "bf16")
+
+    assert any(
+        (
+            candidate.tile_m,
+            candidate.tile_n,
+            candidate.tile_k,
+            candidate.stage2_tile_m,
+            candidate.stage2_tile_n,
+            candidate.stage2_tile_k,
+            candidate.stage1_xcd_swizzle,
+            candidate.stage2_xcd_swizzle,
+            candidate.stage2_pipeline_stages,
+            candidate.stage1_write_padded_rows,
+        )
+        == expected
+        for candidate in candidates
+    )
+
+
 @pytest.mark.parametrize("weight_dtype", (None, "mxfp4", "int4"))
 def test_sonic_moe_default_candidates_keep_packed_weights_at_k128(weight_dtype):
     config = SonicMoEConfig(
@@ -2763,7 +2811,61 @@ def test_sonic_moe_stage2_launcher_cache_separates_output_modes(monkeypatch):
         _get_stage2_launcher.cache_clear()
 
 
-def test_sonic_moe_stage2_pipeline_gate_is_exact():
+@pytest.mark.parametrize(
+    "tuned",
+    (
+        SonicMoEConfig(
+            hidden_size=4096,
+            intermediate_size=2048,
+            num_experts=64,
+            top_k=8,
+            tile_m=128,
+            tile_n=256,
+            tile_k=64,
+            down_tile_m=128,
+            down_tile_n=128,
+            down_tile_k=64,
+            stage2_xcd_swizzle=8,
+        ),
+        SonicMoEConfig(
+            hidden_size=2048,
+            intermediate_size=768,
+            num_experts=128,
+            top_k=8,
+            tile_m=128,
+            tile_n=192,
+            tile_k=64,
+            down_tile_m=64,
+            down_tile_n=256,
+            down_tile_k=128,
+            stage1_xcd_swizzle=8,
+            stage2_xcd_swizzle=0,
+            stage1_write_padded_rows=True,
+        ),
+        SonicMoEConfig(
+            hidden_size=4096,
+            intermediate_size=14336,
+            num_experts=8,
+            top_k=2,
+            tile_m=128,
+            tile_n=256,
+            tile_k=64,
+            down_tile_m=128,
+            down_tile_n=128,
+            down_tile_k=64,
+            stage1_xcd_swizzle=8,
+            stage2_xcd_swizzle=8,
+        ),
+    ),
+    ids=("e64-throughput", "e128-prefill", "e8-prefill"),
+)
+def test_sonic_moe_stage2_pipeline_gate_is_exact(tuned):
+    assert _stage2_stages(tuned, 4096) == 2
+    assert _stage2_stages(tuned, 4095) == 1
+    assert _stage2_stages(tuned, 8192) == 1
+
+
+def test_sonic_moe_stage2_pipeline_gate_rejects_other_tuning_axes():
     tuned = SonicMoEConfig(
         hidden_size=4096,
         intermediate_size=2048,
@@ -2778,9 +2880,6 @@ def test_sonic_moe_stage2_pipeline_gate_is_exact():
         stage2_xcd_swizzle=8,
     )
 
-    assert _stage2_stages(tuned, 4096) == 2
-    assert _stage2_stages(tuned, 4095) == 1
-    assert _stage2_stages(tuned, 8192) == 1
     for fallback in (
         replace(tuned, hidden_size=3584),
         replace(tuned, intermediate_size=1024),

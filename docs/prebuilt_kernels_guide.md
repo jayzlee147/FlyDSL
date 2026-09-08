@@ -560,6 +560,15 @@ contains the measured asymmetric-N points `S1 BN64/S2 BN128/k_wave=2` and
 least 128. Illegal DMA, divisibility, and 160 KiB LDS combinations are pruned.
 Cache policy, XCD swizzle, waves-per-EU, and persistent Stage 2 remain available
 for a custom candidate sweep and are included in the autotune cache identity.
+For dense BF16 SwiGLU, the bounded list also includes the measured MI350
+prefill candidates `H2048/I768/E128/K8: S1=(128,192,64,xcd8,padded),
+S2=(64,256,128,xcd0)` and `H4096/I14336/E8/K2: S1=(128,256,64,xcd8),
+S2=(128,128,64,xcd8)`. These candidates are only added for their exact
+contraction/expert shapes and retain the automatic Stage-2 pipeline setting.
+The runtime gate resolves that setting to two stages only at exactly 4096
+tokens and to the serial loop otherwise. The autotuner cache remains
+power-of-two token-bucketed, but records each candidate's effective pipeline
+depth in its identity so a 4096-token result cannot be reused at 4095 tokens.
 
 For decode, workspace sizing is based on the number of routes that can actually
 activate experts. With `R=tokens*top_k`, `A=min(E,R)`, and distinct top-k IDs per

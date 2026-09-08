@@ -112,7 +112,7 @@ def default_sonic_moe_candidates(
     candidates: list[SonicMoEConfig] = []
     seen: set[tuple[int | bool | None, ...]] = set()
 
-    def append_candidate(**overrides: int) -> None:
+    def append_candidate(**overrides: int | bool | None) -> None:
         try:
             candidate = replace(base, **overrides)
         except (TypeError, ValueError):
@@ -191,6 +191,54 @@ def default_sonic_moe_candidates(
                     stage1_k_wave=1,
                     stage2_xcd_swizzle=8,
                 )
+
+        # Exact dense production shapes measured on MI350.  Keep these out of
+        # unrelated search spaces: their asymmetric tiles and XCD policies are
+        # responses to the route density and contraction dimensions below.
+        if (
+            base.hidden_size == 2048
+            and base.intermediate_size == 768
+            and base.num_experts == 128
+            and base.top_k == 8
+            and base.compute_dtype == "bf16"
+            and base.activation == "swiglu"
+        ):
+            append_candidate(
+                tile_m=128,
+                tile_n=192,
+                tile_k=64,
+                down_tile_m=64,
+                down_tile_n=256,
+                down_tile_k=128,
+                stage1_xcd_swizzle=8,
+                stage1_k_wave=1,
+                stage2_xcd_swizzle=0,
+                stage2_pipeline_stages=None,
+                stage1_write_padded_rows=True,
+                stage1_lds_swizzle=False,
+            )
+        if (
+            base.hidden_size == 4096
+            and base.intermediate_size == 14336
+            and base.num_experts == 8
+            and base.top_k == 2
+            and base.compute_dtype == "bf16"
+            and base.activation == "swiglu"
+        ):
+            append_candidate(
+                tile_m=128,
+                tile_n=256,
+                tile_k=64,
+                down_tile_m=128,
+                down_tile_n=128,
+                down_tile_k=64,
+                stage1_xcd_swizzle=8,
+                stage1_k_wave=1,
+                stage2_xcd_swizzle=8,
+                stage2_pipeline_stages=None,
+                stage1_write_padded_rows=False,
+                stage1_lds_swizzle=False,
+            )
 
         # Skinny high-E profiles measured on H3584/I512.  BN64 exposes more
         # independent Stage-1 work at T=1; the reciprocal narrow Stage-2 tile
