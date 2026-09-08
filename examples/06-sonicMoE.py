@@ -61,6 +61,11 @@ def _parse_args():
         help="override the auto-selected stage-2 A-LDS pipeline depth",
     )
     parser.add_argument(
+        "--stage1-write-padded-rows",
+        action="store_true",
+        help="skip Stage-1 epilogue token-ID reloads and let Stage 2 discard padded rows",
+    )
+    parser.add_argument(
         "--stage2-output-mode",
         choices=("atomic", "reduce"),
         default="atomic",
@@ -115,6 +120,7 @@ def main():
         stage1_xcd_swizzle=args.stage1_xcd_swizzle,
         stage2_xcd_swizzle=args.stage2_xcd_swizzle,
         stage2_pipeline_stages=args.stage2_pipeline_stages,
+        stage1_write_padded_rows=args.stage1_write_padded_rows,
         stage2_output_mode=args.stage2_output_mode,
         activation=args.activation,
         compute_dtype=compute_dtype,

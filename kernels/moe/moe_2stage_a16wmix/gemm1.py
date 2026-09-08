@@ -171,6 +171,7 @@ def _gemm1_body_a16w4(
     store_preactivation=False,
     store_route_preactivation=False,
     route_preactivation_interleaved=False,
+    skip_epilogue_id_reload=False,
 ):
     """A16W4/A16W16 fused stage1 GEMM body.
 
@@ -856,26 +857,42 @@ def _gemm1_body_a16w4(
                 up_bias.append(fx.Float32(elem_dtype(up_raw)))
 
     # ---- epilogue: activation -> bf16 intermediate [sorted_size, inter] --------
-    # Stored by SORTED POSITION (row = bx_m + row_in_tile). Padding rows (token >=
-    # tokens) masked out; for k_wave>1 only the primary k-group (wave_k_id==0) writes.
+    # Stored by SORTED POSITION (row = bx_m + row_in_tile).  The ordinary
+    # forward may materialize padding rows and let Stage 2 perform the definitive
+    # token validity check.  That removes one serialized token-ID reload per
+    # output row.  Route-order preactivation still needs the packed token/slot,
+    # while the exclusive backward preactivation path preserves its established
+    # padding behavior.  For k_wave>1 only the primary K group writes.
     if const_expr(k_wave > 1):
         _is_primary = wave_k_id == fx.Int32(0)
     for mi in range_constexpr(m_repeat):
         for ii in range_constexpr(4):
             row_in_tile = fx.Int32(mi * 16) + lane_div_16 * fx.Int32(4) + fx.Int32(ii)
             sorted_row = bx_m + row_in_tile
-            fused = fx.Int32(_global_i32_at(arg_mind, sorted_row))
-            token = fused & fx.Int32(0x00FFFFFF)
-            valid = token < i32_ntok
-            if const_expr(k_wave > 1):
-                valid = valid & _is_primary
-                preactivation_valid = _is_primary
+            if const_expr(
+                skip_epilogue_id_reload
+                and not store_preactivation
+                and not store_route_preactivation
+            ):
+                # Every body tile is below cumsum0, and out_rsrc is bounded to
+                # that dynamic extent.  Padding values are internal-only:
+                # Stage 2 reloads the packed token ID and suppresses their
+                # external stores.  Secondary split-K waves must still stay
+                # silent because only the primary wave owns the reduced value.
+                valid = _is_primary if const_expr(k_wave > 1) else None
             else:
-                # Every row below cumsum0 belongs to a real expert tile.  Its
-                # route may be padding, but backward still needs a finite
-                # zero/bias preactivation there because later dense GEMMs
-                # contract across the complete padded segment.
-                preactivation_valid = sorted_row < _cumsum0
+                fused = fx.Int32(_global_i32_at(arg_mind, sorted_row))
+                token = fused & fx.Int32(0x00FFFFFF)
+                valid = token < i32_ntok
+                if const_expr(k_wave > 1):
+                    valid = valid & _is_primary
+                    preactivation_valid = _is_primary
+                else:
+                    # Every row below cumsum0 belongs to a real expert tile.  Its
+                    # route may be padding, but backward still needs a finite
+                    # zero/bias preactivation there because later dense GEMMs
+                    # contract across the complete padded segment.
+                    preactivation_valid = sorted_row < _cumsum0
             for ni in range_constexpr(num_acc_n):
                 g = fx.Float32(fx.Vector(fx.memref_load_vec(acc_gate[mi][ni]))[ii])
                 if const_expr(has_bias):
@@ -1010,6 +1027,7 @@ def compile_gemm1_a16w4_port(
     expert_grid=False,
     compact_grid=False,
     persist=False,
+    skip_epilogue_id_reload=False,
 ):
     """A16W4/A16W16 fused stage1 builder.
 
@@ -1083,6 +1101,7 @@ def compile_gemm1_a16w4_port(
     assert isinstance(store_preactivation, bool), "store_preactivation must be bool"
     assert isinstance(store_route_preactivation, bool), "store_route_preactivation must be bool"
     assert isinstance(route_preactivation_interleaved, bool), "route_preactivation_interleaved must be bool"
+    assert isinstance(skip_epilogue_id_reload, bool), "skip_epilogue_id_reload must be bool"
     assert isinstance(expert_grid, bool), "expert_grid must be bool"
     assert isinstance(compact_grid, bool), "compact_grid must be bool"
     assert isinstance(persist, bool), "persist must be bool"
@@ -1171,12 +1190,13 @@ def compile_gemm1_a16w4_port(
     _expert_grid_tag = "_egrid" if expert_grid else ""
     _compact_grid_tag = "_cgrid" if compact_grid else ""
     _persist_tag = "_persist" if persist else ""
+    _padding_store_tag = "_padstore" if skip_epilogue_id_reload else ""
     _sorted_tag = f"_sbm{SORTED_BM}" if SORTED_BM != BM else ""
     name_suffix = (
         f"a16w4{_wd_tag}{_ad_tag}{_wl_tag}_h{_K}_i{_INTER}_ne{NE}_bm{BM}"
         f"{_sorted_tag}_tn{TILE_N}_tk{TILE_K}{_act_tag}{_bcm_tag}{_xcd_tag}"
         f"{_wpe_tag}{_kw_tag}{_round_tag}{_bias_tag}{_logical_w_tag}{_preact_tag}{_route_preact_tag}"
-        f"{_expert_grid_tag}{_compact_grid_tag}{_persist_tag}"
+        f"{_expert_grid_tag}{_compact_grid_tag}{_persist_tag}{_padding_store_tag}"
     )
 
     @fx.struct
@@ -1273,6 +1293,7 @@ def compile_gemm1_a16w4_port(
                 store_preactivation=store_preactivation,
                 store_route_preactivation=store_route_preactivation,
                 route_preactivation_interleaved=route_preactivation_interleaved,
+                skip_epilogue_id_reload=skip_epilogue_id_reload,
             )
 
         if const_expr(compact_grid):

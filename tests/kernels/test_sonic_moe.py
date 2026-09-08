@@ -464,6 +464,7 @@ def test_sonic_moe_inference_stage1_launcher_does_not_enable_dual_store(monkeypa
         inference = _get_stage1_launcher(config, 2, "bf16", False, 0)
         assert inference is _get_stage1_launcher(config, 2, "bf16", False, 0)
         assert compile_kwargs[-1].get("store_route_preactivation", False) is False
+        assert compile_kwargs[-1]["skip_epilogue_id_reload"] is False
         assert _get_stage1_launcher.cache_info().currsize == 1
         assert _get_stage1_training_launcher.cache_info().currsize == 0
 
@@ -476,6 +477,33 @@ def test_sonic_moe_inference_stage1_launcher_does_not_enable_dual_store(monkeypa
     finally:
         _get_stage1_launcher.cache_clear()
         _get_stage1_training_launcher.cache_clear()
+
+
+def test_sonic_moe_stage1_padding_store_is_an_inference_cache_key(monkeypatch):
+    import kernels.moe.sonic as sonic_module
+
+    compile_kwargs = []
+
+    def fake_compile(**kwargs):
+        compile_kwargs.append(kwargs)
+        return object()
+
+    monkeypatch.setattr(sonic_module, "compile_gemm1_a16w4_port", fake_compile)
+    _get_stage1_launcher.cache_clear()
+    try:
+        masked = _get_stage1_launcher(_config(), 0, "bf16", False, 0)
+        padded = _get_stage1_launcher(
+            _config(stage1_write_padded_rows=True), 0, "bf16", False, 0
+        )
+
+        assert masked is not padded
+        assert [call["skip_epilogue_id_reload"] for call in compile_kwargs] == [
+            False,
+            True,
+        ]
+        assert _get_stage1_launcher.cache_info().currsize == 2
+    finally:
+        _get_stage1_launcher.cache_clear()
 
 
 def test_sonic_moe_training_stage1_t4096_policy_is_targeted():
@@ -624,10 +652,30 @@ def test_sonic_moe_fp16_forward_matches_reference():
 
 
 def test_sonic_moe_stage1_k_wave2_matches_reference():
-    config = _config(stage1_k_wave=2)
+    config = _config(stage1_k_wave=2, stage1_write_padded_rows=True)
     x, w1, w2, router_logits = _make_case(seed=147)
     expected = sonic_moe_reference(x, w1, w2, router_logits, config)
     actual = SonicMoE(config, prepare_sonic_bf16_weights(w1, w2, config))(x, router_logits)
+    torch.cuda.synchronize()
+    _assert_close(actual, expected)
+
+
+def test_sonic_moe_stage1_padding_store_k_wave4_matches_reference():
+    config = _config(
+        tile_m=32,
+        tile_n=64,
+        tile_k=64,
+        down_tile_m=32,
+        down_tile_n=128,
+        down_tile_k=128,
+        stage1_k_wave=4,
+        stage1_write_padded_rows=True,
+    )
+    x, w1, w2, router_logits = _make_case(seed=148)
+    expected = sonic_moe_reference(x, w1, w2, router_logits, config)
+    actual = SonicMoE(config, prepare_sonic_bf16_weights(w1, w2, config))(
+        x, router_logits
+    )
     torch.cuda.synchronize()
     _assert_close(actual, expected)
 
@@ -731,7 +779,11 @@ def test_sonic_moe_reduce_mode_fixed_topk_matches_reference_and_route_sum(
     compute_dtype,
     torch_dtype,
 ):
-    config = _config(stage2_output_mode="reduce", compute_dtype=compute_dtype)
+    config = _config(
+        stage2_output_mode="reduce",
+        compute_dtype=compute_dtype,
+        stage1_write_padded_rows=True,
+    )
     x, w1, w2, router_logits = _make_case(seed=151, dtype=torch_dtype)
     generator = torch.Generator(device=x.device).manual_seed(157)
     b1 = (
@@ -989,9 +1041,16 @@ def test_sonic_moe_mxfp4_activation_variants(activation):
     _assert_close(actual, expected)
 
 
+@pytest.mark.parametrize("stage1_write_padded_rows", (False, True))
 @pytest.mark.parametrize("activation", ("swiglu", "relu"))
-def test_sonic_moe_bf16_bias_matches_reference_fixed_and_flat_routes(activation):
-    config = _config(activation=activation)
+def test_sonic_moe_bf16_bias_matches_reference_fixed_and_flat_routes(
+    activation,
+    stage1_write_padded_rows,
+):
+    config = _config(
+        activation=activation,
+        stage1_write_padded_rows=stage1_write_padded_rows,
+    )
     x, w1, w2, router_logits = _make_case(seed=97, activation=activation)
     generator = torch.Generator(device=x.device).manual_seed(101)
     b1 = (
@@ -1129,7 +1188,7 @@ def test_sonic_moe_activation_preserves_legacy_bf16_preactivation_rounding():
 def test_sonic_moe_ragged_routes_match_reference_and_frequency():
     """Flat routes allow missing tokens, duplicate edges, and arbitrary weights."""
 
-    config = _config()
+    config = _config(stage1_write_padded_rows=True)
     x, w1, w2, _ = _make_case(seed=19)
     prepared = prepare_sonic_bf16_weights(w1, w2, config)
     op = SonicMoE(config, prepared)
@@ -1781,7 +1840,7 @@ def test_sonic_moe_autotuner_search_and_disk_cache(tmp_path):
     torch.cuda.synchronize()
     assert recovered.search_count == 1
     rewritten_cache = non_object_cache_file.read_text(encoding="utf-8")
-    assert '"version": 12' in rewritten_cache
+    assert '"version": 13' in rewritten_cache
     assert '"stage1_k_wave": 1' in rewritten_cache
 
 
@@ -2694,6 +2753,12 @@ def test_sonic_moe_rejects_invalid_stage2_pipeline_depth_value(value):
 def test_sonic_moe_rejects_non_integer_stage2_pipeline_depth(value):
     with pytest.raises(TypeError, match="stage2_pipeline_stages"):
         _config(stage2_pipeline_stages=value)
+
+
+@pytest.mark.parametrize("value", (None, 0, 1, "yes"))
+def test_sonic_moe_rejects_non_boolean_stage1_padding_store(value):
+    with pytest.raises(TypeError, match="stage1_write_padded_rows"):
+        _config(stage1_write_padded_rows=value)
 
 
 def test_sonic_moe_stage2_pipeline_single_k_tile_normalizes_to_one():

@@ -150,12 +150,18 @@ class SonicMoEConfig:
     # Appended to preserve the positional ABI of every pre-existing field.
     stage2_pipeline_stages: int | None = None
     persistent_stage1: bool = False
+    stage1_write_padded_rows: bool = False
 
     def __post_init__(self) -> None:
         if not isinstance(self.persistent_stage1, bool):
             raise TypeError(
                 "persistent_stage1 must be bool, got "
                 f"{type(self.persistent_stage1).__name__}"
+            )
+        if not isinstance(self.stage1_write_padded_rows, bool):
+            raise TypeError(
+                "stage1_write_padded_rows must be bool, got "
+                f"{type(self.stage1_write_padded_rows).__name__}"
             )
         if not isinstance(self.stage2_output_mode, str):
             raise TypeError(
@@ -1213,6 +1219,7 @@ def _get_stage1_launcher(
         persist=config.persistent_stage1,
         round_preact_bf16=True,
         has_bias=has_bias,
+        skip_epilogue_id_reload=config.stage1_write_padded_rows,
     )
 
 
