@@ -23,7 +23,7 @@ from kernels.moe.moe_2stage_a16wmix.gemm2 import compile_gemm2_a16w4_port
 from kernels.moe.moe_sorting_kernel import moe_softmax_sort_flydsl
 from kernels.moe.sonic import SonicMoE, SonicMoEConfig, SonicMoEWeights, _stage2_stages
 
-_CACHE_SCHEMA_VERSION = 14
+_CACHE_SCHEMA_VERSION = 16
 _DENSE_WEIGHT_DTYPES = frozenset({"bf16", "fp16"})
 _TUNING_FIELDS = (
     "tile_m",
@@ -209,13 +209,13 @@ def default_sonic_moe_candidates(
                 tile_k=64,
                 down_tile_m=64,
                 down_tile_n=256,
-                down_tile_k=128,
+                down_tile_k=64,
                 stage1_xcd_swizzle=8,
                 stage1_k_wave=1,
                 stage2_xcd_swizzle=0,
                 stage2_pipeline_stages=None,
                 stage1_write_padded_rows=True,
-                stage1_lds_swizzle=False,
+                stage1_lds_swizzle=True,
             )
         if (
             base.hidden_size == 4096
@@ -236,8 +236,8 @@ def default_sonic_moe_candidates(
                 stage1_k_wave=1,
                 stage2_xcd_swizzle=8,
                 stage2_pipeline_stages=None,
-                stage1_write_padded_rows=False,
-                stage1_lds_swizzle=False,
+                stage1_write_padded_rows=True,
+                stage1_lds_swizzle=True,
             )
 
         # Skinny high-E profiles measured on H3584/I512.  BN64 exposes more

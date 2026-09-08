@@ -889,12 +889,17 @@ def _gemm1_body_a16w4(
                 and not store_preactivation
                 and not store_route_preactivation
             ):
-                # Every body tile is below cumsum0, and out_rsrc is bounded to
-                # that dynamic extent.  Padding values are internal-only:
-                # Stage 2 reloads the packed token ID and suppresses their
-                # external stores.  Secondary split-K waves must still stay
-                # silent because only the primary wave owns the reduced value.
-                valid = _is_primary if const_expr(k_wave > 1) else None
+                # Every executed body tile is below cumsum0, so this dynamic
+                # extent predicate is true for its rows.  Keep it explicit
+                # instead of passing ``mask=None``: the masked-store lowering
+                # avoids the register-pressure cliff seen on the large E8
+                # profile while still eliminating the serialized token-ID
+                # reload.  Padding values are internal-only; Stage 2 reloads
+                # the packed token ID and suppresses their external stores.
+                valid = sorted_row < _cumsum0
+                if const_expr(k_wave > 1):
+                    # Only the primary split-K wave owns the reduced value.
+                    valid = valid & _is_primary
             else:
                 fused = fx.Int32(_global_i32_at(arg_mind, sorted_row))
                 token = fused & fx.Int32(0x00FFFFFF)

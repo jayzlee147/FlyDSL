@@ -689,11 +689,6 @@ def _gemm2_body_a16w4(
             )
             bias_values.append(fx.Float32(elem_dtype(bias_raw)))
 
-    # Both epilogues transpose accumulator ownership through LDS for coalesced
-    # vec2 stores.  Sorted mode skips route weights and atomics after the same
-    # proven MFMA-fragment mapping.
-    gpu.barrier()
-    lds_acc_base_i32 = fx.Int32(fx.ptrtoint(lds_raw_ptr))
     accm_v = []
     for i in range_constexpr(m_repeat):
         row = []
@@ -710,6 +705,11 @@ def _gemm2_body_a16w4(
                 vec = vec.to(elem_dtype).to(fx.Float32)
             row.append(vec.ir_value())
         accm_v.append(row)
+    # Both epilogues transpose accumulator ownership through LDS for coalesced
+    # vec2 stores.  Sorted mode skips route weights and atomics after the same
+    # proven MFMA-fragment mapping.
+    gpu.barrier()
+    lds_acc_base_i32 = fx.Int32(fx.ptrtoint(lds_raw_ptr))
     if const_expr(store_sorted_projection):
         _sorted_a16_epilog(
             lds_acc_base_i32,

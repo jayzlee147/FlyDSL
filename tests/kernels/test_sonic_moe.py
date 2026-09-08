@@ -1905,7 +1905,7 @@ def test_sonic_moe_autotuner_search_and_disk_cache(tmp_path):
     torch.cuda.synchronize()
     assert recovered.search_count == 1
     rewritten_cache = non_object_cache_file.read_text(encoding="utf-8")
-    assert '"version": 14' in rewritten_cache
+    assert '"version": 16' in rewritten_cache
     assert '"stage1_k_wave": 1' in rewritten_cache
 
 
@@ -2620,7 +2620,7 @@ def test_sonic_moe_default_candidates_include_curated_gfx950_dense_profiles(weig
                 num_experts=128,
                 top_k=8,
             ),
-            (128, 192, 64, 64, 256, 128, 8, 0, None, True),
+            (128, 192, 64, 64, 256, 64, 8, 0, None, True, True),
         ),
         (
             SonicMoEConfig(
@@ -2629,7 +2629,7 @@ def test_sonic_moe_default_candidates_include_curated_gfx950_dense_profiles(weig
                 num_experts=8,
                 top_k=2,
             ),
-            (128, 256, 64, 128, 128, 64, 8, 8, None, False),
+            (128, 256, 64, 128, 128, 64, 8, 8, None, True, True),
         ),
     ),
     ids=("e128-prefill", "e8-prefill"),
@@ -2649,6 +2649,7 @@ def test_sonic_moe_default_candidates_include_measured_prefill_profiles(config, 
             candidate.stage2_xcd_swizzle,
             candidate.stage2_pipeline_stages,
             candidate.stage1_write_padded_rows,
+            candidate.stage1_lds_swizzle,
         )
         == expected
         for candidate in candidates
@@ -2685,6 +2686,9 @@ def test_sonic_moe_candidate_fingerprint_covers_gfx950_tuning_axes():
         replace(config, down_tile_m=128),
         replace(config, stage1_k_wave=2),
         replace(config, stage2_xcd_swizzle=8),
+        replace(config, tile_k=64),
+        replace(config, down_tile_k=64),
+        replace(config, stage1_lds_swizzle=True),
     )
     tuner = object.__new__(SonicMoEAutotuner)
     tuner.candidates = probes
@@ -2694,6 +2698,9 @@ def test_sonic_moe_candidate_fingerprint_covers_gfx950_tuning_axes():
     assert fingerprints[1]["down_tile_m"] == 128
     assert fingerprints[2]["stage1_k_wave"] == 2
     assert fingerprints[3]["stage2_xcd_swizzle"] == 8
+    assert fingerprints[4]["tile_k"] == 64
+    assert fingerprints[5]["down_tile_k"] == 64
+    assert fingerprints[6]["stage1_lds_swizzle"] is True
 
 
 def test_sonic_moe_config_validation():
@@ -2837,10 +2844,11 @@ def test_sonic_moe_stage2_launcher_cache_separates_output_modes(monkeypatch):
             tile_k=64,
             down_tile_m=64,
             down_tile_n=256,
-            down_tile_k=128,
+            down_tile_k=64,
             stage1_xcd_swizzle=8,
             stage2_xcd_swizzle=0,
             stage1_write_padded_rows=True,
+            stage1_lds_swizzle=True,
         ),
         SonicMoEConfig(
             hidden_size=4096,
@@ -2855,6 +2863,8 @@ def test_sonic_moe_stage2_launcher_cache_separates_output_modes(monkeypatch):
             down_tile_k=64,
             stage1_xcd_swizzle=8,
             stage2_xcd_swizzle=8,
+            stage1_write_padded_rows=True,
+            stage1_lds_swizzle=True,
         ),
     ),
     ids=("e64-throughput", "e128-prefill", "e8-prefill"),
@@ -2863,6 +2873,13 @@ def test_sonic_moe_stage2_pipeline_gate_is_exact(tuned):
     assert _stage2_stages(tuned, 4096) == 2
     assert _stage2_stages(tuned, 4095) == 1
     assert _stage2_stages(tuned, 8192) == 1
+    if tuned.num_experts in (8, 128):
+        assert tuned.stage1_write_padded_rows
+        assert tuned.stage1_lds_swizzle
+        assert tuned.down_tile_k == 64
+        assert _stage2_stages(replace(tuned, stage1_write_padded_rows=False), 4096) == 1
+        assert _stage2_stages(replace(tuned, stage1_lds_swizzle=False), 4096) == 1
+        assert _stage2_stages(replace(tuned, down_tile_k=128), 4096) == 1
 
 
 def test_sonic_moe_stage2_pipeline_gate_rejects_other_tuning_axes():

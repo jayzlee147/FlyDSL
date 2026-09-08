@@ -597,6 +597,10 @@ def _routing_report(torch, case: Case, a: _Runtime, b: _Runtime) -> dict[str, An
                 a.workspace.sorted_expert_ids[:metadata_blocks],
                 b.workspace.sorted_expert_ids[:metadata_blocks],
             )
+            and torch.equal(
+                a.workspace.sorted_weights[:a_padded],
+                b.workspace.sorted_weights[:b_padded],
+            )
         )
     return {
         "a": details(a),
@@ -702,11 +706,80 @@ def _run_comparison(
         "routing": routing,
         "correctness_b_vs_a": correctness,
         "isolated_path_vs_public": isolated_correctness or None,
+        "shared_stage2_buffers": args.shared_stage2_buffers,
+        "shared_stage2_correctness": None,
         "timings": None,
     }
     if not args.compile_only:
         no_reset = {"a": lambda: None, "b": lambda: None}
         reset_stage2 = {"a": a.reset_stage2, "b": b.reset_stage2}
+        stage2_kernel_functions = {"a": a.stage2_kernel, "b": b.stage2_kernel}
+        stage2_path_functions = {"a": a.stage2_path, "b": b.stage2_path}
+        if args.shared_stage2_buffers:
+            if a.config.stage2_output_mode != "atomic" or b.config.stage2_output_mode != "atomic":
+                raise ValueError("--shared-stage2-buffers currently supports only atomic output")
+            if a.grid["stage2_launch"] != b.grid["stage2_launch"]:
+                raise ValueError("--shared-stage2-buffers requires identical Stage-2 grids")
+            if a.workspace.stage2_max_m_blocks != b.workspace.stage2_max_m_blocks:
+                raise ValueError(
+                    "--shared-stage2-buffers requires identical Stage-2 max-M bounds"
+                )
+            if routing["sorted_metadata_equal"] is not True:
+                raise ValueError(
+                    "--shared-stage2-buffers requires identical sorted routing metadata"
+                )
+            shared_workspace = a.workspace
+            shared_outputs = a.stage2_outputs
+            shared_cursor = [0]
+
+            def shared_reset_stage2() -> None:
+                shared_cursor[0] = 0
+                for target in shared_outputs:
+                    target.zero_()
+
+            def make_shared_stage2(runtime: _Runtime):
+                def launch():
+                    target = shared_outputs[shared_cursor[0] % len(shared_outputs)]
+                    shared_cursor[0] += 1
+                    run_compiled(
+                        runtime.stage2_launcher,
+                        shared_workspace.intermediate.data_ptr(),
+                        weights.down.data_ptr(),
+                        weights.dummy_scale.data_ptr(),
+                        weights.dummy_scale.data_ptr(),
+                        shared_workspace.sorted_expert_ids.data_ptr(),
+                        shared_workspace.num_valid_ids.data_ptr(),
+                        shared_workspace.sorted_token_ids.data_ptr(),
+                        shared_workspace.sorted_weights.data_ptr(),
+                        case.tokens,
+                        shared_workspace.stage2_max_m_blocks,
+                        int(runtime.grid["stage2_launch"]),
+                        target.data_ptr(),
+                        torch.cuda.current_stream(x.device),
+                    )
+                    return target
+
+                return launch
+
+            shared_a = make_shared_stage2(a)
+            shared_b = make_shared_stage2(b)
+            shared_correctness = {}
+            for name, launch in (("a", shared_a), ("b", shared_b)):
+                shared_reset_stage2()
+                shared_output = launch()
+                torch.cuda.synchronize()
+                accuracy = _accuracy(shared_output, a.output)
+                accuracy["passed"] = _accuracy_passed(accuracy)
+                shared_correctness[name] = accuracy
+                if not accuracy["passed"]:
+                    raise AssertionError(
+                        f"{case.name}/{comparison}/{name} shared Stage-2 correctness failed: "
+                        f"{accuracy}"
+                    )
+            result["shared_stage2_correctness"] = shared_correctness
+            stage2_kernel_functions = {"a": shared_a, "b": shared_b}
+            stage2_path_functions = stage2_kernel_functions
+            reset_stage2 = {"a": shared_reset_stage2, "b": shared_reset_stage2}
         common = {
             "warmup": args.warmup,
             "iters": args.iters,
@@ -743,7 +816,7 @@ def _run_comparison(
             if "stage2-kernel" in args.metrics:
                 timings["stage2_kernel_us"] = _measure_orders(
                     torch,
-                    {"a": a.stage2_kernel, "b": b.stage2_kernel},
+                    stage2_kernel_functions,
                     reset_stage2,
                     batch_iters=batch_iters,
                     **common,
@@ -753,7 +826,7 @@ def _run_comparison(
             if "stage2-path" in args.metrics:
                 timings["stage2_path_us"] = _measure_orders(
                     torch,
-                    {"a": a.stage2_path, "b": b.stage2_path},
+                    stage2_path_functions,
                     reset_stage2,
                     batch_iters=batch_iters,
                     **common,
@@ -855,6 +928,11 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--seed", type=int, default=20260907)
     parser.add_argument("--check", action="store_true")
+    parser.add_argument(
+        "--shared-stage2-buffers",
+        action="store_true",
+        help="time Stage-2 variants against identical input/metadata/output addresses",
+    )
     parser.add_argument("--compile-only", action="store_true")
     parser.add_argument("--dump-dir", type=Path)
     parser.add_argument("--output", type=Path)

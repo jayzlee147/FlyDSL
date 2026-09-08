@@ -396,11 +396,11 @@ class SonicMoEConfig:
                 and self.top_k == 8
                 and (self.tile_m, self.tile_n, self.tile_k) == (128, 192, 64)
                 and (self.stage2_tile_m, self.stage2_tile_n, self.stage2_tile_k)
-                == (64, 256, 128)
+                == (64, 256, 64)
                 and self.stage1_xcd_swizzle == 8
                 and self.stage2_xcd_swizzle == 0
                 and self.stage1_write_padded_rows
-                and not self.stage1_lds_swizzle
+                and self.stage1_lds_swizzle
             )
             or (
                 self.hidden_size == 4096
@@ -412,8 +412,8 @@ class SonicMoEConfig:
                 == (128, 128, 64)
                 and self.stage1_xcd_swizzle == 8
                 and self.stage2_xcd_swizzle == 8
-                and not self.stage1_write_padded_rows
-                and not self.stage1_lds_swizzle
+                and self.stage1_write_padded_rows
+                and self.stage1_lds_swizzle
             )
         )
 

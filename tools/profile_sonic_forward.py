@@ -28,7 +28,7 @@ import os
 import re
 import subprocess
 import sys
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Any, Callable
 
@@ -62,7 +62,6 @@ def _config(sonic, case: Case, profile: str):
         "stage2_output_mode": "atomic",
         "activation": "swiglu",
         "compute_dtype": "bf16",
-        "stage1_lds_swizzle": False,
     }
     profiles: dict[tuple[str, str], dict[str, Any]] = {
         # Original production profile used by the formal E128 comparison.
@@ -79,6 +78,7 @@ def _config(sonic, case: Case, profile: str):
             "stage2_xcd_swizzle": 1,
             "stage2_pipeline_stages": 1,
             "stage1_write_padded_rows": False,
+            "stage1_lds_swizzle": False,
         },
         # Final dense E128 candidate.  The automatic pipeline gate resolves to
         # two stages only for this exact T4096 production bucket.
@@ -88,13 +88,14 @@ def _config(sonic, case: Case, profile: str):
             "tile_k": 64,
             "down_tile_m": 64,
             "down_tile_n": 256,
-            "down_tile_k": 128,
+            "down_tile_k": 64,
             "stage1_b_cache_mod": 0,
             "stage2_b_cache_mod": 0,
             "stage1_xcd_swizzle": 8,
             "stage2_xcd_swizzle": 0,
             "stage2_pipeline_stages": None,
             "stage1_write_padded_rows": True,
+            "stage1_lds_swizzle": True,
         },
         # Throughput profile immediately preceding the final E8 XCD/pipeline
         # changes; the tile shapes already match the E8 winner.
@@ -111,6 +112,7 @@ def _config(sonic, case: Case, profile: str):
             "stage2_xcd_swizzle": 8,
             "stage2_pipeline_stages": 1,
             "stage1_write_padded_rows": False,
+            "stage1_lds_swizzle": False,
         },
         ("e8", "winner"): {
             "tile_m": 128,
@@ -124,7 +126,8 @@ def _config(sonic, case: Case, profile: str):
             "stage1_xcd_swizzle": 8,
             "stage2_xcd_swizzle": 8,
             "stage2_pipeline_stages": None,
-            "stage1_write_padded_rows": False,
+            "stage1_write_padded_rows": True,
+            "stage1_lds_swizzle": True,
         },
     }
     return sonic.SonicMoEConfig(**common, **profiles[(case.name, profile)])
@@ -220,6 +223,13 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--profile", choices=("baseline", "winner"), required=True)
     parser.add_argument("--kernel", choices=("stage1", "stage2", "full"), required=True)
     parser.add_argument(
+        "--stage2-pipeline-stages",
+        type=int,
+        choices=(1, 2),
+        default=None,
+        help="override the Stage-2 pipeline depth independently of the profile's auto policy",
+    )
+    parser.add_argument(
         "--warmup",
         type=int,
         default=20,
@@ -249,6 +259,11 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
 
     case = CASES[args.case]
     config = _config(sonic, case, args.profile)
+    if args.stage2_pipeline_stages is not None:
+        config = replace(
+            config,
+            stage2_pipeline_stages=args.stage2_pipeline_stages,
+        )
     torch.manual_seed(args.seed)
     device = torch.device("cuda")
     x = torch.randn((case.tokens, case.hidden), device=device, dtype=torch.bfloat16)

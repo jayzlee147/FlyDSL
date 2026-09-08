@@ -561,8 +561,9 @@ least 128. Illegal DMA, divisibility, and 160 KiB LDS combinations are pruned.
 Cache policy, XCD swizzle, waves-per-EU, and persistent Stage 2 remain available
 for a custom candidate sweep and are included in the autotune cache identity.
 For dense BF16 SwiGLU, the bounded list also includes the measured MI350
-prefill candidates `H2048/I768/E128/K8: S1=(128,192,64,xcd8,padded),
-S2=(64,256,128,xcd0)` and `H4096/I14336/E8/K2: S1=(128,256,64,xcd8),
+prefill candidates `H2048/I768/E128/K8:
+S1=(128,192,64,xcd8,padded,lds-xor), S2=(64,256,64,xcd0)` and
+`H4096/I14336/E8/K2: S1=(128,256,64,xcd8,padded,lds-xor),
 S2=(128,128,64,xcd8)`. These candidates are only added for their exact
 contraction/expert shapes and retain the automatic Stage-2 pipeline setting.
 The runtime gate resolves that setting to two stages only at exactly 4096
