@@ -71,6 +71,8 @@ CASES = {
     "e8": Case("e8", 4096, 4096, 14336, 8, 2),
 }
 
+METRICS = ("stage1", "stage2-kernel", "stage2-path", "end-to-end")
+
 COMPARISONS: dict[str, tuple[str, dict[str, Any], str, dict[str, Any]]] = {
     "stage2-stages": (
         "stages1",
@@ -711,52 +713,61 @@ def _run_comparison(
             "repeats": args.repeats,
             "orders": args.orders,
         }
-        timings = {
-            "stage1_kernel_us": _measure_orders(
+        timings = {}
+        if "stage1" in args.metrics:
+            timings["stage1_kernel_us"] = _measure_orders(
                 torch,
                 {"a": a.stage1, "b": b.stage1},
                 no_reset,
                 **common,
-            ),
-            "end_to_end_us": _measure_orders(
+            )
+        if "end-to-end" in args.metrics:
+            timings["end_to_end_us"] = _measure_orders(
                 torch,
                 {"a": a.full, "b": b.full},
                 no_reset,
                 **common,
-            ),
-        }
+            )
         same_output_mode = a.config.stage2_output_mode == b.config.stage2_output_mode
-        if same_output_mode:
+        requested_stage2_metrics = {
+            "stage2-kernel",
+            "stage2-path",
+        }.intersection(args.metrics)
+        if same_output_mode and requested_stage2_metrics:
             batch_iters = {
                 "a": len(a.stage2_outputs) if a.config.stage2_output_mode == "atomic" else args.iters,
                 "b": len(b.stage2_outputs) if b.config.stage2_output_mode == "atomic" else args.iters,
             }
             # This is only the grouped down-projection kernel.  For reduce mode
             # it intentionally excludes the following top-k reduction.
-            timings["stage2_kernel_us"] = _measure_orders(
-                torch,
-                {"a": a.stage2_kernel, "b": b.stage2_kernel},
-                reset_stage2,
-                batch_iters=batch_iters,
-                **common,
-            )
+            if "stage2-kernel" in args.metrics:
+                timings["stage2_kernel_us"] = _measure_orders(
+                    torch,
+                    {"a": a.stage2_kernel, "b": b.stage2_kernel},
+                    reset_stage2,
+                    batch_iters=batch_iters,
+                    **common,
+                )
             # This is the complete output path: projection+atomic for atomic,
             # and projection+top-k reduction for reduce.
-            timings["stage2_path_us"] = _measure_orders(
-                torch,
-                {"a": a.stage2_path, "b": b.stage2_path},
-                reset_stage2,
-                batch_iters=batch_iters,
-                **common,
-            )
+            if "stage2-path" in args.metrics:
+                timings["stage2_path_us"] = _measure_orders(
+                    torch,
+                    {"a": a.stage2_path, "b": b.stage2_path},
+                    reset_stage2,
+                    batch_iters=batch_iters,
+                    **common,
+                )
             timings["stage2_isolated_comparison"] = "valid_same_output_mode"
-        else:
+        elif requested_stage2_metrics:
             # Atomic needs pre-zeroed output storage while reduce overwrites a
             # route tensor and then runs a separate reduction.  Pre-clearing
             # only the atomic buffers would create asymmetric cache/TLB state;
             # compare these modes through the production end-to-end path.
-            timings["stage2_kernel_us"] = None
-            timings["stage2_path_us"] = None
+            if "stage2-kernel" in args.metrics:
+                timings["stage2_kernel_us"] = None
+            if "stage2-path" in args.metrics:
+                timings["stage2_path_us"] = None
             timings["stage2_isolated_comparison"] = "omitted_asymmetric_output_cache_conditioning"
         result["timings"] = timings
     print(json.dumps({"case": case.name, **result}), flush=True)
@@ -834,6 +845,13 @@ def _parse_args() -> argparse.Namespace:
         choices=("ab", "ba"),
         default="ab",
         help="runtime/workspace allocation order; repeat formal runs with both values",
+    )
+    parser.add_argument(
+        "--metrics",
+        nargs="+",
+        choices=METRICS,
+        default=list(METRICS),
+        help="timing groups to run; correctness smoke always covers the full isolated path",
     )
     parser.add_argument("--seed", type=int, default=20260907)
     parser.add_argument("--check", action="store_true")
@@ -930,6 +948,7 @@ def main() -> None:
             "repeats": args.repeats,
             "orders": [order.upper() for order in args.orders],
             "allocation_order": args.allocation_order.upper(),
+            "metrics": args.metrics,
             "compile_only": args.compile_only,
             "correctness_thresholds": {"cosine_min": 0.999, "relative_l2_max": 0.05},
             "isolated_stage2_atomic_output_pool_cap": 8,
