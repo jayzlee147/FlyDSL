@@ -66,6 +66,11 @@ def _parse_args():
         help="skip Stage-1 epilogue token-ID reloads and let Stage 2 discard padded rows",
     )
     parser.add_argument(
+        "--stage1-lds-swizzle",
+        action="store_true",
+        help="use the safe XOR-permuted Stage-1 A gather/LDS-read layout",
+    )
+    parser.add_argument(
         "--stage2-output-mode",
         choices=("atomic", "reduce"),
         default="atomic",
@@ -121,6 +126,7 @@ def main():
         stage2_xcd_swizzle=args.stage2_xcd_swizzle,
         stage2_pipeline_stages=args.stage2_pipeline_stages,
         stage1_write_padded_rows=args.stage1_write_padded_rows,
+        stage1_lds_swizzle=args.stage1_lds_swizzle,
         stage2_output_mode=args.stage2_output_mode,
         activation=args.activation,
         compute_dtype=compute_dtype,

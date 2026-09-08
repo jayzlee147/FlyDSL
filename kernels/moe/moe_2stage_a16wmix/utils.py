@@ -195,8 +195,10 @@ def lds_acc_bytes_for(rows, BN):
 def _a16w4_swizzle_xor16(row, col_bytes, k_blocks16, *, enable=False):
     """A-LDS bank-conflict XOR swizzle (aiter swizzle_xor16: col ^ ((row&(kb16-1))*16)).
 
-    Both the DMA write and the LDS read go through this helper so the physical layout
-    stays consistent. gemm1 keeps linear (enable=False); gemm2 enables it.
+    For gfx950 direct-to-LDS copies, use the swizzled value for the GMEM source
+    column, keep the LDS destination linear, and use it again for the LDS read.
+    The hardware destination is a wave-uniform M0 base plus an implicit lane
+    stride, so a per-lane swizzled destination is not representable.
     """
     if not enable:
         return col_bytes

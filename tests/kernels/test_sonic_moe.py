@@ -158,7 +158,7 @@ def test_sonic_moe_bf16_forward_matches_reference():
 @pytest.mark.parametrize("interleaved_w1", (False, True), ids=("separate", "interleaved"))
 @pytest.mark.parametrize("has_bias", (False, True), ids=("no-bias", "bias"))
 def test_sonic_moe_training_forward_state_matches_route_order_gemm(interleaved_w1, has_bias):
-    config = _config()
+    config = _config(stage1_lds_swizzle=True)
     x, w1, w2, router_logits = _make_case(seed=271)
     generator = torch.Generator(device=x.device).manual_seed(273)
     b1 = (
@@ -465,6 +465,7 @@ def test_sonic_moe_inference_stage1_launcher_does_not_enable_dual_store(monkeypa
         assert inference is _get_stage1_launcher(config, 2, "bf16", False, 0)
         assert compile_kwargs[-1].get("store_route_preactivation", False) is False
         assert compile_kwargs[-1]["skip_epilogue_id_reload"] is False
+        assert compile_kwargs[-1]["a_lds_swizzle"] is False
         assert _get_stage1_launcher.cache_info().currsize == 1
         assert _get_stage1_training_launcher.cache_info().currsize == 0
 
@@ -472,6 +473,7 @@ def test_sonic_moe_inference_stage1_launcher_does_not_enable_dual_store(monkeypa
         assert training is _get_stage1_training_launcher(config, 2, False, True, 0)
         assert compile_kwargs[-1]["store_route_preactivation"] is True
         assert compile_kwargs[-1]["route_preactivation_interleaved"] is True
+        assert compile_kwargs[-1]["a_lds_swizzle"] is False
         assert _get_stage1_launcher.cache_info().currsize == 1
         assert _get_stage1_training_launcher.cache_info().currsize == 1
     finally:
@@ -504,6 +506,41 @@ def test_sonic_moe_stage1_padding_store_is_an_inference_cache_key(monkeypatch):
         assert _get_stage1_launcher.cache_info().currsize == 2
     finally:
         _get_stage1_launcher.cache_clear()
+
+
+def test_sonic_moe_stage1_lds_swizzle_is_a_launcher_cache_key(monkeypatch):
+    import kernels.moe.sonic as sonic_module
+
+    compile_kwargs = []
+
+    def fake_compile(**kwargs):
+        compile_kwargs.append(kwargs)
+        return object()
+
+    monkeypatch.setattr(sonic_module, "compile_gemm1_a16w4_port", fake_compile)
+    _get_stage1_launcher.cache_clear()
+    _get_stage1_training_launcher.cache_clear()
+    try:
+        linear = _get_stage1_launcher(_config(), 0, "bf16", False, 0)
+        swizzled = _get_stage1_launcher(
+            _config(stage1_lds_swizzle=True), 0, "bf16", False, 0
+        )
+        training = _get_stage1_training_launcher(
+            _config(stage1_lds_swizzle=True), 0, False, False, 0
+        )
+
+        assert linear is not swizzled
+        assert [call["a_lds_swizzle"] for call in compile_kwargs] == [
+            False,
+            True,
+            True,
+        ]
+        assert _get_stage1_launcher.cache_info().currsize == 2
+        assert _get_stage1_training_launcher.cache_info().currsize == 1
+        assert training is not swizzled
+    finally:
+        _get_stage1_launcher.cache_clear()
+        _get_stage1_training_launcher.cache_clear()
 
 
 def test_sonic_moe_training_stage1_t4096_policy_is_targeted():
@@ -629,7 +666,7 @@ def test_sonic_moe_training_forward_rejects_unsupported_contracts():
 
 
 def test_sonic_moe_fp16_forward_matches_reference():
-    config = _config(compute_dtype="fp16")
+    config = _config(compute_dtype="fp16", stage1_lds_swizzle=True)
     x, w1, w2, router_logits = _make_case(dtype=torch.float16)
     prepared = prepare_sonic_fp16_weights(w1, w2, config)
     op = SonicMoE(config, prepared)
@@ -652,7 +689,11 @@ def test_sonic_moe_fp16_forward_matches_reference():
 
 
 def test_sonic_moe_stage1_k_wave2_matches_reference():
-    config = _config(stage1_k_wave=2, stage1_write_padded_rows=True)
+    config = _config(
+        stage1_k_wave=2,
+        stage1_write_padded_rows=True,
+        stage1_lds_swizzle=True,
+    )
     x, w1, w2, router_logits = _make_case(seed=147)
     expected = sonic_moe_reference(x, w1, w2, router_logits, config)
     actual = SonicMoE(config, prepare_sonic_bf16_weights(w1, w2, config))(x, router_logits)
@@ -670,6 +711,7 @@ def test_sonic_moe_stage1_padding_store_k_wave4_matches_reference():
         down_tile_k=128,
         stage1_k_wave=4,
         stage1_write_padded_rows=True,
+        stage1_lds_swizzle=True,
     )
     x, w1, w2, router_logits = _make_case(seed=148)
     expected = sonic_moe_reference(x, w1, w2, router_logits, config)
@@ -694,6 +736,7 @@ def test_sonic_moe_dense_stage1_tile_k64_matches_k128(compute_dtype, torch_dtype
         down_tile_n=128,
         down_tile_k=128,
         compute_dtype=compute_dtype,
+        stage1_lds_swizzle=True,
     )
     config128 = replace(config64, tile_k=128)
     x, w1, w2, router_logits = _make_case(seed=149, dtype=torch_dtype)
@@ -727,6 +770,21 @@ def test_sonic_moe_dense_stage1_tile_k64_matches_k128(compute_dtype, torch_dtype
         return routes
 
     _assert_close(unsort_intermediate(op64), unsort_intermediate(op128))
+
+
+def test_sonic_moe_stage1_lds_swizzle_single_k_tile_matches_reference():
+    config = _config(
+        tile_k=256,
+        down_tile_k=128,
+        stage1_lds_swizzle=True,
+    )
+    x, w1, w2, router_logits = _make_case(seed=150)
+    expected = sonic_moe_reference(x, w1, w2, router_logits, config)
+    actual = SonicMoE(config, prepare_sonic_bf16_weights(w1, w2, config))(
+        x, router_logits
+    )
+    torch.cuda.synchronize()
+    _assert_close(actual, expected)
 
 
 @pytest.mark.parametrize("stage1_tile_m,stage2_tile_m", ((32, 128), (64, 128), (48, 64)))
@@ -1032,7 +1090,7 @@ def test_sonic_moe_bf16_activation_variants_fixed_and_flat_routes(activation):
 
 @pytest.mark.parametrize("activation", ("geglu", "relu_sq"))
 def test_sonic_moe_mxfp4_activation_variants(activation):
-    config = _config(activation=activation)
+    config = _config(activation=activation, stage1_lds_swizzle=True)
     x, w1, w2, router_logits = _make_case(seed=89, activation=activation)
     prepared = prepare_sonic_mxfp4_weights(w1, w2, config)
     expected = sonic_moe_mxfp4_reference(x, w1, w2, router_logits, config)
@@ -1050,6 +1108,7 @@ def test_sonic_moe_bf16_bias_matches_reference_fixed_and_flat_routes(
     config = _config(
         activation=activation,
         stage1_write_padded_rows=stage1_write_padded_rows,
+        stage1_lds_swizzle=True,
     )
     x, w1, w2, router_logits = _make_case(seed=97, activation=activation)
     generator = torch.Generator(device=x.device).manual_seed(101)
@@ -1188,7 +1247,10 @@ def test_sonic_moe_activation_preserves_legacy_bf16_preactivation_rounding():
 def test_sonic_moe_ragged_routes_match_reference_and_frequency():
     """Flat routes allow missing tokens, duplicate edges, and arbitrary weights."""
 
-    config = _config(stage1_write_padded_rows=True)
+    config = _config(
+        stage1_write_padded_rows=True,
+        stage1_lds_swizzle=True,
+    )
     x, w1, w2, _ = _make_case(seed=19)
     prepared = prepare_sonic_bf16_weights(w1, w2, config)
     op = SonicMoE(config, prepared)
@@ -1840,7 +1902,7 @@ def test_sonic_moe_autotuner_search_and_disk_cache(tmp_path):
     torch.cuda.synchronize()
     assert recovered.search_count == 1
     rewritten_cache = non_object_cache_file.read_text(encoding="utf-8")
-    assert '"version": 13' in rewritten_cache
+    assert '"version": 14' in rewritten_cache
     assert '"stage1_k_wave": 1' in rewritten_cache
 
 
@@ -2759,6 +2821,28 @@ def test_sonic_moe_rejects_non_integer_stage2_pipeline_depth(value):
 def test_sonic_moe_rejects_non_boolean_stage1_padding_store(value):
     with pytest.raises(TypeError, match="stage1_write_padded_rows"):
         _config(stage1_write_padded_rows=value)
+
+
+@pytest.mark.parametrize("value", (None, 0, 1, "yes"))
+def test_sonic_moe_rejects_non_boolean_stage1_lds_swizzle(value):
+    with pytest.raises(TypeError, match="stage1_lds_swizzle"):
+        _config(stage1_lds_swizzle=value)
+
+
+def test_sonic_moe_stage1_lds_swizzle_rejects_non_power_of_two_chunk_count():
+    with pytest.raises(AssertionError, match="TILE_K/8 to be a power of two"):
+        compile_gemm1_a16w4_port(
+            BM=64,
+            D_HIDDEN=192,
+            D_INTER=128,
+            NE=1,
+            TOPK=1,
+            TILE_N=128,
+            TILE_K=96,
+            w_dtype="bf16",
+            a_dtype="bf16",
+            a_lds_swizzle=True,
+        )
 
 
 def test_sonic_moe_stage2_pipeline_single_k_tile_normalizes_to_one():

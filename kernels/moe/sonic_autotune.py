@@ -23,7 +23,7 @@ from kernels.moe.moe_2stage_a16wmix.gemm2 import compile_gemm2_a16w4_port
 from kernels.moe.moe_sorting_kernel import moe_softmax_sort_flydsl
 from kernels.moe.sonic import SonicMoE, SonicMoEConfig, SonicMoEWeights, _stage2_stages
 
-_CACHE_SCHEMA_VERSION = 13
+_CACHE_SCHEMA_VERSION = 14
 _DENSE_WEIGHT_DTYPES = frozenset({"bf16", "fp16"})
 _TUNING_FIELDS = (
     "tile_m",
@@ -42,6 +42,7 @@ _TUNING_FIELDS = (
     "persistent_stage2",
     "stage2_pipeline_stages",
     "stage1_write_padded_rows",
+    "stage1_lds_swizzle",
 )
 
 
@@ -138,6 +139,7 @@ def default_sonic_moe_candidates(
             candidate.persistent_stage2,
             candidate.stage2_pipeline_stages,
             candidate.stage1_write_padded_rows,
+            candidate.stage1_lds_swizzle,
         )
         if effective not in seen:
             seen.add(effective)

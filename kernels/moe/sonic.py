@@ -151,6 +151,7 @@ class SonicMoEConfig:
     stage2_pipeline_stages: int | None = None
     persistent_stage1: bool = False
     stage1_write_padded_rows: bool = False
+    stage1_lds_swizzle: bool = False
 
     def __post_init__(self) -> None:
         if not isinstance(self.persistent_stage1, bool):
@@ -162,6 +163,11 @@ class SonicMoEConfig:
             raise TypeError(
                 "stage1_write_padded_rows must be bool, got "
                 f"{type(self.stage1_write_padded_rows).__name__}"
+            )
+        if not isinstance(self.stage1_lds_swizzle, bool):
+            raise TypeError(
+                "stage1_lds_swizzle must be bool, got "
+                f"{type(self.stage1_lds_swizzle).__name__}"
             )
         if not isinstance(self.stage2_output_mode, str):
             raise TypeError(
@@ -1220,6 +1226,7 @@ def _get_stage1_launcher(
         round_preact_bf16=True,
         has_bias=has_bias,
         skip_epilogue_id_reload=config.stage1_write_padded_rows,
+        a_lds_swizzle=config.stage1_lds_swizzle,
     )
 
 
@@ -1264,6 +1271,7 @@ def _get_stage1_training_launcher(
         has_bias=has_bias,
         store_route_preactivation=True,
         route_preactivation_interleaved=interleaved_w1,
+        a_lds_swizzle=config.stage1_lds_swizzle,
     )
 
 

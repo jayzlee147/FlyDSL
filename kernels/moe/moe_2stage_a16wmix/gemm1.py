@@ -172,6 +172,7 @@ def _gemm1_body_a16w4(
     store_route_preactivation=False,
     route_preactivation_interleaved=False,
     skip_epilogue_id_reload=False,
+    a_lds_swizzle=False,
 ):
     """A16W4/A16W16 fused stage1 GEMM body.
 
@@ -401,10 +402,19 @@ def _gemm1_body_a16w4(
         slot_byte = k_grp_base_bytes + fx.Int32(slot * A_SLOT_BYTES)
         for i in range_constexpr(num_x_loads):
             col_bytes = x_col_dw[i] * fx.Int32(4)
-            col_sw = _a16w4_swizzle_xor16(x_row_local[i], col_bytes, fx.Int32(k_blocks16))
+            # gfx950's direct-to-LDS destination is wave-uniform M0 plus an
+            # implicit lane stride, so it cannot encode a per-lane XOR there.
+            # Permute the GMEM source instead, keep the LDS destination linear,
+            # and apply the same involution on LDS readback.
+            col_sw = _a16w4_swizzle_xor16(
+                x_row_local[i],
+                col_bytes,
+                fx.Int32(k_blocks16),
+                enable=a_lds_swizzle,
+            )
             row_k_dw = x_row_base_div4[i] + base_k_div4
-            global_byte = row_k_dw * fx.Int32(4) + col_bytes
-            lds_byte = slot_byte + x_row_local[i] * fx.Int32(KH_TILE_BYTES) + col_sw
+            global_byte = row_k_dw * fx.Int32(4) + col_sw
+            lds_byte = slot_byte + x_row_local[i] * fx.Int32(KH_TILE_BYTES) + col_bytes
             if const_expr(use_k16 or store_preactivation):
                 # gfx942 and backward's safe-padding path stage through VGPRs.
                 r = fx.make_rmem_tensor(fx.make_layout(4, 1), fx.Int32)
@@ -446,7 +456,12 @@ def _gemm1_body_a16w4(
 
     def lds_load_a(mi, ku, slot=0):
         row = row_a_lds + fx.Int32(mi * 16)
-        col_swz_bytes = _a16w4_swizzle_xor16(row, _a_col_bytes_for_ku(ku), fx.Int32(k_blocks16))
+        col_swz_bytes = _a16w4_swizzle_xor16(
+            row,
+            _a_col_bytes_for_ku(ku),
+            fx.Int32(k_blocks16),
+            enable=a_lds_swizzle,
+        )
         # byte offset within this k-group's A-LDS slot -> 16-byte tile index.
         byte_off = k_grp_base_bytes + fx.Int32(slot * A_SLOT_BYTES) + row * fx.Int32(KH_TILE_BYTES) + col_swz_bytes
         r = fx.make_rmem_tensor(fx.make_layout(4, 1), fx.Int32)
@@ -1028,6 +1043,7 @@ def compile_gemm1_a16w4_port(
     compact_grid=False,
     persist=False,
     skip_epilogue_id_reload=False,
+    a_lds_swizzle=False,
 ):
     """A16W4/A16W16 fused stage1 builder.
 
@@ -1072,6 +1088,10 @@ def compile_gemm1_a16w4_port(
     while an additional pointer receives rounded gate/up values in compact
     fixed-K route order. ``route_preactivation_interleaved`` selects
     ``[g0,u0,...]`` instead of the default ``[gate...,up...]`` last dimension.
+
+    ``a_lds_swizzle`` uses an XOR-permuted GMEM gather plus the inverse LDS
+    read address. The direct-to-LDS destination remains linear because gfx950
+    lowers it through a wave-uniform M0 base.
     """
     SORTED_BM = BM if SORTED_BM is None else SORTED_BM
     assert w_dtype in ("mxfp4", "int4", "bf16", "fp16"), (
@@ -1102,6 +1122,7 @@ def compile_gemm1_a16w4_port(
     assert isinstance(store_route_preactivation, bool), "store_route_preactivation must be bool"
     assert isinstance(route_preactivation_interleaved, bool), "route_preactivation_interleaved must be bool"
     assert isinstance(skip_epilogue_id_reload, bool), "skip_epilogue_id_reload must be bool"
+    assert isinstance(a_lds_swizzle, bool), "a_lds_swizzle must be bool"
     assert isinstance(expert_grid, bool), "expert_grid must be bool"
     assert isinstance(compact_grid, bool), "compact_grid must be bool"
     assert isinstance(persist, bool), "persist must be bool"
@@ -1134,6 +1155,12 @@ def compile_gemm1_a16w4_port(
         "compact_grid requires logical dense weights because arg_bscale carries the descriptor queue"
     )
     assert _K % TILE_K == 0, f"D_HIDDEN (K) must be a multiple of {TILE_K}, got {_K}"
+    if a_lds_swizzle:
+        _k_blocks16 = (TILE_K * 2) // 16
+        assert TILE_K % 8 == 0 and _k_blocks16 > 0 and (_k_blocks16 & (_k_blocks16 - 1)) == 0, (
+            "a_lds_swizzle requires TILE_K/8 to be a power of two, "
+            f"got TILE_K={TILE_K}"
+        )
     assert _K % (k_wave * TILE_K) == 0, f"D_HIDDEN (K) must be a multiple of k_wave*TILE_K, got {_K}, k_wave={k_wave}"
     assert _INTER % TILE_N == 0, f"D_INTER must be a multiple of TILE_N={TILE_N}, got {_INTER}"
     assert BM % 16 == 0, f"BM must be a multiple of 16, got {BM}"
@@ -1191,12 +1218,13 @@ def compile_gemm1_a16w4_port(
     _compact_grid_tag = "_cgrid" if compact_grid else ""
     _persist_tag = "_persist" if persist else ""
     _padding_store_tag = "_padstore" if skip_epilogue_id_reload else ""
+    _a_lds_swizzle_tag = "_aldsxor16" if a_lds_swizzle else ""
     _sorted_tag = f"_sbm{SORTED_BM}" if SORTED_BM != BM else ""
     name_suffix = (
         f"a16w4{_wd_tag}{_ad_tag}{_wl_tag}_h{_K}_i{_INTER}_ne{NE}_bm{BM}"
         f"{_sorted_tag}_tn{TILE_N}_tk{TILE_K}{_act_tag}{_bcm_tag}{_xcd_tag}"
         f"{_wpe_tag}{_kw_tag}{_round_tag}{_bias_tag}{_logical_w_tag}{_preact_tag}{_route_preact_tag}"
-        f"{_expert_grid_tag}{_compact_grid_tag}{_persist_tag}{_padding_store_tag}"
+        f"{_expert_grid_tag}{_compact_grid_tag}{_persist_tag}{_padding_store_tag}{_a_lds_swizzle_tag}"
     )
 
     @fx.struct
@@ -1294,6 +1322,7 @@ def compile_gemm1_a16w4_port(
                 store_route_preactivation=store_route_preactivation,
                 route_preactivation_interleaved=route_preactivation_interleaved,
                 skip_epilogue_id_reload=skip_epilogue_id_reload,
+                a_lds_swizzle=a_lds_swizzle,
             )
 
         if const_expr(compact_grid):
