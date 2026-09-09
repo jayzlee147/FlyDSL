@@ -9,9 +9,17 @@ This tool compares the current checkout against an explicitly loaded baseline
 T4096/H3584/I512/E896/K16 BF16 SwiGLU contract.  It deliberately exercises the
 public non-concatenated GLU layout: forward receives separated ``[gate | up]``
 weights, while backward consumes native interleaved ``[g0, u0, ...]`` weights
-and a retained forward state with the same interleaved layout.  The launch
-audit also verifies that the candidate never reconstructs expert segments on
-the host, while the designated baseline still exercises that readback.
+and a retained forward state with the same interleaved layout.
+
+The default ``legacy-vs-hostless`` comparison retains the original acceptance
+contract: the baseline must exercise legacy projection, dX, and host segment
+materialization while the candidate must use the fully grouped hostless path.
+The ``incremental`` comparison is for tuning the current hostless
+implementation against a small candidate change.  It requires both sources to
+select the large grouped-dX descriptor queue and retained-state hostless policy,
+and launch-audits one grouped dX for each source without requiring legacy work
+from the baseline.  Candidate generic GEMM and host materialization remain
+forbidden in both modes.
 
 Timing is refused unless ``--exclusive-gpu`` is supplied.  On a shared/busy
 machine use ``--correctness-only``; this still checks both routing regimes,
@@ -33,6 +41,14 @@ Formal timing on an independently reserved gfx950::
         --baseline /path/to/baseline/kernels/moe/sonic_backward.py \
         --exclusive-gpu --pairs 11 --cases balanced hot16 \
         --output /tmp/sonic-e896-abba.json
+
+Strict hostless-to-hostless incremental timing::
+
+    PYTHONPATH=. python tools/accept_sonic_e896_backward.py \
+        --comparison-mode incremental \
+        --baseline /path/to/hostless-baseline/kernels/moe/sonic_backward.py \
+        --exclusive-gpu --pairs 11 --cases balanced hot16 \
+        --output /tmp/sonic-e896-incremental-abba.json
 """
 
 from __future__ import annotations
@@ -63,6 +79,7 @@ EXPERTS = 896
 TOPK = 16
 GRADIENT_NAMES = ("dx", "dw1", "dw2", "dtopk_weights")
 ROUTING_CASES = ("balanced", "hot16")
+COMPARISON_MODES = ("legacy-vs-hostless", "incremental")
 CHUNK_ELEMENTS = 32 * 1024 * 1024
 
 # The E896 adapter initialization keeps activations and weights near zero, so
@@ -155,6 +172,44 @@ def _load_isolated_baseline(path: Path):
     if loaded_from != path:
         raise RuntimeError(f"baseline sonic_moe_backward isolation failed: expected {path}, loaded {loaded_from}")
     return module
+
+
+def _evaluate_policy_probe(
+    comparison_mode: str,
+    *,
+    baseline_large_grouped_dx: bool,
+    candidate_large_grouped_dx: bool,
+    baseline_hostless_retained_backward: bool | None,
+    candidate_hostless_retained_backward: bool,
+) -> dict[str, Any]:
+    """Evaluate mode-specific policy observations without touching a GPU."""
+
+    if comparison_mode not in COMPARISON_MODES:
+        raise ValueError(f"unknown comparison mode {comparison_mode!r}")
+
+    if comparison_mode == "legacy-vs-hostless":
+        checks = {
+            "baseline_uses_legacy_dx": baseline_large_grouped_dx is False,
+            "candidate_uses_large_grouped_dx": candidate_large_grouped_dx is True,
+            "candidate_uses_hostless_retained_backward": candidate_hostless_retained_backward is True,
+        }
+    else:
+        checks = {
+            "baseline_uses_large_grouped_dx": baseline_large_grouped_dx is True,
+            "candidate_uses_large_grouped_dx": candidate_large_grouped_dx is True,
+            "baseline_uses_hostless_retained_backward": baseline_hostless_retained_backward is True,
+            "candidate_uses_hostless_retained_backward": candidate_hostless_retained_backward is True,
+        }
+
+    return {
+        "comparison_mode": comparison_mode,
+        "baseline_large_grouped_dx": baseline_large_grouped_dx,
+        "candidate_large_grouped_dx": candidate_large_grouped_dx,
+        "baseline_hostless_retained_backward": baseline_hostless_retained_backward,
+        "candidate_hostless_retained_backward": candidate_hostless_retained_backward,
+        "required_checks": checks,
+        "passed": all(checks.values()),
+    }
 
 
 def _collect_code_identity(baseline_path: Path) -> dict[str, Any]:
@@ -469,6 +524,55 @@ def _audit_launches(module, fn: Callable[[], tuple[torch.Tensor, ...]]):
     return gradients, counts
 
 
+def _evaluate_launch_topology(
+    comparison_mode: str,
+    baseline_launches: dict[str, Any],
+    candidate_launches: dict[str, Any],
+) -> dict[str, Any]:
+    """Return the launch gate while keeping non-required observations visible."""
+
+    if comparison_mode not in COMPARISON_MODES:
+        raise ValueError(f"unknown comparison mode {comparison_mode!r}")
+
+    checks = {
+        "candidate_generic_gemm_zero": candidate_launches["generic_gemm_launches"] == 0,
+        "candidate_projection_zero": candidate_launches["projection_launches"] == 0,
+        "candidate_legacy_dx_zero": candidate_launches["legacy_dx_gemm_launches"] == 0,
+        "candidate_host_segment_materialization_zero": (candidate_launches["host_segment_materializations"] == 0),
+        "candidate_single_grouped_dx": candidate_launches["grouped_dx_launches"] == 1,
+        "candidate_single_total_dx": candidate_launches["total_dx_launches"] == 1,
+        "baseline_single_grouped_dx": baseline_launches["grouped_dx_launches"] == 1,
+        "baseline_single_total_dx": baseline_launches["total_dx_launches"] == 1,
+        "baseline_generic_gemm_zero": baseline_launches["generic_gemm_launches"] == 0,
+        "baseline_host_segment_materialization_zero": baseline_launches["host_segment_materializations"] == 0,
+        "baseline_exercises_legacy_dx": baseline_launches["legacy_dx_gemm_launches"] > 0,
+        "baseline_exercises_projection": baseline_launches["projection_launches"] > 0,
+        "baseline_exercises_host_segment_materialization": (baseline_launches["host_segment_materializations"] > 0),
+    }
+    candidate_requirements = (
+        "candidate_generic_gemm_zero",
+        "candidate_projection_zero",
+        "candidate_legacy_dx_zero",
+        "candidate_host_segment_materialization_zero",
+        "candidate_single_grouped_dx",
+        "candidate_single_total_dx",
+    )
+    if comparison_mode == "legacy-vs-hostless":
+        required_checks = candidate_requirements + (
+            "baseline_exercises_legacy_dx",
+            "baseline_exercises_projection",
+            "baseline_exercises_host_segment_materialization",
+        )
+    else:
+        required_checks = candidate_requirements + ("baseline_single_grouped_dx",)
+
+    return {
+        **checks,
+        "required_checks": list(required_checks),
+        "passed": all(checks[name] for name in required_checks),
+    }
+
+
 def _event_time(fn: Callable[[], tuple[torch.Tensor, ...]]):
     begin = torch.cuda.Event(enable_timing=True)
     end = torch.cuda.Event(enable_timing=True)
@@ -594,12 +698,21 @@ def _emit_report(report: dict[str, Any], output: str | None) -> None:
         output_path.write_text(payload + "\n", encoding="utf-8")
 
 
-def _parse_args() -> argparse.Namespace:
+def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--comparison-mode",
+        choices=COMPARISON_MODES,
+        default="legacy-vs-hostless",
+        help=(
+            "legacy-vs-hostless preserves the original migration gate; incremental compares two "
+            "large-grouped-dX hostless implementations"
+        ),
+    )
     parser.add_argument(
         "--baseline",
         required=True,
-        help="mainline sonic_backward.py loaded under a private module name",
+        help="baseline sonic_backward.py loaded under a private module name",
     )
     parser.add_argument("--cases", nargs="+", choices=ROUTING_CASES, default=list(ROUTING_CASES))
     parser.add_argument("--warmup", type=int, default=2)
@@ -625,7 +738,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--min-paired-win-rate", type=float, default=0.75)
     parser.add_argument("--seed", type=int, default=20260907)
     parser.add_argument("--output")
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     if args.warmup < 0:
         parser.error("--warmup must be non-negative")
     if args.pairs < 1:
@@ -669,30 +782,44 @@ def main() -> None:
         "topk": TOPK,
         "flat_routes": False,
     }
-    policy_probe = {
-        "baseline_large_grouped_dx": baseline_module._use_large_grouped_dx_descriptor_queue(**policy_kwargs),
-        "candidate_large_grouped_dx": candidate_module._use_large_grouped_dx_descriptor_queue(**policy_kwargs),
-    }
-    policy_probe["candidate_hostless_retained_backward"] = candidate_module._use_hostless_grouped_backward(
-        flat_routes=False,
-        has_bias=False,
-        reuse_forward_preactivation=True,
-        use_large_grouped_dx=policy_probe["candidate_large_grouped_dx"],
-        use_grouped_w1=False,
-        use_grouped_w2=False,
-        use_grouped_dw2=True,
-        use_grouped_da=True,
-        use_grouped_dw1=True,
-        use_grouped_dx=True,
+    baseline_large_grouped_dx = baseline_module._use_large_grouped_dx_descriptor_queue(**policy_kwargs)
+    candidate_large_grouped_dx = candidate_module._use_large_grouped_dx_descriptor_queue(**policy_kwargs)
+    hostless_kwargs = {
+        "flat_routes": False,
+        "has_bias": False,
+        "reuse_forward_preactivation": True,
+        "use_grouped_w1": False,
+        "use_grouped_w2": False,
+        "use_grouped_dw2": True,
+        "use_grouped_da": True,
+        "use_grouped_dw1": True,
+        "use_grouped_dx": True,
         **{key: value for key, value in policy_kwargs.items() if key != "flat_routes"},
+    }
+    candidate_hostless_retained_backward = candidate_module._use_hostless_grouped_backward(
+        use_large_grouped_dx=candidate_large_grouped_dx,
+        **hostless_kwargs,
     )
-    policy_probe["passed"] = (
-        policy_probe["baseline_large_grouped_dx"] is False
-        and policy_probe["candidate_large_grouped_dx"] is True
-        and policy_probe["candidate_hostless_retained_backward"] is True
+    # A historical baseline may predate this policy helper entirely.  Preserve
+    # legacy-mode compatibility by probing it only when incremental mode makes
+    # the baseline's hostless policy part of the acceptance contract.
+    baseline_hostless_retained_backward = None
+    if args.comparison_mode == "incremental":
+        if not hasattr(baseline_module, "_use_hostless_grouped_backward"):
+            raise RuntimeError("incremental comparison requires the baseline to expose _use_hostless_grouped_backward")
+        baseline_hostless_retained_backward = baseline_module._use_hostless_grouped_backward(
+            use_large_grouped_dx=baseline_large_grouped_dx,
+            **hostless_kwargs,
+        )
+    policy_probe = _evaluate_policy_probe(
+        args.comparison_mode,
+        baseline_large_grouped_dx=baseline_large_grouped_dx,
+        candidate_large_grouped_dx=candidate_large_grouped_dx,
+        baseline_hostless_retained_backward=baseline_hostless_retained_backward,
+        candidate_hostless_retained_backward=candidate_hostless_retained_backward,
     )
     if not policy_probe["passed"]:
-        raise RuntimeError(f"baseline/candidate policy split is not the intended E896 comparison: {policy_probe}")
+        raise RuntimeError(f"baseline/candidate policies do not satisfy the selected E896 comparison: {policy_probe}")
 
     config = _adapter_config()
     generator = torch.Generator(device="cuda").manual_seed(args.seed)
@@ -718,7 +845,18 @@ def main() -> None:
     modules = {"baseline": baseline_module, "candidate": candidate_module}
 
     report: dict[str, Any] = {
-        "schema": "flydsl.sonic_e896_backward_acceptance.v1",
+        "schema": "flydsl.sonic_e896_backward_acceptance.v2",
+        "comparison": {
+            "mode": args.comparison_mode,
+            "source_isolation": "sonic_backward.py only; shared runtime sources must be byte-identical",
+            "timing_design": "paired ABBA/BAAB for backward and full-step",
+            "baseline_role": (
+                "legacy projection/readback path"
+                if args.comparison_mode == "legacy-vs-hostless"
+                else "large-grouped-dX retained-state hostless reference"
+            ),
+            "candidate_role": "large-grouped-dX retained-state hostless implementation",
+        },
         "device": {
             "name": torch.cuda.get_device_name(),
             "arch": arch,
@@ -819,15 +957,8 @@ def main() -> None:
         repeatability_passed = all(
             entry["bitwise_equal"] for repeat in repeatability for entry in repeat["candidate_vs_first"].values()
         )
-        candidate_zero_launches = all(candidate_launches["zero_launch_gates"].values())
-        launch_topology_passed = bool(
-            candidate_zero_launches
-            and candidate_launches["grouped_dx_launches"] == 1
-            and candidate_launches["total_dx_launches"] == 1
-            and baseline_launches["legacy_dx_gemm_launches"] > 0
-            and baseline_launches["projection_launches"] > 0
-            and baseline_launches["host_segment_materializations"] > 0
-        )
+        launch_gate = _evaluate_launch_topology(args.comparison_mode, baseline_launches, candidate_launches)
+        launch_topology_passed = launch_gate["passed"]
         case_report: dict[str, Any] = {
             "routing": routing_summary,
             "candidate_vs_baseline": accuracy,
@@ -835,21 +966,7 @@ def main() -> None:
             "launches": {
                 "baseline": baseline_launches,
                 "candidate": candidate_launches,
-                "gate": {
-                    "candidate_generic_gemm_zero": candidate_launches["generic_gemm_launches"] == 0,
-                    "candidate_projection_zero": candidate_launches["projection_launches"] == 0,
-                    "candidate_legacy_dx_zero": candidate_launches["legacy_dx_gemm_launches"] == 0,
-                    "candidate_host_segment_materialization_zero": (
-                        candidate_launches["host_segment_materializations"] == 0
-                    ),
-                    "candidate_single_grouped_dx": candidate_launches["grouped_dx_launches"] == 1,
-                    "baseline_exercises_legacy_dx": baseline_launches["legacy_dx_gemm_launches"] > 0,
-                    "baseline_exercises_projection": baseline_launches["projection_launches"] > 0,
-                    "baseline_exercises_host_segment_materialization": (
-                        baseline_launches["host_segment_materializations"] > 0
-                    ),
-                    "passed": launch_topology_passed,
-                },
+                "gate": launch_gate,
             },
             "gates": {
                 "accuracy": accuracy_passed,
