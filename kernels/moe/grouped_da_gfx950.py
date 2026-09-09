@@ -315,8 +315,8 @@ def compile_grouped_da_gfx950(
         raise ValueError("block_k must be a multiple of 32 and divide hidden_size")
     if intermediate_size % block_n != 0:
         raise ValueError("block_n must divide intermediate_size")
-    if sorted_block_size % block_m != 0:
-        raise ValueError("sorted_block_size must be divisible by block_m")
+    if sorted_block_size <= 0:
+        raise ValueError("sorted_block_size must be positive")
     if stages < 2 or hidden_size // block_k < stages - 1:
         raise ValueError("the staged pipeline requires at least stages - 1 K tiles")
 

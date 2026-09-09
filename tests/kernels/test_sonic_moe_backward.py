@@ -22,6 +22,7 @@ from kernels.moe.sonic import (
     sonic_moe_backward_routes,
 )
 from kernels.moe.sonic_backward import (
+    _grouped_da_hostless_profiles,
     _grouped_da_tuning,
     _grouped_dw1_tuning,
     _grouped_dw2_stages,
@@ -394,6 +395,34 @@ def test_grouped_da_policy_bounds_worst_case_expert_rows(tokens, routes, flat_ro
 )
 def test_grouped_da_tuning_tracks_actual_expert_rows(max_expert_rows, hidden_size, expected):
     assert _grouped_da_tuning(max_expert_rows, hidden_size) == expected
+
+
+def test_e896_hostless_grouped_da_uses_large_m_tiles():
+    assert _grouped_da_hostless_profiles(
+        tokens=4096,
+        hidden_size=3584,
+        intermediate_size=512,
+        num_experts=896,
+        topk=16,
+        max_expert_rows=4096,
+    ) == (
+        (256, 64, 64, 8, 1, True, 0, 32),
+        (128, 64, 64, 4, 2, False, 33, None),
+    )
+
+
+def test_short_hostless_grouped_da_keeps_existing_profiles():
+    assert _grouped_da_hostless_profiles(
+        tokens=128,
+        hidden_size=3584,
+        intermediate_size=512,
+        num_experts=64,
+        topk=8,
+        max_expert_rows=128,
+    ) == (
+        (64, 64, 64, 2, 2, True, 0, 32),
+        (32, 64, 64, 2, 2, False, 33, None),
+    )
 
 
 @pytest.mark.parametrize(

@@ -332,6 +332,35 @@ _LARGE_GROUPED_DX_SHAPES = frozenset(
 # or device-resident extent.
 _HOSTLESS_LARGE_STATE_SHAPES = frozenset({(4096, 3584, 512, 896, 16)})
 
+
+def _grouped_da_hostless_profiles(
+    *,
+    tokens: int,
+    hidden_size: int,
+    intermediate_size: int,
+    num_experts: int,
+    topk: int,
+    max_expert_rows: int,
+):
+    """Return sparse/dense device-guarded dA profiles for hostless backward."""
+
+    shape = (tokens, hidden_size, intermediate_size, num_experts, topk)
+    if shape in _HOSTLESS_LARGE_STATE_SHAPES:
+        # The E896 production bucket is dominated by repeated W2 fetches.  A
+        # wider M tile amortizes each slab across more routes while preserving
+        # the per-wave BM64 profile's two M repeats.  Dense routing uses eight
+        # waves (MW4/NW2); sparse hot routing uses BM256 with MW8/NW1 so the B
+        # tile remains exactly covered by the 512-thread async-load layout.
+        sparse_tuning = (256, _GROUPED_DA_BN, 64, 8, 1)
+        dense_tuning = (128, _GROUPED_DA_BN, 64, 4, 2)
+    else:
+        sparse_tuning = _grouped_da_tuning(max_expert_rows, hidden_size)
+        dense_tuning = _grouped_da_tuning(min(max_expert_rows, 2), hidden_size)
+    return (
+        (*sparse_tuning, True, 0, _GROUPED_DW2_SPARSE_EXPERTS),
+        (*dense_tuning, False, _GROUPED_DW2_SPARSE_EXPERTS + 1, None),
+    )
+
 # Weight gradients are output-stationary TN contractions.  BM/BN128 with BK32
 # is the measured throughput winner once an expert can own multiple rows;
 # decode prefers BM/BN64 because its output tile count exposes more parallelism
@@ -3561,19 +3590,13 @@ def _sonic_moe_backward_impl(
 
         if use_grouped_da:
             if use_hostless_grouped and active_expert_storage is not None:
-                grouped_da_profiles = (
-                    (
-                        *_grouped_da_tuning(max_expert_rows, hidden_size),
-                        True,
-                        0,
-                        _GROUPED_DW2_SPARSE_EXPERTS,
-                    ),
-                    (
-                        *_grouped_da_tuning(min(max_expert_rows, 2), hidden_size),
-                        False,
-                        _GROUPED_DW2_SPARSE_EXPERTS + 1,
-                        None,
-                    ),
+                grouped_da_profiles = _grouped_da_hostless_profiles(
+                    tokens=tokens,
+                    hidden_size=hidden_size,
+                    intermediate_size=intermediate_size,
+                    num_experts=num_experts,
+                    topk=topk,
+                    max_expert_rows=max_expert_rows,
                 )
                 active_count_ptr = active_expert_storage.data_ptr()
             else:
