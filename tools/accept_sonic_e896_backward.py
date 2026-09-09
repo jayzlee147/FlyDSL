@@ -21,10 +21,11 @@ and launch-audits one grouped dX for each source without requiring legacy work
 from the baseline.  Candidate generic GEMM and host materialization remain
 forbidden in both modes.
 
-Timing is refused unless ``--exclusive-gpu`` is supplied.  On a shared/busy
-machine use ``--correctness-only``; this still checks both routing regimes,
-four-gradient accuracy, repeated bitwise determinism, code isolation, and the
-expected launch topology.
+Formal timing is refused unless ``--exclusive-gpu`` is supplied.  On a
+shared/busy machine use ``--correctness-only`` for the acceptance checks or
+explicit ``--diagnostic-shared-gpu`` for non-acceptance ABBA/BAAB observations.
+The diagnostic mode can never report formal acceptance even when its observed
+thresholds pass.
 
 Examples
 --------
@@ -49,6 +50,23 @@ Strict hostless-to-hostless incremental timing::
         --baseline /path/to/hostless-baseline/kernels/moe/sonic_backward.py \
         --exclusive-gpu --pairs 11 --cases balanced hot16 \
         --output /tmp/sonic-e896-incremental-abba.json
+
+Incremental timing with one privately isolated baseline runtime source::
+
+    PYTHONPATH=. python tools/accept_sonic_e896_backward.py \
+        --comparison-mode incremental \
+        --baseline /path/to/baseline/kernels/moe/sonic_backward.py \
+        --baseline-runtime-override kernels/moe/sonic_grouped_tn.py \
+        --exclusive-gpu --pairs 11 --cases balanced hot16 \
+        --output /tmp/sonic-e896-runtime-override-abba.json
+
+Non-acceptance timing diagnostics on a shared gfx950::
+
+    PYTHONPATH=. python tools/accept_sonic_e896_backward.py \
+        --comparison-mode incremental \
+        --baseline /path/to/baseline/kernels/moe/sonic_backward.py \
+        --diagnostic-shared-gpu --pairs 3 --cases balanced hot16 \
+        --output /tmp/sonic-e896-shared-gpu-diagnostic.json
 """
 
 from __future__ import annotations
@@ -56,11 +74,13 @@ from __future__ import annotations
 import argparse
 import gc
 import hashlib
+import importlib
 import importlib.util
 import inspect
 import json
 import statistics
 import subprocess
+import sys
 import time
 from collections.abc import Callable
 from pathlib import Path
@@ -124,6 +144,25 @@ SHARED_RUNTIME_SOURCES = (
     "kernels/moe/sonic_grouped_tn.py",
 )
 
+# A same-process comparison normally isolates only sonic_backward.py.  These
+# are the complete imported-symbol boundaries that may instead be rebound to a
+# privately loaded baseline runtime source when explicitly requested.  Keep
+# the relative paths exact: this is an allowlist, not a filename/glob filter.
+BASELINE_RUNTIME_OVERRIDE_SYMBOLS = {
+    "kernels/moe/grouped_da_gfx950.py": ("compile_grouped_da_gfx950",),
+    "kernels/moe/sonic_grouped_a16w16.py": ("compile_sonic_grouped_a16w16_nn",),
+    "kernels/moe/sonic_grouped_tn.py": (
+        "active_expert_descriptor_capacity",
+        "active_expert_queue_elements",
+        "build_active_expert_queue_flydsl",
+        "grouped_tn_from_metadata_flydsl",
+        "grouped_tn_from_queue_flydsl",
+        "zero_inactive_weight_grads_flydsl",
+        "zero_weight_grads_adaptive_flydsl",
+    ),
+}
+BASELINE_RUNTIME_OVERRIDE_CHOICES = tuple(BASELINE_RUNTIME_OVERRIDE_SYMBOLS)
+
 
 def _sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
@@ -134,10 +173,18 @@ def _file_identity(path: Path) -> dict[str, str]:
     return {"path": str(resolved), "sha256": _sha256(resolved)}
 
 
+def _verify_file_identity(expected: dict[str, str], *, label: str) -> dict[str, str]:
+    observed = _file_identity(Path(expected["path"]))
+    if observed != expected:
+        raise RuntimeError(f"{label} changed after code identity collection: expected={expected}, observed={observed}")
+    return observed
+
+
 def _git_value(repo: Path, *args: str) -> str | None:
+    resolved_repo = repo.resolve()
     try:
         completed = subprocess.run(
-            ("git", "-C", str(repo), *args),
+            ("git", "-C", str(resolved_repo), "-c", f"safe.directory={resolved_repo}", *args),
             check=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
@@ -166,12 +213,228 @@ def _load_source_module(name: str, path: Path):
     return module
 
 
-def _load_isolated_baseline(path: Path):
+def _load_isolated_baseline(path: Path, *, expected_identity: dict[str, str] | None = None):
     module = _load_source_module("kernels.moe._e896_acceptance_baseline", path)
     loaded_from = Path(inspect.getsourcefile(module.sonic_moe_backward) or "").resolve()
     if loaded_from != path:
         raise RuntimeError(f"baseline sonic_moe_backward isolation failed: expected {path}, loaded {loaded_from}")
+    if expected_identity is not None:
+        _verify_file_identity(expected_identity, label="baseline sonic_backward.py")
     return module
+
+
+def _normalize_baseline_runtime_overrides(values: list[str] | tuple[str, ...] | None) -> tuple[str, ...]:
+    """Validate and return runtime overrides in stable allowlist order."""
+
+    requested = tuple(values or ())
+    unknown = sorted(set(requested) - set(BASELINE_RUNTIME_OVERRIDE_CHOICES))
+    if unknown:
+        raise ValueError("unknown baseline runtime override(s): " + ", ".join(unknown))
+    duplicates = sorted({value for value in requested if requested.count(value) > 1})
+    if duplicates:
+        raise ValueError("duplicate baseline runtime override(s): " + ", ".join(duplicates))
+    requested_set = set(requested)
+    return tuple(relative for relative in BASELINE_RUNTIME_OVERRIDE_CHOICES if relative in requested_set)
+
+
+def _runtime_module_name(relative: str) -> str:
+    return relative.removesuffix(".py").replace("/", ".")
+
+
+def _private_runtime_module_name(relative: str, path: Path) -> str:
+    fingerprint_source = f"{path.resolve()}:{_sha256(path)}".encode()
+    fingerprint = hashlib.sha256(fingerprint_source).hexdigest()[:12]
+    return f"kernels.moe._e896_baseline_runtime_{Path(relative).stem}_{fingerprint}"
+
+
+def _load_private_runtime_module(
+    relative: str,
+    path: Path,
+    *,
+    expected_identity: dict[str, str] | None = None,
+):
+    """Load one allowlisted baseline source without replacing its canonical module."""
+
+    if relative not in BASELINE_RUNTIME_OVERRIDE_SYMBOLS:
+        raise ValueError(f"unknown baseline runtime override: {relative}")
+    private_name = _private_runtime_module_name(relative, path)
+    spec = importlib.util.spec_from_file_location(private_name, path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"cannot load baseline runtime {relative} from {path}")
+    module = importlib.util.module_from_spec(spec)
+    previous = sys.modules.get(private_name)
+    sys.modules[private_name] = module
+    try:
+        spec.loader.exec_module(module)
+    except BaseException:
+        if previous is None:
+            sys.modules.pop(private_name, None)
+        else:
+            sys.modules[private_name] = previous
+        raise
+    loaded_from = Path(module.__file__ or "").resolve()
+    if loaded_from != path.resolve():
+        if previous is None:
+            sys.modules.pop(private_name, None)
+        else:
+            sys.modules[private_name] = previous
+        raise RuntimeError(f"baseline runtime isolation failed for {relative}: expected {path}, loaded {loaded_from}")
+    loaded_identity = _file_identity(loaded_from)
+    if expected_identity is not None and loaded_identity != expected_identity:
+        if previous is None:
+            sys.modules.pop(private_name, None)
+        else:
+            sys.modules[private_name] = previous
+        raise RuntimeError(
+            f"baseline runtime override {relative} changed after code identity collection: "
+            f"expected={expected_identity}, observed={loaded_identity}"
+        )
+    module.__e896_loaded_source_identity__ = loaded_identity
+    return module
+
+
+def _load_baseline_runtime_overrides(
+    baseline_repo: Path,
+    runtime_overrides: tuple[str, ...],
+    *,
+    expected_sources: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    runtime_overrides = _normalize_baseline_runtime_overrides(runtime_overrides)
+    modules = {}
+    for relative in runtime_overrides:
+        path = (baseline_repo / relative).resolve()
+        if not path.is_file():
+            raise FileNotFoundError(f"baseline runtime override does not exist: {path}")
+        expected_identity = None if expected_sources is None else expected_sources[relative]["baseline"]
+        modules[relative] = _load_private_runtime_module(
+            relative,
+            path,
+            expected_identity=expected_identity,
+        )
+    return modules
+
+
+def _callable_identity(value: Any) -> dict[str, str | None]:
+    source = inspect.getsourcefile(inspect.unwrap(value))
+    return {
+        "module": getattr(value, "__module__", None),
+        "name": getattr(value, "__name__", None),
+        "qualname": getattr(value, "__qualname__", None),
+        "source": str(Path(source).resolve()) if source else None,
+    }
+
+
+def _validate_runtime_symbol_origin(
+    value: Any,
+    *,
+    symbol: str,
+    expected_module: str,
+    expected_path: Path,
+    role: str,
+) -> None:
+    if not callable(value):
+        raise RuntimeError(f"{role} runtime symbol {expected_module}.{symbol} is not callable")
+    unwrapped = inspect.unwrap(value)
+    observed_module = getattr(unwrapped, "__module__", None)
+    source = inspect.getsourcefile(unwrapped)
+    observed_path = Path(source).resolve() if source else None
+    if observed_module != expected_module or observed_path != expected_path.resolve():
+        raise RuntimeError(
+            f"{role} runtime symbol {symbol} has the wrong origin: "
+            f"expected module={expected_module} source={expected_path.resolve()}, "
+            f"observed module={observed_module} source={observed_path}"
+        )
+
+
+def _patch_baseline_runtime_symbols(
+    baseline_module: Any,
+    runtime_modules: dict[str, Any],
+    *,
+    expected_sources: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Preflight and atomically rebind baseline imports to private modules."""
+
+    pending = []
+    report = {}
+    runtime_overrides = _normalize_baseline_runtime_overrides(tuple(runtime_modules))
+    for relative in runtime_overrides:
+        private_module = runtime_modules[relative]
+        canonical_name = _runtime_module_name(relative)
+        canonical_module = importlib.import_module(canonical_name)
+        canonical_path = Path(canonical_module.__file__ or "").resolve()
+        expected_canonical_path = (Path(__file__).resolve().parents[1] / relative).resolve()
+        if canonical_path != expected_canonical_path:
+            raise RuntimeError(
+                f"canonical runtime import does not resolve to this checkout for {relative}: "
+                f"expected {expected_canonical_path}, loaded {canonical_path}"
+            )
+        private_path = Path(private_module.__file__ or "").resolve()
+        canonical_identity = _file_identity(canonical_path)
+        private_identity = getattr(private_module, "__e896_loaded_source_identity__", None)
+        if private_identity is None:
+            private_identity = _file_identity(private_path)
+        if expected_sources is not None:
+            expected = expected_sources[relative]
+            if canonical_identity != expected["candidate"]:
+                raise RuntimeError(
+                    f"candidate runtime {relative} changed after code identity collection: "
+                    f"expected={expected['candidate']}, observed={canonical_identity}"
+                )
+            if private_identity != expected["baseline"]:
+                raise RuntimeError(
+                    f"loaded baseline runtime {relative} does not match the authorized identity: "
+                    f"expected={expected['baseline']}, observed={private_identity}"
+                )
+        symbol_reports = []
+        for symbol in BASELINE_RUNTIME_OVERRIDE_SYMBOLS[relative]:
+            if not hasattr(baseline_module, symbol):
+                raise RuntimeError(f"baseline sonic_backward.py is missing imported runtime symbol {symbol}")
+            if not hasattr(canonical_module, symbol):
+                raise RuntimeError(f"canonical runtime {canonical_name} is missing symbol {symbol}")
+            if not hasattr(private_module, symbol):
+                raise RuntimeError(f"private baseline runtime {private_module.__name__} is missing symbol {symbol}")
+
+            original = getattr(baseline_module, symbol)
+            canonical = getattr(canonical_module, symbol)
+            replacement = getattr(private_module, symbol)
+            if original is not canonical:
+                raise RuntimeError(
+                    f"baseline runtime symbol {symbol} was not imported from the expected canonical module "
+                    f"{canonical_name}"
+                )
+            _validate_runtime_symbol_origin(
+                canonical,
+                symbol=symbol,
+                expected_module=canonical_name,
+                expected_path=canonical_path,
+                role="canonical",
+            )
+            _validate_runtime_symbol_origin(
+                replacement,
+                symbol=symbol,
+                expected_module=private_module.__name__,
+                expected_path=private_path,
+                role="private baseline",
+            )
+            pending.append((symbol, replacement))
+            symbol_reports.append(
+                {
+                    "symbol": symbol,
+                    "original": _callable_identity(original),
+                    "replacement": _callable_identity(replacement),
+                }
+            )
+        report[relative] = {
+            "canonical_module": canonical_name,
+            "canonical_source": canonical_identity,
+            "private_module": private_module.__name__,
+            "loaded_source": private_identity,
+            "patched_symbols": symbol_reports,
+        }
+
+    for symbol, replacement in pending:
+        setattr(baseline_module, symbol, replacement)
+    return report
 
 
 def _evaluate_policy_probe(
@@ -212,7 +475,11 @@ def _evaluate_policy_probe(
     }
 
 
-def _collect_code_identity(baseline_path: Path) -> dict[str, Any]:
+def _collect_code_identity(
+    baseline_path: Path,
+    baseline_runtime_overrides: list[str] | tuple[str, ...] | None = None,
+) -> dict[str, Any]:
+    runtime_overrides = _normalize_baseline_runtime_overrides(baseline_runtime_overrides)
     candidate_path = Path(candidate_module.__file__).resolve()
     candidate_repo = Path(__file__).resolve().parents[1]
     baseline_repo = baseline_path.parents[2]
@@ -225,14 +492,20 @@ def _collect_code_identity(baseline_path: Path) -> dict[str, Any]:
         )
     if baseline_path == candidate_path:
         raise RuntimeError("candidate and baseline sonic_backward.py resolve to the same file")
-    if _sha256(baseline_path) == _sha256(candidate_path):
+    backward_identical = _sha256(baseline_path) == _sha256(candidate_path)
+    if not runtime_overrides and backward_identical:
         raise RuntimeError("candidate and baseline sonic_backward.py are byte-identical")
 
     shared_sources: dict[str, Any] = {}
     mismatches = []
+    redundant_overrides = []
     for relative in SHARED_RUNTIME_SOURCES:
         baseline_source = baseline_repo / relative
         candidate_source = candidate_repo / relative
+        if not baseline_source.is_file():
+            raise FileNotFoundError(f"baseline shared runtime source does not exist: {baseline_source}")
+        if not candidate_source.is_file():
+            raise FileNotFoundError(f"candidate shared runtime source does not exist: {candidate_source}")
         baseline_identity = _file_identity(baseline_source)
         candidate_identity = _file_identity(candidate_source)
         identical = baseline_identity["sha256"] == candidate_identity["sha256"]
@@ -243,13 +516,24 @@ def _collect_code_identity(baseline_path: Path) -> dict[str, Any]:
         }
         if not identical:
             mismatches.append(relative)
-    if mismatches:
+        elif relative in runtime_overrides:
+            redundant_overrides.append(relative)
+    if not runtime_overrides and mismatches:
         raise RuntimeError(
             "this single-file-isolation benchmark requires byte-identical shared "
             "runtime sources; mismatches: " + ", ".join(mismatches)
         )
+    if runtime_overrides:
+        unlisted_mismatches = [relative for relative in mismatches if relative not in runtime_overrides]
+        failures = []
+        if unlisted_mismatches:
+            failures.append("unlisted shared runtime mismatches: " + ", ".join(unlisted_mismatches))
+        if redundant_overrides:
+            failures.append("selected runtime overrides are byte-identical: " + ", ".join(redundant_overrides))
+        if failures:
+            raise RuntimeError("invalid baseline runtime override identity: " + "; ".join(failures))
 
-    return {
+    identity = {
         "acceptance_tool": _file_identity(Path(__file__)),
         "baseline": {
             "sonic_backward": _file_identity(baseline_path),
@@ -260,8 +544,22 @@ def _collect_code_identity(baseline_path: Path) -> dict[str, Any]:
             "git": _repo_identity(candidate_repo, candidate_path),
         },
         "shared_runtime_sources": shared_sources,
-        "shared_runtime_sources_identical": True,
+        "shared_runtime_sources_identical": not mismatches,
     }
+    if runtime_overrides:
+        identity["baseline_runtime_overrides"] = {
+            "requested": list(runtime_overrides),
+            "sonic_backward_identical": backward_identical,
+            "sources": {
+                relative: {
+                    "baseline": shared_sources[relative]["baseline"],
+                    "candidate": shared_sources[relative]["candidate"],
+                    "identical": shared_sources[relative]["identical"],
+                }
+                for relative in runtime_overrides
+            },
+        }
+    return identity
 
 
 def _adapter_config() -> SonicMoEConfig:
@@ -698,6 +996,49 @@ def _emit_report(report: dict[str, Any], output: str | None) -> None:
         output_path.write_text(payload + "\n", encoding="utf-8")
 
 
+def _acceptance_report_fields(*, observed_passed: bool, diagnostic_shared_gpu: bool) -> dict[str, bool]:
+    """Keep shared-GPU observations distinct from formal acceptance."""
+
+    if diagnostic_shared_gpu:
+        return {
+            "acceptance": False,
+            "observed_passed": bool(observed_passed),
+            "passed": False,
+        }
+    return {"passed": bool(observed_passed)}
+
+
+def _timing_status(*, correctness_only: bool, diagnostic_shared_gpu: bool) -> str:
+    if correctness_only:
+        return "skipped"
+    if diagnostic_shared_gpu:
+        return "diagnostic-shared-gpu"
+    return "measured"
+
+
+def _performance_report_fields(
+    performance_gates: dict[str, Any],
+    *,
+    observed_passed: bool,
+    diagnostic_shared_gpu: bool,
+) -> dict[str, Any]:
+    if diagnostic_shared_gpu:
+        fields = {
+            "timing_status": "diagnostic-shared-gpu",
+            "diagnostic_shared_gpu_asserted": True,
+            "observed_performance_gates": performance_gates,
+        }
+    else:
+        fields = {"performance_gates": performance_gates}
+    fields.update(
+        _acceptance_report_fields(
+            observed_passed=observed_passed,
+            diagnostic_shared_gpu=diagnostic_shared_gpu,
+        )
+    )
+    return fields
+
+
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -713,6 +1054,16 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--baseline",
         required=True,
         help="baseline sonic_backward.py loaded under a private module name",
+    )
+    parser.add_argument(
+        "--baseline-runtime-override",
+        action="append",
+        choices=BASELINE_RUNTIME_OVERRIDE_CHOICES,
+        default=[],
+        help=(
+            "repeatable exact relative path whose baseline implementation is privately loaded and rebound; "
+            "all unlisted shared runtime sources must remain byte-identical"
+        ),
     )
     parser.add_argument("--cases", nargs="+", choices=ROUTING_CASES, default=list(ROUTING_CASES))
     parser.add_argument("--warmup", type=int, default=2)
@@ -733,12 +1084,26 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help="assert that the selected gfx950 is independently verified idle and reserved",
     )
+    parser.add_argument(
+        "--diagnostic-shared-gpu",
+        action="store_true",
+        help=(
+            "run non-acceptance ABBA/BAAB diagnostics on a shared GPU; cannot be combined with "
+            "--correctness-only or --exclusive-gpu"
+        ),
+    )
     parser.add_argument("--min-backward-speedup", type=float, default=1.01)
     parser.add_argument("--min-full-step-speedup", type=float, default=1.01)
     parser.add_argument("--min-paired-win-rate", type=float, default=0.75)
     parser.add_argument("--seed", type=int, default=20260907)
     parser.add_argument("--output")
     args = parser.parse_args(argv)
+    try:
+        args.baseline_runtime_override = list(
+            _normalize_baseline_runtime_overrides(args.baseline_runtime_override)
+        )
+    except ValueError as error:
+        parser.error(str(error))
     if args.warmup < 0:
         parser.error("--warmup must be non-negative")
     if args.pairs < 1:
@@ -749,8 +1114,13 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         parser.error("speedup thresholds must be positive")
     if not 0.0 <= args.min_paired_win_rate <= 1.0:
         parser.error("--min-paired-win-rate must be between 0 and 1")
-    if not args.correctness_only and not args.exclusive_gpu:
-        parser.error("timing requires --exclusive-gpu after independently reserving the selected GPU")
+    if args.diagnostic_shared_gpu and (args.correctness_only or args.exclusive_gpu):
+        parser.error("--diagnostic-shared-gpu cannot be combined with --correctness-only or --exclusive-gpu")
+    if not args.correctness_only and not args.exclusive_gpu and not args.diagnostic_shared_gpu:
+        parser.error(
+            "timing requires --exclusive-gpu after independently reserving the selected GPU, "
+            "or explicit non-acceptance --diagnostic-shared-gpu"
+        )
     return args
 
 
@@ -765,8 +1135,27 @@ def main() -> None:
     baseline_path = Path(args.baseline).resolve()
     if not baseline_path.is_file():
         raise FileNotFoundError(f"baseline sonic_backward.py does not exist: {baseline_path}")
-    code_identity = _collect_code_identity(baseline_path)
-    baseline_module = _load_isolated_baseline(baseline_path)
+    runtime_overrides = tuple(args.baseline_runtime_override)
+    code_identity = _collect_code_identity(baseline_path, runtime_overrides)
+    baseline_module = _load_isolated_baseline(
+        baseline_path,
+        expected_identity=code_identity["baseline"]["sonic_backward"],
+    )
+    if runtime_overrides:
+        baseline_repo = baseline_path.parents[2]
+        override_sources = code_identity["baseline_runtime_overrides"]["sources"]
+        runtime_modules = _load_baseline_runtime_overrides(
+            baseline_repo,
+            runtime_overrides,
+            expected_sources=override_sources,
+        )
+        patch_report = _patch_baseline_runtime_symbols(
+            baseline_module,
+            runtime_modules,
+            expected_sources=override_sources,
+        )
+        for relative, details in patch_report.items():
+            override_sources[relative].update(details)
     candidate_source = Path(inspect.getsourcefile(candidate_module.sonic_moe_backward) or "").resolve()
     if candidate_source != Path(candidate_module.__file__).resolve():
         raise RuntimeError(
@@ -848,7 +1237,12 @@ def main() -> None:
         "schema": "flydsl.sonic_e896_backward_acceptance.v2",
         "comparison": {
             "mode": args.comparison_mode,
-            "source_isolation": "sonic_backward.py only; shared runtime sources must be byte-identical",
+            "source_isolation": (
+                "sonic_backward.py plus explicit private baseline runtime overrides; "
+                "all unlisted shared runtime sources must be byte-identical"
+                if runtime_overrides
+                else "sonic_backward.py only; shared runtime sources must be byte-identical"
+            ),
             "timing_design": "paired ABBA/BAAB for backward and full-step",
             "baseline_role": (
                 "legacy projection/readback path"
@@ -890,6 +1284,7 @@ def main() -> None:
     }
 
     overall_passed = True
+    overall_correctness_passed = True
     for case in dict.fromkeys(args.cases):
         ids, scores, routing_summary = _routing(case, generator)
         forward_output, fixed_state = op.forward_topk_training(
@@ -978,6 +1373,7 @@ def main() -> None:
         gc.collect()
 
         correctness_passed = accuracy_passed and repeatability_passed and launch_topology_passed
+        overall_correctness_passed &= correctness_passed
         if args.correctness_only:
             case_report["timing_status"] = "skipped (--correctness-only)"
             case_report["passed"] = correctness_passed
@@ -1021,6 +1417,7 @@ def main() -> None:
                 value for key, value in performance_gates[scope].items() if key.endswith("_passed")
             )
         performance_passed = all(entry["passed"] for entry in performance_gates.values())
+        case_observed_passed = correctness_passed and performance_passed
         case_report.update(
             {
                 "exclusive_gpu_asserted": args.exclusive_gpu,
@@ -1031,19 +1428,38 @@ def main() -> None:
                     "summary": _summarize_peaks(peaks),
                 },
                 "measurements": measurements,
-                "performance_gates": performance_gates,
-                "passed": correctness_passed and performance_passed,
             }
         )
+        case_report.update(
+            _performance_report_fields(
+                performance_gates,
+                observed_passed=case_observed_passed,
+                diagnostic_shared_gpu=args.diagnostic_shared_gpu,
+            )
+        )
         report["cases"][case] = case_report
-        overall_passed &= case_report["passed"]
+        overall_passed &= case_observed_passed
         gc.collect()
 
-    report["timing_status"] = "skipped" if args.correctness_only else "measured"
+    report["timing_status"] = _timing_status(
+        correctness_only=args.correctness_only,
+        diagnostic_shared_gpu=args.diagnostic_shared_gpu,
+    )
     report["exclusive_gpu_asserted"] = args.exclusive_gpu
-    report["passed"] = bool(overall_passed and policy_probe["passed"])
+    if args.diagnostic_shared_gpu:
+        report["diagnostic_shared_gpu_asserted"] = True
+        report["diagnostic_valid"] = bool(overall_correctness_passed and policy_probe["passed"])
+    report.update(
+        _acceptance_report_fields(
+            observed_passed=bool(overall_passed and policy_probe["passed"]),
+            diagnostic_shared_gpu=args.diagnostic_shared_gpu,
+        )
+    )
     _emit_report(report, args.output)
-    if not report["passed"]:
+    if args.diagnostic_shared_gpu:
+        if not report["diagnostic_valid"]:
+            raise SystemExit(2)
+    elif not report["passed"]:
         raise SystemExit(2)
 
 
