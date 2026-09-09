@@ -84,6 +84,8 @@ _MAX_SIGNED_I32 = (1 << 31) - 1
 _MAX_BUFFER_BYTE_OFFSET = (1 << 32) - 1
 _WARP_SIZE = get_warp_size()
 _RED_SLOTS = max(1, (_BLOCK_THREADS + _WARP_SIZE - 1) // _WARP_SIZE)
+_DY_COPY_DWORDS = 4
+_DY_COPY_BF16_ELEMENTS = 2 * _DY_COPY_DWORDS
 _GLU_ACTIVATIONS = frozenset({"swiglu", "geglu", "reglu"})
 _SUPPORTED_ACTIVATIONS = frozenset({"swiglu", "geglu", "reglu", "gelu_tanh_approx", "relu", "silu", "relu_sq"})
 
@@ -1534,6 +1536,11 @@ def _compile_fused_forward_state_prepare(
     projection_size = 2 * intermediate_size
     projection_column_stride = 2 if interleaved_w1 else 1
     up_column_offset = 1 if interleaved_w1 else intermediate_size
+    vector_dy_copy = (
+        defer_dy_scaling
+        and not store_x_sorted
+        and hidden_size % _DY_COPY_BF16_ELEMENTS == 0
+    )
     if schedule_block_m not in (_COMPACT_W1_BM, _LARGE_GROUPED_DX_BM):
         raise ValueError("state-prepare schedule_block_m must be 16 or 64")
 
@@ -1576,30 +1583,56 @@ def _compile_fused_forward_state_prepare(
                     )
                 source_base = token * fx.Int32(hidden_size)
                 destination_base = row * fx.Int32(hidden_size)
-                for base in range_constexpr(0, hidden_size, _BLOCK_THREADS):
-                    column = tid + fx.Int32(base)
-                    if column < fx.Int32(hidden_size):
-                        source = source_base + column
-                        destination = destination_base + column
-                        dout_value = buffer_ops.buffer_load(
-                            dout_rsrc,
-                            source,
-                            vec_width=1,
-                            dtype=elem_dtype,
-                        ).extf(T.f32)
-                        if const_expr(store_x_sorted):
-                            x_value = buffer_ops.buffer_load(
-                                x_rsrc,
+                if const_expr(vector_dy_copy):
+                    # This path defers route-weight scaling to the fused dA/
+                    # dscore consumer and does not materialize x_sorted, so dy
+                    # is a bitwise copy.  Move one contiguous 128-bit chunk per
+                    # lane instead of serializing eight BF16 load/wait/store
+                    # sequences through the vector ALU.
+                    dwords_per_row = hidden_size // 2
+                    vectors_per_row = hidden_size // _DY_COPY_BF16_ELEMENTS
+                    source_dword_base = token * fx.Int32(dwords_per_row)
+                    destination_dword_base = row * fx.Int32(dwords_per_row)
+                    for base in range_constexpr(0, vectors_per_row, _BLOCK_THREADS):
+                        vector_index = tid + fx.Int32(base)
+                        if vector_index < fx.Int32(vectors_per_row):
+                            dword_offset = vector_index * fx.Int32(_DY_COPY_DWORDS)
+                            dout_vector = buffer_ops.buffer_load(
+                                dout_rsrc,
+                                source_dword_base + dword_offset,
+                                vec_width=_DY_COPY_DWORDS,
+                                dtype=T.i32,
+                            )
+                            buffer_ops.buffer_store(
+                                dout_vector,
+                                dy_rsrc,
+                                destination_dword_base + dword_offset,
+                            )
+                else:
+                    for base in range_constexpr(0, hidden_size, _BLOCK_THREADS):
+                        column = tid + fx.Int32(base)
+                        if column < fx.Int32(hidden_size):
+                            source = source_base + column
+                            destination = destination_base + column
+                            dout_value = buffer_ops.buffer_load(
+                                dout_rsrc,
                                 source,
                                 vec_width=1,
                                 dtype=elem_dtype,
+                            ).extf(T.f32)
+                            if const_expr(store_x_sorted):
+                                x_value = buffer_ops.buffer_load(
+                                    x_rsrc,
+                                    source,
+                                    vec_width=1,
+                                    dtype=elem_dtype,
+                                )
+                                buffer_ops.buffer_store(x_value, x_sorted_rsrc, destination)
+                            buffer_ops.buffer_store(
+                                fx.Float32(dout_value * route_weight).to(elem_dtype),
+                                dy_rsrc,
+                                destination,
                             )
-                            buffer_ops.buffer_store(x_value, x_sorted_rsrc, destination)
-                        buffer_ops.buffer_store(
-                            fx.Float32(dout_value * route_weight).to(elem_dtype),
-                            dy_rsrc,
-                            destination,
-                        )
 
                 route_row = token * fx.Int32(topk) + slot
                 route_base = route_row * fx.Int32(projection_size)
