@@ -455,8 +455,8 @@ def test_e896_hostless_grouped_da_uses_large_m_tiles():
         topk=16,
         max_expert_rows=4096,
     ) == (
-        (256, 64, 64, 8, 1, True, 0, 32),
-        (128, 64, 64, 4, 2, False, 33, None),
+        (256, 64, 64, 8, 1, True, 0, 32, 2, None),
+        (128, 64, 64, 4, 2, False, 33, None, 3, 256),
     )
 
 
@@ -469,8 +469,8 @@ def test_short_hostless_grouped_da_keeps_existing_profiles():
         topk=8,
         max_expert_rows=128,
     ) == (
-        (64, 64, 64, 2, 2, True, 0, 32),
-        (32, 64, 64, 2, 2, False, 33, None),
+        (64, 64, 64, 2, 2, True, 0, 32, 2, None),
+        (32, 64, 64, 2, 2, False, 33, None, 2, None),
     )
 
 

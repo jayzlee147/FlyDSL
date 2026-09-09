@@ -349,11 +349,11 @@ def test_grouped_da_active_count_guards_are_mutually_exclusive(active_experts):
     default_output = torch.full_like(low_output, float("nan"))
 
     profiles = (
-        (low_output, 64, True, 0, 32),
-        (high_output, 32, False, 33, None),
-        (default_output, 32, False, 0, None),
+        (low_output, 64, True, 0, 32, 2, False, active_experts),
+        (high_output, 32, False, 33, None, 3, True, 1),
+        (default_output, 32, False, 0, None, 2, False, num_experts),
     )
-    for output, block_m, queue_direct, min_active, max_active in profiles:
+    for output, block_m, queue_direct, min_active, max_active, stages, persistent, grid in profiles:
         grouped_da = compile_grouped_da_gfx950(
             hidden_size=hidden_size,
             intermediate_size=intermediate_size,
@@ -362,10 +362,11 @@ def test_grouped_da_active_count_guards_are_mutually_exclusive(active_experts):
             block_m=block_m,
             block_n=64,
             block_k=64,
-            stages=2,
+            stages=stages,
             m_waves=2,
             n_waves=2,
             queue_direct=queue_direct,
+            persistent=persistent,
             min_active_experts=min_active,
             max_active_experts=max_active,
         )
@@ -378,7 +379,7 @@ def test_grouped_da_active_count_guards_are_mutually_exclusive(active_experts):
             num_valid_ids.data_ptr(),
             active_queue.data_ptr(),
             output.data_ptr(),
-            active_experts if queue_direct else num_experts,
+            grid,
             torch.cuda.current_stream(device),
         )
     torch.cuda.synchronize(device)
@@ -405,11 +406,13 @@ def test_grouped_da_active_count_guards_are_mutually_exclusive(active_experts):
     ((128, 4, 2), (256, 8, 1)),
 )
 @pytest.mark.parametrize("queue_direct", (False, True))
+@pytest.mark.parametrize("stages", (2, 3))
 def test_grouped_da_large_m_tile_handles_sort_blocks_and_frequency_tails(
     block_m,
     m_waves,
     n_waves,
     queue_direct,
+    stages,
 ):
     """A dA tile may span sort blocks while masking each expert's real tail."""
 
@@ -471,10 +474,11 @@ def test_grouped_da_large_m_tile_handles_sort_blocks_and_frequency_tails(
         block_m=block_m,
         block_n=64,
         block_k=64,
-        stages=2,
+        stages=stages,
         m_waves=m_waves,
         n_waves=n_waves,
         queue_direct=queue_direct,
+        persistent=not queue_direct,
     )
     _run_compiled(
         grouped_da,
@@ -485,7 +489,7 @@ def test_grouped_da_large_m_tile_handles_sort_blocks_and_frequency_tails(
         num_valid_ids.data_ptr(),
         active_queue.data_ptr(),
         output.data_ptr(),
-        num_experts,
+        1,
         torch.cuda.current_stream(device),
     )
     torch.cuda.synchronize(device)
@@ -501,3 +505,82 @@ def test_grouped_da_large_m_tile_handles_sort_blocks_and_frequency_tails(
             atol=5e-2,
         )
     assert torch.isnan(output[~live_rows]).all()
+
+
+def test_grouped_da_stage3_h192_executes_steady_state_pipeline():
+    """Three BK64 tiles exercise one stage-3 main-loop iteration before drain."""
+
+    device = _gfx950_device()
+    hidden_size, intermediate_size, num_experts = 192, 64, 1
+    frequency_value = 65
+    padded_rows = 128
+    generator = torch.Generator(device=device).manual_seed(719)
+
+    dy = torch.full(
+        (padded_rows, hidden_size),
+        float("nan"),
+        dtype=torch.bfloat16,
+        device=device,
+    )
+    dy[:frequency_value] = torch.randn(
+        (frequency_value, hidden_size),
+        dtype=torch.float32,
+        device=device,
+        generator=generator,
+    ).to(torch.bfloat16)
+    w2 = torch.randn(
+        (num_experts, hidden_size, intermediate_size),
+        dtype=torch.float32,
+        device=device,
+        generator=generator,
+    ).to(torch.bfloat16)
+    frequency = torch.tensor([frequency_value], dtype=torch.int32, device=device)
+    sorted_expert_ids = torch.zeros(2, dtype=torch.int32, device=device)
+    num_valid_ids = torch.tensor(
+        [padded_rows, frequency_value],
+        dtype=torch.int32,
+        device=device,
+    )
+    active_queue = torch.tensor([1, 0, 0], dtype=torch.int32, device=device)
+    output = torch.full(
+        (padded_rows, intermediate_size),
+        float("nan"),
+        dtype=torch.bfloat16,
+        device=device,
+    )
+
+    grouped_da = compile_grouped_da_gfx950(
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+        num_experts=num_experts,
+        sorted_block_size=64,
+        block_m=128,
+        block_n=64,
+        block_k=64,
+        stages=3,
+        m_waves=4,
+        n_waves=2,
+        persistent=True,
+    )
+    _run_compiled(
+        grouped_da,
+        dy.data_ptr(),
+        w2.data_ptr(),
+        frequency.data_ptr(),
+        sorted_expert_ids.data_ptr(),
+        num_valid_ids.data_ptr(),
+        active_queue.data_ptr(),
+        output.data_ptr(),
+        1,
+        torch.cuda.current_stream(device),
+    )
+    torch.cuda.synchronize(device)
+
+    expected = dy[:frequency_value].float() @ w2[0].float()
+    torch.testing.assert_close(
+        output[:frequency_value].float(),
+        expected,
+        rtol=3e-2,
+        atol=5e-2,
+    )
+    assert torch.isnan(output[frequency_value:]).all()

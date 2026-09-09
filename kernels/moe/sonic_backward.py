@@ -141,6 +141,9 @@ _GROUPED_W2_MAX_EXPERT_ROWS = 128
 # frequency read; the short hostless path dispatches from the device queue.
 _GROUPED_DA_BN = 64
 _GROUPED_DA_MAX_EXPERT_ROWS = 4096
+_GROUPED_DA_STAGES = 2
+_GROUPED_DA_E896_DENSE_STAGES = 3
+_GROUPED_DA_E896_DENSE_GRID_CAP = 256
 
 # Keep the first token-major grouped-dW1 rollout on the production E896
 # retained-state contract until its cache behavior has been measured broadly.
@@ -355,15 +358,33 @@ def _grouped_da_hostless_profiles(
         # the per-wave BM64 profile's two M repeats.  Dense routing uses eight
         # waves (MW4/NW2); sparse hot routing uses BM256 with MW8/NW1 so the B
         # tile remains exactly covered by the 512-thread async-load layout.
+        # Triple buffering raises the dense BM128 profile from 48 to 72 KiB
+        # LDS.  LDS alone fits two CTAs/CU, but its combined VGPR/AGPR usage
+        # quantizes residency to one; a 256-CTA persistent grid fills gfx950.
+        # Keep sparse BM256 double-buffered: its 120 KiB stage-3 footprint
+        # lowers occupancy and regresses instruction-wait/VMEM-latency PMCs.
         sparse_tuning = (256, _GROUPED_DA_BN, 64, 8, 1)
         dense_tuning = (128, _GROUPED_DA_BN, 64, 4, 2)
+        sparse_stages = _GROUPED_DA_STAGES
+        dense_stages = _GROUPED_DA_E896_DENSE_STAGES
+        dense_grid_cap = _GROUPED_DA_E896_DENSE_GRID_CAP
     else:
         sparse_tuning = _grouped_da_tuning(max_expert_rows, hidden_size)
         dense_tuning = _grouped_da_tuning(min(max_expert_rows, 2), hidden_size)
+        sparse_stages = dense_stages = _GROUPED_DA_STAGES
+        dense_grid_cap = None
     return (
-        (*sparse_tuning, True, 0, _GROUPED_DW2_SPARSE_EXPERTS),
-        (*dense_tuning, False, _GROUPED_DW2_SPARSE_EXPERTS + 1, None),
+        (*sparse_tuning, True, 0, _GROUPED_DW2_SPARSE_EXPERTS, sparse_stages, None),
+        (
+            *dense_tuning,
+            False,
+            _GROUPED_DW2_SPARSE_EXPERTS + 1,
+            None,
+            dense_stages,
+            dense_grid_cap,
+        ),
     )
+
 
 # Weight gradients are output-stationary TN contractions.  BM/BN128 with BK32
 # is the measured throughput winner once an expert can own multiple rows;
@@ -850,6 +871,8 @@ def _compile_grouped_da(
     queue_direct: bool = False,
     min_active_experts: int = 0,
     max_active_experts: int | None = None,
+    stages: int = _GROUPED_DA_STAGES,
+    persistent: bool = False,
 ):
     """Build the grouped raw-W2 dA contraction for BF16 SwiGLU."""
 
@@ -862,10 +885,11 @@ def _compile_grouped_da(
         block_m=block_m,
         block_n=block_n,
         block_k=block_k,
-        stages=2,
+        stages=stages,
         m_waves=m_waves,
         n_waves=n_waves,
         queue_direct=queue_direct,
+        persistent=persistent,
         min_active_experts=min_active_experts,
         max_active_experts=max_active_experts,
     )
@@ -3679,7 +3703,16 @@ def _sonic_moe_backward_impl(
                 )
                 active_count_ptr = active_expert_storage.data_ptr()
             else:
-                grouped_da_profiles = ((*_grouped_da_tuning(max_expert_rows, hidden_size), False, 0, None),)
+                grouped_da_profiles = (
+                    (
+                        *_grouped_da_tuning(max_expert_rows, hidden_size),
+                        False,
+                        0,
+                        None,
+                        _GROUPED_DA_STAGES,
+                        None,
+                    ),
+                )
                 # Unguarded specializations do not dereference this argument.
                 active_count_ptr = expert_frequency.data_ptr()
 
@@ -3692,6 +3725,8 @@ def _sonic_moe_backward_impl(
                 grouped_da_queue_direct,
                 min_active_experts,
                 max_active_experts,
+                grouped_da_stages,
+                grouped_da_grid_cap,
             ) in grouped_da_profiles:
                 grouped_da = _compile_grouped_da(
                     hidden_size,
@@ -3706,6 +3741,8 @@ def _sonic_moe_backward_impl(
                     grouped_da_queue_direct,
                     min_active_experts,
                     max_active_experts,
+                    stages=grouped_da_stages,
+                    persistent=grouped_da_grid_cap is not None,
                 )
                 if grouped_da_queue_direct:
                     guarded_capacity = active_expert_capacity
@@ -3714,6 +3751,8 @@ def _sonic_moe_backward_impl(
                     grouped_da_grid = guarded_capacity * (intermediate_size // grouped_da_bn)
                 else:
                     grouped_da_grid = num_experts * (intermediate_size // grouped_da_bn)
+                    if grouped_da_grid_cap is not None:
+                        grouped_da_grid = min(grouped_da_grid, grouped_da_grid_cap)
                 _run_compiled(
                     grouped_da,
                     dy.data_ptr(),

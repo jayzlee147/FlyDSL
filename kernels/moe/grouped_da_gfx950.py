@@ -286,6 +286,7 @@ def compile_grouped_da_gfx950(
     n_waves: int = 4,
     waves_per_eu: int | None = None,
     queue_direct: bool = False,
+    persistent: bool = False,
     min_active_experts: int = 0,
     max_active_experts: int | None = None,
 ):
@@ -303,6 +304,10 @@ def compile_grouped_da_gfx950(
         raise ValueError("hidden_size, intermediate_size, and num_experts must be positive")
     if not isinstance(min_active_experts, int) or min_active_experts < 0:
         raise ValueError("min_active_experts must be a non-negative int")
+    if not isinstance(persistent, bool):
+        raise TypeError(f"persistent must be bool, got {type(persistent).__name__}")
+    if queue_direct and persistent:
+        raise ValueError("persistent is implicit for queue_direct profiles")
     if max_active_experts is not None and (
         not isinstance(max_active_experts, int) or max_active_experts < min_active_experts
     ):
@@ -338,10 +343,12 @@ def compile_grouped_da_gfx950(
         raise ValueError(f"grouped dA requires {lds_bytes} LDS bytes, exceeding gfx950 capacity")
 
     num_n_blocks = intermediate_size // block_n
+    persistent_suffix = "_p1" if persistent else ""
     name = (
         f"grouped_da_bf16_gfx950_h{hidden_size}_i{intermediate_size}_e{num_experts}"
         f"_bm{block_m}_bn{block_n}_bk{block_k}_s{stages}_w{m_waves}x{n_waves}"
         f"_q{int(queue_direct)}"
+        f"{persistent_suffix}"
         f"_amin{min_active_experts}_amax{max_active_experts}"
     )
 
@@ -460,9 +467,10 @@ def compile_grouped_da_gfx950(
                     expert_bound,
                     fx.Int32(0),
                 )
-            if block_id < expert_bound:
-                expert = block_id // fx.Int32(num_n_blocks)
-                n_block = block_id % fx.Int32(num_n_blocks)
+
+            def run_expert_work(work):
+                expert = work // fx.Int32(num_n_blocks)
+                n_block = work % fx.Int32(num_n_blocks)
                 frequency = rocdl.readfirstlane(T.i32, _raw(_global_i32_at(arg_frequency, expert)))
                 if frequency > fx.Int32(0):
                     lo = fx.Int32(0)
@@ -478,6 +486,20 @@ def compile_grouped_da_gfx950(
                         hi = move_left.select(mid, hi)
                     first_sorted_row = lo * fx.Int32(sorted_block_size)
                     run_expert_tile(expert, n_block, first_sorted_row, frequency)
+
+            if const_expr(persistent):
+                # A capped persistent launch avoids paying the full expert
+                # grid for a device-guarded profile that is inactive.  The
+                # body ends in a workgroup barrier, so shared A/B/C storage is
+                # safe to reuse on each grid-stride iteration.
+                grid_size = fx.Int32(gpu.grid_dim.x)
+                if block_id < expert_bound:
+                    run_expert_work(block_id)
+                for work in range(block_id + grid_size, expert_bound, grid_size):
+                    run_expert_work(fx.Int32(work))
+            else:
+                if block_id < expert_bound:
+                    run_expert_work(block_id)
 
     @flyc.jit
     def launch_grouped_da(
