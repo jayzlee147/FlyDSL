@@ -142,6 +142,10 @@ _GROUPED_W2_MAX_EXPERT_ROWS = 128
 _GROUPED_DA_BN = 64
 _GROUPED_DA_MAX_EXPERT_ROWS = 4096
 
+# Keep the first token-major grouped-dW1 rollout on the production E896
+# retained-state contract until its cache behavior has been measured broadly.
+_DIRECT_GROUPED_DW1_RHS_SHAPE = (4096, 3584, 512, 896, 16)
+
 # Weight-gradient TN contractions are output-stationary: each CTA owns one
 # output tile and reduces all rows for one expert before a single BF16 store.
 # BK32 is the measured short/ragged-row winner on gfx950.  Exact resource
@@ -386,14 +390,21 @@ def _grouped_dw1_tuning(
     max_expert_rows: int,
     hidden_size: int,
     intermediate_size: int,
+    *,
+    direct_rhs: bool = False,
 ) -> tuple[int, int, int, int, int, int]:
     """Return ``(BM, BN, BK, K-pad, M-waves, N-waves)`` for grouped dW1."""
 
     preferred_tile = 64 if max_expert_rows <= 1 else 128
     output_m = 2 * intermediate_size
     block_m = preferred_tile if output_m % preferred_tile == 0 else 64
-    block_n = preferred_tile if hidden_size % preferred_tile == 0 else 64
-    return (block_m, block_n, _GROUPED_DW1_BLOCK_K, 0, 2, 2)
+    if direct_rhs and max_expert_rows > 1 and hidden_size % 256 == 0:
+        block_n = 256
+        n_waves = 4
+    else:
+        block_n = preferred_tile if hidden_size % preferred_tile == 0 else 64
+        n_waves = 2
+    return (block_m, block_n, _GROUPED_DW1_BLOCK_K, 0, 2, n_waves)
 
 
 def _use_grouped_dw1(
@@ -639,6 +650,42 @@ def _use_fused_da_dscore(
         and not has_bias
         and compute_dtype == "bf16"
         and activation == "swiglu"
+    )
+
+
+def _use_direct_grouped_dw1_rhs(
+    *,
+    reuse_forward_preactivation: bool,
+    use_fused_forward_state_prepare: bool,
+    use_grouped_dw1: bool,
+    flat_routes: bool,
+    has_bias: bool,
+    compute_dtype: str,
+    activation: str,
+    tokens: int,
+    hidden_size: int,
+    intermediate_size: int,
+    num_experts: int,
+    topk: int,
+) -> bool:
+    """Select token-major RHS gather for retained-state grouped dW1.
+
+    Keep the first rollout on the exact fixed-K BF16 SwiGLU path whose fused
+    state preparation has no other consumer for the sorter-order hidden-state
+    copy.  Standalone, ragged, bias, and legacy contracts continue to
+    materialize ``x_sorted``.
+    """
+
+    return (
+        reuse_forward_preactivation
+        and use_fused_forward_state_prepare
+        and use_grouped_dw1
+        and not flat_routes
+        and not has_bias
+        and compute_dtype == "bf16"
+        and activation == "swiglu"
+        and (tokens, hidden_size, intermediate_size, num_experts, topk)
+        == _DIRECT_GROUPED_DW1_RHS_SHAPE
     )
 
 
@@ -1443,6 +1490,7 @@ def _compile_fused_forward_state_prepare(
     device_index: int,
     schedule_block_m: int = _COMPACT_W1_BM,
     defer_dy_scaling: bool = False,
+    store_x_sorted: bool = True,
 ):
     """Gather the exact live rows and prepare retained-state backward inputs.
 
@@ -1479,12 +1527,16 @@ def _compile_fused_forward_state_prepare(
         i32_tokens: fx.Int32,
     ):
         tid = gpu.thread_idx.x
-        x_rsrc = buffer_ops.create_buffer_resource(hidden_states, max_size=True)
         dout_rsrc = buffer_ops.create_buffer_resource(grad_output, max_size=True)
+        x_rsrc = dout_rsrc
+        if const_expr(store_x_sorted):
+            x_rsrc = buffer_ops.create_buffer_resource(hidden_states, max_size=True)
         route_preact_rsrc = buffer_ops.create_buffer_resource(route_preactivation, max_size=True)
-        x_sorted_rsrc = buffer_ops.create_buffer_resource(x_sorted, max_size=True)
         activation_rsrc = buffer_ops.create_buffer_resource(activation, max_size=True)
         dy_rsrc = buffer_ops.create_buffer_resource(dy, max_size=True)
+        x_sorted_rsrc = dy_rsrc
+        if const_expr(store_x_sorted):
+            x_sorted_rsrc = buffer_ops.create_buffer_resource(x_sorted, max_size=True)
         weights_rsrc = buffer_ops.create_buffer_resource(sorted_weights, max_size=True)
         ids_rsrc = buffer_ops.create_buffer_resource(sorted_token_ids, max_size=True)
 
@@ -1505,19 +1557,20 @@ def _compile_fused_forward_state_prepare(
                     if column < fx.Int32(hidden_size):
                         source = source_base + column
                         destination = destination_base + column
-                        x_value = buffer_ops.buffer_load(
-                            x_rsrc,
-                            source,
-                            vec_width=1,
-                            dtype=elem_dtype,
-                        )
                         dout_value = buffer_ops.buffer_load(
                             dout_rsrc,
                             source,
                             vec_width=1,
                             dtype=elem_dtype,
                         ).extf(T.f32)
-                        buffer_ops.buffer_store(x_value, x_sorted_rsrc, destination)
+                        if const_expr(store_x_sorted):
+                            x_value = buffer_ops.buffer_load(
+                                x_rsrc,
+                                source,
+                                vec_width=1,
+                                dtype=elem_dtype,
+                            )
+                            buffer_ops.buffer_store(x_value, x_sorted_rsrc, destination)
                         buffer_ops.buffer_store(
                             fx.Float32(dout_value * route_weight).to(elem_dtype),
                             dy_rsrc,
@@ -3040,6 +3093,20 @@ def _sonic_moe_backward_impl(
         and not has_bias
         and ((use_hostless_grouped and use_compact_w1) or use_large_grouped_dx)
     )
+    use_direct_grouped_dw1_rhs = _use_direct_grouped_dw1_rhs(
+        reuse_forward_preactivation=reuse_forward_preactivation,
+        use_fused_forward_state_prepare=use_fused_forward_state_prepare,
+        use_grouped_dw1=use_grouped_dw1,
+        flat_routes=flat_routes,
+        has_bias=has_bias,
+        compute_dtype=compute_dtype,
+        activation=activation_name,
+        tokens=tokens,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+        num_experts=num_experts,
+        topk=topk,
+    )
     use_fused_da_dscore = _use_fused_da_dscore(
         reuse_forward_preactivation=reuse_forward_preactivation,
         use_hostless_grouped=use_hostless_grouped,
@@ -3166,18 +3233,27 @@ def _sonic_moe_backward_impl(
         state_row_schedule = None
         state_schedule_block_m = 0
         state_schedule_bound = 0
-    x_sorted = torch.empty((max_padded, hidden_size), dtype=hidden_states.dtype, device=device)
+    sorted_hidden_shape = (max_padded, hidden_size)
+    x_sorted = (
+        None
+        if use_direct_grouped_dw1_rhs
+        else torch.empty(sorted_hidden_shape, dtype=hidden_states.dtype, device=device)
+    )
     # The retained-state hostless path reads token-major grad_output directly
     # in both dy preparation and dscore, avoiding a large padded sorted copy.
-    dout_sorted = None if use_fused_forward_state_prepare else torch.empty_like(x_sorted)
-    dy = torch.empty_like(x_sorted)
+    dout_sorted = (
+        None
+        if use_fused_forward_state_prepare
+        else torch.empty(sorted_hidden_shape, dtype=hidden_states.dtype, device=device)
+    )
+    dy = torch.empty(sorted_hidden_shape, dtype=hidden_states.dtype, device=device)
     # The fused state path derives route-score gradients from q=dout@W2 and
     # therefore does not materialize the forward down projection.  Fallbacks
     # retain their original padding initialization contract.
     projection = (
         None
         if use_fused_da_dscore
-        else (torch.empty_like(x_sorted) if use_hostless_grouped or not use_grouped_w2 else torch.zeros_like(x_sorted))
+        else (torch.empty_like(dy) if use_hostless_grouped or not use_grouped_w2 else torch.zeros_like(dy))
     )
     # Grouped W1 writes ceil(real_rows/BM)*BM rows instead of every
     # SORTED_BM-padded row.  Zero-initialize the untouched suffix: gather makes
@@ -3218,7 +3294,7 @@ def _sonic_moe_backward_impl(
         dtype=hidden_states.dtype,
         device=device,
     )
-    dx_sorted = None if direct_grouped_dx_routes else torch.empty_like(x_sorted)
+    dx_sorted = None if direct_grouped_dx_routes else torch.empty_like(dy)
     dx_routes = (
         None if flat_routes else torch.empty((tokens, topk, hidden_size), dtype=hidden_states.dtype, device=device)
     )
@@ -3442,6 +3518,7 @@ def _sonic_moe_backward_impl(
             )
 
         if not use_fused_forward_state_prepare:
+            assert x_sorted is not None
             assert dout_sorted is not None
             gather = _compile_gather(
                 hidden_size,
@@ -3471,6 +3548,7 @@ def _sonic_moe_backward_impl(
         # preactivation path.
         if not use_grouped_w1 and not reuse_forward_preactivation:
             assert preactivation is not None
+            assert x_sorted is not None
             for expert, start, rows in segments:
                 end = start + rows
                 gemm_a16w16(
@@ -3523,6 +3601,7 @@ def _sonic_moe_backward_impl(
                     device_index,
                     state_schedule_block_m,
                     use_fused_da_dscore,
+                    store_x_sorted=not use_direct_grouped_dw1_rhs,
                 )
                 assert state_row_schedule is not None
                 state_prepare_grid = min(
@@ -3534,7 +3613,7 @@ def _sonic_moe_backward_impl(
                     x_arg,
                     dout_arg,
                     route_preactivation,
-                    x_sorted,
+                    x_arg if x_sorted is None else x_sorted,
                     activation,
                     dy,
                     sorted_weights,
@@ -3810,6 +3889,8 @@ def _sonic_moe_backward_impl(
             )
 
         if use_grouped_dw1:
+            grouped_dw1_rhs = x_arg if use_direct_grouped_dw1_rhs else x_sorted
+            assert grouped_dw1_rhs is not None
             (
                 grouped_dw1_bm,
                 grouped_dw1_bn,
@@ -3821,6 +3902,7 @@ def _sonic_moe_backward_impl(
                 max_expert_rows,
                 hidden_size,
                 intermediate_size,
+                direct_rhs=use_direct_grouped_dw1_rhs,
             )
             grouped_dw1_kwargs = {
                 "block_m": grouped_dw1_bm,
@@ -3834,21 +3916,23 @@ def _sonic_moe_backward_impl(
             if use_tn_metadata_direct:
                 grouped_tn_from_metadata_flydsl(
                     dz,
-                    x_sorted,
+                    grouped_dw1_rhs,
                     expert_frequency,
                     sorted_expert_ids,
                     num_valid_ids,
                     dw1,
+                    sorted_token_ids=(sorted_token_ids if use_direct_grouped_dw1_rhs else None),
                     **grouped_dw1_kwargs,
                 )
             else:
                 assert active_expert_storage is not None
                 grouped_tn_from_queue_flydsl(
                     dz,
-                    x_sorted,
+                    grouped_dw1_rhs,
                     expert_frequency,
                     active_expert_storage,
                     dw1,
+                    sorted_token_ids=(sorted_token_ids if use_direct_grouped_dw1_rhs else None),
                     **grouped_dw1_kwargs,
                 )
 
@@ -3956,6 +4040,7 @@ def _sonic_moe_backward_impl(
         for expert, start, rows in segments:
             end = start + rows
             if not use_grouped_dw1:
+                assert x_sorted is not None
                 gemm_a16w16(
                     dz[start:end].transpose(0, 1),
                     x_sorted[start:end],

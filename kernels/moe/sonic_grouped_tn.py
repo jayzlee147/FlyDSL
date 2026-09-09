@@ -35,10 +35,12 @@ from kernels.gemm.gemm_a16w16_gfx950_utils import (
     GFX950_DMA_BYTES,
     GFX950_WAVE_SIZE,
     __barrier,
+    buffer_load_lds_inline,
     get_wave_lds_offset,
     make_transposed_lds_layout,
+    make_wave_lds_ptr,
+    transposed_contiguous_idx,
 )
-
 
 _BLOCK_THREADS = 256
 _SORTED_BLOCK_M = 64
@@ -47,6 +49,7 @@ _MAX_RESIDENT_THREADS_PER_CU = 1024
 _LDS_BYTES_PER_CU = 163840
 _MAX_SIGNED_I32 = (1 << 31) - 1
 _MAX_BUFFER_BYTES = (1 << 32) - 1
+_TOKEN_MASK = 0x00FFFFFF
 _ZERO_VECTOR_ELEMENTS = GFX950_DMA_BYTES // 2
 _ZERO_BLOCK_THREADS = 1024
 
@@ -521,6 +524,7 @@ def grouped_tn_grid_cap(
     stages: int,
     m_waves: int,
     n_waves: int,
+    gather_rhs: bool = False,
 ) -> int:
     """Return a gfx950 persistent-grid cap derived from tile resources.
 
@@ -535,6 +539,8 @@ def grouped_tn_grid_cap(
         raise ValueError("grouped TN grid tuning values must be positive")
     block_threads = m_waves * n_waves * GFX950_WAVE_SIZE
     lds_ab_bytes = stages * (block_m + block_n) * block_k * 2
+    if gather_rhs:
+        lds_ab_bytes += stages * block_k * 4
     lds_c_bytes = block_m * block_n * 2
     lds_bytes = max(lds_ab_bytes, lds_c_bytes)
     resident_by_threads = _MAX_RESIDENT_THREADS_PER_CU // block_threads
@@ -553,6 +559,7 @@ def grouped_tn_launch_grid(
     stages: int,
     m_waves: int,
     n_waves: int,
+    gather_rhs: bool = False,
 ) -> int:
     """Return the host-known persistent launch bound for grouped TN."""
 
@@ -562,7 +569,15 @@ def grouped_tn_launch_grid(
     max_work = schedule_capacity * output_tiles
     return min(
         max_work,
-        grouped_tn_grid_cap(block_m, block_n, block_k, stages, m_waves, n_waves),
+        grouped_tn_grid_cap(
+            block_m,
+            block_n,
+            block_k,
+            stages,
+            m_waves,
+            n_waves,
+            gather_rhs,
+        ),
     )
 
 
@@ -582,6 +597,7 @@ def compile_grouped_tn(
     stages: int = 2,
     min_active_experts: int = 0,
     max_active_experts: int | None = None,
+    gather_rhs: bool = False,
 ):
     """Compile the persistent grouped TN consumer for a prebuilt queue.
 
@@ -596,6 +612,8 @@ def compile_grouped_tn(
     specialization with the device-resident queue count.  Two disjoint
     guarded launches can therefore select different gfx950 tile profiles
     without synchronizing the routing distribution back to the host.
+    ``gather_rhs`` loads token-major RHS rows through packed sorter token IDs,
+    eliminating their otherwise materialized sorter-order copy.
     """
 
     del device_index
@@ -609,6 +627,11 @@ def compile_grouped_tn(
     ldg_x_threads = block_k // async_load_vec_size
     ldg_a_iters = (block_m * block_k) // (block_threads * async_load_vec_size)
     ldg_b_iters = (block_n * block_k) // (block_threads * async_load_vec_size)
+    # Gathered RHS tiles issue one packed-ID VMEM operation in addition to
+    # their regular A/B direct-to-LDS operations.  The IDs are staged by the
+    # first wave, one dword per lane, instead of being loaded separately by
+    # every B load iteration.
+    scheduled_vmem_ops = ldg_a_iters + ldg_b_iters + int(gather_rhs)
     mma_m_iters = block_m // (m_waves * mma_m)
     mma_n_iters = block_n // (n_waves * mma_n)
     k_mma_iters = block_k // mma_k
@@ -646,15 +669,32 @@ def compile_grouped_tn(
         raise ValueError("grouped TN A tile must have exact whole-workgroup DMA coverage")
     if ldg_b_iters * block_threads * async_load_vec_size != block_n * block_k:
         raise ValueError("grouped TN B tile must have exact whole-workgroup DMA coverage")
-    lds_ab_bytes = stages * (block_m + block_n) * block_k * in_data_bytes
+    gather_lanes_per_row = block_n // async_load_vec_size
+    if gather_rhs and (gather_lanes_per_row > GFX950_WAVE_SIZE or GFX950_WAVE_SIZE % gather_lanes_per_row):
+        raise ValueError("gathered RHS row vectors must form whole groups within one wave")
+    token_id_lds_bytes = stages * block_k * 4 if gather_rhs else 0
+    lds_ab_bytes = (
+        stages * (block_m + block_n) * block_k * in_data_bytes
+        + token_id_lds_bytes
+    )
     lds_c_bytes = block_m * block_n * in_data_bytes
     if max(lds_ab_bytes, lds_c_bytes) > 163840:
         raise ValueError("grouped TN tuning exceeds gfx950 LDS capacity")
 
-    @fx.struct
-    class SharedABStorage:
-        a: fx.Array[fx.BFloat16, stages * block_m * block_k, 16]
-        b: fx.Array[fx.BFloat16, stages * block_n * block_k, 16]
+    if gather_rhs:
+
+        @fx.struct
+        class SharedABStorage:
+            a: fx.Array[fx.BFloat16, stages * block_m * block_k, 16]
+            b: fx.Array[fx.BFloat16, stages * block_n * block_k, 16]
+            token_ids: fx.Array[fx.Int32, stages * block_k, 16]
+
+    else:
+
+        @fx.struct
+        class SharedABStorage:
+            a: fx.Array[fx.BFloat16, stages * block_m * block_k, 16]
+            b: fx.Array[fx.BFloat16, stages * block_n * block_k, 16]
 
     @fx.union
     class SharedStorage:
@@ -666,6 +706,7 @@ def compile_grouped_tn(
             f"sonic_grouped_tn_bf16_m{output_m}_n{output_n}_e{num_experts}"
             f"_bm{block_m}_bn{block_n}_bk{block_k}_s{stages}_kp{k_padding}_w{m_waves}x{n_waves}"
             f"_md{int(metadata_direct)}"
+            f"_gr{int(gather_rhs)}"
             f"_amin{min_active_experts}_amax{max_active_experts}"
         ),
         known_block_size=[block_threads, 1, 1],
@@ -673,6 +714,7 @@ def compile_grouped_tn(
     def grouped_tn_kernel(
         lhs_rows: fx.Tensor,
         rhs_rows: fx.Tensor,
+        sorted_token_ids: fx.Tensor,
         expert_frequency: fx.Tensor,
         schedule_storage: fx.Tensor,
         num_valid_ids: fx.Tensor,
@@ -717,11 +759,22 @@ def compile_grouped_tn(
         storage = fx.SharedAllocator().allocate(SharedStorage)
         smem_a = storage.ab.a.peek().ptr
         smem_b = storage.ab.b.peek().ptr
+        # Keep the non-gather specialization's storage type and LDS footprint
+        # unchanged.  This alias is never consumed after constexpr folding.
+        smem_token_ids = storage.ab.token_ids.peek().ptr if gather_rhs else smem_b
         smem_c = storage.c.peek().ptr
         lhs_base_addr = fx.Int64(fx.ptrtoint(fx.get_iter(lhs_rows)))
         rhs_base_addr = fx.Int64(fx.ptrtoint(fx.get_iter(rhs_rows)))
         output_base_addr = fx.Int64(fx.ptrtoint(fx.get_iter(output)))
         frequency_rsrc = buffer_ops.create_buffer_resource(expert_frequency, max_size=True)
+        rhs_row_count = fx.Int32(fx.get_scalar(rhs_rows.shape[0]))
+        rhs_bytes = fx.Int64(rhs_row_count) * fx.Int64(output_n * in_data_bytes)
+        full_rhs_rsrc = buffer_ops.create_buffer_resource(
+            rhs_rows,
+            max_size=False,
+            num_records_bytes=_raw(rhs_bytes),
+        )
+        token_ids_rsrc = buffer_ops.create_buffer_resource(sorted_token_ids, max_size=True)
 
         a_read_atom = fx.make_copy_atom(fx.rocdl.cdna4.LDSReadTrans16_64b(), fx.BFloat16)
         b_read_atom = fx.make_copy_atom(fx.rocdl.cdna4.LDSReadTrans16_64b(), fx.BFloat16)
@@ -789,21 +842,23 @@ def compile_grouped_tn(
             k_tiles = padded_k // fx.Int32(block_k)
             resource_rows = frequency if k_padding == 0 else padded_k
             lhs_addr = lhs_base_addr + fx.Int64(first_sorted_row) * fx.Int64(output_m * in_data_bytes)
-            rhs_addr = rhs_base_addr + fx.Int64(first_sorted_row) * fx.Int64(
-                output_n * in_data_bytes
-            )
             lhs_rsrc = buffer_ops.create_buffer_resource_from_addr(
                 _raw(lhs_addr),
                 num_records_bytes=_raw(
                     fx.Int64(resource_rows) * fx.Int64(output_m * in_data_bytes)
                 ),
             )
-            rhs_rsrc = buffer_ops.create_buffer_resource_from_addr(
-                _raw(rhs_addr),
-                num_records_bytes=_raw(
-                    fx.Int64(resource_rows) * fx.Int64(output_n * in_data_bytes)
-                ),
-            )
+            rhs_rsrc = full_rhs_rsrc
+            if const_expr(not gather_rhs):
+                rhs_addr = rhs_base_addr + fx.Int64(first_sorted_row) * fx.Int64(
+                    output_n * in_data_bytes
+                )
+                rhs_rsrc = buffer_ops.create_buffer_resource_from_addr(
+                    _raw(rhs_addr),
+                    num_records_bytes=_raw(
+                        fx.Int64(resource_rows) * fx.Int64(output_n * in_data_bytes)
+                    ),
+                )
             block_m_index = output_tile // fx.Int32(num_n_tiles)
             block_n_index = output_tile % fx.Int32(num_n_tiles)
             block_m_offset = block_m_index * fx.Int32(block_m)
@@ -866,20 +921,163 @@ def compile_grouped_tn(
                     async_context,
                 )
 
-            def load_b(k_tile, stage):
-                async_load_to_lds(
-                    smem_b + stage * block_n * block_k,
-                    rhs_rsrc,
-                    b_lds_layout,
-                    block_n,
-                    output_n,
-                    block_n_offset,
-                    output_n,
-                    ldg_b_iters,
-                    True,
-                    k_tile,
-                    async_context,
-                )
+            def load_b_serial(k_tile, stage):
+                if const_expr(gather_rhs):
+                    lds_ptr = make_wave_lds_ptr(
+                        smem_b + stage * block_n * block_k,
+                        wave_offset,
+                    )
+                    # Every row is consumed by BN/8 contiguous lanes.  Have
+                    # one lane fetch its packed token once, retain all this
+                    # thread's load-iteration values in VGPRs, then broadcast
+                    # within the wave before issuing the dependent 16-byte
+                    # row-vector DMAs.  This avoids both redundant metadata
+                    # traffic and an LDS index-staging/barrier round trip.
+                    packed_lanes = []
+                    load_coordinates = []
+                    tile_valid = k_tile < k_tiles
+                    for load_iter in range_constexpr(ldg_b_iters):
+                        global_tid = fx.Int32(block_threads * load_iter) + tid
+                        outer_lds_idx = (global_tid % fx.Int32(gather_lanes_per_row)) * fx.Int32(async_load_vec_size)
+                        k_local_idx = global_tid // fx.Int32(gather_lanes_per_row)
+                        outer_local_idx = transposed_contiguous_idx(
+                            outer_lds_idx,
+                            k_local_idx,
+                            b_lds_layout,
+                            block_n,
+                        )
+                        sorted_row = first_sorted_row + k_tile * fx.Int32(block_k) + k_local_idx
+                        safe_sorted_row = tile_valid.select(sorted_row, first_sorted_row)
+                        lane = tid % fx.Int32(GFX950_WAVE_SIZE)
+                        packed_lane = fx.Int32(0)
+                        if lane % fx.Int32(gather_lanes_per_row) == fx.Int32(0):
+                            packed_lane = fx.Int32(
+                                buffer_ops.buffer_load(
+                                    token_ids_rsrc,
+                                    safe_sorted_row,
+                                    vec_width=1,
+                                    dtype=T.i32,
+                                )
+                            )
+                        source_lane = lane - lane % fx.Int32(gather_lanes_per_row)
+                        packed_lanes.append((packed_lane, source_lane))
+                        load_coordinates.append((lds_ptr, block_n_offset + outer_local_idx))
+                        if load_iter < ldg_b_iters - 1:
+                            lds_ptr = lds_ptr + fx.Int32(block_threads * async_load_bytes)
+
+                    for load_iter in range_constexpr(ldg_b_iters):
+                        packed_lane, source_lane = packed_lanes[load_iter]
+                        packed = fx.Int32(
+                            rocdl.ds_bpermute(
+                                T.i32,
+                                source_lane * fx.Int32(4),
+                                packed_lane,
+                            )
+                        )
+                        target_lds_ptr, global_col = load_coordinates[load_iter]
+                        decoded_token = packed & fx.Int32(_TOKEN_MASK)
+                        token_valid = tile_valid & (decoded_token < rhs_row_count)
+                        token = token_valid.select(decoded_token, rhs_row_count)
+                        safe_global_col = token_valid.select(global_col, fx.Int32(0))
+                        global_byte = (token * fx.Int32(output_n) + safe_global_col) * fx.Int32(in_data_bytes)
+                        buffer_load_lds_inline(
+                            full_rhs_rsrc,
+                            target_lds_ptr,
+                            global_byte,
+                            async_load_bytes,
+                        )
+                else:
+                    async_load_to_lds(
+                        smem_b + stage * block_n * block_k,
+                        rhs_rsrc,
+                        b_lds_layout,
+                        block_n,
+                        output_n,
+                        block_n_offset,
+                        output_n,
+                        ldg_b_iters,
+                        True,
+                        k_tile,
+                        async_context,
+                    )
+
+            def prefetch_token_ids(k_tile, stage):
+                if const_expr(gather_rhs):
+                    # A single wave writes one packed int32 ID per K row.
+                    # buffer_load ... lds adds lane*4 to this uniform m0 base,
+                    # so BK32 naturally uses the low half-wave and BK64 the
+                    # full wave.  The existing K-stage barrier publishes this
+                    # LDS region; no extra workgroup barrier is introduced.
+                    tile_valid = k_tile < k_tiles
+                    if tid < fx.Int32(block_k):
+                        sorted_row = first_sorted_row + k_tile * fx.Int32(block_k) + tid
+                        safe_sorted_row = tile_valid.select(sorted_row, first_sorted_row)
+                        token_lds_ptr = fx.recast_iter(
+                            fx.Int8,
+                            smem_token_ids + stage * fx.Int32(block_k),
+                        )
+                        buffer_load_lds_inline(
+                            token_ids_rsrc,
+                            token_lds_ptr,
+                            safe_sorted_row * fx.Int32(4),
+                            4,
+                        )
+
+            def load_b_from_prefetched_ids(k_tile, stage):
+                if const_expr(gather_rhs):
+                    lds_ptr = make_wave_lds_ptr(
+                        smem_b + stage * block_n * block_k,
+                        wave_offset,
+                    )
+                    tile_valid = k_tile < k_tiles
+                    for load_iter in range_constexpr(ldg_b_iters):
+                        global_tid = fx.Int32(block_threads * load_iter) + tid
+                        outer_lds_idx = (
+                            global_tid % fx.Int32(gather_lanes_per_row)
+                        ) * fx.Int32(async_load_vec_size)
+                        k_local_idx = global_tid // fx.Int32(gather_lanes_per_row)
+                        outer_local_idx = transposed_contiguous_idx(
+                            outer_lds_idx,
+                            k_local_idx,
+                            b_lds_layout,
+                            block_n,
+                        )
+                        lane = tid % fx.Int32(GFX950_WAVE_SIZE)
+                        packed_lane = fx.Int32(0)
+                        if lane % fx.Int32(gather_lanes_per_row) == fx.Int32(0):
+                            packed_lane = fx.Int32(
+                                fx.ptr_load(
+                                    smem_token_ids
+                                    + stage * fx.Int32(block_k)
+                                    + k_local_idx
+                                )
+                            )
+                        source_lane = lane - lane % fx.Int32(gather_lanes_per_row)
+                        packed = fx.Int32(
+                            rocdl.ds_bpermute(
+                                T.i32,
+                                source_lane * fx.Int32(4),
+                                packed_lane,
+                            )
+                        )
+                        decoded_token = packed & fx.Int32(_TOKEN_MASK)
+                        token_valid = tile_valid & (decoded_token < rhs_row_count)
+                        token = token_valid.select(decoded_token, rhs_row_count)
+                        global_col = block_n_offset + outer_local_idx
+                        safe_global_col = token_valid.select(global_col, fx.Int32(0))
+                        global_byte = (
+                            token * fx.Int32(output_n) + safe_global_col
+                        ) * fx.Int32(in_data_bytes)
+                        buffer_load_lds_inline(
+                            full_rhs_rsrc,
+                            lds_ptr,
+                            global_byte,
+                            async_load_bytes,
+                        )
+                        if load_iter < ldg_b_iters - 1:
+                            lds_ptr = lds_ptr + fx.Int32(
+                                block_threads * async_load_bytes
+                            )
 
             def compute_stage(read_stage):
                 stage_a = fx.make_view(
@@ -913,7 +1111,7 @@ def compile_grouped_tn(
                     )
 
             for stage in range_constexpr(stages - 1):
-                load_b(fx.Int32(stage), stage)
+                load_b_serial(fx.Int32(stage), stage)
                 load_a(fx.Int32(stage), stage)
             rocdl.sched_barrier(0)
             raw_main_loop_end = k_tiles - fx.Int32(stages - 1)
@@ -923,14 +1121,38 @@ def compile_grouped_tn(
                     raw_main_loop_end,
                     fx.Int32(0),
                 )
+            if const_expr(gather_rhs):
+                if main_loop_end > fx.Int32(0):
+                    prefetch_token_ids(
+                        fx.Int32(stages - 1),
+                        fx.Int32(stages - 1),
+                    )
             for k_tile in range(fx.Int32(0), main_loop_end, fx.Int32(1)):
                 current_stage = k_tile % fx.Int32(stages)
                 write_stage = (current_stage + fx.Int32(stages - 1)) % fx.Int32(stages)
-                __barrier((stages - 2) * (ldg_a_iters + ldg_b_iters))
-                load_b(k_tile + fx.Int32(stages - 1), write_stage)
+                # The prefetched metadata is the newest VMEM operation.  A
+                # non-zero vmcnt could therefore publish its LDS stage too
+                # early.  Stage-2 already waited at vmcnt(0); keep that exact
+                # safety rule for experimental deep gather pipelines until a
+                # separately ordered metadata counter is available.
+                if const_expr(gather_rhs):
+                    __barrier(0)
+                    load_b_from_prefetched_ids(
+                        k_tile + fx.Int32(stages - 1),
+                        write_stage,
+                    )
+                else:
+                    __barrier((stages - 2) * (ldg_a_iters + ldg_b_iters))
+                    load_b_serial(k_tile + fx.Int32(stages - 1), write_stage)
                 load_a(k_tile + fx.Int32(stages - 1), write_stage)
+                if const_expr(gather_rhs):
+                    if k_tile + fx.Int32(1) < main_loop_end:
+                        prefetch_token_ids(
+                            k_tile + fx.Int32(stages),
+                            current_stage,
+                        )
                 compute_stage(current_stage)
-                rocdl.sched_vmem(ldg_a_iters + ldg_b_iters)
+                rocdl.sched_vmem(scheduled_vmem_ops)
                 for _ in range_constexpr(k_mma_iters):
                     rocdl.sched_dsrd(mma_n_iters)
                     rocdl.sched_dsrd(mma_m_iters)
@@ -980,40 +1202,82 @@ def compile_grouped_tn(
             gpu.barrier()
             run_output_tile(fx.Int32(work_index))
 
-    @flyc.jit
-    def launch(
-        lhs_rows: fx.Tensor,
-        rhs_rows: fx.Tensor,
-        expert_frequency: fx.Tensor,
-        schedule_storage: fx.Tensor,
-        num_valid_ids: fx.Tensor,
-        output: fx.Tensor,
-        i32_grid: fx.Int32,
-        stream: fx.Stream = fx.Stream(None),
-    ):
-        mma_atom = fx.make_mma_atom(fx.rocdl.MFMA(mma_m, mma_n, mma_k, fx.BFloat16))
-        tiled_mma = fx.make_tiled_mma(
-            mma_atom,
-            fx.make_layout((m_waves, n_waves, 1), (n_waves, 1, 0)),
-            fx.make_tile(
-                None,
-                None,
-                fx.make_layout((mma_k // 4, 4), (1, mma_k // 4)),
-            ),
-        )
-        grouped_tn_kernel(
-            lhs_rows,
-            rhs_rows,
-            expert_frequency,
-            schedule_storage,
-            num_valid_ids,
-            output,
-            tiled_mma,
-        ).launch(
-            grid=(i32_grid, 1, 1),
-            block=(block_threads, 1, 1),
-            stream=stream,
-        )
+    if gather_rhs:
+
+        @flyc.jit
+        def launch(
+            lhs_rows: fx.Tensor,
+            rhs_rows: fx.Tensor,
+            sorted_token_ids: fx.Tensor,
+            expert_frequency: fx.Tensor,
+            schedule_storage: fx.Tensor,
+            num_valid_ids: fx.Tensor,
+            output: fx.Tensor,
+            i32_grid: fx.Int32,
+            stream: fx.Stream = fx.Stream(None),
+        ):
+            mma_atom = fx.make_mma_atom(fx.rocdl.MFMA(mma_m, mma_n, mma_k, fx.BFloat16))
+            tiled_mma = fx.make_tiled_mma(
+                mma_atom,
+                fx.make_layout((m_waves, n_waves, 1), (n_waves, 1, 0)),
+                fx.make_tile(
+                    None,
+                    None,
+                    fx.make_layout((mma_k // 4, 4), (1, mma_k // 4)),
+                ),
+            )
+            grouped_tn_kernel(
+                lhs_rows,
+                rhs_rows,
+                sorted_token_ids,
+                expert_frequency,
+                schedule_storage,
+                num_valid_ids,
+                output,
+                tiled_mma,
+            ).launch(
+                grid=(i32_grid, 1, 1),
+                block=(block_threads, 1, 1),
+                stream=stream,
+            )
+
+    else:
+
+        @flyc.jit
+        def launch(
+            lhs_rows: fx.Tensor,
+            rhs_rows: fx.Tensor,
+            expert_frequency: fx.Tensor,
+            schedule_storage: fx.Tensor,
+            num_valid_ids: fx.Tensor,
+            output: fx.Tensor,
+            i32_grid: fx.Int32,
+            stream: fx.Stream = fx.Stream(None),
+        ):
+            mma_atom = fx.make_mma_atom(fx.rocdl.MFMA(mma_m, mma_n, mma_k, fx.BFloat16))
+            tiled_mma = fx.make_tiled_mma(
+                mma_atom,
+                fx.make_layout((m_waves, n_waves, 1), (n_waves, 1, 0)),
+                fx.make_tile(
+                    None,
+                    None,
+                    fx.make_layout((mma_k // 4, 4), (1, mma_k // 4)),
+                ),
+            )
+            grouped_tn_kernel(
+                lhs_rows,
+                rhs_rows,
+                schedule_storage,
+                expert_frequency,
+                schedule_storage,
+                num_valid_ids,
+                output,
+                tiled_mma,
+            ).launch(
+                grid=(i32_grid, 1, 1),
+                block=(block_threads, 1, 1),
+                stream=stream,
+            )
 
     return launch
 
@@ -1098,6 +1362,7 @@ def grouped_tn_from_queue_flydsl(
     queue_storage: torch.Tensor,
     output: torch.Tensor,
     *,
+    sorted_token_ids: torch.Tensor | None = None,
     block_m: int | None = None,
     block_n: int | None = None,
     block_k: int | None = None,
@@ -1111,21 +1376,28 @@ def grouped_tn_from_queue_flydsl(
 ) -> torch.Tensor:
     """Consume a prebuilt active-expert queue for one grouped TN contraction.
 
-    Both inputs use the same sorter-padded row dimension.  ``output`` must
-    already be zero so empty experts retain exact-zero gradients.  Optional
-    tuning arguments let dW1 and dW2 select independent output/K tiles.  An
-    optional inclusive active-expert interval makes the launch a no-op when
-    ``queue_storage[0]`` falls outside it.
+    By default both inputs use the same sorter-padded row dimension.  Passing
+    ``sorted_token_ids`` switches the RHS to token-major ``[T,N]`` storage and
+    gathers its rows directly into LDS.  ``output`` must already be zero so
+    empty experts retain exact-zero gradients.  Optional tuning arguments let
+    dW1 and dW2 select independent output/K tiles.  An optional inclusive
+    active-expert interval makes the launch a no-op when ``queue_storage[0]``
+    falls outside it.
     """
 
     if lhs_rows.ndim != 2 or rhs_rows.ndim != 2 or output.ndim != 3:
-        raise ValueError("expected lhs_rows[P,M], rhs_rows[P,N], and output[E,M,N]")
+        raise ValueError("expected lhs_rows[P,M], rhs_rows[rows,N], and output[E,M,N]")
     num_experts, output_m, output_n = (int(value) for value in output.shape)
-    if tuple(lhs_rows.shape) != (int(rhs_rows.shape[0]), output_m):
-        raise ValueError("lhs_rows and rhs_rows must share P and match output M")
+    gather_rhs = sorted_token_ids is not None
+    if int(lhs_rows.shape[1]) != output_m:
+        raise ValueError("lhs_rows width must match output M")
+    if not gather_rhs and int(lhs_rows.shape[0]) != int(rhs_rows.shape[0]):
+        raise ValueError("lhs_rows and rhs_rows must share P without RHS gather")
     if int(rhs_rows.shape[1]) != output_n:
         raise ValueError("rhs_rows width must match output N")
-    tensors = (lhs_rows, rhs_rows, expert_frequency, queue_storage, output)
+    tensors = (lhs_rows, rhs_rows, expert_frequency, queue_storage, output) + (
+        (sorted_token_ids,) if sorted_token_ids is not None else ()
+    )
     if any(tensor.device != lhs_rows.device for tensor in tensors):
         raise ValueError("grouped TN tensors must share one device")
     if (
@@ -1136,12 +1408,22 @@ def grouped_tn_from_queue_flydsl(
         raise TypeError("grouped TN currently requires BF16 inputs and output")
     if expert_frequency.dtype != torch.int32 or queue_storage.dtype != torch.int32:
         raise TypeError("grouped TN metadata must use int32")
+    if sorted_token_ids is not None and sorted_token_ids.dtype != torch.int32:
+        raise TypeError("sorted_token_ids must use int32")
     if not all(tensor.is_contiguous() for tensor in tensors):
         raise ValueError("grouped TN tensors must be contiguous")
     if tuple(expert_frequency.shape) != (num_experts,):
         raise ValueError("expert_frequency must have shape [E]")
     if queue_storage.ndim != 1 or queue_storage.numel() < 1 or (queue_storage.numel() - 1) % 2:
         raise ValueError("queue_storage must use [count, (expert, first_row) * capacity] ABI")
+    if sorted_token_ids is not None and (sorted_token_ids.ndim != 1 or sorted_token_ids.numel() < lhs_rows.shape[0]):
+        raise ValueError("sorted_token_ids must be 1D and cover every lhs sorted row")
+    if gather_rhs and sorted_token_ids.numel() * sorted_token_ids.element_size() > _MAX_BUFFER_BYTES:
+        raise ValueError("sorted_token_ids exceeds the gfx950 buffer-resource byte limit")
+    if gather_rhs and rhs_rows.shape[0] > _TOKEN_MASK:
+        raise ValueError("token-major RHS row count exceeds packed token-id capacity")
+    if gather_rhs and rhs_rows.numel() * rhs_rows.element_size() > _MAX_BUFFER_BYTES:
+        raise ValueError("token-major RHS exceeds the gfx950 buffer-resource byte limit")
 
     capacity = (int(queue_storage.numel()) - 1) // 2
     if capacity == 0:
@@ -1167,6 +1449,7 @@ def grouped_tn_from_queue_flydsl(
         stages,
         m_waves,
         n_waves,
+        gather_rhs,
     )
     if stream is None:
         stream = torch.cuda.current_stream(lhs_rows.device)
@@ -1185,19 +1468,36 @@ def grouped_tn_from_queue_flydsl(
         stages,
         min_active_experts,
         max_active_experts,
+        gather_rhs,
     )
-    _run_compiled(
-        launcher,
-        lhs_rows,
-        rhs_rows,
-        expert_frequency,
-        queue_storage,
-        queue_storage,
-        output,
-        grid,
-        stream,
-    )
+    if gather_rhs:
+        _run_compiled(
+            launcher,
+            lhs_rows,
+            rhs_rows,
+            sorted_token_ids,
+            expert_frequency,
+            queue_storage,
+            queue_storage,
+            output,
+            grid,
+            stream,
+        )
+    else:
+        _run_compiled(
+            launcher,
+            lhs_rows,
+            rhs_rows,
+            expert_frequency,
+            queue_storage,
+            queue_storage,
+            output,
+            grid,
+            stream,
+        )
     queue_storage.record_stream(stream)
+    if sorted_token_ids is not None:
+        sorted_token_ids.record_stream(stream)
     return output
 
 
@@ -1209,6 +1509,7 @@ def grouped_tn_from_metadata_flydsl(
     num_valid_ids: torch.Tensor,
     output: torch.Tensor,
     *,
+    sorted_token_ids: torch.Tensor | None = None,
     block_m: int | None = None,
     block_n: int | None = None,
     block_k: int | None = None,
@@ -1222,14 +1523,18 @@ def grouped_tn_from_metadata_flydsl(
 
     This is the builder-free fixed-K T1 path.  Callers must guarantee every
     non-empty expert has at most ``_SORTED_BLOCK_M`` rows; otherwise repeated
-    expert IDs would race while writing the same output tile.
+    expert IDs would race while writing the same output tile.  Passing
+    ``sorted_token_ids`` gathers a token-major RHS directly into LDS.
     """
 
     if lhs_rows.ndim != 2 or rhs_rows.ndim != 2 or output.ndim != 3:
-        raise ValueError("expected lhs_rows[P,M], rhs_rows[P,N], and output[E,M,N]")
+        raise ValueError("expected lhs_rows[P,M], rhs_rows[rows,N], and output[E,M,N]")
     num_experts, output_m, output_n = (int(value) for value in output.shape)
-    if tuple(lhs_rows.shape) != (int(rhs_rows.shape[0]), output_m):
-        raise ValueError("lhs_rows and rhs_rows must share P and match output M")
+    gather_rhs = sorted_token_ids is not None
+    if int(lhs_rows.shape[1]) != output_m:
+        raise ValueError("lhs_rows width must match output M")
+    if not gather_rhs and int(lhs_rows.shape[0]) != int(rhs_rows.shape[0]):
+        raise ValueError("lhs_rows and rhs_rows must share P without RHS gather")
     if int(rhs_rows.shape[1]) != output_n:
         raise ValueError("rhs_rows width must match output N")
     tensors = (
@@ -1239,7 +1544,7 @@ def grouped_tn_from_metadata_flydsl(
         sorted_expert_ids,
         num_valid_ids,
         output,
-    )
+    ) + ((sorted_token_ids,) if sorted_token_ids is not None else ())
     if any(tensor.device != lhs_rows.device for tensor in tensors):
         raise ValueError("grouped TN tensors must share one device")
     if (
@@ -1253,6 +1558,8 @@ def grouped_tn_from_metadata_flydsl(
         for tensor in (expert_frequency, sorted_expert_ids, num_valid_ids)
     ):
         raise TypeError("grouped TN metadata must use int32")
+    if sorted_token_ids is not None and sorted_token_ids.dtype != torch.int32:
+        raise TypeError("sorted_token_ids must use int32")
     if not all(tensor.is_contiguous() for tensor in tensors):
         raise ValueError("grouped TN tensors must be contiguous")
     if tuple(expert_frequency.shape) != (num_experts,):
@@ -1261,6 +1568,14 @@ def grouped_tn_from_metadata_flydsl(
         raise ValueError("sorted_expert_ids must be one-dimensional")
     if num_valid_ids.ndim != 1 or num_valid_ids.numel() < 1:
         raise ValueError("num_valid_ids must contain the padded row count")
+    if sorted_token_ids is not None and (sorted_token_ids.ndim != 1 or sorted_token_ids.numel() < lhs_rows.shape[0]):
+        raise ValueError("sorted_token_ids must be 1D and cover every lhs sorted row")
+    if gather_rhs and sorted_token_ids.numel() * sorted_token_ids.element_size() > _MAX_BUFFER_BYTES:
+        raise ValueError("sorted_token_ids exceeds the gfx950 buffer-resource byte limit")
+    if gather_rhs and rhs_rows.shape[0] > _TOKEN_MASK:
+        raise ValueError("token-major RHS row count exceeds packed token-id capacity")
+    if gather_rhs and rhs_rows.numel() * rhs_rows.element_size() > _MAX_BUFFER_BYTES:
+        raise ValueError("token-major RHS exceeds the gfx950 buffer-resource byte limit")
     if sorted_expert_ids.numel() == 0:
         return output
 
@@ -1288,6 +1603,7 @@ def grouped_tn_from_metadata_flydsl(
         stages,
         m_waves,
         n_waves,
+        gather_rhs,
     )
     if stream is None:
         stream = torch.cuda.current_stream(lhs_rows.device)
@@ -1304,20 +1620,37 @@ def grouped_tn_from_metadata_flydsl(
         lhs_rows.device.index or 0,
         True,
         stages,
+        gather_rhs=gather_rhs,
     )
-    _run_compiled(
-        launcher,
-        lhs_rows,
-        rhs_rows,
-        expert_frequency,
-        sorted_expert_ids,
-        num_valid_ids,
-        output,
-        grid,
-        stream,
-    )
+    if gather_rhs:
+        _run_compiled(
+            launcher,
+            lhs_rows,
+            rhs_rows,
+            sorted_token_ids,
+            expert_frequency,
+            sorted_expert_ids,
+            num_valid_ids,
+            output,
+            grid,
+            stream,
+        )
+    else:
+        _run_compiled(
+            launcher,
+            lhs_rows,
+            rhs_rows,
+            expert_frequency,
+            sorted_expert_ids,
+            num_valid_ids,
+            output,
+            grid,
+            stream,
+        )
     sorted_expert_ids.record_stream(stream)
     num_valid_ids.record_stream(stream)
+    if sorted_token_ids is not None:
+        sorted_token_ids.record_stream(stream)
     return output
 
 

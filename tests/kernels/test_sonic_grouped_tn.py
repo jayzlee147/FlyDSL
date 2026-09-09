@@ -3,6 +3,7 @@
 
 """Correctness tests for the gfx950 device-driven grouped TN kernel."""
 
+import inspect
 import math
 
 import pytest
@@ -13,16 +14,16 @@ from kernels.moe.sonic_grouped_tn import (
     active_expert_descriptor_capacity,
     active_expert_queue_elements,
     build_active_expert_queue_flydsl,
+    compile_grouped_tn,
     grouped_dw2_flydsl,
     grouped_dw2_tuning,
-    grouped_tn_grid_cap,
-    grouped_tn_launch_grid,
     grouped_tn_from_metadata_flydsl,
     grouped_tn_from_queue_flydsl,
+    grouped_tn_grid_cap,
+    grouped_tn_launch_grid,
     zero_inactive_weight_grads_flydsl,
     zero_weight_grads_adaptive_flydsl,
 )
-
 
 pytestmark = [pytest.mark.l2_device, pytest.mark.rocm_lower]
 _SORTED_BLOCK_M = 64
@@ -277,6 +278,284 @@ def test_grouped_tn_consumes_single_block_metadata_without_builder():
             assert torch.count_nonzero(output[expert]) == 0
 
 
+def test_grouped_tn_metadata_direct_gathers_t1_rhs_and_zeroes_sentinel_tail():
+    device = _gfx950_device()
+    generator = torch.Generator(device=device).manual_seed(1423)
+    tokens, output_m, output_n = 1, 64, 64
+    frequencies = [1, 0, 1]
+    padded_rows = 2 * _SORTED_BLOCK_M
+    lhs = torch.zeros((padded_rows, output_m), dtype=torch.bfloat16, device=device)
+    lhs[0].normal_(generator=generator)
+    lhs[_SORTED_BLOCK_M].normal_(generator=generator)
+    token_rhs = torch.randn(
+        (tokens, output_n),
+        dtype=torch.float32,
+        device=device,
+        generator=generator,
+    ).to(torch.bfloat16)
+    sorted_rhs = torch.zeros((padded_rows, output_n), dtype=torch.bfloat16, device=device)
+    sorted_rhs[0] = token_rhs[0]
+    sorted_rhs[_SORTED_BLOCK_M] = token_rhs[0]
+    sorted_token_ids = torch.full(
+        (padded_rows,),
+        tokens,
+        dtype=torch.int32,
+        device=device,
+    )
+    sorted_token_ids[0] = 0
+    sorted_token_ids[_SORTED_BLOCK_M] = 1 << 24
+    frequency = torch.tensor(frequencies, dtype=torch.int32, device=device)
+    sorted_experts = torch.tensor([0, 2], dtype=torch.int32, device=device)
+    num_valid = torch.tensor([padded_rows, sum(frequencies)], dtype=torch.int32, device=device)
+    materialized = torch.zeros(
+        (len(frequencies), output_m, output_n),
+        dtype=torch.bfloat16,
+        device=device,
+    )
+    gathered = torch.zeros_like(materialized)
+    tuning = {
+        "block_m": 64,
+        "block_n": 64,
+        "block_k": 32,
+        "k_padding": 0,
+        "m_waves": 2,
+        "n_waves": 2,
+    }
+
+    grouped_tn_from_metadata_flydsl(
+        lhs,
+        sorted_rhs,
+        frequency,
+        sorted_experts,
+        num_valid,
+        materialized,
+        **tuning,
+    )
+    grouped_tn_from_metadata_flydsl(
+        lhs,
+        token_rhs,
+        frequency,
+        sorted_experts,
+        num_valid,
+        gathered,
+        sorted_token_ids=sorted_token_ids,
+        **tuning,
+    )
+    torch.cuda.synchronize()
+
+    assert torch.equal(gathered, materialized)
+
+
+@pytest.mark.parametrize(
+    ("tokens", "frequencies", "block_k", "stages"),
+    (
+        (128, [33, 0, 65, 30], 32, 2),
+        (256, [33, 0, 129, 94], 64, 3),
+        (512, [257, 0, 129, 126], 64, 3),
+        (512, [257, 0, 129, 126], 64, 4),
+    ),
+    ids=(
+        "bk32-stage2",
+        "bk64-stage3-short",
+        "bk64-stage3-wrapped",
+        "bk64-stage4-wrapped",
+    ),
+)
+def test_grouped_tn_queue_gathers_nonmonotonic_rhs_across_bk_tails(
+    tokens,
+    frequencies,
+    block_k,
+    stages,
+):
+    device = _gfx950_device()
+    generator = torch.Generator(device=device).manual_seed(1425)
+    output_m, output_n = 128, 128
+    padded_counts = [math.ceil(count / _SORTED_BLOCK_M) * _SORTED_BLOCK_M for count in frequencies]
+    padded_rows = sum(padded_counts)
+    lhs = torch.zeros((padded_rows, output_m), dtype=torch.bfloat16, device=device)
+    token_rhs = torch.randn(
+        (tokens, output_n),
+        dtype=torch.float32,
+        device=device,
+        generator=generator,
+    ).to(torch.bfloat16)
+    sorted_rhs = torch.zeros((padded_rows, output_n), dtype=torch.bfloat16, device=device)
+    sorted_token_ids = torch.full(
+        (padded_rows,),
+        tokens,
+        dtype=torch.int32,
+        device=device,
+    )
+    token_order = torch.tensor(
+        [value for pair in zip(range(tokens - 1, tokens // 2 - 1, -1), range(tokens // 2)) for value in pair],
+        dtype=torch.int32,
+        device=device,
+    )
+    sorted_experts = []
+    route_offset = 0
+    sorted_offset = 0
+    for expert, (count, padded) in enumerate(zip(frequencies, padded_counts)):
+        if count == 0:
+            continue
+        expert_tokens = token_order[route_offset : route_offset + count]
+        lhs[sorted_offset : sorted_offset + count] = torch.randn(
+            (count, output_m),
+            dtype=torch.float32,
+            device=device,
+            generator=generator,
+        ).to(torch.bfloat16)
+        sorted_rhs[sorted_offset : sorted_offset + count] = token_rhs[expert_tokens.long()]
+        slots = torch.arange(count, dtype=torch.int32, device=device) % 4
+        sorted_token_ids[sorted_offset : sorted_offset + count] = expert_tokens | (slots << 24)
+        sorted_experts.extend([expert] * (padded // _SORTED_BLOCK_M))
+        route_offset += count
+        sorted_offset += padded
+
+    frequency = torch.tensor(frequencies, dtype=torch.int32, device=device)
+    sorted_experts = torch.tensor(sorted_experts, dtype=torch.int32, device=device)
+    num_valid = torch.tensor([padded_rows, tokens], dtype=torch.int32, device=device)
+    queue = build_active_expert_queue_flydsl(
+        frequency,
+        sorted_experts,
+        num_valid,
+        routes=tokens,
+    )
+    materialized = torch.zeros(
+        (len(frequencies), output_m, output_n),
+        dtype=torch.bfloat16,
+        device=device,
+    )
+    gathered = torch.zeros_like(materialized)
+    tuning = {
+        "block_m": 128,
+        "block_n": 128,
+        "block_k": block_k,
+        "k_padding": 0,
+        "m_waves": 2,
+        "n_waves": 2,
+        "stages": stages,
+    }
+
+    grouped_tn_from_queue_flydsl(
+        lhs,
+        sorted_rhs,
+        frequency,
+        queue,
+        materialized,
+        **tuning,
+    )
+    grouped_tn_from_queue_flydsl(
+        lhs,
+        token_rhs,
+        frequency,
+        queue,
+        gathered,
+        sorted_token_ids=sorted_token_ids,
+        **tuning,
+    )
+    torch.cuda.synchronize()
+
+    assert torch.equal(gathered, materialized)
+
+
+def test_grouped_tn_gather_rhs_validates_packed_ids():
+    device = _gfx950_device()
+    lhs = torch.zeros((64, 64), dtype=torch.bfloat16, device=device)
+    rhs = torch.zeros((1, 64), dtype=torch.bfloat16, device=device)
+    frequency = torch.tensor([1], dtype=torch.int32, device=device)
+    sorted_experts = torch.tensor([0], dtype=torch.int32, device=device)
+    num_valid = torch.tensor([64, 1], dtype=torch.int32, device=device)
+    output = torch.zeros((1, 64, 64), dtype=torch.bfloat16, device=device)
+
+    with pytest.raises(TypeError, match="sorted_token_ids must use int32"):
+        grouped_tn_from_metadata_flydsl(
+            lhs,
+            rhs,
+            frequency,
+            sorted_experts,
+            num_valid,
+            output,
+            sorted_token_ids=torch.zeros(64, dtype=torch.int64, device=device),
+        )
+    with pytest.raises(ValueError, match="1D and cover"):
+        grouped_tn_from_metadata_flydsl(
+            lhs,
+            rhs,
+            frequency,
+            sorted_experts,
+            num_valid,
+            output,
+            sorted_token_ids=torch.zeros((8, 8), dtype=torch.int32, device=device),
+        )
+    with pytest.raises(ValueError, match="1D and cover"):
+        grouped_tn_from_metadata_flydsl(
+            lhs,
+            rhs,
+            frequency,
+            sorted_experts,
+            num_valid,
+            output,
+            sorted_token_ids=torch.zeros(63, dtype=torch.int32, device=device),
+        )
+
+    queue = torch.zeros(3, dtype=torch.int32, device=device)
+    with pytest.raises(TypeError, match="sorted_token_ids must use int32"):
+        grouped_tn_from_queue_flydsl(
+            lhs,
+            rhs,
+            frequency,
+            queue,
+            output,
+            sorted_token_ids=torch.zeros(64, dtype=torch.int64, device=device),
+        )
+    with pytest.raises(ValueError, match="1D and cover"):
+        grouped_tn_from_queue_flydsl(
+            lhs,
+            rhs,
+            frequency,
+            queue,
+            output,
+            sorted_token_ids=torch.zeros((8, 8), dtype=torch.int32, device=device),
+        )
+    with pytest.raises(ValueError, match="1D and cover"):
+        grouped_tn_from_queue_flydsl(
+            lhs,
+            rhs,
+            frequency,
+            queue,
+            output,
+            sorted_token_ids=torch.zeros(63, dtype=torch.int32, device=device),
+        )
+
+
+def test_compile_grouped_tn_preserves_sorted_rhs_launcher_abi():
+    compile_args = (64, 64, 1, 64, 64, 32, 0, 2, 2, 0)
+    sorted_rhs_launcher = compile_grouped_tn(*compile_args)
+    gathered_rhs_launcher = compile_grouped_tn(*compile_args, gather_rhs=True)
+
+    assert tuple(inspect.signature(sorted_rhs_launcher.func).parameters) == (
+        "lhs_rows",
+        "rhs_rows",
+        "expert_frequency",
+        "schedule_storage",
+        "num_valid_ids",
+        "output",
+        "i32_grid",
+        "stream",
+    )
+    assert tuple(inspect.signature(gathered_rhs_launcher.func).parameters) == (
+        "lhs_rows",
+        "rhs_rows",
+        "sorted_token_ids",
+        "expert_frequency",
+        "schedule_storage",
+        "num_valid_ids",
+        "output",
+        "i32_grid",
+        "stream",
+    )
+
+
 def test_grouped_tn_uses_64_bit_output_base_for_last_production_expert():
     device = _gfx950_device()
     num_experts = 896
@@ -437,6 +716,8 @@ def test_grouped_dw2_policy_helpers():
     assert grouped_tn_grid_cap(128, 256, 32, 2, 2, 4) == 512
     assert grouped_tn_grid_cap(128, 128, 32, 2, 2, 2) == 1024
     assert grouped_tn_grid_cap(128, 128, 32, 3, 2, 2) == 768
+    assert grouped_tn_grid_cap(64, 64, 32, 2, 1, 1) == 2560
+    assert grouped_tn_grid_cap(64, 64, 32, 2, 1, 1, True) == 2304
     assert grouped_tn_launch_grid(3, 256, 256, 128, 128, 32, 2, 2, 2) == 12
     with pytest.raises(ValueError):
         active_expert_descriptor_capacity(-1, 8)

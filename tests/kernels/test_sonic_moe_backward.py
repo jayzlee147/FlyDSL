@@ -29,6 +29,7 @@ from kernels.moe.sonic_backward import (
     _grouped_dw2_tuning,
     _grouped_dx_tuning,
     _grouped_w1_tuning,
+    _use_direct_grouped_dw1_rhs,
     _use_direct_grouped_dx_routes,
     _use_fused_da_dscore,
     _use_grouped_da,
@@ -98,6 +99,43 @@ def test_e896_retained_state_hostless_policy_is_narrow(overrides, expected):
     }
     kwargs.update(overrides)
     assert _use_hostless_grouped_backward(**kwargs) is expected
+
+
+@pytest.mark.parametrize(
+    ("overrides", "expected"),
+    (
+        ({}, True),
+        ({"reuse_forward_preactivation": False}, False),
+        ({"use_fused_forward_state_prepare": False}, False),
+        ({"use_grouped_dw1": False}, False),
+        ({"flat_routes": True}, False),
+        ({"has_bias": True}, False),
+        ({"compute_dtype": "fp16"}, False),
+        ({"activation": "geglu"}, False),
+        ({"tokens": 128}, False),
+        ({"hidden_size": 4096}, False),
+        ({"intermediate_size": 1024}, False),
+        ({"num_experts": 64}, False),
+        ({"topk": 8}, False),
+    ),
+)
+def test_direct_grouped_dw1_rhs_policy_is_production_e896_only(overrides, expected):
+    kwargs = {
+        "reuse_forward_preactivation": True,
+        "use_fused_forward_state_prepare": True,
+        "use_grouped_dw1": True,
+        "flat_routes": False,
+        "has_bias": False,
+        "compute_dtype": "bf16",
+        "activation": "swiglu",
+        "tokens": 4096,
+        "hidden_size": 3584,
+        "intermediate_size": 512,
+        "num_experts": 896,
+        "topk": 16,
+    }
+    kwargs.update(overrides)
+    assert _use_direct_grouped_dw1_rhs(**kwargs) is expected
 
 
 def test_short_hostless_policy_still_requires_grouped_projection_recompute():
@@ -170,6 +208,17 @@ def test_fused_da_dscore_policy_is_narrow(overrides, expected):
 )
 def test_grouped_dw1_tuning(max_expert_rows, hidden_size, intermediate_size, expected):
     assert _grouped_dw1_tuning(max_expert_rows, hidden_size, intermediate_size) == expected
+
+
+def test_direct_grouped_dw1_rhs_uses_wider_n_tile():
+    assert _grouped_dw1_tuning(4096, 3584, 512, direct_rhs=True) == (
+        128,
+        256,
+        32,
+        0,
+        2,
+        4,
+    )
 
 
 @pytest.mark.parametrize(
