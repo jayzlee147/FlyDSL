@@ -36,6 +36,13 @@ Formal paired acceptance on an independently reserved gfx950::
     PYTHONPATH=. python tools/accept_sonic_e896_forward.py \
         --exclusive-gpu --profiles full-candidate --pairs 11 \
         --output /tmp/sonic-e896-forward.json
+
+Parent-relative single-step acceptance::
+
+    PYTHONPATH=. python tools/accept_sonic_e896_forward.py \
+        --exclusive-gpu --compare-to parent \
+        --profiles m80-pipeline2 m80-stage1-persistent --pairs 11 \
+        --output /tmp/sonic-e896-forward-parent.json
 """
 
 from __future__ import annotations
@@ -66,6 +73,7 @@ EXPERTS = 896
 TOPK = 16
 ROUTING_CASES = ("balanced", "hot16")
 APIS = ("inference", "training")
+COMPARISON_MODES = ("baseline", "parent")
 GFX950_PERSISTENT_GRID_CAP = 256
 GFX950_LDS_BYTES = 160 * 1024
 CHUNK_ELEMENTS = 8 * 1024 * 1024
@@ -941,7 +949,7 @@ def _collect_source_identity(
         "codegen_environment": _codegen_environment(),
         "runtime_sha256": aggregate.hexdigest(),
         "files": files,
-        "comparison_model": "config-only; baseline and candidates execute these identical runtime sources",
+        "comparison_model": "config-only; reference and candidate profiles execute these identical runtime sources",
         "checks": checks,
         "passed": all(checks.values()) if enforce_provenance else True,
     }
@@ -955,6 +963,68 @@ def _selected_profiles(args: argparse.Namespace) -> tuple[str, ...]:
     return unique
 
 
+def _reference_profile_name(candidate_name: str, compare_to: str) -> str:
+    """Resolve the actual reference executed for one candidate.
+
+    ``baseline`` preserves the historical all-candidates-vs-baseline sweep.
+    ``parent`` makes the declared profile graph operational instead of using
+    it only for manifest reporting.
+    """
+
+    if candidate_name not in PROFILE_BY_NAME:
+        raise KeyError(f"unknown candidate profile {candidate_name!r}")
+    if candidate_name == "baseline":
+        raise ValueError("baseline cannot be used as a candidate")
+    if compare_to == "baseline":
+        return "baseline"
+    if compare_to == "parent":
+        parent = PROFILE_BY_NAME[candidate_name].parent
+        if parent is None:
+            raise ValueError(f"profile {candidate_name!r} has no parent")
+        if parent not in PROFILE_BY_NAME:
+            raise KeyError(f"profile {candidate_name!r} has unknown parent {parent!r}")
+        return parent
+    raise ValueError(f"unknown comparison mode {compare_to!r}")
+
+
+def _config_changes(reference: dict[str, Any], candidate: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    """Return a stable, complete candidate-minus-reference config diff."""
+
+    return {
+        key: {"from": reference.get(key), "to": candidate.get(key)}
+        for key in sorted(reference.keys() | candidate.keys())
+        if reference.get(key) != candidate.get(key)
+    }
+
+
+def _comparison_record(candidate_name: str, compare_to: str) -> dict[str, Any]:
+    """Describe exactly which two resolved profiles a run will execute."""
+
+    reference_name = _reference_profile_name(candidate_name, compare_to)
+    reference = _profile_record(PROFILE_BY_NAME[reference_name])
+    candidate = _profile_record(PROFILE_BY_NAME[candidate_name])
+    reference_signature = reference["prepared_weight_compatibility"]["signature"]
+    candidate_signature = candidate["prepared_weight_compatibility"]["signature"]
+    return {
+        "mode": compare_to,
+        "reference_profile": reference_name,
+        "candidate_profile": candidate_name,
+        "reference_config": reference["config"],
+        "reference_config_sha256": reference["config_sha256"],
+        "candidate_config": candidate["config"],
+        "candidate_config_sha256": candidate["config_sha256"],
+        "changes_from_reference": _config_changes(reference["config"], candidate["config"]),
+        "prepared_weight_compatibility": {
+            "fields": list(WEIGHT_COMPATIBILITY_FIELDS),
+            "reference_signature": reference_signature,
+            "candidate_signature": candidate_signature,
+            "reference_matches_baseline": reference["prepared_weight_compatibility"]["matches_baseline"],
+            "candidate_matches_baseline": candidate["prepared_weight_compatibility"]["matches_baseline"],
+            "candidate_matches_reference": candidate_signature == reference_signature,
+        },
+    }
+
+
 def _emit(payload: dict[str, Any], output: Path | None) -> None:
     encoded = json.dumps(payload, indent=2)
     print(encoded)
@@ -966,6 +1036,7 @@ def _emit(payload: dict[str, Any], output: Path | None) -> None:
 def _plan_payload(args: argparse.Namespace, repo: Path) -> dict[str, Any]:
     selected = _selected_profiles(args)
     records = [_profile_record(profile) for profile in PROFILES]
+    comparisons = {name: _comparison_record(name, args.compare_to) for name in selected}
     weight_reuse_passed = all(record["prepared_weight_compatibility"]["matches_baseline"] for record in records)
     return {
         "schema": "flydsl.sonic_e896_forward_plan.v1",
@@ -978,6 +1049,8 @@ def _plan_payload(args: argparse.Namespace, repo: Path) -> dict[str, Any]:
             "training_state_interleaved_w1": True,
         },
         "suite": args.suite if args.profiles is None else None,
+        "comparison_mode": args.compare_to,
+        "comparisons": comparisons,
         "selected_candidates": list(selected),
         "selected_cases": list(dict.fromkeys(args.cases)),
         "selected_apis": list(dict.fromkeys(args.apis)),
@@ -995,11 +1068,20 @@ def _plan_payload(args: argparse.Namespace, repo: Path) -> dict[str, Any]:
     }
 
 
-def _parse_args() -> argparse.Namespace:
+def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     selection = parser.add_mutually_exclusive_group()
     selection.add_argument("--suite", choices=tuple(SUITES), default="smoke")
     selection.add_argument("--profiles", nargs="+", choices=CANDIDATE_NAMES)
+    parser.add_argument(
+        "--compare-to",
+        choices=COMPARISON_MODES,
+        default="baseline",
+        help=(
+            "reference selection: compare every candidate with the global baseline "
+            "(default), or with its declared parent for sequential tuning"
+        ),
+    )
     parser.add_argument("--cases", nargs="+", choices=ROUTING_CASES, default=list(ROUTING_CASES))
     parser.add_argument("--apis", nargs="+", choices=APIS, default=list(APIS))
     parser.add_argument(
@@ -1069,7 +1151,7 @@ def _parse_args() -> argparse.Namespace:
         help="enable FlyDSL IR/ISA dumps and attach matching ISA resource summaries",
     )
     parser.add_argument("--output", type=Path)
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
     if args.device < 0:
         parser.error("--device must be non-negative")
@@ -2262,6 +2344,21 @@ def _self_test_payload(repo: Path) -> dict[str, Any]:
 
     checks = {
         "all_profiles_static_valid": len(records) == len(PROFILES),
+        "default_comparison_resolves_global_baseline": (
+            _reference_profile_name("m80-pipeline2", "baseline") == "baseline"
+        ),
+        "parent_comparison_resolves_declared_parent": (
+            _reference_profile_name("m80-pipeline2", "parent") == "m80-equal"
+        ),
+        "parent_pipeline_comparison_is_one_config_step": (
+            _comparison_record("m80-pipeline2", "parent")["changes_from_reference"]
+            == {"stage2_pipeline_stages": {"from": None, "to": 2}}
+        ),
+        "parent_comparison_reuses_prepared_weights": (
+            _comparison_record("m80-pipeline2", "parent")["prepared_weight_compatibility"][
+                "candidate_matches_reference"
+            ]
+        ),
         "all_profiles_reuse_prepared_weights": all(
             record["prepared_weight_compatibility"]["matches_baseline"] for record in records.values()
         ),
@@ -2380,10 +2477,21 @@ def _execute(args: argparse.Namespace, repo: Path) -> dict[str, Any]:
         raise RuntimeError(f"this acceptance sweep requires gfx950, found {arch!r}")
 
     selected = _selected_profiles(args)
-    profile_records = {name: _profile_record(PROFILE_BY_NAME[name]) for name in ("baseline", *selected)}
+    comparisons = {name: _comparison_record(name, args.compare_to) for name in selected}
+    reference_names = tuple(dict.fromkeys(comparison["reference_profile"] for comparison in comparisons.values()))
+    required_profile_names = tuple(dict.fromkeys(("baseline", *reference_names, *selected)))
+    profile_records = {
+        name: _profile_record(PROFILE_BY_NAME[name])
+        for name in required_profile_names
+    }
     configs = {name: sonic.SonicMoEConfig(**profile_records[name]["config"]) for name in profile_records}
     if not all(profile_records[name]["prepared_weight_compatibility"]["matches_baseline"] for name in profile_records):
-        raise RuntimeError("selected tile candidates do not share the baseline prepared-weight ABI")
+        raise RuntimeError("selected reference/candidate profiles do not share the baseline prepared-weight ABI")
+    if not all(
+        comparison["prepared_weight_compatibility"]["candidate_matches_reference"]
+        for comparison in comparisons.values()
+    ):
+        raise RuntimeError("a selected candidate does not share its reference prepared-weight ABI")
 
     generator = torch.Generator(device="cuda").manual_seed(args.seed)
     torch.cuda.reset_peak_memory_stats()
@@ -2433,8 +2541,6 @@ def _execute(args: argparse.Namespace, repo: Path) -> dict[str, Any]:
     gc.collect()
     torch.cuda.empty_cache()
 
-    baseline_op = sonic.SonicMoE(configs["baseline"], weights)
-    baseline_out = torch.empty_like(x)
     report: dict[str, Any] = {
         "schema": "flydsl.sonic_e896_forward_acceptance.v1",
         "generated_at_utc": datetime.now(timezone.utc).isoformat(),
@@ -2459,9 +2565,18 @@ def _execute(args: argparse.Namespace, repo: Path) -> dict[str, Any]:
         "oracle": {case: oracle_results[case]["metadata"] for case in dict.fromkeys(args.cases)},
         "setup_peak_memory": setup_peak,
         "baseline": profile_records["baseline"],
+        "comparison_mode": args.compare_to,
+        "comparison_role_labels": {
+            "baseline": "the per-candidate reference named by candidates[*].comparison.reference_profile",
+            "candidate": "the selected candidate profile",
+        },
+        "comparisons": comparisons,
         "prepared_weight_reuse_gate": {
             "fields": list(WEIGHT_COMPATIBILITY_FIELDS),
+            "required_profiles": list(required_profile_names),
             "all_selected_profiles_match_baseline": True,
+            "all_reference_and_candidate_profiles_match_baseline": True,
+            "all_candidates_match_their_reference": True,
             "validated_by_sonic_moe_constructors": True,
         },
         "selected_candidates": list(selected),
@@ -2474,12 +2589,22 @@ def _execute(args: argparse.Namespace, repo: Path) -> dict[str, Any]:
     performance_all = True
     performance_required = not args.correctness_only and not args.skip_performance_gate
     for profile_name in selected:
-        print(f"[sonic-e896-forward] profile={profile_name}", file=sys.stderr, flush=True)
+        comparison = comparisons[profile_name]
+        reference_name = comparison["reference_profile"]
+        print(
+            f"[sonic-e896-forward] reference={reference_name} candidate={profile_name}",
+            file=sys.stderr,
+            flush=True,
+        )
         profile = profile_records[profile_name]
+        reference_op = sonic.SonicMoE(configs[reference_name], weights)
         candidate_op = sonic.SonicMoE(configs[profile_name], weights)
+        reference_out = torch.empty_like(x)
         candidate_out = torch.empty_like(x)
         profile_result: dict[str, Any] = {
             "profile": profile,
+            "reference": profile_records[reference_name],
+            "comparison": comparison,
             "cases": {},
         }
         for case in dict.fromkeys(args.cases):
@@ -2487,7 +2612,8 @@ def _execute(args: argparse.Namespace, repo: Path) -> dict[str, Any]:
             case_result: dict[str, Any] = {"routing": routing_summary, "apis": {}}
             for api in dict.fromkeys(args.apis):
                 print(
-                    f"[sonic-e896-forward] profile={profile_name} case={case} api={api}",
+                    f"[sonic-e896-forward] reference={reference_name} candidate={profile_name} "
+                    f"case={case} api={api}",
                     file=sys.stderr,
                     flush=True,
                 )
@@ -2495,9 +2621,9 @@ def _execute(args: argparse.Namespace, repo: Path) -> dict[str, Any]:
                     torch,
                     sonic,
                     x,
-                    baseline_op,
+                    reference_op,
                     candidate_op,
-                    baseline_out,
+                    reference_out,
                     candidate_out,
                     api,
                     case,
@@ -2513,8 +2639,8 @@ def _execute(args: argparse.Namespace, repo: Path) -> dict[str, Any]:
                     api=api,
                     ids=ids,
                     scores=scores,
-                    op=baseline_op,
-                    out=baseline_out,
+                    op=reference_op,
+                    out=reference_out,
                     hidden=x,
                 ):
                     return _run_api(op, api, hidden, ids, scores, out)
@@ -2538,7 +2664,7 @@ def _execute(args: argparse.Namespace, repo: Path) -> dict[str, Any]:
                     peak_memory = _measure_peaks(
                         torch,
                         calls,
-                        {"baseline": baseline_op, "candidate": candidate_op},
+                        {"baseline": reference_op, "candidate": candidate_op},
                         args.peak_samples,
                     )
                     peak_memory["correctness_run_owned_workspace_comparison"] = correctness[
@@ -2600,12 +2726,12 @@ def _execute(args: argparse.Namespace, repo: Path) -> dict[str, Any]:
             for api_result in case_result["apis"].values()
         )
         report["candidates"][profile_name] = profile_result
+        reference_op.clear_workspace()
         candidate_op.clear_workspace()
-        del candidate_op, candidate_out
+        del reference_op, candidate_op, reference_out, candidate_out
         gc.collect()
         torch.cuda.empty_cache()
 
-    baseline_op.clear_workspace()
     report["correctness_passed"] = bool(correctness_all)
     report["resource_gate_passed"] = bool(resource_all)
     report["memory_isolation_passed"] = bool(memory_isolation_all)

@@ -89,7 +89,9 @@ def test_stage1_persistent_grid_cap_and_threshold() -> None:
 def test_stage1_persistent_config_accepts_only_audited_bm_profiles(tile_m: int) -> None:
     config = _e896_config(tile_m)
     assert config.persistent_stage1
-    assert fields(SonicMoEConfig)[-1].name == "persistent_stage1"
+    field_names = tuple(field.name for field in fields(SonicMoEConfig))
+    assert "persistent_stage1" in field_names
+    assert field_names.index("persistent_stage1") < field_names.index("stage1_write_padded_rows")
 
 
 def test_stage1_persistent_config_rejects_unvalidated_static_shapes() -> None:
