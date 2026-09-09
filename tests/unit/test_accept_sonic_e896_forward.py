@@ -87,3 +87,30 @@ def test_global_baseline_comparison_keeps_historical_reference() -> None:
         "stage2_pipeline_stages": {"from": None, "to": 2},
         "tile_m": {"from": 64, "to": 80},
     }
+
+
+def test_acceptance_only_profiles_have_exact_parent_relative_diffs() -> None:
+    expected = {
+        "bn256-bk64-stage1-xcd8": (
+            "bn256-bk64",
+            {"stage1_xcd_swizzle": {"from": 0, "to": 8}},
+        ),
+        "bn256-bk64-stage2-xcd8": (
+            "bn256-bk64",
+            {"stage2_xcd_swizzle": {"from": 1, "to": 8}},
+        ),
+        "xcd8-cached-pipeline2": (
+            "xcd8-cached",
+            {"stage2_pipeline_stages": {"from": None, "to": 2}},
+        ),
+    }
+    for profile_name, (parent, changes) in expected.items():
+        comparison = _comparison_record(profile_name, "parent")
+        assert comparison["reference_profile"] == parent
+        assert comparison["changes_from_reference"] == changes
+        assert comparison["prepared_weight_compatibility"]["candidate_matches_reference"]
+
+    for profile_name in ("bn256-bk64-stage1-xcd8", "bn256-bk64-stage2-xcd8"):
+        candidate = _comparison_record(profile_name, "parent")["candidate_config"]
+        assert candidate["stage1_b_cache_mod"] is None
+        assert candidate["stage2_b_cache_mod"] is None

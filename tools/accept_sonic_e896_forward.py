@@ -304,6 +304,27 @@ PROFILES = (
         },
     ),
     Profile(
+        "bn256-bk64-stage1-xcd8",
+        "4-locality",
+        "bn256-bk64",
+        "Isolate Stage-1 eight-XCD distribution without changing the effective cache policy.",
+        {"stage1_xcd_swizzle": 8},
+    ),
+    Profile(
+        "bn256-bk64-stage2-xcd8",
+        "4-locality",
+        "bn256-bk64",
+        "Isolate Stage-2 eight-XCD distribution without changing the effective cache policy.",
+        {"stage2_xcd_swizzle": 8},
+    ),
+    Profile(
+        "xcd8-cached-pipeline2",
+        "4-locality",
+        "xcd8-cached",
+        "Isolate the two-stage Stage-2 pipeline after the combined XCD/cache profile.",
+        {"stage2_pipeline_stages": 2},
+    ),
+    Profile(
         "non-temporal",
         "4-locality",
         "bn256-bk64",
@@ -401,7 +422,10 @@ SUITES = {
         "m80-pipeline2",
     ),
     "locality": (
+        "bn256-bk64-stage1-xcd8",
+        "bn256-bk64-stage2-xcd8",
         "xcd8-cached",
+        "xcd8-cached-pipeline2",
         "non-temporal",
         "m80-xcd8-cached",
         "stage1-persistent",
