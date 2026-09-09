@@ -1847,6 +1847,7 @@ def _compile_fused_activation_derivative_dscore_scale_dy(
     projection_size = 2 * intermediate_size
     projection_column_stride = 2 if interleaved_w1 else 1
     up_column_offset = 1 if interleaved_w1 else intermediate_size
+    vector_dy_scale = hidden_size % _DY_COPY_BF16_ELEMENTS == 0
     if schedule_block_m not in (_COMPACT_W1_BM, _LARGE_GROUPED_DX_BM):
         raise ValueError("fused derivative schedule_block_m must be 16 or 64")
 
@@ -1933,16 +1934,49 @@ def _compile_fused_activation_derivative_dscore_scale_dy(
                     )
 
             # dW2 retains the existing multiply-before-GEMM A16 boundary.
-            for base in range_constexpr(0, hidden_size, _BLOCK_THREADS):
-                column = tid + fx.Int32(base)
-                if column < fx.Int32(hidden_size):
-                    offset = row * fx.Int32(hidden_size) + column
-                    dout_value = buffer_ops.buffer_load(dy_rsrc, offset, vec_width=1, dtype=elem_dtype).extf(T.f32)
-                    buffer_ops.buffer_store(
-                        fx.Float32(dout_value * route_weight).to(elem_dtype),
-                        dy_rsrc,
-                        offset,
-                    )
+            if const_expr(vector_dy_scale):
+                # Scale eight packed BF16 values per VMEM transaction so the
+                # in-place pass does not serialize one load/wait/store chain
+                # per scalar element.
+                dwords_per_row = hidden_size // 2
+                vectors_per_row = hidden_size // _DY_COPY_BF16_ELEMENTS
+                row_dword_base = row * fx.Int32(dwords_per_row)
+                for base in range_constexpr(0, vectors_per_row, _BLOCK_THREADS):
+                    vector_index = tid + fx.Int32(base)
+                    if vector_index < fx.Int32(vectors_per_row):
+                        dword_offset = vector_index * fx.Int32(_DY_COPY_DWORDS)
+                        dout_raw = buffer_ops.buffer_load(
+                            dy_rsrc,
+                            row_dword_base + dword_offset,
+                            vec_width=_DY_COPY_DWORDS,
+                            dtype=T.i32,
+                        )
+                        dout_vector = fx.Vector(dout_raw).bitcast(fx.BFloat16).to(fx.Float32)
+                        scaled_vector = fx.Vector.from_elements(
+                            [dout_vector[index] * route_weight for index in range_constexpr(_DY_COPY_BF16_ELEMENTS)],
+                            fx.Float32,
+                        ).to(fx.BFloat16)
+                        buffer_ops.buffer_store(
+                            scaled_vector.bitcast(fx.Int32),
+                            dy_rsrc,
+                            row_dword_base + dword_offset,
+                        )
+            else:
+                for base in range_constexpr(0, hidden_size, _BLOCK_THREADS):
+                    column = tid + fx.Int32(base)
+                    if column < fx.Int32(hidden_size):
+                        offset = row * fx.Int32(hidden_size) + column
+                        dout_value = buffer_ops.buffer_load(
+                            dy_rsrc,
+                            offset,
+                            vec_width=1,
+                            dtype=elem_dtype,
+                        ).extf(T.f32)
+                        buffer_ops.buffer_store(
+                            fx.Float32(dout_value * route_weight).to(elem_dtype),
+                            dy_rsrc,
+                            offset,
+                        )
 
             reduced = wave_reduce_add(thread_dot)
             if const_expr(_RED_SLOTS > 1):
