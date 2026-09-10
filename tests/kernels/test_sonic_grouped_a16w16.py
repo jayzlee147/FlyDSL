@@ -28,7 +28,18 @@ def _gfx950_device():
     (
         ({"store_route_slots": 1}, "store_route_slots"),
         ({"expert_m_reuse": 1}, "expert_m_reuse"),
+        ({"expert_m_reuse_threshold": True}, "expert_m_reuse_threshold"),
+        ({"expert_m_reuse_threshold": 0}, "expert_m_reuse_threshold"),
         ({"expert_m_reuse": True}, "requires store_route_slots"),
+        ({"expert_m_reuse_threshold": 3}, "requires store_route_slots"),
+        (
+            {
+                "expert_m_reuse": True,
+                "expert_m_reuse_threshold": 3,
+                "store_route_slots": True,
+            },
+            "mutually exclusive",
+        ),
         (
             {
                 "expert_m_reuse": True,
@@ -136,15 +147,11 @@ def test_compact_final_tile_writes_zero_dz_padding(block_n, n_waves):
 
 
 @pytest.mark.parametrize(
-    ("active_count", "run_descriptor", "run_reuse"),
-    ((2, True, False), (3, False, True)),
+    "active_count",
+    (2, 3),
 )
-def test_grouped_dx_expert_m_reuse_device_guard_is_bitwise(
-    active_count,
-    run_descriptor,
-    run_reuse,
-):
-    """Complementary guards select exactly one schedule with identical tiles."""
+def test_grouped_dx_single_launch_device_dispatch_is_bitwise(active_count):
+    """One kernel selects descriptor-major or M-reuse from device metadata."""
 
     device = _gfx950_device()
     contraction_size, output_size, num_experts = 128, 512, 3
@@ -202,8 +209,7 @@ def test_grouped_dx_expert_m_reuse_device_guard_is_bitwise(
         dtype=torch.bfloat16,
         device=device,
     )
-    descriptor_output = torch.full_like(reference_output, float("nan"))
-    reuse_output = torch.full_like(reference_output, float("nan"))
+    dispatched_output = torch.full_like(reference_output, float("nan"))
 
     common = {
         "contraction_size": contraction_size,
@@ -221,14 +227,9 @@ def test_grouped_dx_expert_m_reuse_device_guard_is_bitwise(
         "top_k": 1,
     }
     reference_kernel = compile_sonic_grouped_a16w16_nn(**common)
-    descriptor_kernel = compile_sonic_grouped_a16w16_nn(
+    dispatched_kernel = compile_sonic_grouped_a16w16_nn(
         **common,
-        max_active_experts=2,
-    )
-    reuse_kernel = compile_sonic_grouped_a16w16_nn(
-        **common,
-        min_active_experts=3,
-        expert_m_reuse=True,
+        expert_m_reuse_threshold=3,
     )
     stream = torch.cuda.current_stream(device)
     _run_compiled(
@@ -245,26 +246,14 @@ def test_grouped_dx_expert_m_reuse_device_guard_is_bitwise(
         stream,
     )
     _run_compiled(
-        descriptor_kernel,
+        dispatched_kernel,
         dz.data_ptr(),
         w1.data_ptr(),
         descriptor_schedule.data_ptr(),
         sorted_expert_ids.data_ptr(),
         active_queue.data_ptr(),
-        descriptor_output.data_ptr(),
-        sorted_token_ids.data_ptr(),
-        tokens,
-        5,
-        stream,
-    )
-    _run_compiled(
-        reuse_kernel,
-        dz.data_ptr(),
-        w1.data_ptr(),
-        active_queue.data_ptr(),
         frequency.data_ptr(),
-        active_queue.data_ptr(),
-        reuse_output.data_ptr(),
+        dispatched_output.data_ptr(),
         sorted_token_ids.data_ptr(),
         tokens,
         5,
@@ -279,19 +268,11 @@ def test_grouped_dx_expert_m_reuse_device_guard_is_bitwise(
                 dz[first_row : first_row + expert_rows].float() @ w1[expert].float()
             )
     expected = torch.cat(expected_chunks)
-    assert run_descriptor is (active_count <= 2)
-    assert run_reuse is (active_count >= 3)
-    selected, rejected = (
-        (descriptor_output, reuse_output)
-        if run_descriptor
-        else (reuse_output, descriptor_output)
-    )
-    assert torch.equal(selected[:tokens], reference_output[:tokens])
-    assert torch.isnan(rejected).all()
+    assert torch.equal(dispatched_output[:tokens], reference_output[:tokens])
     assert torch.isnan(reference_output[tokens]).all()
-    assert torch.isnan(selected[tokens]).all()
+    assert torch.isnan(dispatched_output[tokens]).all()
     torch.testing.assert_close(
-        selected[:tokens].float(),
+        dispatched_output[:tokens].float(),
         expected,
         rtol=3e-2,
         atol=5e-2,

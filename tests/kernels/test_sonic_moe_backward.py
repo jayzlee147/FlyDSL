@@ -2713,6 +2713,7 @@ def test_sonic_moe_backward_forward_state_skips_generic_w1_and_keeps_large_dx_qu
                 _argument("min_active_experts", 8, 0),
                 _argument("max_active_experts", 9, None),
                 _argument("expert_m_reuse", 12, False),
+                _argument("expert_m_reuse_threshold", 13, None),
             )
         )
         return original_compile_dx(*compile_args, **compile_kwargs)
@@ -2839,7 +2840,7 @@ def test_sonic_moe_backward_forward_state_skips_generic_w1_and_keeps_large_dx_qu
     assert prepare_blocks == [64]
     assert derivative_blocks == [64]
     assert da_profiles == [(True, 0, 32), (False, 33, None)]
-    assert dx_profiles == [(0, 32, False), (33, None, True)]
+    assert dx_profiles == [(0, None, False, 33)]
     assert tn_profiles == [(0, 32), (33, None), (0, None)]
     assert adaptive_zero_calls == 1
     for actual_gradient, expected_gradient in zip(actual, expected):

@@ -60,6 +60,7 @@ def compile_sonic_grouped_a16w16_nn(
     store_route_slots: bool = False,
     top_k: int = 1,
     expert_m_reuse: bool = False,
+    expert_m_reuse_threshold: int | None = None,
 ):
     """Compile a BF16 grouped NN GEMM with a device-derived M schedule.
 
@@ -80,6 +81,13 @@ def compile_sonic_grouped_a16w16_nn(
     work item owns an expert/N slab and either the even or odd M tiles, allowing
     the same CTA to revisit the same weight slab.  The launcher ABI and the
     GEMM/load/store body are otherwise identical to compact descriptor mode.
+
+    ``expert_m_reuse_threshold`` combines the compact descriptor and M-reuse
+    schedules in one kernel launch.  ``arg_schedule`` and ``arg_eids`` retain
+    their compact descriptor meanings, ``arg_cumsum`` supplies the active
+    expert queue, and the extra launcher argument supplies exact expert
+    frequencies.  The device-side active count selects M-reuse at or above the
+    threshold; lower counts retain descriptor-major scheduling.
     """
 
     del device_index
@@ -95,6 +103,12 @@ def compile_sonic_grouped_a16w16_nn(
         raise ValueError("store_route_slots must be a bool")
     if not isinstance(expert_m_reuse, bool):
         raise ValueError("expert_m_reuse must be a bool")
+    if expert_m_reuse_threshold is not None and (
+        not isinstance(expert_m_reuse_threshold, int)
+        or isinstance(expert_m_reuse_threshold, bool)
+        or expert_m_reuse_threshold <= 0
+    ):
+        raise ValueError("expert_m_reuse_threshold must be None or a positive int")
     if not isinstance(top_k, int) or top_k <= 0 or top_k > 256:
         raise ValueError("top_k must be an int in [1, 256]")
     if (min_active_experts > 0 or max_active_experts is not None) and not compact_grid:
@@ -103,6 +117,12 @@ def compile_sonic_grouped_a16w16_nn(
         raise ValueError("expert_m_reuse requires compact_grid=True")
     if expert_m_reuse and not store_route_slots:
         raise ValueError("expert_m_reuse requires store_route_slots=True")
+    if expert_m_reuse and expert_m_reuse_threshold is not None:
+        raise ValueError("expert_m_reuse and expert_m_reuse_threshold are mutually exclusive")
+    if expert_m_reuse_threshold is not None and not compact_grid:
+        raise ValueError("expert_m_reuse_threshold requires compact_grid=True")
+    if expert_m_reuse_threshold is not None and not store_route_slots:
+        raise ValueError("expert_m_reuse_threshold requires store_route_slots=True")
     if block_m % 16 or sorted_block_m % block_m:
         raise ValueError("block_m must be a multiple of 16 that divides sorted_block_m")
     if output_size % block_n:
@@ -169,7 +189,12 @@ def compile_sonic_grouped_a16w16_nn(
         )
     cshuffle_vectors = block_m * block_n // cshuffle_vec_size
     cshuffle_iters = (cshuffle_vectors + block_threads - 1) // block_threads
-    schedule_suffix = "_mreuse2" if expert_m_reuse else ""
+    if expert_m_reuse:
+        schedule_suffix = "_mreuse2"
+    elif expert_m_reuse_threshold is not None:
+        schedule_suffix = f"_mreuse2_ge{expert_m_reuse_threshold}"
+    else:
+        schedule_suffix = ""
     name = (
         f"sonic_grouped_nn_bf16_k{contraction_size}_n{output_size}_e{num_experts}"
         f"_bm{block_m}_bn{block_n}_bk{block_k}_s{stages}_nw{n_waves}"
@@ -196,6 +221,7 @@ def compile_sonic_grouped_a16w16_nn(
         arg_schedule: fx.Int64,
         arg_eids: fx.Int64,
         arg_cumsum: fx.Int64,
+        arg_frequency: fx.Int64,
         arg_out: fx.Int64,
         arg_sorted_token_ids: fx.Int64,
         i32_tokens: fx.Int32,
@@ -499,6 +525,69 @@ def compile_sonic_grouped_a16w16_nn(
                     )
                     _run_tile(first_m_block + local_m_block, n_block, expert)
 
+        elif const_expr(expert_m_reuse_threshold is not None):
+            active_count = cumsum0
+            use_m_reuse = active_count >= fx.Int32(expert_m_reuse_threshold)
+            descriptor_count = rocdl.readfirstlane(
+                T.i32,
+                _raw(_global_i32_at(arg_schedule, fx.Int32(0))),
+            )
+            m_partitions = 2
+            reuse_work_per_expert = num_n_blocks * m_partitions
+            descriptor_work_count = descriptor_count * fx.Int32(num_n_blocks)
+            reuse_work_count = active_count * fx.Int32(reuse_work_per_expert)
+            work_count = use_m_reuse.select(reuse_work_count, descriptor_work_count)
+
+            def _run_work(work):
+                first_m_block = fx.Int32(0)
+                n_block = fx.Int32(0)
+                expert = fx.Int32(0)
+                tile_count = fx.Int32(0)
+                tile_stride = fx.Int32(1)
+                if use_m_reuse:
+                    active_index = work // fx.Int32(reuse_work_per_expert)
+                    expert_work = work % fx.Int32(reuse_work_per_expert)
+                    n_block = expert_work // fx.Int32(m_partitions)
+                    m_partition = expert_work % fx.Int32(m_partitions)
+                    active_offset = fx.Int32(1) + active_index * fx.Int32(2)
+                    expert = rocdl.readfirstlane(
+                        T.i32,
+                        _raw(_global_i32_at(arg_cumsum, active_offset)),
+                    )
+                    first_sorted_row = rocdl.readfirstlane(
+                        T.i32,
+                        _raw(_global_i32_at(arg_cumsum, active_offset + fx.Int32(1))),
+                    )
+                    frequency = rocdl.readfirstlane(
+                        T.i32,
+                        _raw(_global_i32_at(arg_frequency, expert)),
+                    )
+                    num_m_blocks = (frequency + fx.Int32(block_m - 1)) // fx.Int32(block_m)
+                    tile_count = (
+                        num_m_blocks + fx.Int32(m_partitions - 1) - m_partition
+                    ) // fx.Int32(m_partitions)
+                    first_m_block = first_sorted_row // fx.Int32(block_m) + m_partition
+                    tile_stride = fx.Int32(m_partitions)
+                else:
+                    descriptor_index = work // fx.Int32(num_n_blocks)
+                    n_block = work % fx.Int32(num_n_blocks)
+                    first_m_block = rocdl.readfirstlane(
+                        T.i32,
+                        _raw(_global_i32_at(arg_schedule, descriptor_index + fx.Int32(1))),
+                    )
+                    metadata_block = first_m_block // fx.Int32(sorted_block_m // block_m)
+                    expert = rocdl.readfirstlane(
+                        T.i32,
+                        _raw(_global_i32_at(arg_eids, metadata_block)),
+                    )
+                    tile_count = fx.Int32(1)
+                for local_tile in range(0, tile_count, 1):
+                    _run_tile(
+                        first_m_block + fx.Int32(local_tile) * tile_stride,
+                        n_block,
+                        expert,
+                    )
+
         elif const_expr(compact_grid):
             descriptor_count = rocdl.readfirstlane(
                 T.i32,
@@ -552,7 +641,39 @@ def compile_sonic_grouped_a16w16_nn(
         for work in range(block_id + grid_size, work_count, gpu.grid_dim.x):
             _run_work(fx.Int32(work))
 
-    if store_route_slots:
+    if expert_m_reuse_threshold is not None:
+
+        @flyc.jit
+        def launch(
+            arg_a: fx.Int64,
+            arg_b: fx.Int64,
+            arg_schedule: fx.Int64,
+            arg_eids: fx.Int64,
+            arg_cumsum: fx.Int64,
+            arg_frequency: fx.Int64,
+            arg_out: fx.Int64,
+            arg_sorted_token_ids: fx.Int64,
+            i32_tokens: fx.Int32,
+            i32_grid: fx.Int32,
+            stream: fx.Stream,
+        ):
+            grouped_nn_kernel(
+                arg_a,
+                arg_b,
+                arg_schedule,
+                arg_eids,
+                arg_cumsum,
+                arg_frequency,
+                arg_out,
+                arg_sorted_token_ids,
+                i32_tokens,
+            ).launch(
+                grid=(fx.Int64(i32_grid), 1, 1),
+                block=(block_threads, 1, 1),
+                stream=stream,
+            )
+
+    elif store_route_slots:
 
         @flyc.jit
         def launch(
@@ -573,6 +694,7 @@ def compile_sonic_grouped_a16w16_nn(
                 arg_schedule,
                 arg_eids,
                 arg_cumsum,
+                fx.Int64(0),
                 arg_out,
                 arg_sorted_token_ids,
                 i32_tokens,
@@ -601,6 +723,7 @@ def compile_sonic_grouped_a16w16_nn(
                 arg_schedule,
                 arg_eids,
                 arg_cumsum,
+                fx.Int64(0),
                 arg_out,
                 fx.Int64(0),
                 fx.Int32(0),

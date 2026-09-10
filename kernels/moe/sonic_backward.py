@@ -791,6 +791,7 @@ def _compile_grouped_dx(
     store_route_slots: bool = False,
     top_k: int = 1,
     expert_m_reuse: bool = False,
+    expert_m_reuse_threshold: int | None = None,
 ):
     """Build the gfx950 grouped ``dZ @ W1`` specialization."""
 
@@ -811,6 +812,7 @@ def _compile_grouped_dx(
         store_route_slots=store_route_slots,
         top_k=top_k,
         expert_m_reuse=expert_m_reuse,
+        expert_m_reuse_threshold=expert_m_reuse_threshold,
     )
 
 
@@ -4163,20 +4165,21 @@ def _sonic_moe_backward_impl(
                             _LARGE_GROUPED_DX_BN,
                             _LARGE_GROUPED_DX_N_WAVES,
                             0,
-                            _GROUPED_DX_M_REUSE_MIN_ACTIVE_EXPERTS - 1,
-                            False,
-                        ),
-                        (
-                            _LARGE_GROUPED_DX_BN,
-                            _LARGE_GROUPED_DX_N_WAVES,
-                            _GROUPED_DX_M_REUSE_MIN_ACTIVE_EXPERTS,
                             None,
-                            True,
+                            False,
+                            _GROUPED_DX_M_REUSE_MIN_ACTIVE_EXPERTS,
                         ),
                     )
                 else:
                     grouped_dx_profiles = (
-                        (_LARGE_GROUPED_DX_BN, _LARGE_GROUPED_DX_N_WAVES, 0, None, False),
+                        (
+                            _LARGE_GROUPED_DX_BN,
+                            _LARGE_GROUPED_DX_N_WAVES,
+                            0,
+                            None,
+                            False,
+                            None,
+                        ),
                     )
                 grouped_dx_m_tiles = large_dx_bound
                 grouped_dx_compact = True
@@ -4186,11 +4189,11 @@ def _sonic_moe_backward_impl(
                 sparse_dx = _grouped_dx_tuning(0, hidden_size)
                 dense_dx = _grouped_dx_tuning(_GROUPED_DX_DENSE_EXPERTS, hidden_size)
                 if sparse_dx == dense_dx:
-                    grouped_dx_profiles = ((*sparse_dx, 0, None, False),)
+                    grouped_dx_profiles = ((*sparse_dx, 0, None, False, None),)
                 else:
                     grouped_dx_profiles = (
-                        (*sparse_dx, 0, _GROUPED_DX_DENSE_EXPERTS - 1, False),
-                        (*dense_dx, _GROUPED_DX_DENSE_EXPERTS, None, False),
+                        (*sparse_dx, 0, _GROUPED_DX_DENSE_EXPERTS - 1, False, None),
+                        (*dense_dx, _GROUPED_DX_DENSE_EXPERTS, None, False, None),
                     )
                 grouped_dx_m_tiles = compact_w1_bound
                 grouped_dx_compact = use_compact_w1
@@ -4199,7 +4202,7 @@ def _sonic_moe_backward_impl(
                 grouped_dx_bm = _GROUPED_DX_BM
                 active_experts = min(routes, num_experts) if use_hostless_grouped else len(segments)
                 grouped_dx_profiles = (
-                    (*_grouped_dx_tuning(active_experts, hidden_size), 0, None, False),
+                    (*_grouped_dx_tuning(active_experts, hidden_size), 0, None, False, None),
                 )
                 grouped_dx_m_tiles = (
                     sum((int(count) + _GROUPED_DX_BM - 1) // _GROUPED_DX_BM for count in frequencies)
@@ -4215,6 +4218,7 @@ def _sonic_moe_backward_impl(
                 min_active_experts,
                 max_active_experts,
                 expert_m_reuse,
+                expert_m_reuse_threshold,
             ) in grouped_dx_profiles:
                 grouped_dx = _compile_grouped_dx(
                     hidden_size,
@@ -4230,12 +4234,18 @@ def _sonic_moe_backward_impl(
                     store_route_slots=direct_grouped_dx_routes,
                     top_k=topk,
                     expert_m_reuse=expert_m_reuse,
+                    expert_m_reuse_threshold=expert_m_reuse_threshold,
                 )
                 if expert_m_reuse:
                     assert active_expert_storage is not None
                     profile_m_tiles = 2 * active_expert_capacity
                     profile_schedule = active_expert_storage
                     profile_eids = expert_frequency
+                elif expert_m_reuse_threshold is not None:
+                    assert active_expert_storage is not None
+                    profile_m_tiles = max(grouped_dx_m_tiles, 2 * active_expert_capacity)
+                    profile_schedule = grouped_dx_schedule
+                    profile_eids = sorted_expert_ids
                 else:
                     profile_m_tiles = grouped_dx_m_tiles
                     profile_schedule = grouped_dx_schedule
@@ -4259,9 +4269,15 @@ def _sonic_moe_backward_impl(
                     profile_eids.data_ptr(),
                     (
                         active_expert_storage.data_ptr()
-                        if min_active_experts > 0 or max_active_experts is not None
+                        if (
+                            min_active_experts > 0
+                            or max_active_experts is not None
+                            or expert_m_reuse
+                            or expert_m_reuse_threshold is not None
+                        )
                         else num_valid_ids.data_ptr()
                     ),
+                    *((expert_frequency.data_ptr(),) if expert_m_reuse_threshold is not None else ()),
                     (dx_routes if direct_grouped_dx_routes else dx_sorted).data_ptr(),
                     *(
                         (sorted_token_ids.data_ptr(), tokens)
