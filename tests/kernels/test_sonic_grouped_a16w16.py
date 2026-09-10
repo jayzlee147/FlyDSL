@@ -27,6 +27,16 @@ def _gfx950_device():
     ("overrides", "message"),
     (
         ({"store_route_slots": 1}, "store_route_slots"),
+        ({"expert_m_reuse": 1}, "expert_m_reuse"),
+        ({"expert_m_reuse": True}, "requires store_route_slots"),
+        (
+            {
+                "expert_m_reuse": True,
+                "store_route_slots": True,
+                "compact_grid": False,
+            },
+            "requires compact_grid",
+        ),
         ({"store_route_slots": True, "top_k": 0}, "top_k"),
         ({"store_route_slots": True, "top_k": 257}, "top_k"),
         (
@@ -123,6 +133,169 @@ def test_compact_final_tile_writes_zero_dz_padding(block_n, n_waves):
     )
     assert torch.count_nonzero(dx_sorted[real_rows:80]) == 0
     assert torch.isnan(dx_sorted[80:]).all()
+
+
+@pytest.mark.parametrize(
+    ("active_count", "run_descriptor", "run_reuse"),
+    ((2, True, False), (3, False, True)),
+)
+def test_grouped_dx_expert_m_reuse_device_guard_is_bitwise(
+    active_count,
+    run_descriptor,
+    run_reuse,
+):
+    """Complementary guards select exactly one schedule with identical tiles."""
+
+    device = _gfx950_device()
+    contraction_size, output_size, num_experts = 128, 512, 3
+    frequencies = (129, 0, 65) if active_count == 2 else (129, 1, 65)
+    first_rows = (0, 192, 192 if active_count == 2 else 256)
+    padded_rows = 320 if active_count == 2 else 384
+    tokens = sum(frequencies)
+    generator = torch.Generator(device=device).manual_seed(20260910 + active_count)
+
+    dz = torch.zeros((padded_rows, contraction_size), dtype=torch.bfloat16, device=device)
+    sorted_token_ids = torch.full((padded_rows,), tokens, dtype=torch.int32, device=device)
+    descriptor_values = []
+    sorted_expert_values = []
+    active_values = [active_count]
+    route_row = 0
+    for expert, (first_row, frequency) in enumerate(zip(first_rows, frequencies, strict=True)):
+        if frequency == 0:
+            continue
+        dz[first_row : first_row + frequency] = torch.randn(
+            (frequency, contraction_size),
+            dtype=torch.float32,
+            device=device,
+            generator=generator,
+        ).to(torch.bfloat16)
+        sorted_token_ids[first_row : first_row + frequency] = torch.arange(
+            route_row,
+            route_row + frequency,
+            dtype=torch.int32,
+            device=device,
+        )
+        first_m_block = first_row // 64
+        num_m_blocks = (frequency + 63) // 64
+        descriptor_values.extend(first_m_block + tile for tile in range(num_m_blocks))
+        sorted_expert_values.extend([expert] * num_m_blocks)
+        active_values.extend((expert, first_row))
+        route_row += frequency
+
+    w1 = torch.randn(
+        (num_experts, contraction_size, output_size),
+        dtype=torch.float32,
+        device=device,
+        generator=generator,
+    ).to(torch.bfloat16)
+    frequency = torch.tensor(frequencies, dtype=torch.int32, device=device)
+    descriptor_schedule = torch.tensor(
+        [len(descriptor_values), *descriptor_values],
+        dtype=torch.int32,
+        device=device,
+    )
+    sorted_expert_ids = torch.tensor(sorted_expert_values, dtype=torch.int32, device=device)
+    active_queue = torch.tensor(active_values, dtype=torch.int32, device=device)
+    reference_output = torch.full(
+        (tokens + 1, output_size),
+        float("nan"),
+        dtype=torch.bfloat16,
+        device=device,
+    )
+    descriptor_output = torch.full_like(reference_output, float("nan"))
+    reuse_output = torch.full_like(reference_output, float("nan"))
+
+    common = {
+        "contraction_size": contraction_size,
+        "output_size": output_size,
+        "num_experts": num_experts,
+        "block_m": 64,
+        "block_n": 256,
+        "block_k": 64,
+        "stages": 2,
+        "n_waves": 4,
+        "sorted_block_m": 64,
+        "compact_grid": True,
+        "device_index": device.index or 0,
+        "store_route_slots": True,
+        "top_k": 1,
+    }
+    reference_kernel = compile_sonic_grouped_a16w16_nn(**common)
+    descriptor_kernel = compile_sonic_grouped_a16w16_nn(
+        **common,
+        max_active_experts=2,
+    )
+    reuse_kernel = compile_sonic_grouped_a16w16_nn(
+        **common,
+        min_active_experts=3,
+        expert_m_reuse=True,
+    )
+    stream = torch.cuda.current_stream(device)
+    _run_compiled(
+        reference_kernel,
+        dz.data_ptr(),
+        w1.data_ptr(),
+        descriptor_schedule.data_ptr(),
+        sorted_expert_ids.data_ptr(),
+        active_queue.data_ptr(),
+        reference_output.data_ptr(),
+        sorted_token_ids.data_ptr(),
+        tokens,
+        5,
+        stream,
+    )
+    _run_compiled(
+        descriptor_kernel,
+        dz.data_ptr(),
+        w1.data_ptr(),
+        descriptor_schedule.data_ptr(),
+        sorted_expert_ids.data_ptr(),
+        active_queue.data_ptr(),
+        descriptor_output.data_ptr(),
+        sorted_token_ids.data_ptr(),
+        tokens,
+        5,
+        stream,
+    )
+    _run_compiled(
+        reuse_kernel,
+        dz.data_ptr(),
+        w1.data_ptr(),
+        active_queue.data_ptr(),
+        frequency.data_ptr(),
+        active_queue.data_ptr(),
+        reuse_output.data_ptr(),
+        sorted_token_ids.data_ptr(),
+        tokens,
+        5,
+        stream,
+    )
+    torch.cuda.synchronize(device)
+
+    expected_chunks = []
+    for expert, (first_row, expert_rows) in enumerate(zip(first_rows, frequencies, strict=True)):
+        if expert_rows:
+            expected_chunks.append(
+                dz[first_row : first_row + expert_rows].float() @ w1[expert].float()
+            )
+    expected = torch.cat(expected_chunks)
+    assert run_descriptor is (active_count <= 2)
+    assert run_reuse is (active_count >= 3)
+    selected, rejected = (
+        (descriptor_output, reuse_output)
+        if run_descriptor
+        else (reuse_output, descriptor_output)
+    )
+    assert torch.equal(selected[:tokens], reference_output[:tokens])
+    assert torch.isnan(rejected).all()
+    assert torch.isnan(reference_output[tokens]).all()
+    assert torch.isnan(selected[tokens]).all()
+    torch.testing.assert_close(
+        selected[:tokens].float(),
+        expected,
+        rtol=3e-2,
+        atol=5e-2,
+    )
 
 
 @pytest.mark.parametrize("active_experts", (32, 33))

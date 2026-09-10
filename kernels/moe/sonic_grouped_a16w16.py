@@ -59,6 +59,7 @@ def compile_sonic_grouped_a16w16_nn(
     max_active_experts: int | None = None,
     store_route_slots: bool = False,
     top_k: int = 1,
+    expert_m_reuse: bool = False,
 ):
     """Compile a BF16 grouped NN GEMM with a device-derived M schedule.
 
@@ -72,6 +73,13 @@ def compile_sonic_grouped_a16w16_nn(
     host.  ``store_route_slots=True`` folds the fixed-K sorted-row permutation
     into the BF16 epilogue and writes ``[token, slot, output]`` directly.  The
     default sorted-output mode retains the original launcher ABI.
+
+    ``expert_m_reuse=True`` changes only the device schedule: ``arg_schedule``
+    uses the counter-first ``[count, (expert, first_row) * capacity]`` active
+    expert ABI and ``arg_eids`` supplies exact expert frequencies.  One logical
+    work item owns an expert/N slab and either the even or odd M tiles, allowing
+    the same CTA to revisit the same weight slab.  The launcher ABI and the
+    GEMM/load/store body are otherwise identical to compact descriptor mode.
     """
 
     del device_index
@@ -85,10 +93,16 @@ def compile_sonic_grouped_a16w16_nn(
         raise ValueError("max_active_experts must be None or at least min_active_experts")
     if not isinstance(store_route_slots, bool):
         raise ValueError("store_route_slots must be a bool")
+    if not isinstance(expert_m_reuse, bool):
+        raise ValueError("expert_m_reuse must be a bool")
     if not isinstance(top_k, int) or top_k <= 0 or top_k > 256:
         raise ValueError("top_k must be an int in [1, 256]")
     if (min_active_experts > 0 or max_active_experts is not None) and not compact_grid:
         raise ValueError("active-expert guards require compact_grid=True")
+    if expert_m_reuse and not compact_grid:
+        raise ValueError("expert_m_reuse requires compact_grid=True")
+    if expert_m_reuse and not store_route_slots:
+        raise ValueError("expert_m_reuse requires store_route_slots=True")
     if block_m % 16 or sorted_block_m % block_m:
         raise ValueError("block_m must be a multiple of 16 that divides sorted_block_m")
     if output_size % block_n:
@@ -155,12 +169,14 @@ def compile_sonic_grouped_a16w16_nn(
         )
     cshuffle_vectors = block_m * block_n // cshuffle_vec_size
     cshuffle_iters = (cshuffle_vectors + block_threads - 1) // block_threads
+    schedule_suffix = "_mreuse2" if expert_m_reuse else ""
     name = (
         f"sonic_grouped_nn_bf16_k{contraction_size}_n{output_size}_e{num_experts}"
         f"_bm{block_m}_bn{block_n}_bk{block_k}_s{stages}_nw{n_waves}"
         f"_{'compact' if compact_grid else 'metadata'}"
         f"_amin{min_active_experts}_amax{max_active_experts}"
         f"_{f'routek{top_k}' if store_route_slots else 'sorted'}"
+        f"{schedule_suffix}"
     )
 
     @fx.struct
@@ -445,7 +461,45 @@ def compile_sonic_grouped_a16w16_nn(
             gpu.barrier()
 
         cumsum0 = rocdl.readfirstlane(T.i32, _raw(_global_i32_at(arg_cumsum, fx.Int32(0))))
-        if const_expr(compact_grid):
+        if const_expr(expert_m_reuse):
+            active_count = rocdl.readfirstlane(
+                T.i32,
+                _raw(_global_i32_at(arg_schedule, fx.Int32(0))),
+            )
+            m_partitions = 2
+            work_per_expert = num_n_blocks * m_partitions
+            work_count = active_count * fx.Int32(work_per_expert)
+
+            def _run_work(work):
+                active_index = work // fx.Int32(work_per_expert)
+                expert_work = work % fx.Int32(work_per_expert)
+                n_block = expert_work // fx.Int32(m_partitions)
+                m_partition = expert_work % fx.Int32(m_partitions)
+                active_offset = fx.Int32(1) + active_index * fx.Int32(2)
+                expert = rocdl.readfirstlane(
+                    T.i32,
+                    _raw(_global_i32_at(arg_schedule, active_offset)),
+                )
+                first_sorted_row = rocdl.readfirstlane(
+                    T.i32,
+                    _raw(_global_i32_at(arg_schedule, active_offset + fx.Int32(1))),
+                )
+                frequency = rocdl.readfirstlane(
+                    T.i32,
+                    _raw(_global_i32_at(arg_eids, expert)),
+                )
+                num_m_blocks = (frequency + fx.Int32(block_m - 1)) // fx.Int32(block_m)
+                partition_tiles = (
+                    num_m_blocks + fx.Int32(m_partitions - 1) - m_partition
+                ) // fx.Int32(m_partitions)
+                first_m_block = first_sorted_row // fx.Int32(block_m)
+                for partition_tile in range(0, partition_tiles, 1):
+                    local_m_block = (
+                        m_partition + fx.Int32(partition_tile) * fx.Int32(m_partitions)
+                    )
+                    _run_tile(first_m_block + local_m_block, n_block, expert)
+
+        elif const_expr(compact_grid):
             descriptor_count = rocdl.readfirstlane(
                 T.i32,
                 _raw(_global_i32_at(arg_schedule, fx.Int32(0))),

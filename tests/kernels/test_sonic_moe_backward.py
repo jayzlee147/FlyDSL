@@ -36,6 +36,7 @@ from kernels.moe.sonic_backward import (
     _use_grouped_dw1,
     _use_grouped_dw2,
     _use_grouped_dx,
+    _use_grouped_dx_m_reuse_schedule,
     _use_grouped_w1_recompute,
     _use_grouped_w2_recompute,
     _use_hostless_grouped_backward,
@@ -54,6 +55,45 @@ _ACTIVATIONS = (
     "relu_sq",
 )
 _DTYPES = ((torch.bfloat16, "bf16"), (torch.float16, "fp16"))
+
+
+@pytest.mark.parametrize(
+    ("overrides", "expected"),
+    (
+        ({}, True),
+        ({"compute_dtype": "fp16"}, False),
+        ({"activation": "geglu"}, False),
+        ({"tokens": 4095}, False),
+        ({"hidden_size": 4096}, False),
+        ({"intermediate_size": 1024}, False),
+        ({"num_experts": 895}, False),
+        ({"topk": 8}, False),
+        ({"flat_routes": True}, False),
+        ({"has_bias": True}, False),
+        ({"reuse_forward_preactivation": False}, False),
+        ({"use_large_grouped_dx": False}, False),
+        ({"use_hostless_grouped": False}, False),
+        ({"direct_grouped_dx_routes": False}, False),
+    ),
+)
+def test_grouped_dx_m_reuse_policy_is_production_e896_only(overrides, expected):
+    kwargs = {
+        "compute_dtype": "bf16",
+        "activation": "swiglu",
+        "tokens": 4096,
+        "hidden_size": 3584,
+        "intermediate_size": 512,
+        "num_experts": 896,
+        "topk": 16,
+        "flat_routes": False,
+        "has_bias": False,
+        "reuse_forward_preactivation": True,
+        "use_large_grouped_dx": True,
+        "use_hostless_grouped": True,
+        "direct_grouped_dx_routes": True,
+    }
+    kwargs.update(overrides)
+    assert _use_grouped_dx_m_reuse_schedule(**kwargs) is expected
 
 
 @pytest.mark.parametrize(
@@ -2623,6 +2663,7 @@ def test_sonic_moe_backward_forward_state_skips_generic_w1_and_keeps_large_dx_qu
     original_fused_prepare = sonic_backward_module._compile_fused_forward_state_prepare
     original_fused_derivative = sonic_backward_module._compile_fused_activation_derivative_dscore_scale_dy
     original_compile_da = sonic_backward_module._compile_grouped_da
+    original_compile_dx = sonic_backward_module._compile_grouped_dx
     original_grouped_tn = sonic_backward_module.grouped_tn_from_queue_flydsl
     original_adaptive_zero = sonic_backward_module.zero_weight_grads_adaptive_flydsl
     builder_blocks = []
@@ -2630,6 +2671,7 @@ def test_sonic_moe_backward_forward_state_skips_generic_w1_and_keeps_large_dx_qu
     prepare_blocks = []
     derivative_blocks = []
     da_profiles = []
+    dx_profiles = []
     tn_profiles = []
     adaptive_zero_calls = 0
 
@@ -2661,6 +2703,19 @@ def test_sonic_moe_backward_forward_state_skips_generic_w1_and_keeps_large_dx_qu
             )
         )
         return original_compile_da(*compile_args, **compile_kwargs)
+
+    def _tracked_compile_dx(*compile_args, **compile_kwargs):
+        def _argument(name, position, default):
+            return compile_kwargs.get(name, compile_args[position] if len(compile_args) > position else default)
+
+        dx_profiles.append(
+            (
+                _argument("min_active_experts", 8, 0),
+                _argument("max_active_experts", 9, None),
+                _argument("expert_m_reuse", 12, False),
+            )
+        )
+        return original_compile_dx(*compile_args, **compile_kwargs)
 
     def _tracked_grouped_tn(*tn_args, **tn_kwargs):
         tn_profiles.append(
@@ -2699,6 +2754,11 @@ def test_sonic_moe_backward_forward_state_skips_generic_w1_and_keeps_large_dx_qu
     )
     monkeypatch.setattr(
         sonic_backward_module,
+        "_use_grouped_dx_m_reuse_schedule",
+        lambda **_kwargs: True,
+    )
+    monkeypatch.setattr(
+        sonic_backward_module,
         "build_compact_m_tile_descriptors",
         _tracked_builder,
     )
@@ -2713,6 +2773,7 @@ def test_sonic_moe_backward_forward_state_skips_generic_w1_and_keeps_large_dx_qu
         _tracked_fused_derivative,
     )
     monkeypatch.setattr(sonic_backward_module, "_compile_grouped_da", _tracked_compile_da)
+    monkeypatch.setattr(sonic_backward_module, "_compile_grouped_dx", _tracked_compile_dx)
     monkeypatch.setattr(
         sonic_backward_module,
         "grouped_tn_from_queue_flydsl",
@@ -2778,6 +2839,7 @@ def test_sonic_moe_backward_forward_state_skips_generic_w1_and_keeps_large_dx_qu
     assert prepare_blocks == [64]
     assert derivative_blocks == [64]
     assert da_profiles == [(True, 0, 32), (False, 33, None)]
+    assert dx_profiles == [(0, 32, False), (33, None, True)]
     assert tn_profiles == [(0, 32), (33, None), (0, None)]
     assert adaptive_zero_calls == 1
     for actual_gradient, expected_gradient in zip(actual, expected):
