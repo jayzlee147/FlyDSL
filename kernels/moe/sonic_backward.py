@@ -643,6 +643,36 @@ def _use_hostless_grouped_backward(
     )
 
 
+def _use_sorter_native_backward_metadata(
+    *,
+    flat_routes: bool,
+    has_bias: bool,
+    tokens: int,
+    hidden_size: int,
+    intermediate_size: int,
+    num_experts: int,
+    topk: int,
+    reuse_forward_preactivation: bool,
+    use_hostless_grouped: bool,
+    use_large_grouped_dx: bool,
+    use_compact_w1: bool,
+    sort_unit: int,
+) -> bool:
+    """Select sorter-native metadata only for the audited E896 contract."""
+
+    return (
+        not flat_routes
+        and not has_bias
+        and reuse_forward_preactivation
+        and use_hostless_grouped
+        and use_large_grouped_dx
+        and not use_compact_w1
+        and sort_unit == _LARGE_GROUPED_DX_BM == 64
+        and (tokens, hidden_size, intermediate_size, num_experts, topk)
+        == (4096, 3584, 512, 896, 16)
+    )
+
+
 def _use_fused_da_dscore(
     *,
     reuse_forward_preactivation: bool,
@@ -3176,6 +3206,20 @@ def _sonic_moe_backward_impl(
         use_grouped_dw1=use_grouped_dw1,
         use_grouped_dx=use_grouped_dx,
     )
+    use_sorter_native_backward_metadata = _use_sorter_native_backward_metadata(
+        flat_routes=flat_routes,
+        has_bias=has_bias,
+        tokens=tokens,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+        num_experts=num_experts,
+        topk=topk,
+        reuse_forward_preactivation=reuse_forward_preactivation,
+        use_hostless_grouped=use_hostless_grouped,
+        use_large_grouped_dx=use_large_grouped_dx,
+        use_compact_w1=use_compact_w1,
+        sort_unit=sort_unit,
+    )
     # Exact-row state preparation reuses either the short BM16 queue or the
     # production T4096 BM64 dX queue.  Decode has only ~18 us of gather/prepare
     # work and is faster on the original one-row kernels.
@@ -3450,9 +3494,13 @@ def _sonic_moe_backward_impl(
                 sorted_route_ids=sorted_route_ids,
             )
         else:
-            route_grid = max(1, (routes + _BLOCK_THREADS - 1) // _BLOCK_THREADS)
-            histogram = _compile_expert_histogram(num_experts, device_index)
-            _run_compiled(histogram, ids_arg, expert_frequency, routes, route_grid, stream)
+            if not use_sorter_native_backward_metadata:
+                route_grid = max(1, (routes + _BLOCK_THREADS - 1) // _BLOCK_THREADS)
+                histogram = _compile_expert_histogram(num_experts, device_index)
+                _run_compiled(histogram, ids_arg, expert_frequency, routes, route_grid, stream)
+            else:
+                assert active_expert_storage is not None
+                assert large_dx_storage is not None
             moe_sorting_flydsl(
                 ids_arg,
                 weights_arg,
@@ -3464,9 +3512,18 @@ def _sonic_moe_backward_impl(
                 num_experts,
                 unit_size=sort_unit,
                 workspace=sorting_workspace,
+                expert_frequency_out=(
+                    expert_frequency if use_sorter_native_backward_metadata else None
+                ),
+                active_expert_storage=(
+                    active_expert_storage if use_sorter_native_backward_metadata else None
+                ),
+                bm64_schedule_storage=(
+                    large_dx_storage if use_sorter_native_backward_metadata else None
+                ),
             )
 
-        if use_large_grouped_dx:
+        if use_large_grouped_dx and not use_sorter_native_backward_metadata:
             assert large_dx_descriptors is not None
             assert large_dx_total is not None
             build_compact_m_tile_descriptors(

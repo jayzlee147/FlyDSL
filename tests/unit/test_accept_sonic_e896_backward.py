@@ -85,6 +85,10 @@ def _hostless_launches(**overrides):
         "grouped_dx_launches": 1,
         "total_dx_launches": 1,
         "host_segment_materializations": 0,
+        "expert_histogram_sequences": 0,
+        "compact_descriptor_builder_sequences": 0,
+        "sorter_calls": 1,
+        "sorter_backward_metadata_calls": 1,
     }
     launches.update(overrides)
     return launches
@@ -98,6 +102,10 @@ def _legacy_launches():
         "grouped_dx_launches": 0,
         "total_dx_launches": 1,
         "host_segment_materializations": 1,
+        "expert_histogram_sequences": 1,
+        "compact_descriptor_builder_sequences": 1,
+        "sorter_calls": 1,
+        "sorter_backward_metadata_calls": 0,
     }
 
 
@@ -503,7 +511,12 @@ def test_incremental_policy_requires_both_large_grouped_dx_and_hostless(override
 
 
 def test_incremental_launch_gate_does_not_require_legacy_baseline_work():
-    gate = _evaluate_launch_topology("incremental", _hostless_launches(), _hostless_launches())
+    baseline = _hostless_launches(
+        expert_histogram_sequences=1,
+        compact_descriptor_builder_sequences=1,
+        sorter_backward_metadata_calls=0,
+    )
+    gate = _evaluate_launch_topology("incremental", baseline, _hostless_launches())
     assert gate["passed"]
     assert not gate["baseline_exercises_legacy_dx"]
     assert not gate["baseline_exercises_projection"]
@@ -520,13 +533,26 @@ def test_incremental_launch_gate_does_not_require_legacy_baseline_work():
         ({}, {"grouped_dx_launches": 0, "total_dx_launches": 0}),
         ({}, {"generic_gemm_launches": 1}),
         ({}, {"host_segment_materializations": 1}),
+        ({"expert_histogram_sequences": 0}, {}),
+        ({"compact_descriptor_builder_sequences": 0}, {}),
+        ({"sorter_calls": 0}, {}),
+        ({}, {"expert_histogram_sequences": 1}),
+        ({}, {"compact_descriptor_builder_sequences": 1}),
+        ({}, {"sorter_calls": 0}),
+        ({}, {"sorter_backward_metadata_calls": 0}),
     ),
 )
 def test_incremental_launch_gate_rejects_required_topology_violations(
     baseline_overrides,
     candidate_overrides,
 ):
-    baseline = _hostless_launches(**baseline_overrides)
+    baseline_values = {
+        "expert_histogram_sequences": 1,
+        "compact_descriptor_builder_sequences": 1,
+        "sorter_backward_metadata_calls": 0,
+    }
+    baseline_values.update(baseline_overrides)
+    baseline = _hostless_launches(**baseline_values)
     candidate = _hostless_launches(**candidate_overrides)
     assert not _evaluate_launch_topology("incremental", baseline, candidate)["passed"]
 

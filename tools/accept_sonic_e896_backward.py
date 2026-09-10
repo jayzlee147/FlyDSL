@@ -151,6 +151,10 @@ SHARED_RUNTIME_SOURCES = (
 BASELINE_RUNTIME_OVERRIDE_SYMBOLS = {
     "kernels/moe/grouped_da_gfx950.py": ("compile_grouped_da_gfx950",),
     "kernels/moe/sonic_grouped_a16w16.py": ("compile_sonic_grouped_a16w16_nn",),
+    "kernels/moe/moe_sorting_kernel.py": (
+        "moe_sorting_flydsl",
+        "moe_sorting_get_workspace_size",
+    ),
     "kernels/moe/sonic_grouped_tn.py": (
         "active_expert_descriptor_capacity",
         "active_expert_queue_elements",
@@ -713,15 +717,18 @@ def _repeatability(first: tuple[torch.Tensor, ...], repeated: tuple[torch.Tensor
 
 
 def _audit_launches(module, fn: Callable[[], tuple[torch.Tensor, ...]]):
-    """Run once while classifying generic, projection, and dX launches."""
+    """Run once while classifying compute and routing-metadata launches."""
 
     original_run = module._run_compiled
     original_gemm = module.gemm_a16w16
     original_materialize = module._materialize_expert_segments
+    original_sorter = module.moe_sorting_flydsl
+    original_descriptor_builder = module.build_compact_m_tile_descriptors
     compile_names = (
         "_compile_grouped_w1_recompute",
         "_compile_grouped_w2_recompute",
         "_compile_grouped_dx",
+        "_compile_expert_histogram",
     )
     original_compilers = {name: getattr(module, name) for name in compile_names}
     compiled_labels: dict[int, str] = {}
@@ -733,6 +740,12 @@ def _audit_launches(module, fn: Callable[[], tuple[torch.Tensor, ...]]):
         "legacy_dx_gemm_launches": 0,
         "grouped_dx_launches": 0,
         "host_segment_materializations": 0,
+        "expert_histogram_sequences": 0,
+        "expert_histogram_kernel_launches": 0,
+        "compact_descriptor_builder_sequences": 0,
+        "compact_descriptor_builder_kernel_launches": 0,
+        "sorter_calls": 0,
+        "sorter_backward_metadata_calls": 0,
     }
     generic_gemms = []
 
@@ -746,7 +759,10 @@ def _audit_launches(module, fn: Callable[[], tuple[torch.Tensor, ...]]):
 
     def wrapped_run(compiled, *args, **kwargs):
         label = compiled_labels.get(id(compiled))
-        if label is not None:
+        if label == "expert_histogram":
+            counts["expert_histogram_sequences"] += 1
+            counts["expert_histogram_kernel_launches"] += 2
+        elif label is not None:
             counts[f"{label}_launches"] += 1
         return original_run(compiled, *args, **kwargs)
 
@@ -785,9 +801,27 @@ def _audit_launches(module, fn: Callable[[], tuple[torch.Tensor, ...]]):
         counts["host_segment_materializations"] += 1
         return original_materialize(*args, **kwargs)
 
+    def wrapped_sorter(*args, **kwargs):
+        counts["sorter_calls"] += 1
+        metadata_outputs = (
+            kwargs.get("expert_frequency_out"),
+            kwargs.get("active_expert_storage"),
+            kwargs.get("bm64_schedule_storage"),
+        )
+        if all(output is not None for output in metadata_outputs):
+            counts["sorter_backward_metadata_calls"] += 1
+        return original_sorter(*args, **kwargs)
+
+    def wrapped_descriptor_builder(*args, **kwargs):
+        counts["compact_descriptor_builder_sequences"] += 1
+        counts["compact_descriptor_builder_kernel_launches"] += 2
+        return original_descriptor_builder(*args, **kwargs)
+
     module._run_compiled = wrapped_run
     module.gemm_a16w16 = wrapped_gemm
     module._materialize_expert_segments = wrapped_materialize
+    module.moe_sorting_flydsl = wrapped_sorter
+    module.build_compact_m_tile_descriptors = wrapped_descriptor_builder
     module._compile_grouped_w1_recompute = tracking_compiler(
         "grouped_w1_projection", original_compilers["_compile_grouped_w1_recompute"]
     )
@@ -795,6 +829,10 @@ def _audit_launches(module, fn: Callable[[], tuple[torch.Tensor, ...]]):
         "grouped_w2_projection", original_compilers["_compile_grouped_w2_recompute"]
     )
     module._compile_grouped_dx = tracking_compiler("grouped_dx", original_compilers["_compile_grouped_dx"])
+    module._compile_expert_histogram = tracking_compiler(
+        "expert_histogram",
+        original_compilers["_compile_expert_histogram"],
+    )
     try:
         gradients = fn()
         torch.cuda.synchronize()
@@ -802,6 +840,8 @@ def _audit_launches(module, fn: Callable[[], tuple[torch.Tensor, ...]]):
         module._run_compiled = original_run
         module.gemm_a16w16 = original_gemm
         module._materialize_expert_segments = original_materialize
+        module.moe_sorting_flydsl = original_sorter
+        module.build_compact_m_tile_descriptors = original_descriptor_builder
         for name, compiler in original_compilers.items():
             setattr(module, name, compiler)
 
@@ -839,6 +879,10 @@ def _evaluate_launch_topology(
         "candidate_host_segment_materialization_zero": (candidate_launches["host_segment_materializations"] == 0),
         "candidate_single_grouped_dx": candidate_launches["grouped_dx_launches"] == 1,
         "candidate_single_total_dx": candidate_launches["total_dx_launches"] == 1,
+        "candidate_standalone_histogram_zero": candidate_launches["expert_histogram_sequences"] == 0,
+        "candidate_descriptor_builder_zero": candidate_launches["compact_descriptor_builder_sequences"] == 0,
+        "candidate_single_sorter": candidate_launches["sorter_calls"] == 1,
+        "candidate_single_sorter_metadata": candidate_launches["sorter_backward_metadata_calls"] == 1,
         "baseline_single_grouped_dx": baseline_launches["grouped_dx_launches"] == 1,
         "baseline_single_total_dx": baseline_launches["total_dx_launches"] == 1,
         "baseline_generic_gemm_zero": baseline_launches["generic_gemm_launches"] == 0,
@@ -846,6 +890,9 @@ def _evaluate_launch_topology(
         "baseline_exercises_legacy_dx": baseline_launches["legacy_dx_gemm_launches"] > 0,
         "baseline_exercises_projection": baseline_launches["projection_launches"] > 0,
         "baseline_exercises_host_segment_materialization": (baseline_launches["host_segment_materializations"] > 0),
+        "baseline_single_histogram": baseline_launches["expert_histogram_sequences"] == 1,
+        "baseline_single_descriptor_builder": baseline_launches["compact_descriptor_builder_sequences"] == 1,
+        "baseline_single_sorter": baseline_launches["sorter_calls"] == 1,
     }
     candidate_requirements = (
         "candidate_generic_gemm_zero",
@@ -854,6 +901,10 @@ def _evaluate_launch_topology(
         "candidate_host_segment_materialization_zero",
         "candidate_single_grouped_dx",
         "candidate_single_total_dx",
+        "candidate_standalone_histogram_zero",
+        "candidate_descriptor_builder_zero",
+        "candidate_single_sorter",
+        "candidate_single_sorter_metadata",
     )
     if comparison_mode == "legacy-vs-hostless":
         required_checks = candidate_requirements + (
@@ -862,7 +913,12 @@ def _evaluate_launch_topology(
             "baseline_exercises_host_segment_materialization",
         )
     else:
-        required_checks = candidate_requirements + ("baseline_single_grouped_dx",)
+        required_checks = candidate_requirements + (
+            "baseline_single_grouped_dx",
+            "baseline_single_histogram",
+            "baseline_single_descriptor_builder",
+            "baseline_single_sorter",
+        )
 
     return {
         **checks,

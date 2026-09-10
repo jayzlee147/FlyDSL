@@ -14,6 +14,8 @@ Usage:
 """
 
 import argparse
+import heapq
+import math
 import os
 import sys
 
@@ -38,6 +40,7 @@ from kernels.moe.moe_sorting_kernel import (  # noqa: E402
     _supports_fused_oneshot,
     moe_softmax_sort_flydsl,
     moe_sorting_flydsl,
+    moe_sorting_get_workspace_size,
 )
 from kernels.moe.topk_gating_softmax_kernel import (  # noqa: E402
     build_topk_gating_softmax_module,
@@ -155,6 +158,220 @@ def test_moe_sorting_optional_frequency_validates_contract_and_aliasing():
         invoke(topk_ids.flatten()[:experts])
     with pytest.raises(ValueError, match="must not alias"):
         invoke(sorted_ids[:experts])
+
+
+_E896_METADATA_TOKENS = 4096
+_E896_METADATA_EXPERTS = 896
+_E896_METADATA_TOPK = 16
+_E896_METADATA_UNIT = 64
+_E896_METADATA_CANARY = 0x5A5A5A5A
+
+
+def _e896_boundary_frequencies():
+    boundary = [0, 1, 15, 16, 17, 31, 32, 33, 63, 64, 65, 127, 128, 129, 4095, 4096]
+    # The remaining 880 experts carry exactly 56,624 routes: 304*65 +
+    # 576*64.  This preserves all requested boundary values and the fixed-K
+    # production total of T*K=65,536 routes.
+    frequencies = boundary + [65] * 304 + [64] * 576
+    assert len(frequencies) == _E896_METADATA_EXPERTS
+    assert sum(frequencies) == _E896_METADATA_TOKENS * _E896_METADATA_TOPK
+    return frequencies
+
+
+def _fixed_topk_ids_from_frequencies(frequencies):
+    """Construct unique-per-token fixed-K routes with exact expert degrees."""
+
+    heap = [(-count, expert) for expert, count in enumerate(frequencies) if count]
+    heapq.heapify(heap)
+    rows = []
+    for _ in range(_E896_METADATA_TOKENS):
+        chosen = [heapq.heappop(heap) for _ in range(_E896_METADATA_TOPK)]
+        rows.append([expert for _, expert in chosen])
+        for remaining, expert in chosen:
+            remaining += 1
+            if remaining:
+                heapq.heappush(heap, (remaining, expert))
+    assert not heap
+    assert all(len(set(row)) == _E896_METADATA_TOPK for row in rows)
+    return torch.tensor(rows, dtype=torch.int32, device="cuda")
+
+
+def _allocate_e896_sorter_case(topk_ids):
+    tokens = _E896_METADATA_TOKENS
+    experts = _E896_METADATA_EXPERTS
+    topk = _E896_METADATA_TOPK
+    unit = _E896_METADATA_UNIT
+    routes = tokens * topk
+    max_blocks = (routes + experts * (unit - 1)) // unit
+    max_padded = max_blocks * unit
+    workspace_elements = moe_sorting_get_workspace_size(tokens, experts, topk, unit)
+    return {
+        "topk_ids": topk_ids,
+        "topk_weights": torch.rand((tokens, topk), dtype=torch.float32, device="cuda"),
+        "sorted_ids": torch.empty(max_padded, dtype=torch.int32, device="cuda"),
+        "sorted_weights": torch.empty(max_padded, dtype=torch.float32, device="cuda"),
+        "sorted_expert_ids": torch.empty(max_blocks, dtype=torch.int32, device="cuda"),
+        "num_valid_ids": torch.empty(2, dtype=torch.int32, device="cuda"),
+        "moe_buf": torch.empty(4, dtype=torch.int32, device="cuda"),
+        "workspace": torch.empty(workspace_elements, dtype=torch.int32, device="cuda"),
+        "frequency": torch.empty(experts, dtype=torch.int32, device="cuda"),
+        "max_blocks": max_blocks,
+    }
+
+
+def _guarded_i32(elements, guard=8):
+    raw = torch.full(
+        (elements + 2 * guard,),
+        _E896_METADATA_CANARY,
+        dtype=torch.int32,
+        device="cuda",
+    )
+    return raw, raw[guard : guard + elements]
+
+
+def _launch_e896_sorter_metadata(case, active_storage, schedule_storage, *, stream=None):
+    context = torch.cuda.stream(stream) if stream is not None else torch.cuda.device("cuda")
+    with context:
+        moe_sorting_flydsl(
+            case["topk_ids"],
+            case["topk_weights"],
+            case["sorted_ids"],
+            case["sorted_weights"],
+            case["sorted_expert_ids"],
+            case["num_valid_ids"],
+            case["moe_buf"],
+            _E896_METADATA_EXPERTS,
+            unit_size=_E896_METADATA_UNIT,
+            workspace=case["workspace"],
+            expert_frequency_out=case["frequency"],
+            active_expert_storage=active_storage,
+            bm64_schedule_storage=schedule_storage,
+        )
+
+
+def _assert_e896_sorter_metadata(case, frequencies, active_raw, active, schedule_raw, schedule):
+    expected_frequency = torch.tensor(frequencies, dtype=torch.int32, device="cuda")
+    assert torch.equal(case["frequency"], expected_frequency)
+    assert int(case["frequency"].sum()) == _E896_METADATA_TOKENS * _E896_METADATA_TOPK
+
+    expected_pairs = []
+    first_row = 0
+    for expert, count in enumerate(frequencies):
+        if count:
+            expected_pairs.append((expert, first_row))
+        first_row += math.ceil(count / _E896_METADATA_UNIT) * _E896_METADATA_UNIT
+    expected_blocks = first_row // _E896_METADATA_UNIT
+    assert int(case["num_valid_ids"][0]) == first_row
+    assert int(schedule[0]) == expected_blocks
+    assert torch.equal(
+        schedule[1 : 1 + expected_blocks],
+        torch.arange(expected_blocks, dtype=torch.int32, device="cuda"),
+    )
+
+    active_count = int(active[0])
+    assert active_count == len(expected_pairs)
+    actual_pairs = active[1 : 1 + 2 * active_count].reshape(-1, 2).cpu().tolist()
+    assert sorted(map(tuple, actual_pairs)) == expected_pairs
+
+    guard = (active_raw.numel() - active.numel()) // 2
+    for raw, payload in ((active_raw, active), (schedule_raw, schedule)):
+        assert torch.all(raw[:guard] == _E896_METADATA_CANARY)
+        assert torch.all(raw[guard + payload.numel() :] == _E896_METADATA_CANARY)
+    assert torch.all(active[1 + 2 * active_count :] == _E896_METADATA_CANARY)
+    assert torch.all(schedule[1 + expected_blocks :] == _E896_METADATA_CANARY)
+
+
+def test_moe_sorting_e896_native_backward_metadata_boundaries_and_repeatability():
+    frequencies = _e896_boundary_frequencies()
+    topk_ids = _fixed_topk_ids_from_frequencies(frequencies)
+    case = _allocate_e896_sorter_case(topk_ids)
+    active_raw, active = _guarded_i32(1 + 2 * _E896_METADATA_EXPERTS)
+    schedule_raw, schedule = _guarded_i32(1 + case["max_blocks"])
+
+    for _ in range(128):
+        active.fill_(_E896_METADATA_CANARY)
+        schedule.fill_(_E896_METADATA_CANARY)
+        case["frequency"].fill_(-1)
+        _launch_e896_sorter_metadata(case, active, schedule)
+    torch.cuda.synchronize()
+    _assert_e896_sorter_metadata(case, frequencies, active_raw, active, schedule_raw, schedule)
+
+
+def test_moe_sorting_e896_native_backward_metadata_is_reentrant_across_streams():
+    frequencies = _e896_boundary_frequencies()
+    topk_ids = _fixed_topk_ids_from_frequencies(frequencies)
+    cases = [_allocate_e896_sorter_case(topk_ids.clone()) for _ in range(2)]
+    storages = []
+    streams = [torch.cuda.Stream(), torch.cuda.Stream()]
+    for case, stream in zip(cases, streams):
+        active_raw, active = _guarded_i32(1 + 2 * _E896_METADATA_EXPERTS)
+        schedule_raw, schedule = _guarded_i32(1 + case["max_blocks"])
+        storages.append((active_raw, active, schedule_raw, schedule))
+        _launch_e896_sorter_metadata(case, active, schedule, stream=stream)
+    for stream in streams:
+        stream.synchronize()
+    for case, storage in zip(cases, storages):
+        _assert_e896_sorter_metadata(case, frequencies, *storage)
+
+
+def test_moe_sorting_e896_native_backward_metadata_validates_api_contract():
+    frequencies = _e896_boundary_frequencies()
+    case = _allocate_e896_sorter_case(_fixed_topk_ids_from_frequencies(frequencies))
+    active = torch.empty(1 + 2 * _E896_METADATA_EXPERTS, dtype=torch.int32, device="cuda")
+    schedule = torch.empty(1 + case["max_blocks"], dtype=torch.int32, device="cuda")
+
+    def invoke(**overrides):
+        kwargs = {
+            "expert_frequency_out": case["frequency"],
+            "active_expert_storage": active,
+            "bm64_schedule_storage": schedule,
+        }
+        kwargs.update(overrides)
+        return moe_sorting_flydsl(
+            case["topk_ids"],
+            case["topk_weights"],
+            case["sorted_ids"],
+            case["sorted_weights"],
+            case["sorted_expert_ids"],
+            case["num_valid_ids"],
+            case["moe_buf"],
+            _E896_METADATA_EXPERTS,
+            unit_size=_E896_METADATA_UNIT,
+            workspace=case["workspace"],
+            **kwargs,
+        )
+
+    with pytest.raises(ValueError, match="requires expert_frequency_out"):
+        invoke(expert_frequency_out=None)
+    with pytest.raises(ValueError, match="requires expert_frequency_out"):
+        invoke(active_expert_storage=None)
+    with pytest.raises(TypeError, match="active_expert_storage must be a torch.Tensor"):
+        invoke(active_expert_storage=[0] * active.numel())
+    with pytest.raises(ValueError, match="at least"):
+        invoke(active_expert_storage=active[:-2])
+    with pytest.raises(ValueError, match="at least"):
+        invoke(bm64_schedule_storage=schedule[:-1])
+    with pytest.raises(ValueError, match="must not alias"):
+        invoke(bm64_schedule_storage=schedule, active_expert_storage=schedule[: active.numel()])
+
+    unsupported_ids = case["topk_ids"][:-1].contiguous()
+    unsupported = _allocate_e896_sorter_case(unsupported_ids)
+    with pytest.raises(ValueError, match="restricted to fixed-K"):
+        moe_sorting_flydsl(
+            unsupported["topk_ids"],
+            unsupported["topk_weights"][:-1],
+            unsupported["sorted_ids"],
+            unsupported["sorted_weights"],
+            unsupported["sorted_expert_ids"],
+            unsupported["num_valid_ids"],
+            unsupported["moe_buf"],
+            _E896_METADATA_EXPERTS,
+            unit_size=_E896_METADATA_UNIT,
+            workspace=unsupported["workspace"],
+            expert_frequency_out=unsupported["frequency"],
+            active_expert_storage=active,
+            bm64_schedule_storage=schedule,
+        )
 
 
 BENCH_ITERS = 20

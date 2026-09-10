@@ -47,6 +47,12 @@ BLOCK_SIZE = 256
 UNIT_SIZE = 32  # GEMM tile-M, aka block_size in CK
 WARP_SIZE = get_warp_size()
 
+# The native backward-metadata producer is deliberately limited to the one
+# production contract for which the sorter's 64-row metadata blocks are also
+# the grouped-dX work descriptors.  Keeping this tuple exact prevents a new
+# public/general sorter contract from being inferred from the opt-in outputs.
+_E896_BACKWARD_METADATA_CONTRACT = (4096, 896, 16, 64)
+
 # DPP constants for prefix sum (used by oneshot and multiphase)
 DPP_ROW_SHR_1 = 0x111
 DPP_ROW_SHR_2 = 0x112
@@ -54,6 +60,22 @@ DPP_ROW_SHR_4 = 0x114
 DPP_ROW_SHR_8 = 0x118
 DPP_ROW_MASK = 0xF
 DPP_BANK_MASK = 0xF
+
+
+def _supports_e896_backward_metadata(
+    *,
+    tokens: int,
+    num_experts: int,
+    topk: int,
+    unit_size: int,
+    has_mask: bool,
+) -> bool:
+    """Return whether sorter-native BM64 backward metadata is legal."""
+
+    return (
+        (tokens, num_experts, topk, unit_size) == _E896_BACKWARD_METADATA_CONTRACT
+        and not has_mask
+    )
 
 
 def _unwrap_val(v):
@@ -1566,6 +1588,7 @@ def _compile_moe_sorting_multiphase(
     unit_size: int = UNIT_SIZE,
     has_mask: bool = False,
     export_frequency: bool = False,
+    export_backward_metadata: bool = False,
 ):
     """Compile the multiphase MoE sorting kernels (2 or 4 kernels via HBM workspace).
 
@@ -1593,8 +1616,21 @@ def _compile_moe_sorting_multiphase(
         Build an opt-in producer variant that stores each expert's raw count
         directly to a caller-owned output.  The default variant retains the
         original kernel signatures and generated ISA.
+    export_backward_metadata : bool
+        Build the E896/T4096 fixed-K producer variant that additionally emits
+        the active-expert queue and the identity BM64 grouped-dX schedule.
+        This always requires ``export_frequency`` and is never selected by the
+        default sorter ABI.
     """
     E = num_experts
+    if export_backward_metadata:
+        if not export_frequency:
+            raise ValueError("backward metadata export requires frequency export")
+        if (num_experts, topk, unit_size, has_mask) != (896, 16, 64, False):
+            raise ValueError(
+                "backward metadata export is restricted to "
+                "E896/K16/unit64 without an expert mask"
+            )
 
     @flyc.jit
     def _extend_local_idx_for_extra_experts(cumsum_mr, mask_rsrc, K4_BLOCK, E, has_mask):
@@ -1741,6 +1777,33 @@ def _compile_moe_sorting_multiphase(
         # Each thread stores exactly one element (no loop needed).
         valid = gid < i32_total_elems
         buffer_ops.buffer_store(c_zero, ws_rsrc, valid.select(gid, c_zero))
+
+    if export_backward_metadata:
+
+        @flyc.kernel(known_block_size=[K1_BLOCK, 1, 1])
+        def clear_workspace_backward_metadata_kernel(
+            workspace: fx.Tensor,
+            i32_total_elems: fx.Int32,
+            active_expert_storage: fx.Tensor,
+            bm64_schedule_storage: fx.Tensor,
+        ):
+            gid = gpu.block_idx.x * fx.Int32(K1_BLOCK) + gpu.thread_idx.x
+            ws_rsrc = buffer_ops.create_buffer_resource(workspace, max_size=True)
+            c_zero = fx.Int32(0)
+
+            valid = gid < i32_total_elems
+            buffer_ops.buffer_store(c_zero, ws_rsrc, valid.select(gid, c_zero))
+            if gid == c_zero:
+                active_rsrc = buffer_ops.create_buffer_resource(
+                    active_expert_storage,
+                    max_size=True,
+                )
+                schedule_rsrc = buffer_ops.create_buffer_resource(
+                    bm64_schedule_storage,
+                    max_size=True,
+                )
+                buffer_ops.buffer_store(c_zero, active_rsrc, c_zero)
+                buffer_ops.buffer_store(c_zero, schedule_rsrc, c_zero)
 
     @flyc.jit
     def launch_clear_ws(
@@ -2226,8 +2289,8 @@ def _compile_moe_sorting_multiphase(
         cumsum: fx.Array[fx.Int32, k4_smem_cols, 16]
         scatter: fx.Array[fx.Int32, K4_NUM_WAVES, 16]
 
-    @flyc.kernel(known_block_size=[K4_BLOCK, 1, 1])
-    def p23_kernel(
+    @flyc.jit
+    def _p23_body(
         workspace: fx.Tensor,
         topk_weights_tensor: fx.Tensor,
         sorted_token_ids: fx.Tensor,
@@ -2240,6 +2303,8 @@ def _compile_moe_sorting_multiphase(
         i32_mesh_stride: fx.Int32,
         i32_mesh_size: fx.Int32,
         i32_moe_buf_elems: fx.Int32,
+        active_expert_storage: fx.Tensor,
+        bm64_schedule_storage: fx.Tensor,
     ):
         bid = gpu.block_idx.x
         tid = gpu.thread_idx.x
@@ -2344,6 +2409,54 @@ def _compile_moe_sorting_multiphase(
             my_start = _lds_load_raw(cumsum_mr, my_expert)
             my_end = _lds_load_raw(cumsum_mr, my_expert + c_one)
 
+            if export_backward_metadata:
+                active_rsrc = buffer_ops.create_buffer_resource(
+                    active_expert_storage,
+                    max_size=True,
+                )
+                schedule_rsrc = buffer_ops.create_buffer_resource(
+                    bm64_schedule_storage,
+                    max_size=True,
+                )
+                if (bid == c_zero) & (tid == c_zero):
+                    buffer_ops.buffer_store(total_padded // c_unit, schedule_rsrc, c_zero)
+
+                # Each non-empty expert owns one P23 block, so a single thread
+                # can reserve its queue entry without introducing another
+                # launch.  Queue order remains intentionally unspecified.
+                if (tid == c_zero) & (my_start != my_end):
+                    active_slot = fx.Int32(
+                        atomic_add(
+                            active_expert_storage,
+                            c_zero,
+                            c_one,
+                            dtype_bytes=4,
+                        )
+                    )
+                    active_offset = c_one + active_slot * fx.Int32(2)
+                    buffer_ops.buffer_store(my_expert, active_rsrc, active_offset)
+                    buffer_ops.buffer_store(my_start, active_rsrc, active_offset + c_one)
+
+                # With block_m == sorter unit == 64, the grouped-dX descriptor
+                # is exactly the global sorter block index.  Expert ranges are
+                # disjoint, so this needs neither a reservation atomic nor a
+                # binary search over sorted_expert_ids.
+                block_count = (my_end - my_start) // c_unit
+                block_iters = (block_count + fx.Int32(K4_BLOCK - 1)) // fx.Int32(K4_BLOCK)
+                for _metadata_i in range(
+                    fx.Index(0),
+                    ArithValue(block_iters).index_cast(T.index),
+                    fx.Index(1),
+                ):
+                    local_block = fx.Int32(_metadata_i) * fx.Int32(K4_BLOCK) + tid
+                    if local_block < block_count:
+                        global_block = my_start // c_unit + local_block
+                        buffer_ops.buffer_store(
+                            global_block,
+                            schedule_rsrc,
+                            c_one + global_block,
+                        )
+
             # Step 3 reuses cumsum_mr in place.  Drain every wave's prefix
             # loads before any thread overwrites that LDS with local indices.
             fly_rocdl.s_waitcnt(lgkmcnt=0)
@@ -2411,40 +2524,267 @@ def _compile_moe_sorting_multiphase(
                 c_oob_idx,
             )
 
-    @flyc.jit
-    def launch_p23(
-        workspace: fx.Tensor,
-        topk_weights_tensor: fx.Tensor,
-        sorted_token_ids: fx.Tensor,
-        sorted_weights_out: fx.Tensor,
-        sorted_expert_ids: fx.Tensor,
-        num_valid_ids_out: fx.Tensor,
-        moe_buf: fx.Tensor,
-        expert_mask_tensor: fx.Tensor,
-        i32_tokens: fx.Int32,
-        i32_mesh_stride: fx.Int32,
-        i32_mesh_size: fx.Int32,
-        i32_moe_buf_elems: fx.Int32,
-        n_grid: fx.Int32,
-        stream: fx.Stream = fx.Stream(None),
-    ):
-        launcher = p23_kernel(
-            workspace,
-            topk_weights_tensor,
-            sorted_token_ids,
-            sorted_weights_out,
-            sorted_expert_ids,
-            num_valid_ids_out,
-            moe_buf,
-            expert_mask_tensor,
-            i32_tokens,
-            i32_mesh_stride,
-            i32_mesh_size,
-            i32_moe_buf_elems,
-        )
-        launcher.launch(grid=(n_grid, 1, 1), block=(K4_BLOCK, 1, 1), stream=stream)
+    if export_backward_metadata:
 
-    if export_frequency:
+        @flyc.kernel(known_block_size=[K4_BLOCK, 1, 1])
+        def p23_kernel(
+            workspace: fx.Tensor,
+            topk_weights_tensor: fx.Tensor,
+            sorted_token_ids: fx.Tensor,
+            sorted_weights_out: fx.Tensor,
+            sorted_expert_ids: fx.Tensor,
+            num_valid_ids: fx.Tensor,
+            moe_buf: fx.Tensor,
+            expert_mask_tensor: fx.Tensor,
+            i32_tokens: fx.Int32,
+            i32_mesh_stride: fx.Int32,
+            i32_mesh_size: fx.Int32,
+            i32_moe_buf_elems: fx.Int32,
+            active_expert_storage: fx.Tensor,
+            bm64_schedule_storage: fx.Tensor,
+        ):
+            _p23_body(
+                workspace,
+                topk_weights_tensor,
+                sorted_token_ids,
+                sorted_weights_out,
+                sorted_expert_ids,
+                num_valid_ids,
+                moe_buf,
+                expert_mask_tensor,
+                i32_tokens,
+                i32_mesh_stride,
+                i32_mesh_size,
+                i32_moe_buf_elems,
+                active_expert_storage,
+                bm64_schedule_storage,
+            )
+
+        @flyc.jit
+        def launch_p23(
+            workspace: fx.Tensor,
+            topk_weights_tensor: fx.Tensor,
+            sorted_token_ids: fx.Tensor,
+            sorted_weights_out: fx.Tensor,
+            sorted_expert_ids: fx.Tensor,
+            num_valid_ids_out: fx.Tensor,
+            moe_buf: fx.Tensor,
+            expert_mask_tensor: fx.Tensor,
+            active_expert_storage: fx.Tensor,
+            bm64_schedule_storage: fx.Tensor,
+            i32_tokens: fx.Int32,
+            i32_mesh_stride: fx.Int32,
+            i32_mesh_size: fx.Int32,
+            i32_moe_buf_elems: fx.Int32,
+            n_grid: fx.Int32,
+            stream: fx.Stream = fx.Stream(None),
+        ):
+            launcher = p23_kernel(
+                workspace,
+                topk_weights_tensor,
+                sorted_token_ids,
+                sorted_weights_out,
+                sorted_expert_ids,
+                num_valid_ids_out,
+                moe_buf,
+                expert_mask_tensor,
+                i32_tokens,
+                i32_mesh_stride,
+                i32_mesh_size,
+                i32_moe_buf_elems,
+                active_expert_storage,
+                bm64_schedule_storage,
+            )
+            launcher.launch(grid=(n_grid, 1, 1), block=(K4_BLOCK, 1, 1), stream=stream)
+
+    else:
+
+        @flyc.kernel(known_block_size=[K4_BLOCK, 1, 1])
+        def p23_kernel(
+            workspace: fx.Tensor,
+            topk_weights_tensor: fx.Tensor,
+            sorted_token_ids: fx.Tensor,
+            sorted_weights_out: fx.Tensor,
+            sorted_expert_ids: fx.Tensor,
+            num_valid_ids: fx.Tensor,
+            moe_buf: fx.Tensor,
+            expert_mask_tensor: fx.Tensor,
+            i32_tokens: fx.Int32,
+            i32_mesh_stride: fx.Int32,
+            i32_mesh_size: fx.Int32,
+            i32_moe_buf_elems: fx.Int32,
+        ):
+            _p23_body(
+                workspace,
+                topk_weights_tensor,
+                sorted_token_ids,
+                sorted_weights_out,
+                sorted_expert_ids,
+                num_valid_ids,
+                moe_buf,
+                expert_mask_tensor,
+                i32_tokens,
+                i32_mesh_stride,
+                i32_mesh_size,
+                i32_moe_buf_elems,
+                workspace,
+                workspace,
+            )
+
+        @flyc.jit
+        def launch_p23(
+            workspace: fx.Tensor,
+            topk_weights_tensor: fx.Tensor,
+            sorted_token_ids: fx.Tensor,
+            sorted_weights_out: fx.Tensor,
+            sorted_expert_ids: fx.Tensor,
+            num_valid_ids_out: fx.Tensor,
+            moe_buf: fx.Tensor,
+            expert_mask_tensor: fx.Tensor,
+            i32_tokens: fx.Int32,
+            i32_mesh_stride: fx.Int32,
+            i32_mesh_size: fx.Int32,
+            i32_moe_buf_elems: fx.Int32,
+            n_grid: fx.Int32,
+            stream: fx.Stream = fx.Stream(None),
+        ):
+            launcher = p23_kernel(
+                workspace,
+                topk_weights_tensor,
+                sorted_token_ids,
+                sorted_weights_out,
+                sorted_expert_ids,
+                num_valid_ids_out,
+                moe_buf,
+                expert_mask_tensor,
+                i32_tokens,
+                i32_mesh_stride,
+                i32_mesh_size,
+                i32_moe_buf_elems,
+            )
+            launcher.launch(grid=(n_grid, 1, 1), block=(K4_BLOCK, 1, 1), stream=stream)
+
+    if export_backward_metadata:
+
+        @flyc.jit
+        def launch_p0v2_p23(
+            topk_ids: fx.Tensor,
+            workspace: fx.Tensor,
+            expert_frequency_out: fx.Tensor,
+            active_expert_storage: fx.Tensor,
+            bm64_schedule_storage: fx.Tensor,
+            topk_weights_tensor: fx.Tensor,
+            sorted_token_ids: fx.Tensor,
+            sorted_weights_out: fx.Tensor,
+            sorted_expert_ids: fx.Tensor,
+            num_valid_ids_out: fx.Tensor,
+            moe_buf: fx.Tensor,
+            expert_mask_tensor: fx.Tensor,
+            i32_tokens: fx.Int32,
+            i32_mesh_stride: fx.Int32,
+            i32_mesh_size: fx.Int32,
+            i32_moe_buf_elems: fx.Int32,
+            n_grid_p23: fx.Int32,
+            stream: fx.Stream = fx.Stream(None),
+        ):
+            # The public entry point rejects this T<=2048 path.  Keeping the
+            # composite complete makes direct compilation fail-safe while the
+            # production path below still has exactly four launches.
+            clear_workspace_backward_metadata_kernel(
+                workspace,
+                fx.Int32(0),
+                active_expert_storage,
+                bm64_schedule_storage,
+            ).launch(grid=(1, 1, 1), block=(K1_BLOCK, 1, 1), stream=stream)
+            p0v2_kernel(
+                topk_ids,
+                workspace,
+                expert_mask_tensor,
+                i32_tokens,
+                i32_mesh_stride,
+                i32_mesh_size,
+                expert_frequency_out,
+            ).launch(grid=(E, 1, 1), block=(P0V2_BLOCK, 1, 1), stream=stream)
+            p23_kernel(
+                workspace,
+                topk_weights_tensor,
+                sorted_token_ids,
+                sorted_weights_out,
+                sorted_expert_ids,
+                num_valid_ids_out,
+                moe_buf,
+                expert_mask_tensor,
+                i32_tokens,
+                i32_mesh_stride,
+                i32_mesh_size,
+                i32_moe_buf_elems,
+                active_expert_storage,
+                bm64_schedule_storage,
+            ).launch(grid=(n_grid_p23, 1, 1), block=(K4_BLOCK, 1, 1), stream=stream)
+
+        @flyc.jit
+        def launch_4k_fused(
+            topk_ids: fx.Tensor,
+            workspace: fx.Tensor,
+            expert_frequency_out: fx.Tensor,
+            active_expert_storage: fx.Tensor,
+            bm64_schedule_storage: fx.Tensor,
+            topk_weights_tensor: fx.Tensor,
+            sorted_token_ids: fx.Tensor,
+            sorted_weights_out: fx.Tensor,
+            sorted_expert_ids: fx.Tensor,
+            num_valid_ids_out: fx.Tensor,
+            moe_buf: fx.Tensor,
+            expert_mask_tensor: fx.Tensor,
+            i32_tokens: fx.Int32,
+            i32_mesh_stride: fx.Int32,
+            i32_mesh_size: fx.Int32,
+            i32_moe_buf_elems: fx.Int32,
+            i32_ws_total: fx.Int32,
+            i32_p0_niters: fx.Int32,
+            n_grid_k1: fx.Int32,
+            n_grid_k2: fx.Int32,
+            n_grid_p23: fx.Int32,
+            stream: fx.Stream = fx.Stream(None),
+        ):
+            clear_workspace_backward_metadata_kernel(
+                workspace,
+                i32_ws_total,
+                active_expert_storage,
+                bm64_schedule_storage,
+            ).launch(grid=(n_grid_k1, 1, 1), block=(K1_BLOCK, 1, 1), stream=stream)
+            p0_scatter_kernel(
+                topk_ids,
+                workspace,
+                i32_tokens,
+                i32_mesh_stride,
+                i32_p0_niters,
+            ).launch(grid=(n_grid_k2, 1, 1), block=(K2_BLOCK, 1, 1), stream=stream)
+            p1_count_kernel(
+                workspace,
+                expert_mask_tensor,
+                i32_mesh_stride,
+                i32_mesh_size,
+                expert_frequency_out,
+            ).launch(grid=(E, 1, 1), block=(K3_BLOCK, 1, 1), stream=stream)
+            p23_kernel(
+                workspace,
+                topk_weights_tensor,
+                sorted_token_ids,
+                sorted_weights_out,
+                sorted_expert_ids,
+                num_valid_ids_out,
+                moe_buf,
+                expert_mask_tensor,
+                i32_tokens,
+                i32_mesh_stride,
+                i32_mesh_size,
+                i32_moe_buf_elems,
+                active_expert_storage,
+                bm64_schedule_storage,
+            ).launch(grid=(n_grid_p23, 1, 1), block=(K4_BLOCK, 1, 1), stream=stream)
+
+    elif export_frequency:
 
         @flyc.jit
         def launch_p0v2_p23(
@@ -2686,6 +3026,7 @@ def compile_moe_sorting(
     unit_size=UNIT_SIZE,
     has_mask=False,
     export_frequency=False,
+    export_backward_metadata=False,
 ):
     """Compile MoE sorting kernels for all paths (oneshot + multiphase).
 
@@ -2701,6 +3042,7 @@ def compile_moe_sorting(
         unit_size=unit_size,
         has_mask=has_mask,
         export_frequency=export_frequency,
+        export_backward_metadata=export_backward_metadata,
     )
     return launch_oneshot, launch_p0v2_p23, launch_4k_fused
 
@@ -2732,6 +3074,8 @@ def moe_sorting_flydsl(
     workspace=None,
     direct_single_token=False,
     expert_frequency_out=None,
+    active_expert_storage=None,
+    bm64_schedule_storage=None,
 ):
     """MoE sorting using FlyDSL kernel (oneshot + multiphase paths).
 
@@ -2754,6 +3098,12 @@ def moe_sorting_flydsl(
     with shape ``[num_experts]``.  Multiphase count producers write it directly;
     other paths use the standalone top-k histogram.  Omitting it preserves the
     legacy launch sequence and selects the original producer ABI.
+
+    ``active_expert_storage`` and ``bm64_schedule_storage`` are an all-or-none,
+    internal opt-in for the production T4096/E896/K16/unit64 backward.  Their
+    counter-first layouts are ``[count, (expert, first_row) * E]`` and
+    ``[tile_count, identity_block_ids...]``.  They do not change the returned
+    public sorter tuple or the default compiled-kernel ABI.
 
     Returns
     -------
@@ -2806,6 +3156,74 @@ def moe_sorting_flydsl(
             if isinstance(tensor, torch.Tensor)
         ):
             raise ValueError("expert_frequency_out must not alias sorter inputs, outputs, or workspace")
+
+    backward_metadata_outputs = (active_expert_storage, bm64_schedule_storage)
+    backward_metadata_requested = any(output is not None for output in backward_metadata_outputs)
+    if backward_metadata_requested:
+        if expert_frequency_out is None or any(output is None for output in backward_metadata_outputs):
+            raise ValueError(
+                "sorter-native backward metadata requires expert_frequency_out, "
+                "active_expert_storage, and bm64_schedule_storage together"
+            )
+        if not _supports_e896_backward_metadata(
+            tokens=M,
+            num_experts=num_experts,
+            topk=topk,
+            unit_size=unit_size,
+            has_mask=expert_mask is not None,
+        ):
+            raise ValueError(
+                "sorter-native backward metadata is restricted to fixed-K "
+                "T4096/E896/K16/unit64 routing without an expert mask"
+            )
+        metadata_specs = (
+            ("active_expert_storage", active_expert_storage, 1 + 2 * num_experts),
+            (
+                "bm64_schedule_storage",
+                bm64_schedule_storage,
+                1 + sorted_expert_ids.numel(),
+            ),
+        )
+        for name, tensor, minimum_elements in metadata_specs:
+            if not isinstance(tensor, torch.Tensor):
+                raise TypeError(f"{name} must be a torch.Tensor")
+            if (
+                tensor.ndim != 1
+                or tensor.numel() < minimum_elements
+                or not tensor.is_cuda
+                or tensor.device != device
+                or tensor.dtype != torch.int32
+                or not tensor.is_contiguous()
+            ):
+                raise ValueError(
+                    f"{name} must be contiguous rank-1 int32 on {device} with "
+                    f"at least {minimum_elements} elements"
+                )
+
+        aliased_tensors = (
+            topk_ids,
+            topk_weights,
+            sorted_ids,
+            sorted_weights,
+            sorted_expert_ids,
+            num_valid_ids,
+            moe_buf,
+            expert_mask,
+            workspace,
+            expert_frequency_out,
+            active_expert_storage,
+            bm64_schedule_storage,
+        )
+        storage_pointers = [
+            tensor.untyped_storage().data_ptr()
+            for tensor in aliased_tensors
+            if isinstance(tensor, torch.Tensor)
+        ]
+        if len(storage_pointers) != len(set(storage_pointers)):
+            raise ValueError(
+                "sorter-native backward metadata outputs must not alias sorter inputs, "
+                "outputs, workspace, or each other"
+            )
 
     # EP: prepare mask tensor and flag.
     has_mask = expert_mask is not None
@@ -2891,18 +3309,22 @@ def moe_sorting_flydsl(
             workspace = torch.empty(ws_total, dtype=torch.int32, device=device)
 
         emit_from_count_producer = expert_frequency_out is not None and not has_mask
+        emit_backward_metadata = backward_metadata_requested
         _, launch_p0v2_p23, launch_4k_fused = compile_moe_sorting(
             num_experts=num_experts,
             topk=topk,
             unit_size=unit_size,
             has_mask=has_mask,
             export_frequency=emit_from_count_producer,
+            export_backward_metadata=emit_backward_metadata,
         )
         stream = torch.cuda.current_stream(device)
         n_zero_blocks = min((moe_buf_elems + BLOCK_SIZE - 1) // BLOCK_SIZE, num_cu * target_occupancy)
         k4_grid = num_experts + n_zero_blocks
         base_key = (num_experts, topk, unit_size, has_mask, moe_buf_i32.ndim, device.index)
-        if emit_from_count_producer:
+        if emit_backward_metadata:
+            base_key += ("backward_metadata",)
+        elif emit_from_count_producer:
             base_key += ("frequency",)
 
         if M <= 2048:
@@ -2910,6 +3332,11 @@ def moe_sorting_flydsl(
                 topk_ids,
                 workspace,
                 *((expert_frequency_out,) if emit_from_count_producer else ()),
+                *(
+                    (active_expert_storage, bm64_schedule_storage)
+                    if emit_backward_metadata
+                    else ()
+                ),
                 topk_weights,
                 sorted_ids,
                 sorted_weights,
@@ -2934,6 +3361,11 @@ def moe_sorting_flydsl(
                 topk_ids,
                 workspace,
                 *((expert_frequency_out,) if emit_from_count_producer else ()),
+                *(
+                    (active_expert_storage, bm64_schedule_storage)
+                    if emit_backward_metadata
+                    else ()
+                ),
                 topk_weights,
                 sorted_ids,
                 sorted_weights,
