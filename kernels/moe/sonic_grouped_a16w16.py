@@ -16,7 +16,7 @@ import functools
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl._mlir.dialects import llvm
-from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
+from flydsl.expr import arith, const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import T
 from kernels.common import buffer_ops
 from kernels.gemm.gemm_a16w16_gfx950_utils import (
@@ -190,9 +190,9 @@ def compile_sonic_grouped_a16w16_nn(
     cshuffle_vectors = block_m * block_n // cshuffle_vec_size
     cshuffle_iters = (cshuffle_vectors + block_threads - 1) // block_threads
     if expert_m_reuse:
-        schedule_suffix = "_mreuse2"
+        schedule_suffix = "_mreuse2_xcd1"
     elif expert_m_reuse_threshold is not None:
-        schedule_suffix = f"_mreuse2_ge{expert_m_reuse_threshold}"
+        schedule_suffix = f"_mreuse2_ge{expert_m_reuse_threshold}_xcd1"
     else:
         schedule_suffix = ""
     name = (
@@ -487,6 +487,20 @@ def compile_sonic_grouped_a16w16_nn(
             gpu.barrier()
 
         cumsum0 = rocdl.readfirstlane(T.i32, _raw(_global_i32_at(arg_cumsum, fx.Int32(0))))
+
+        def _xcd_m_reuse_work(work, work_count):
+            """Bijectively transpose dynamic M-reuse work across eight XCDs."""
+
+            nxcd = fx.Int32(8)
+            xq = work_count // nxcd
+            xr = work_count % nxcd
+            xc = work % nxcd
+            return (
+                xc * xq
+                + fx.Int32(arith.minsi(_raw(xc), _raw(xr)))
+                + work // nxcd
+            )
+
         if const_expr(expert_m_reuse):
             active_count = rocdl.readfirstlane(
                 T.i32,
@@ -497,6 +511,7 @@ def compile_sonic_grouped_a16w16_nn(
             work_count = active_count * fx.Int32(work_per_expert)
 
             def _run_work(work):
+                work = _xcd_m_reuse_work(work, work_count)
                 active_index = work // fx.Int32(work_per_expert)
                 expert_work = work % fx.Int32(work_per_expert)
                 n_block = expert_work // fx.Int32(m_partitions)
@@ -545,6 +560,7 @@ def compile_sonic_grouped_a16w16_nn(
                 tile_count = fx.Int32(0)
                 tile_stride = fx.Int32(1)
                 if use_m_reuse:
+                    work = _xcd_m_reuse_work(work, reuse_work_count)
                     active_index = work // fx.Int32(reuse_work_per_expert)
                     expert_work = work % fx.Int32(reuse_work_per_expert)
                     n_block = expert_work // fx.Int32(m_partitions)
