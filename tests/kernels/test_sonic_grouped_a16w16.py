@@ -27,6 +27,11 @@ def _gfx950_device():
     ("overrides", "message"),
     (
         ({"store_route_slots": 1}, "store_route_slots"),
+        ({"store_route_ids": 1}, "store_route_ids"),
+        (
+            {"store_route_slots": True, "store_route_ids": True},
+            "mutually exclusive",
+        ),
         ({"expert_m_reuse": 1}, "expert_m_reuse"),
         ({"expert_m_reuse_threshold": True}, "expert_m_reuse_threshold"),
         ({"expert_m_reuse_threshold": 0}, "expert_m_reuse_threshold"),
@@ -392,9 +397,11 @@ def test_grouped_dx_route_slot_epilogue_matches_sorted_output_bitwise(compact_gr
         generator=generator,
     ).to(torch.bfloat16)
     sorted_token_ids = torch.full((rows,), tokens, dtype=torch.int32, device=device)
+    sorted_route_ids = torch.full((rows,), -1, dtype=torch.int32, device=device)
     for sorted_row, route_row in zip(real_rows, route_rows):
         token, slot = divmod(route_row, top_k)
         sorted_token_ids[sorted_row] = token | (slot << 24)
+        sorted_route_ids[sorted_row] = route_row
 
     sorted_output = torch.full(
         (rows, output_size),
@@ -409,6 +416,7 @@ def test_grouped_dx_route_slot_epilogue_matches_sorted_output_bitwise(compact_gr
         dtype=torch.bfloat16,
         device=device,
     )
+    route_id_storage = torch.full_like(route_storage, float("nan"))
     common = {
         "contraction_size": contraction_size,
         "output_size": output_size,
@@ -427,6 +435,10 @@ def test_grouped_dx_route_slot_epilogue_matches_sorted_output_bitwise(compact_gr
         **common,
         store_route_slots=True,
         top_k=top_k,
+    )
+    route_id_kernel = compile_sonic_grouped_a16w16_nn(
+        **common,
+        store_route_ids=True,
     )
     grid = 2
     stream = torch.cuda.current_stream(device)
@@ -453,13 +465,24 @@ def test_grouped_dx_route_slot_epilogue_matches_sorted_output_bitwise(compact_gr
         grid,
         stream,
     )
+    _run_compiled(
+        route_id_kernel,
+        *common_args,
+        route_id_storage.data_ptr(),
+        sorted_route_ids.data_ptr(),
+        tokens * top_k,
+        grid,
+        stream,
+    )
     torch.cuda.synchronize(device)
 
     expected_routes = torch.empty_like(route_storage[:-1])
     for sorted_row, route_row in zip(real_rows, route_rows):
         expected_routes[route_row] = sorted_output[sorted_row]
     assert torch.equal(route_storage[:-1], expected_routes)
+    assert torch.equal(route_id_storage[:-1], expected_routes)
     assert torch.isnan(route_storage[-1]).all()
+    assert torch.isnan(route_id_storage[-1]).all()
 
 
 @pytest.mark.parametrize("active_experts", (32, 33))

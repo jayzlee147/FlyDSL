@@ -11,6 +11,7 @@ import pytest
 import torch
 
 from flydsl.runtime.device import get_rocm_arch
+from kernels.common.tensor_shim import _run_compiled
 from kernels.moe import sonic_backward as sonic_backward_module
 from kernels.moe.moe_sorting_kernel import _multiphase_cf_cache, _oneshot_cf_cache
 from kernels.moe.sonic import (
@@ -22,6 +23,7 @@ from kernels.moe.sonic import (
     sonic_moe_backward_routes,
 )
 from kernels.moe.sonic_backward import (
+    _compile_flat_segmented_dx_reduction,
     _grouped_da_hostless_profiles,
     _grouped_da_tuning,
     _grouped_dw1_tuning,
@@ -31,6 +33,9 @@ from kernels.moe.sonic_backward import (
     _grouped_w1_tuning,
     _use_direct_grouped_dw1_rhs,
     _use_direct_grouped_dx_routes,
+    _use_e16_fixed_state_grouped_backward,
+    _use_e16_flat_grouped_backward,
+    _use_e16_flat_segmented_dx,
     _use_fused_da_dscore,
     _use_grouped_da,
     _use_grouped_dw1,
@@ -55,6 +60,194 @@ _ACTIVATIONS = (
     "relu_sq",
 )
 _DTYPES = ((torch.bfloat16, "bf16"), (torch.float16, "fp16"))
+
+
+@pytest.mark.parametrize(
+    ("overrides", "expected"),
+    (
+        ({}, True),
+        ({"compute_dtype": "fp16"}, False),
+        ({"activation": "geglu"}, False),
+        ({"tokens": 8191}, False),
+        ({"hidden_size": 4096}, False),
+        ({"intermediate_size": 1024}, False),
+        ({"num_experts": 64}, False),
+        ({"topk": 2}, False),
+        ({"flat_routes": True}, False),
+        ({"has_bias": True}, False),
+        ({"reuse_forward_preactivation": False}, False),
+    ),
+)
+def test_e16_fixed_state_grouped_backward_policy_is_narrow(overrides, expected):
+    kwargs = {
+        "compute_dtype": "bf16",
+        "activation": "swiglu",
+        "tokens": 8192,
+        "hidden_size": 2048,
+        "intermediate_size": 768,
+        "num_experts": 16,
+        "topk": 1,
+        "flat_routes": False,
+        "has_bias": False,
+        "reuse_forward_preactivation": True,
+    }
+    kwargs.update(overrides)
+    assert _use_e16_fixed_state_grouped_backward(**kwargs) is expected
+
+
+def test_e16_fixed_state_grouped_backward_enables_hostless_four_gemm_path():
+    assert _use_hostless_grouped_backward(
+        flat_routes=False,
+        has_bias=False,
+        tokens=8192,
+        hidden_size=2048,
+        intermediate_size=768,
+        num_experts=16,
+        topk=1,
+        reuse_forward_preactivation=True,
+        use_large_grouped_dx=True,
+        # Retained preactivation and fused dA/dscore remove W1/W2 recompute.
+        use_grouped_w1=False,
+        use_grouped_w2=False,
+        use_grouped_dw2=True,
+        use_grouped_da=True,
+        use_grouped_dw1=True,
+        use_grouped_dx=True,
+        e16_fixed_state_grouped=True,
+    )
+
+
+@pytest.mark.parametrize(
+    ("overrides", "expected"),
+    (
+        ({}, True),
+        ({"compute_dtype": "fp16"}, False),
+        ({"activation": "geglu"}, False),
+        ({"hidden_size": 4096}, False),
+        ({"intermediate_size": 1024}, False),
+        ({"num_experts": 64}, False),
+        ({"routes": 8191}, False),
+        ({"flat_routes": False}, False),
+        ({"has_bias": True}, False),
+    ),
+)
+def test_e16_flat_grouped_backward_policy_is_narrow(overrides, expected):
+    kwargs = {
+        "compute_dtype": "bf16",
+        "activation": "swiglu",
+        "hidden_size": 2048,
+        "intermediate_size": 768,
+        "num_experts": 16,
+        "routes": 8192,
+        "flat_routes": True,
+        "has_bias": False,
+    }
+    kwargs.update(overrides)
+    assert _use_e16_flat_grouped_backward(**kwargs) is expected
+
+
+def test_e16_flat_grouped_backward_enables_hostless_dispatch():
+    assert _use_hostless_grouped_backward(
+        flat_routes=True,
+        has_bias=False,
+        tokens=4096,
+        hidden_size=2048,
+        intermediate_size=768,
+        num_experts=16,
+        topk=2,
+        reuse_forward_preactivation=False,
+        use_large_grouped_dx=False,
+        use_grouped_w1=True,
+        use_grouped_w2=True,
+        use_grouped_dw2=True,
+        use_grouped_da=True,
+        use_grouped_dw1=True,
+        use_grouped_dx=True,
+        e16_flat_grouped=True,
+    )
+
+
+@pytest.mark.parametrize(
+    (
+        "e16_flat_grouped",
+        "reuse_forward_preactivation",
+        "token_indices_sorted",
+        "expected",
+    ),
+    (
+        (True, True, True, True),
+        (True, True, False, False),
+        (True, False, True, False),
+        (False, True, True, False),
+        (False, False, False, False),
+    ),
+)
+def test_e16_flat_segmented_dx_requires_retained_exact_path(
+    e16_flat_grouped,
+    reuse_forward_preactivation,
+    token_indices_sorted,
+    expected,
+):
+    assert (
+        _use_e16_flat_segmented_dx(
+            e16_flat_grouped=e16_flat_grouped,
+            reuse_forward_preactivation=reuse_forward_preactivation,
+            token_indices_sorted=token_indices_sorted,
+        )
+        is expected
+    )
+
+
+def test_flat_segmented_dx_reduces_duplicate_routes_and_zero_route_tokens():
+    device = _gfx950_device()
+    tokens = routes = 8
+    hidden_size = 2048
+    token_indices = torch.tensor(
+        [0, 0, 2, 4, 4, 4, 6, 7],
+        dtype=torch.int32,
+        device=device,
+    )
+    generator = torch.Generator(device=device).manual_seed(20260916)
+    dx_routes = torch.randn(
+        (routes, hidden_size),
+        dtype=torch.float32,
+        device=device,
+        generator=generator,
+    ).to(torch.bfloat16)
+    # A zero row covers the dX consequence of a zero route weight.
+    dx_routes[3].zero_()
+    actual = torch.empty(
+        (tokens, hidden_size),
+        dtype=torch.bfloat16,
+        device=device,
+    )
+    reduce_routes = _compile_flat_segmented_dx_reduction(
+        hidden_size,
+        routes,
+        "bf16",
+        device.index or 0,
+    )
+    _run_compiled(
+        reduce_routes,
+        dx_routes,
+        token_indices,
+        actual,
+        tokens,
+        routes,
+        4,
+        torch.cuda.current_stream(device),
+    )
+
+    expected = torch.zeros(
+        (tokens, hidden_size),
+        dtype=torch.float32,
+        device=device,
+    )
+    expected.index_add_(0, token_indices.long(), dx_routes.float())
+    torch.cuda.synchronize(device)
+
+    assert torch.equal(actual, expected.to(torch.bfloat16))
+    assert torch.count_nonzero(actual[[1, 3, 5]]) == 0
 
 
 @pytest.mark.parametrize(
@@ -2917,6 +3110,284 @@ def test_sonic_moe_backward_t4096_fused_da_dscore_matches_q_reference():
         assert max_abs <= max_abs_limit
 
 
+@pytest.mark.large_shape
+@pytest.mark.parametrize("routing", ("balanced", "hot4"))
+def test_sonic_moe_backward_e16_fixed_state_uses_hostless_four_gemm_path(
+    monkeypatch,
+    routing,
+):
+    """Qwen3's retained K1 state bypasses recompute and host dispatch."""
+
+    tokens, hidden_size, intermediate_size, num_experts, topk = 8192, 2048, 768, 16, 1
+    config = _config(
+        hidden_size,
+        intermediate_size,
+        num_experts,
+        topk,
+        compute_dtype="bf16",
+        down_tile_m=64,
+    )
+    args = list(
+        _make_case(
+            tokens,
+            hidden_size,
+            intermediate_size,
+            num_experts,
+            topk,
+            seed=20260915,
+            dtype=torch.bfloat16,
+        )
+    )
+    active_experts = num_experts if routing == "balanced" else 4
+    args[3] = (
+        torch.arange(tokens, dtype=torch.int32, device=args[0].device)
+        .remainder(active_experts)
+        .reshape(tokens, topk)
+        .contiguous()
+    )
+    args = tuple(args)
+    state = _make_forward_state(args[0], args[1], args[3], config)
+
+    def _unexpected_generic_gemm(*_args, **_kwargs):
+        raise AssertionError("E16 retained-state backward must use grouped contractions")
+
+    def _unexpected_host_segments(*_args, **_kwargs):
+        raise AssertionError("E16 retained-state backward must not copy frequencies to host")
+
+    monkeypatch.setattr(sonic_backward_module, "gemm_a16w16", _unexpected_generic_gemm)
+    monkeypatch.setattr(
+        sonic_backward_module,
+        "_materialize_expert_segments",
+        _unexpected_host_segments,
+    )
+    actual = sonic_moe_backward(*args, config, forward_state=state)
+    expected = _backward_reference(*args, reassociate_da_dscore=True)
+    torch.cuda.synchronize()
+
+    relative_l2_limits = (7.5e-4, 3.0e-4, 1.0e-4, 1.0e-4)
+    max_abs_limits = (0.0625, 0.5, 0.5, 0.25)
+    for actual_gradient, expected_gradient, relative_l2_limit, max_abs_limit in zip(
+        actual,
+        expected,
+        relative_l2_limits,
+        max_abs_limits,
+    ):
+        actual_float = actual_gradient.float()
+        expected_float = expected_gradient.float()
+        difference = actual_float - expected_float
+        relative_l2 = float(torch.linalg.vector_norm(difference)) / max(
+            float(torch.linalg.vector_norm(expected_float)),
+            1e-12,
+        )
+        assert torch.isfinite(actual_float).all()
+        assert relative_l2 <= relative_l2_limit
+        assert float(difference.abs().max()) <= max_abs_limit
+
+
+@pytest.mark.large_shape
+@pytest.mark.parametrize("routing", ("balanced", "skew", "hot4"))
+def test_sonic_moe_backward_e16_routes_reuses_forward_sorter_metadata(
+    monkeypatch,
+    routing,
+):
+    """Exact flat state skips re-sorting without requiring token order for metadata."""
+
+    tokens = routes = 8192
+    hidden_size, intermediate_size, num_experts = 2048, 768, 16
+    device = _gfx950_device()
+    generator = torch.Generator(device=device).manual_seed(20260916)
+
+    def _random_bf16(shape, scale):
+        return torch.randn(
+            shape,
+            dtype=torch.bfloat16,
+            device=device,
+            generator=generator,
+        ).mul_(scale)
+
+    config = SonicMoEConfig(
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+        num_experts=num_experts,
+        top_k=1,
+        tile_m=128,
+        tile_n=192,
+        tile_k=64,
+        down_tile_m=64,
+        down_tile_n=256,
+        down_tile_k=64,
+        stage1_xcd_swizzle=8,
+        stage2_xcd_swizzle=0,
+        stage2_pipeline_stages=2,
+        stage1_write_padded_rows=True,
+        stage1_lds_swizzle=True,
+    )
+    x = _random_bf16((tokens, hidden_size), 0.2)
+    w1 = _random_bf16((num_experts, 2 * intermediate_size, hidden_size), 0.02)
+    w2 = _random_bf16((num_experts, hidden_size, intermediate_size), 0.02)
+    grad_output = _random_bf16((tokens, hidden_size), 0.2)
+    token_indices = torch.arange(
+        0,
+        tokens,
+        2,
+        dtype=torch.int32,
+        device=device,
+    ).repeat_interleave(2)
+    route_id = torch.arange(routes, dtype=torch.int64, device=device)
+    if routing == "balanced":
+        expert_indices = ((route_id * 131) % num_experts).to(torch.int32)
+    elif routing == "skew":
+        expert_indices = torch.where(
+            route_id < routes // 2,
+            torch.zeros_like(route_id),
+            1 + (route_id - routes // 2) % (num_experts - 1),
+        ).to(torch.int32)
+    else:
+        expert_indices = ((route_id * 3) % 4).to(torch.int32)
+    route_weights = torch.linspace(
+        0.25,
+        1.0,
+        routes,
+        dtype=torch.float32,
+        device=device,
+    )
+    operator = SonicMoE(config, prepare_sonic_bf16_weights(w1, w2, config))
+    shared_frequency = torch.empty(
+        num_experts,
+        dtype=torch.int32,
+        device=device,
+    )
+    torch.cuda.synchronize(device)
+    producer_stream = torch.cuda.Stream(device=device)
+    with torch.cuda.stream(producer_stream):
+        _, state = operator.forward_routes_training(
+            x,
+            token_indices,
+            expert_indices,
+            route_weights,
+            expert_frequency_out=shared_frequency,
+        )
+        assert state.expert_frequency is not None
+        first_frequency = state.expert_frequency.clone()
+        second_expert_indices = torch.full_like(
+            expert_indices,
+            num_experts - 1,
+        )
+        _, second_state = operator.forward_routes_training(
+            x,
+            token_indices,
+            second_expert_indices,
+            route_weights,
+            expert_frequency_out=shared_frequency,
+        )
+    assert state.producer_stream == int(producer_stream.cuda_stream)
+    assert state.producer_stream != int(torch.cuda.current_stream(device).cuda_stream)
+    fallback_fields = dict(vars(state))
+    for field in (
+        "sorted_token_ids",
+        "sorted_route_ids",
+        "sorted_weights",
+        "sorted_expert_ids",
+        "num_valid_ids",
+        "expert_frequency",
+    ):
+        fallback_fields.pop(field)
+    fallback_state = SimpleNamespace(**fallback_fields)
+
+    original_sorter = sonic_backward_module.moe_ragged_sorting_flydsl
+
+    def _unexpected_sort(*_args, **_kwargs):
+        raise AssertionError("retained E16 backward must reuse forward metadata")
+
+    monkeypatch.setattr(
+        sonic_backward_module,
+        "moe_ragged_sorting_flydsl",
+        _unexpected_sort,
+    )
+    actual = sonic_moe_backward_routes(
+        x,
+        w1,
+        w2,
+        token_indices,
+        expert_indices,
+        route_weights,
+        grad_output,
+        config,
+        forward_state=state,
+        token_indices_sorted=True,
+    )
+    if routing == "balanced":
+        repeated = sonic_moe_backward_routes(
+            x,
+            w1,
+            w2,
+            token_indices,
+            expert_indices,
+            route_weights,
+            grad_output,
+            config,
+            forward_state=state,
+            token_indices_sorted=True,
+        )
+    monkeypatch.setattr(
+        sonic_backward_module,
+        "moe_ragged_sorting_flydsl",
+        original_sorter,
+    )
+    fallback_sort_calls = 0
+
+    def _counted_sort(*args, **kwargs):
+        nonlocal fallback_sort_calls
+        fallback_sort_calls += 1
+        return original_sorter(*args, **kwargs)
+
+    monkeypatch.setattr(
+        sonic_backward_module,
+        "moe_ragged_sorting_flydsl",
+        _counted_sort,
+    )
+    expected = sonic_moe_backward_routes(
+        x,
+        w1,
+        w2,
+        token_indices,
+        expert_indices,
+        route_weights,
+        grad_output,
+        config,
+        forward_state=fallback_state,
+        token_indices_sorted=True,
+    )
+    torch.cuda.synchronize(device)
+
+    assert state.expert_frequency is not None
+    assert state.expert_frequency.data_ptr() != shared_frequency.data_ptr()
+    assert torch.equal(
+        first_frequency,
+        torch.bincount(expert_indices.long(), minlength=num_experts).to(torch.int32),
+    )
+    assert torch.equal(state.expert_frequency, first_frequency)
+    assert torch.equal(
+        shared_frequency,
+        torch.bincount(second_expert_indices.long(), minlength=num_experts).to(torch.int32),
+    )
+    del second_state
+    assert fallback_sort_calls == 1
+    assert torch.equal(actual[0], expected[0])
+    assert torch.equal(actual[3], expected[3])
+    for candidate, baseline in zip(actual[1:3], expected[1:3]):
+        difference = candidate.float() - baseline.float()
+        relative_l2 = float(torch.linalg.vector_norm(difference)) / max(
+            float(torch.linalg.vector_norm(baseline.float())),
+            1.0e-12,
+        )
+        assert relative_l2 <= 1.0e-4
+        assert float(difference.abs().max()) <= 0.01
+    if routing == "balanced":
+        for repeated_gradient, actual_gradient in zip(repeated, actual):
+            assert torch.equal(repeated_gradient, actual_gradient)
+
+
 @pytest.mark.parametrize(
     ("tokens", "hidden_size", "intermediate_size", "num_experts", "topk", "interleaved_w1", "fused"),
     (
@@ -3222,6 +3693,18 @@ def test_sonic_moe_backward_rejects_unsupported_contracts():
             args[-1],
             route_config,
             interleaved_w1="yes",
+        )
+    with pytest.raises(TypeError, match="token_indices_sorted must be bool"):
+        sonic_moe_backward_routes(
+            args[0],
+            args[1],
+            args[2],
+            token_indices,
+            expert_indices,
+            route_weights,
+            args[-1],
+            route_config,
+            token_indices_sorted=1,
         )
     with pytest.raises(ValueError, match="valid only for GLU activations"):
         sonic_moe_backward_routes(

@@ -56,6 +56,9 @@ from kernels.moe.moe_sorting_kernel import moe_sorting_flydsl, moe_sorting_get_w
 from kernels.moe.sonic_grouped_a16w16 import compile_sonic_grouped_a16w16_nn
 from kernels.moe.sonic_grouped_scheduler import (
     build_compact_m_tile_descriptors,
+    build_exact_m_tile_queue,
+    exact_m_tile_queue_elements,
+    exact_m_tile_queue_upper_bound,
     fixed_compact_m_tile_descriptor_upper_bound,
     ragged_compact_m_tile_descriptor_upper_bound,
 )
@@ -160,6 +163,109 @@ _GROUPED_DW2_BK = 32
 _GROUPED_DW2_PIPELINE_THRESHOLD = 64
 _GROUPED_DW2_SPARSE_EXPERTS = 32
 
+# Qwen3-30B-A3B's EP8 training shard reaches this exact fixed-K bucket.  When
+# forward retained route-order preactivation, backward has only four matrix
+# contractions left (dA, dW2, dW1, and dX).  Keep the initial rollout exact so
+# the 8192-row worst-case bound cannot broaden the grouped policies for other
+# distributions or for standalone backward, which still recomputes W1/W2.
+_E16_FIXED_STATE_GROUPED_SHAPE = (8192, 2048, 768, 16, 1)
+
+# Balanced flat routing in the E16 training bucket has roughly 512 rows per
+# expert.  Its device queues amortize the large H/I contractions without the
+# 16-way host GEMM dispatch used by the generic ragged path.
+_E16_FLAT_GROUPED_SHAPE = (2048, 768, 16, 8192)
+_E16_EXACT_BM = 128
+_E16_EXACT_BK = 64
+_E16_EXACT_DA_BN = 192
+# BN128 was 15% faster than the screenshot's BN256 tile in the balanced
+# single-contraction sweep and also exposes twice as much N parallelism for a
+# hot expert.  Both contractions share the same BM128 exact-tile queue.
+_E16_EXACT_DX_BN = 128
+_E16_EXACT_N_WAVES = 4
+_E16_FLAT_SEGMENTED_DX_GRID_CAP = 1024
+
+_RoutesSorterMetadata = tuple[
+    torch.Tensor,  # sorted_token_ids
+    torch.Tensor,  # sorted_route_ids
+    torch.Tensor,  # sorted_weights
+    torch.Tensor,  # sorted_expert_ids
+    torch.Tensor,  # num_valid_ids
+    torch.Tensor,  # expert_frequency
+    int,  # sorter M padding unit
+]
+def _use_e16_fixed_state_grouped_backward(
+    *,
+    compute_dtype: str,
+    activation: str,
+    tokens: int,
+    hidden_size: int,
+    intermediate_size: int,
+    num_experts: int,
+    topk: int,
+    flat_routes: bool,
+    has_bias: bool,
+    reuse_forward_preactivation: bool,
+) -> bool:
+    """Select Qwen3 E16's retained-state, four-contraction backward."""
+
+    return (
+        not flat_routes
+        and not has_bias
+        and reuse_forward_preactivation
+        and compute_dtype == "bf16"
+        and activation == "swiglu"
+        and (tokens, hidden_size, intermediate_size, num_experts, topk)
+        == _E16_FIXED_STATE_GROUPED_SHAPE
+    )
+
+
+def _use_e16_flat_grouped_backward(
+    *,
+    compute_dtype: str,
+    activation: str,
+    hidden_size: int,
+    intermediate_size: int,
+    num_experts: int,
+    routes: int,
+    flat_routes: bool,
+    has_bias: bool,
+) -> bool:
+    """Select the measured E16/H2048/I768/R8192 flat-route bucket."""
+
+    return (
+        flat_routes
+        and not has_bias
+        and compute_dtype == "bf16"
+        and activation == "swiglu"
+        and (hidden_size, intermediate_size, num_experts, routes)
+        == _E16_FLAT_GROUPED_SHAPE
+    )
+
+
+def _use_e16_flat_segmented_dx(
+    *,
+    e16_flat_grouped: bool,
+    reuse_forward_preactivation: bool,
+    token_indices_sorted: bool = False,
+) -> bool:
+    """Select the route-order dX epilogue and token-segment reducer."""
+
+    return (
+        e16_flat_grouped
+        and reuse_forward_preactivation
+        and token_indices_sorted
+    )
+
+
+def _use_e16_flat_deduplicated_metadata(
+    *,
+    e16_flat_grouped: bool,
+    reuse_forward_preactivation: bool,
+) -> bool:
+    """Select the single-builder retained E16 flat metadata path."""
+
+    return e16_flat_grouped and reuse_forward_preactivation
+
 
 def _grouped_dw2_tuning(
     max_expert_rows: int,
@@ -216,7 +322,24 @@ def _launch_grouped_dw2(
 ) -> None:
     """Launch the tuned grouped dW2 profiles after dy becomes available."""
 
-    if use_hostless_grouped and not use_tn_metadata_direct:
+    if (
+        use_hostless_grouped
+        and not use_tn_metadata_direct
+        and int(expert_frequency.numel()) <= _GROUPED_DW2_SPARSE_EXPERTS
+    ):
+        # The active-count guard can never select the dense profile when the
+        # model has at most 32 experts.  Avoid an unconditional empty launch
+        # in E16's latency-sensitive training path.
+        sparse_dw2 = _grouped_dw2_tuning(
+            max_expert_rows,
+            hidden_size,
+            intermediate_size,
+            active_experts=_GROUPED_DW2_SPARSE_EXPERTS,
+        )
+        grouped_dw2_profiles = (
+            (*sparse_dw2, _grouped_dw2_stages(max_expert_rows), 0, None),
+        )
+    elif use_hostless_grouped and not use_tn_metadata_direct:
         # The queue count is already produced by compact W1.  Launch disjoint
         # sparse/dense profiles without a host-side active-count readback.
         sparse_dw2 = _grouped_dw2_tuning(
@@ -651,6 +774,8 @@ def _use_hostless_grouped_backward(
     use_grouped_da: bool,
     use_grouped_dw1: bool,
     use_grouped_dx: bool,
+    e16_fixed_state_grouped: bool = False,
+    e16_flat_grouped: bool = False,
 ) -> bool:
     """Select a fully device-dispatched fixed-K backward.
 
@@ -665,8 +790,12 @@ def _use_hostless_grouped_backward(
 
     short_grouped = tokens <= 128 and use_grouped_w1 and use_grouped_w2
     shape = (tokens, hidden_size, intermediate_size, num_experts, topk)
-    retained_large_grouped = reuse_forward_preactivation and use_large_grouped_dx and shape in _HOSTLESS_LARGE_STATE_SHAPES
-    return (
+    retained_large_grouped = (
+        reuse_forward_preactivation
+        and use_large_grouped_dx
+        and (shape in _HOSTLESS_LARGE_STATE_SHAPES or e16_fixed_state_grouped)
+    )
+    fully_grouped = (
         not flat_routes
         and not has_bias
         and use_grouped_dw2
@@ -675,6 +804,17 @@ def _use_hostless_grouped_backward(
         and use_grouped_dx
         and (short_grouped or retained_large_grouped)
     )
+    flat_fully_grouped = (
+        e16_flat_grouped
+        and not has_bias
+        and use_grouped_w1
+        and use_grouped_w2
+        and use_grouped_dw2
+        and use_grouped_da
+        and use_grouped_dw1
+        and use_grouped_dx
+    )
+    return fully_grouped or flat_fully_grouped
 
 
 def _use_sorter_native_backward_metadata(
@@ -717,6 +857,7 @@ def _use_fused_da_dscore(
     has_bias: bool,
     compute_dtype: str,
     activation: str,
+    e16_flat_grouped: bool = False,
 ) -> bool:
     """Select the first gfx950 unscaled-dA/route-score fusion rollout.
 
@@ -733,7 +874,7 @@ def _use_fused_da_dscore(
     return (
         reuse_forward_preactivation
         and ((use_hostless_grouped and use_compact_w1) or use_large_grouped_dx)
-        and not flat_routes
+        and (not flat_routes or e16_flat_grouped)
         and not has_bias
         and compute_dtype == "bf16"
         and activation == "swiglu"
@@ -767,10 +908,10 @@ def _use_direct_grouped_dw1_rhs(
         reuse_forward_preactivation
         and use_fused_forward_state_prepare
         and use_grouped_dw1
-        and not flat_routes
         and not has_bias
         and compute_dtype == "bf16"
         and activation == "swiglu"
+        and not flat_routes
         and (tokens, hidden_size, intermediate_size, num_experts, topk)
         == _DIRECT_GROUPED_DW1_RHS_SHAPE
     )
@@ -789,9 +930,11 @@ def _compile_grouped_dx(
     min_active_experts: int = 0,
     max_active_experts: int | None = None,
     store_route_slots: bool = False,
+    store_route_ids: bool = False,
     top_k: int = 1,
     expert_m_reuse: bool = False,
     expert_m_reuse_threshold: int | None = None,
+    exact_tile_queue: bool = False,
 ):
     """Build the gfx950 grouped ``dZ @ W1`` specialization."""
 
@@ -810,9 +953,36 @@ def _compile_grouped_dx(
         min_active_experts=min_active_experts,
         max_active_experts=max_active_experts,
         store_route_slots=store_route_slots,
+        store_route_ids=store_route_ids,
         top_k=top_k,
         expert_m_reuse=expert_m_reuse,
         expert_m_reuse_threshold=expert_m_reuse_threshold,
+        exact_tile_queue=exact_tile_queue,
+    )
+
+
+@functools.lru_cache(maxsize=16)
+def _compile_e16_exact_grouped_da(
+    hidden_size: int,
+    intermediate_size: int,
+    num_experts: int,
+    device_index: int,
+):
+    """Build Qwen3 E16's exact-queue ``dY @ W2`` contraction."""
+
+    return compile_sonic_grouped_a16w16_nn(
+        contraction_size=hidden_size,
+        output_size=intermediate_size,
+        num_experts=num_experts,
+        block_m=_E16_EXACT_BM,
+        block_n=_E16_EXACT_DA_BN,
+        block_k=_E16_EXACT_BK,
+        stages=2,
+        n_waves=_E16_EXACT_N_WAVES,
+        sorted_block_m=_BACKWARD_SORT_UNIT,
+        compact_grid=True,
+        device_index=device_index,
+        exact_tile_queue=True,
     )
 
 
@@ -1003,6 +1173,11 @@ def _compile_grouped_w2_recompute(
 @fx.struct
 class _ScoreBackwardSharedStorage:
     reduction: fx.Array[fx.Float32, _RED_SLOTS, 16]
+
+
+@fx.struct
+class _FlatDxSegmentSharedStorage:
+    bounds: fx.Array[fx.Int32, 2, 16]
 
 
 def _gelu_tanh_derivative_f32(x):
@@ -1585,18 +1760,20 @@ def _compile_fused_forward_state_prepare(
     schedule_block_m: int = _COMPACT_W1_BM,
     defer_dy_scaling: bool = False,
     store_x_sorted: bool = True,
+    flat_routes: bool = False,
+    exact_tile_queue: bool = False,
 ):
     """Gather the exact live rows and prepare retained-state backward inputs.
 
-    This specialization is restricted to the fully grouped BF16 SwiGLU
-    fixed-K path.  It avoids walking every 64-row sorter pad, never
+    This specialization is restricted to fully grouped BF16 SwiGLU paths.  It
+    avoids walking every 64-row sorter pad, never
     materializes a sorted copy of ``grad_output``, and combines the remaining
     hidden-state gather with activation and routed-gradient preparation.
 
-    It consumes an existing counter-first BM16 or BM64 dX descriptor queue.
-    The schedule touches real routes plus at most one tile tail per expert;
-    the independently zeroed ``dZ`` buffer continues to provide that tail's
-    dX contract.
+    It consumes an existing counter-first BM16/BM64 descriptor queue.  The E16
+    flat retained path can instead reuse its BM128 exact queue, whose records
+    carry ``(expert, first_row, valid_rows)`` and therefore need no separate
+    compact state schedule.
     """
 
     del device_index
@@ -1609,7 +1786,12 @@ def _compile_fused_forward_state_prepare(
         and not store_x_sorted
         and hidden_size % _DY_COPY_BF16_ELEMENTS == 0
     )
-    if schedule_block_m not in (_COMPACT_W1_BM, _LARGE_GROUPED_DX_BM):
+    if exact_tile_queue:
+        if schedule_block_m != _E16_EXACT_BM:
+            raise ValueError(
+                f"exact state-prepare schedule_block_m must be {_E16_EXACT_BM}"
+            )
+    elif schedule_block_m not in (_COMPACT_W1_BM, _LARGE_GROUPED_DX_BM):
         raise ValueError("state-prepare schedule_block_m must be 16 or 64")
 
     @flyc.kernel(known_block_size=[_BLOCK_THREADS, 1, 1])
@@ -1622,8 +1804,10 @@ def _compile_fused_forward_state_prepare(
         dy: fx.Tensor,
         sorted_weights: fx.Tensor,
         sorted_token_ids: fx.Tensor,
+        sorted_route_ids: fx.Tensor,
         schedule: fx.Tensor,
         i32_tokens: fx.Int32,
+        i32_routes: fx.Int32,
     ):
         tid = gpu.thread_idx.x
         dout_rsrc = buffer_ops.create_buffer_resource(grad_output, max_size=True)
@@ -1638,12 +1822,35 @@ def _compile_fused_forward_state_prepare(
             x_sorted_rsrc = buffer_ops.create_buffer_resource(x_sorted, max_size=True)
         weights_rsrc = buffer_ops.create_buffer_resource(sorted_weights, max_size=True)
         ids_rsrc = buffer_ops.create_buffer_resource(sorted_token_ids, max_size=True)
+        route_ids_rsrc = ids_rsrc
+        if const_expr(flat_routes):
+            route_ids_rsrc = buffer_ops.create_buffer_resource(
+                sorted_route_ids,
+                max_size=True,
+            )
 
         def prepare_real_row(row):
             packed = fx.Int32(buffer_ops.buffer_load(ids_rsrc, row, vec_width=1, dtype=T.i32))
             token = packed & fx.Int32(_TOKEN_MASK)
             slot = (packed >> fx.Int32(24)) & fx.Int32(0xFF)
-            if (token < i32_tokens) & (slot < fx.Int32(topk)):
+            if const_expr(flat_routes):
+                route_row = fx.Int32(
+                    buffer_ops.buffer_load(
+                        route_ids_rsrc,
+                        row,
+                        vec_width=1,
+                        dtype=T.i32,
+                    )
+                )
+                route_valid = (
+                    (token < i32_tokens)
+                    & (route_row >= fx.Int32(0))
+                    & (route_row < i32_routes)
+                )
+            else:
+                route_row = token * fx.Int32(topk) + slot
+                route_valid = (token < i32_tokens) & (slot < fx.Int32(topk))
+            if route_valid:
                 route_weight = fx.Float32(1.0)
                 if const_expr(not defer_dy_scaling):
                     route_weight = fx.Float32(
@@ -1702,7 +1909,6 @@ def _compile_fused_forward_state_prepare(
                                 destination,
                             )
 
-                route_row = token * fx.Int32(topk) + slot
                 route_base = route_row * fx.Int32(projection_size)
                 activation_base = row * fx.Int32(intermediate_size)
                 for base in range_constexpr(0, intermediate_size, _BLOCK_THREADS):
@@ -1737,15 +1943,38 @@ def _compile_fused_forward_state_prepare(
             task = fx.Int32(task_value)
             descriptor_index = task // fx.Int32(schedule_block_m)
             local_row = task % fx.Int32(schedule_block_m)
-            descriptor = fx.Int32(
-                buffer_ops.buffer_load(
-                    schedule_rsrc,
-                    descriptor_index + fx.Int32(1),
-                    vec_width=1,
-                    dtype=T.i32,
+            if const_expr(exact_tile_queue):
+                record_offset = fx.Int32(1) + descriptor_index * fx.Int32(3)
+                first_row = fx.Int32(
+                    buffer_ops.buffer_load(
+                        schedule_rsrc,
+                        record_offset + fx.Int32(1),
+                        vec_width=1,
+                        dtype=T.i32,
+                    )
                 )
-            )
-            prepare_real_row(descriptor * fx.Int32(schedule_block_m) + local_row)
+                valid_rows = fx.Int32(
+                    buffer_ops.buffer_load(
+                        schedule_rsrc,
+                        record_offset + fx.Int32(2),
+                        vec_width=1,
+                        dtype=T.i32,
+                    )
+                )
+                if local_row < valid_rows:
+                    prepare_real_row(first_row + local_row)
+            else:
+                descriptor = fx.Int32(
+                    buffer_ops.buffer_load(
+                        schedule_rsrc,
+                        descriptor_index + fx.Int32(1),
+                        vec_width=1,
+                        dtype=T.i32,
+                    )
+                )
+                prepare_real_row(
+                    descriptor * fx.Int32(schedule_block_m) + local_row
+                )
 
     @flyc.jit
     def launch(
@@ -1757,8 +1986,10 @@ def _compile_fused_forward_state_prepare(
         dy: fx.Tensor,
         sorted_weights: fx.Tensor,
         sorted_token_ids: fx.Tensor,
+        sorted_route_ids: fx.Tensor,
         schedule: fx.Tensor,
         i32_tokens: fx.Int32,
+        i32_routes: fx.Int32,
         i32_grid: fx.Int32,
         stream: fx.Stream = fx.Stream(None),
     ):
@@ -1771,8 +2002,10 @@ def _compile_fused_forward_state_prepare(
             dy,
             sorted_weights,
             sorted_token_ids,
+            sorted_route_ids,
             schedule,
             i32_tokens,
+            i32_routes,
         ).launch(
             grid=(i32_grid, 1, 1),
             block=(_BLOCK_THREADS, 1, 1),
@@ -1892,6 +2125,8 @@ def _compile_fused_activation_derivative_dscore_scale_dy(
     interleaved_w1: bool,
     device_index: int,
     schedule_block_m: int = _COMPACT_W1_BM,
+    flat_routes: bool = False,
+    device_padded_rows: bool = False,
 ):
     """Fuse the post-dA row work for the BF16 SwiGLU state fast path.
 
@@ -1916,7 +2151,10 @@ def _compile_fused_activation_derivative_dscore_scale_dy(
     projection_column_stride = 2 if interleaved_w1 else 1
     up_column_offset = 1 if interleaved_w1 else intermediate_size
     vector_dy_scale = hidden_size % _DY_COPY_BF16_ELEMENTS == 0
-    if schedule_block_m not in (_COMPACT_W1_BM, _LARGE_GROUPED_DX_BM):
+    if (
+        not device_padded_rows
+        and schedule_block_m not in (_COMPACT_W1_BM, _LARGE_GROUPED_DX_BM)
+    ):
         raise ValueError("fused derivative schedule_block_m must be 16 or 64")
 
     @flyc.kernel(known_block_size=[_BLOCK_THREADS, 1, 1])
@@ -1928,9 +2166,11 @@ def _compile_fused_activation_derivative_dscore_scale_dy(
         dz: fx.Tensor,
         sorted_weights: fx.Tensor,
         sorted_token_ids: fx.Tensor,
+        sorted_route_ids: fx.Tensor,
         dtopk_weights: fx.Tensor,
         schedule: fx.Tensor,
         i32_tokens: fx.Int32,
+        i32_routes: fx.Int32,
     ):
         tid = gpu.thread_idx.x
         zero_f32 = fx.Float32(0.0)
@@ -1942,6 +2182,12 @@ def _compile_fused_activation_derivative_dscore_scale_dy(
         dz_rsrc = buffer_ops.create_buffer_resource(dz, max_size=True)
         weights_rsrc = buffer_ops.create_buffer_resource(sorted_weights, max_size=True)
         ids_rsrc = buffer_ops.create_buffer_resource(sorted_token_ids, max_size=True)
+        route_ids_rsrc = ids_rsrc
+        if const_expr(flat_routes):
+            route_ids_rsrc = buffer_ops.create_buffer_resource(
+                sorted_route_ids,
+                max_size=True,
+            )
         ds_rsrc = buffer_ops.create_buffer_resource(dtopk_weights, max_size=True)
         schedule_rsrc = buffer_ops.create_buffer_resource(schedule, max_size=True)
         lds = fx.SharedAllocator().allocate(_ScoreBackwardSharedStorage).peek()
@@ -1955,10 +2201,9 @@ def _compile_fused_activation_derivative_dscore_scale_dy(
                     result = result + gpu.shuffle_xor(result, offset, _WARP_SIZE)
             return result
 
-        def process_row(row, token, slot):
+        def process_row(row, route_row):
             route_weight = fx.Float32(buffer_ops.buffer_load(weights_rsrc, row, vec_width=1, dtype=T.f32))
             thread_dot = zero_f32
-            route_row = token * fx.Int32(topk) + slot
             route_base = route_row * fx.Int32(projection_size)
             sorted_base = row * fx.Int32(projection_size)
             for base in range_constexpr(0, intermediate_size, _BLOCK_THREADS):
@@ -2064,31 +2309,68 @@ def _compile_fused_activation_derivative_dscore_scale_dy(
                 reduced = fx.memref_load(reduction, fx.Int32(0))
 
             if tid == fx.Int32(0):
-                destination = token * fx.Int32(topk) + slot
-                buffer_ops.buffer_store(reduced, ds_rsrc, destination)
+                buffer_ops.buffer_store(reduced, ds_rsrc, route_row)
 
-        total_tiles = fx.Int32(
-            buffer_ops.buffer_load(schedule_rsrc, fx.Int32(0), vec_width=1, dtype=T.i32)
-        )
-        total_rows = total_tiles * fx.Int32(schedule_block_m)
-        for task_value in range(gpu.block_idx.x, total_rows, gpu.grid_dim.x):
-            task = fx.Int32(task_value)
-            descriptor_index = task // fx.Int32(schedule_block_m)
-            local_row = task % fx.Int32(schedule_block_m)
-            descriptor = fx.Int32(
+        def process_sorted_row(row):
+            packed = fx.Int32(buffer_ops.buffer_load(ids_rsrc, row, vec_width=1, dtype=T.i32))
+            token = packed & fx.Int32(_TOKEN_MASK)
+            slot = (packed >> fx.Int32(24)) & fx.Int32(0xFF)
+            if const_expr(flat_routes):
+                route_row = fx.Int32(
+                    buffer_ops.buffer_load(
+                        route_ids_rsrc,
+                        row,
+                        vec_width=1,
+                        dtype=T.i32,
+                    )
+                )
+                route_valid = (
+                    (token < i32_tokens)
+                    & (route_row >= fx.Int32(0))
+                    & (route_row < i32_routes)
+                )
+            else:
+                route_row = token * fx.Int32(topk) + slot
+                route_valid = (token < i32_tokens) & (slot < fx.Int32(topk))
+            if route_valid:
+                process_row(row, route_row)
+
+        if const_expr(device_padded_rows):
+            padded_rows = fx.Int32(
                 buffer_ops.buffer_load(
                     schedule_rsrc,
-                    descriptor_index + fx.Int32(1),
+                    fx.Int32(0),
                     vec_width=1,
                     dtype=T.i32,
                 )
             )
-            row = descriptor * fx.Int32(schedule_block_m) + local_row
-            packed = fx.Int32(buffer_ops.buffer_load(ids_rsrc, row, vec_width=1, dtype=T.i32))
-            token = packed & fx.Int32(_TOKEN_MASK)
-            slot = (packed >> fx.Int32(24)) & fx.Int32(0xFF)
-            if (token < i32_tokens) & (slot < fx.Int32(topk)):
-                process_row(row, token, slot)
+            for row_value in range(gpu.block_idx.x, padded_rows, gpu.grid_dim.x):
+                process_sorted_row(fx.Int32(row_value))
+        else:
+            total_tiles = fx.Int32(
+                buffer_ops.buffer_load(
+                    schedule_rsrc,
+                    fx.Int32(0),
+                    vec_width=1,
+                    dtype=T.i32,
+                )
+            )
+            total_rows = total_tiles * fx.Int32(schedule_block_m)
+            for task_value in range(gpu.block_idx.x, total_rows, gpu.grid_dim.x):
+                task = fx.Int32(task_value)
+                descriptor_index = task // fx.Int32(schedule_block_m)
+                local_row = task % fx.Int32(schedule_block_m)
+                descriptor = fx.Int32(
+                    buffer_ops.buffer_load(
+                        schedule_rsrc,
+                        descriptor_index + fx.Int32(1),
+                        vec_width=1,
+                        dtype=T.i32,
+                    )
+                )
+                process_sorted_row(
+                    descriptor * fx.Int32(schedule_block_m) + local_row
+                )
 
     @flyc.jit
     def launch(
@@ -2099,9 +2381,11 @@ def _compile_fused_activation_derivative_dscore_scale_dy(
         dz: fx.Tensor,
         sorted_weights: fx.Tensor,
         sorted_token_ids: fx.Tensor,
+        sorted_route_ids: fx.Tensor,
         dtopk_weights: fx.Tensor,
         schedule: fx.Tensor,
         i32_tokens: fx.Int32,
+        i32_routes: fx.Int32,
         i32_grid: fx.Int32,
         stream: fx.Stream = fx.Stream(None),
     ):
@@ -2113,9 +2397,11 @@ def _compile_fused_activation_derivative_dscore_scale_dy(
             dz,
             sorted_weights,
             sorted_token_ids,
+            sorted_route_ids,
             dtopk_weights,
             schedule,
             i32_tokens,
+            i32_routes,
         ).launch(
             grid=(i32_grid, 1, 1),
             block=(_BLOCK_THREADS, 1, 1),
@@ -2720,6 +3006,139 @@ def _compile_ragged_dx_reduction(hidden_size: int, compute_dtype: str, device_in
     return launch
 
 
+@functools.lru_cache(maxsize=16)
+def _compile_flat_segmented_dx_reduction(
+    hidden_size: int,
+    routes: int,
+    compute_dtype: str,
+    device_index: int,
+):
+    """Reduce route-order dX directly into token-order storage.
+
+    The retained E16 adapter supplies route rows in nondecreasing token order.
+    One workgroup therefore owns a token, finds its half-open route segment
+    with two fixed-trip lower bounds, accumulates all matching BF16 rows in
+    FP32, and writes final BF16 dX once.  This replaces the legacy clear,
+    atomic-scatter, and finalize launch sequence for that audited contract.
+    """
+
+    del device_index
+    if compute_dtype != "bf16":
+        raise ValueError("flat segmented dX currently supports compute_dtype='bf16' only")
+    if hidden_size <= 0 or hidden_size % (_BLOCK_THREADS * 8):
+        raise ValueError(
+            "flat segmented dX requires hidden_size to be a positive multiple "
+            f"of {_BLOCK_THREADS * 8}"
+        )
+    if routes <= 0:
+        raise ValueError("flat segmented dX requires a positive compile-time route bound")
+
+    dwords_per_row = hidden_size // 2
+    vectors_per_thread = hidden_size // (_BLOCK_THREADS * 8)
+    lower_bound_steps = max(1, routes.bit_length())
+
+    @flyc.kernel(known_block_size=[_BLOCK_THREADS, 1, 1])
+    def segmented_reduce_kernel(
+        dx_route_order: fx.Tensor,
+        token_indices: fx.Tensor,
+        dx: fx.Tensor,
+        i32_tokens: fx.Int32,
+        i32_routes: fx.Int32,
+    ):
+        tid = gpu.thread_idx.x
+        route_dx_rsrc = buffer_ops.create_buffer_resource(
+            dx_route_order,
+            max_size=True,
+        )
+        token_rsrc = buffer_ops.create_buffer_resource(token_indices, max_size=True)
+        dx_rsrc = buffer_ops.create_buffer_resource(dx, max_size=True)
+        lds = fx.SharedAllocator().allocate(_FlatDxSegmentSharedStorage).peek()
+        bounds = lds.bounds.view(fx.make_layout(2, 1))
+
+        def lower_bound(target):
+            lo = fx.Int32(0)
+            hi = i32_routes
+            for _ in range_constexpr(lower_bound_steps):
+                searching = lo < hi
+                mid = (lo + hi) // fx.Int32(2)
+                safe_mid = searching.select(mid, fx.Int32(0))
+                candidate = fx.Int32(
+                    buffer_ops.buffer_load(
+                        token_rsrc,
+                        safe_mid,
+                        vec_width=1,
+                        dtype=T.i32,
+                    )
+                )
+                move_right = searching & (candidate < target)
+                lo = move_right.select(mid + fx.Int32(1), lo)
+                move_left = searching & (candidate >= target)
+                hi = move_left.select(mid, hi)
+            return lo
+
+        token = gpu.block_idx.x
+        token_stride = gpu.grid_dim.x
+        for token_row in range(token, i32_tokens, token_stride):
+            if tid == fx.Int32(0):
+                start = lower_bound(token_row)
+                end = lower_bound(token_row + fx.Int32(1))
+                fx.memref_store(start, bounds, fx.Int32(0))
+                fx.memref_store(end, bounds, fx.Int32(1))
+            gpu.barrier()
+
+            start = fx.Int32(fx.memref_load(bounds, fx.Int32(0)))
+            end = fx.Int32(fx.memref_load(bounds, fx.Int32(1)))
+            for vector_iter in range_constexpr(vectors_per_thread):
+                dword_column = (
+                    tid * fx.Int32(4)
+                    + fx.Int32(vector_iter * _BLOCK_THREADS * 4)
+                )
+                accum = fx.Vector.filled(8, 0.0, fx.Float32)
+                for route_row in range(start, end, fx.Int32(1)):
+                    route_dword = route_row * fx.Int32(dwords_per_row) + dword_column
+                    packed = buffer_ops.buffer_load(
+                        route_dx_rsrc,
+                        route_dword,
+                        vec_width=4,
+                        dtype=T.i32,
+                    )
+                    accum = accum + fx.Vector(packed).bitcast(fx.BFloat16).to(fx.Float32)
+
+                output_dword = token_row * fx.Int32(dwords_per_row) + dword_column
+                buffer_ops.buffer_store(
+                    accum.to(fx.BFloat16).bitcast(fx.Int32),
+                    dx_rsrc,
+                    output_dword,
+                )
+            # All lanes must finish consuming the current shared bounds before
+            # lane zero publishes the next grid-stride token's segment.
+            gpu.barrier()
+
+    @flyc.jit
+    def launch(
+        dx_route_order: fx.Tensor,
+        token_indices: fx.Tensor,
+        dx: fx.Tensor,
+        i32_tokens: fx.Int32,
+        i32_routes: fx.Int32,
+        i32_grid: fx.Int32,
+        stream: fx.Stream = fx.Stream(None),
+    ):
+        segmented_reduce_kernel(
+            dx_route_order,
+            token_indices,
+            dx,
+            i32_tokens,
+            i32_routes,
+        ).launch(
+            grid=(i32_grid, 1, 1),
+            block=(_BLOCK_THREADS, 1, 1),
+            stream=stream,
+        )
+
+    return launch
+
+
 @functools.lru_cache(maxsize=128)
 def _compile_unsort(
     hidden_size: int,
@@ -3023,6 +3442,266 @@ def _validate_forward_state(
     return preactivation, producer_stream, ready_event
 
 
+def _validate_routes_forward_state(
+    forward_state: object,
+    hidden_states: torch.Tensor,
+    routes: int,
+    config: "SonicMoEConfig",
+    interleaved_w1: bool,
+    has_bias: bool,
+) -> tuple[
+    torch.Tensor,
+    int,
+    torch.cuda.Event,
+    _RoutesSorterMetadata | None,
+]:
+    """Validate retained route-order state for the audited E16 flat path."""
+
+    field_names = (
+        "preactivation",
+        "tokens",
+        "routes",
+        "hidden_size",
+        "intermediate_size",
+        "num_experts",
+        "activation",
+        "compute_dtype",
+        "interleaved_w1",
+        "has_bias",
+        "producer_stream",
+        "ready_event",
+    )
+    values: dict[str, object] = {}
+    missing: list[str] = []
+    for name in field_names:
+        try:
+            values[name] = getattr(forward_state, name)
+        except AttributeError:
+            missing.append(name)
+    if missing:
+        raise ValueError(
+            "forward_state is missing required field(s): " + ", ".join(missing)
+        )
+
+    tokens = int(hidden_states.shape[0])
+    expected_ints = {
+        "tokens": tokens,
+        "routes": routes,
+        "hidden_size": int(config.hidden_size),
+        "intermediate_size": int(config.intermediate_size),
+        "num_experts": int(config.num_experts),
+    }
+    for name, expected in expected_ints.items():
+        value = values[name]
+        if type(value) is not int:
+            raise TypeError(
+                f"forward_state.{name} must be int, got {type(value).__name__}"
+            )
+        if value != expected:
+            raise ValueError(
+                f"forward_state.{name} must equal {expected}, got {value}"
+            )
+
+    expected_strings = {
+        "activation": str(config.activation),
+        "compute_dtype": str(config.compute_dtype),
+    }
+    for name, expected in expected_strings.items():
+        value = values[name]
+        if type(value) is not str:
+            raise TypeError(
+                f"forward_state.{name} must be str, got {type(value).__name__}"
+            )
+        if value != expected:
+            raise ValueError(
+                f"forward_state.{name} must equal {expected!r}, got {value!r}"
+            )
+
+    exact_shape = (
+        tokens,
+        int(config.hidden_size),
+        int(config.intermediate_size),
+        int(config.num_experts),
+        routes,
+    )
+    if exact_shape != (8192, 2048, 768, 16, 8192):
+        raise ValueError(
+            "flat forward_state reuse currently supports only the audited "
+            "T8192/R8192/H2048/I768/E16 bucket"
+        )
+    if config.activation != "swiglu" or config.compute_dtype != "bf16" or has_bias:
+        raise ValueError(
+            "flat forward_state reuse currently supports only bias-free BF16 "
+            "SwiGLU backward"
+        )
+
+    state_interleaved = values["interleaved_w1"]
+    if type(state_interleaved) is not bool:
+        raise TypeError(
+            "forward_state.interleaved_w1 must be bool, got "
+            f"{type(state_interleaved).__name__}"
+        )
+    if state_interleaved != interleaved_w1:
+        raise ValueError(
+            "forward_state.interleaved_w1 must match the backward call, got "
+            f"{state_interleaved} and {interleaved_w1}"
+        )
+    state_has_bias = values["has_bias"]
+    if type(state_has_bias) is not bool:
+        raise TypeError(
+            "forward_state.has_bias must be bool, got "
+            f"{type(state_has_bias).__name__}"
+        )
+    if state_has_bias != has_bias:
+        raise ValueError(
+            "forward_state.has_bias must match the backward call, got "
+            f"{state_has_bias} and {has_bias}"
+        )
+
+    preactivation = values["preactivation"]
+    if not isinstance(preactivation, torch.Tensor):
+        raise TypeError(
+            "forward_state.preactivation must be a torch.Tensor, got "
+            f"{type(preactivation).__name__}"
+        )
+    expected_shape = (routes, 2 * int(config.intermediate_size))
+    if tuple(preactivation.shape) != expected_shape:
+        raise ValueError(
+            f"forward_state.preactivation must have shape {expected_shape}, "
+            f"got {tuple(preactivation.shape)}"
+        )
+    if not preactivation.is_cuda or preactivation.device != hidden_states.device:
+        raise ValueError(
+            "forward_state.preactivation must be on the same ROCm device as "
+            "hidden_states"
+        )
+    if preactivation.dtype != torch.bfloat16:
+        raise TypeError(
+            "forward_state.preactivation must be torch.bfloat16, got "
+            f"{preactivation.dtype}"
+        )
+    preactivation_bytes = preactivation.numel() * preactivation.element_size()
+    if preactivation_bytes > _MAX_SIGNED_I32:
+        raise ValueError(
+            "forward_state.preactivation byte span exceeds the signed 32-bit "
+            f"buffer limit, got {preactivation_bytes}"
+        )
+    if not preactivation.is_contiguous():
+        raise ValueError("forward_state.preactivation must be contiguous")
+
+    producer_stream = values["producer_stream"]
+    if type(producer_stream) is not int:
+        raise TypeError(
+            "forward_state.producer_stream must be int, got "
+            f"{type(producer_stream).__name__}"
+        )
+    if producer_stream < 0:
+        raise ValueError(
+            f"forward_state.producer_stream must be non-negative, got {producer_stream}"
+        )
+
+    ready_event = values["ready_event"]
+    if not isinstance(ready_event, torch.cuda.Event):
+        raise TypeError(
+            "forward_state.ready_event must be torch.cuda.Event, got "
+            f"{type(ready_event).__name__}"
+        )
+    event_device = ready_event.device
+    if event_device is None:
+        raise ValueError("forward_state.ready_event must already be recorded")
+    if torch.device(event_device) != hidden_states.device:
+        raise ValueError(
+            "forward_state.ready_event must be recorded on the same ROCm device "
+            "as hidden_states"
+        )
+
+    # Sorter metadata is an optional optimization ABI.  Older state producers
+    # carry only preactivation; partially populated or structurally invalid
+    # metadata must therefore fall back to a fresh backward sort rather than
+    # weakening the existing state compatibility contract.
+    metadata_names = (
+        "sorted_token_ids",
+        "sorted_route_ids",
+        "sorted_weights",
+        "sorted_expert_ids",
+        "num_valid_ids",
+        "expert_frequency",
+    )
+    metadata_values = tuple(
+        getattr(forward_state, name, None) for name in metadata_names
+    )
+    sorter_metadata: _RoutesSorterMetadata | None = None
+    if all(isinstance(value, torch.Tensor) for value in metadata_values):
+        sort_unit = int(config.route_tile_m)
+        max_padded, max_blocks = _max_padded_flat_routes(
+            routes,
+            int(config.num_experts),
+            sort_unit,
+        )
+        expected_metadata = (
+            ((max_padded,), torch.int32),
+            ((max_padded,), torch.int32),
+            ((max_padded,), torch.float32),
+            ((max_blocks,), torch.int32),
+            ((2,), torch.int32),
+            ((int(config.num_experts),), torch.int32),
+        )
+        metadata_ok = True
+        for value, (shape, dtype) in zip(metadata_values, expected_metadata):
+            assert isinstance(value, torch.Tensor)
+            metadata_ok = metadata_ok and (
+                tuple(value.shape) == shape
+                and value.dtype == dtype
+                and value.is_cuda
+                and value.device == hidden_states.device
+                and value.is_contiguous()
+            )
+        # Invocation-owned fields must not be views into the saved activation
+        # or into one another.  This also makes accidental state construction
+        # from a reusable packed workspace fail closed to the normal sorter.
+        if metadata_ok:
+            storage_ptrs = [
+                value.untyped_storage().data_ptr()
+                for value in metadata_values
+                if isinstance(value, torch.Tensor)
+            ]
+            metadata_ok = (
+                preactivation.untyped_storage().data_ptr() not in storage_ptrs
+                and len(set(storage_ptrs)) == len(storage_ptrs)
+            )
+        if metadata_ok:
+            (
+                sorted_token_ids,
+                sorted_route_ids,
+                sorted_weights,
+                sorted_expert_ids,
+                num_valid_ids,
+                expert_frequency,
+            ) = metadata_values
+            assert isinstance(sorted_token_ids, torch.Tensor)
+            assert isinstance(sorted_route_ids, torch.Tensor)
+            assert isinstance(sorted_weights, torch.Tensor)
+            assert isinstance(sorted_expert_ids, torch.Tensor)
+            assert isinstance(num_valid_ids, torch.Tensor)
+            assert isinstance(expert_frequency, torch.Tensor)
+            sorter_metadata = (
+                sorted_token_ids,
+                sorted_route_ids,
+                sorted_weights,
+                sorted_expert_ids,
+                num_valid_ids,
+                expert_frequency,
+                sort_unit,
+            )
+
+    return (
+        preactivation,
+        producer_stream,
+        ready_event,
+        sorter_metadata,
+    )
+
+
 def _validate_backward_route_inputs(
     hidden_states: torch.Tensor,
     w1: torch.Tensor,
@@ -3144,6 +3823,8 @@ def _sonic_moe_backward_impl(
     b2: torch.Tensor | None = None,
     interleaved_w1: bool = False,
     forward_state_data: tuple[torch.Tensor, int, torch.cuda.Event] | None = None,
+    forward_sorter_metadata: _RoutesSorterMetadata | None = None,
+    token_indices_sorted: bool = False,
 ) -> tuple[torch.Tensor, ...]:
     """Shared sorted-expert implementation for fixed-K and flat routes."""
 
@@ -3153,10 +3834,53 @@ def _sonic_moe_backward_impl(
     topk = int(config.top_k)
     compute_dtype = str(config.compute_dtype)
     activation_name = str(config.activation)
-    sort_unit = _BACKWARD_SORT_UNIT
+    # Forward exact-E16 metadata uses the forward route tile (BM128 for the
+    # tuned Qwen3 configuration).  A fallback backward sort keeps the original
+    # BM64 layout.  Never reinterpret metadata produced at one granularity as
+    # the other: ``sorted_expert_ids`` is indexed in sorter-block units.
+    sort_unit = (
+        forward_sorter_metadata[-1]
+        if forward_sorter_metadata is not None
+        else _BACKWARD_SORT_UNIT
+    )
     projection_size = intermediate_size * (2 if activation_name in _GLU_ACTIVATIONS else 1)
     has_bias = b1 is not None
     reuse_forward_preactivation = forward_state_data is not None
+    use_e16_fixed_state_grouped = _use_e16_fixed_state_grouped_backward(
+        compute_dtype=compute_dtype,
+        activation=activation_name,
+        tokens=tokens,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+        num_experts=num_experts,
+        topk=topk,
+        flat_routes=flat_routes,
+        has_bias=has_bias,
+        reuse_forward_preactivation=reuse_forward_preactivation,
+    )
+    use_e16_flat_grouped = _use_e16_flat_grouped_backward(
+        compute_dtype=compute_dtype,
+        activation=activation_name,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+        num_experts=num_experts,
+        routes=routes,
+        flat_routes=flat_routes,
+        has_bias=has_bias,
+    )
+    # The segmented route-order reducer uses binary search and therefore
+    # requires nondecreasing token indices.  Preserve the generic atomic
+    # reducer unless the caller explicitly supplies that ordering contract.
+    use_flat_segmented_dx = _use_e16_flat_segmented_dx(
+        e16_flat_grouped=use_e16_flat_grouped,
+        reuse_forward_preactivation=reuse_forward_preactivation,
+        token_indices_sorted=token_indices_sorted,
+    )
+    use_e16_deduplicated_metadata = _use_e16_flat_deduplicated_metadata(
+        e16_flat_grouped=use_e16_flat_grouped,
+        reuse_forward_preactivation=reuse_forward_preactivation,
+    )
+    use_e16_exact_queue = use_e16_fixed_state_grouped or use_e16_flat_grouped
     use_grouped_w1 = _use_grouped_w1_recompute(
         compute_dtype=compute_dtype,
         activation=activation_name,
@@ -3166,6 +3890,7 @@ def _sonic_moe_backward_impl(
         routes=routes,
         flat_routes=flat_routes,
     )
+    use_grouped_w1 = use_grouped_w1 or use_e16_flat_grouped
     use_grouped_w2 = _use_grouped_w2_recompute(
         compute_dtype=compute_dtype,
         activation=activation_name,
@@ -3175,6 +3900,7 @@ def _sonic_moe_backward_impl(
         routes=routes,
         flat_routes=flat_routes,
     )
+    use_grouped_w2 = use_grouped_w2 or use_e16_flat_grouped
     use_grouped_dw2 = _use_grouped_dw2(
         compute_dtype=compute_dtype,
         hidden_size=hidden_size,
@@ -3189,6 +3915,7 @@ def _sonic_moe_backward_impl(
         routes=routes,
         flat_routes=flat_routes,
     )
+    use_grouped_da = use_grouped_da or use_e16_fixed_state_grouped or use_e16_flat_grouped
     use_grouped_dw1 = _use_grouped_dw1(
         compute_dtype=compute_dtype,
         activation=activation_name,
@@ -3197,6 +3924,9 @@ def _sonic_moe_backward_impl(
         tokens=tokens,
         routes=routes,
         flat_routes=flat_routes,
+    )
+    use_grouped_dw1 = (
+        use_grouped_dw1 or use_e16_fixed_state_grouped or use_e16_flat_grouped
     )
     grouped_w1_bm, grouped_w1_bn, _, _, compact_w1_grid = _grouped_w1_tuning(
         tokens=tokens,
@@ -3215,17 +3945,23 @@ def _sonic_moe_backward_impl(
         flat_routes=flat_routes,
         compact_w1=use_compact_w1,
     )
+    use_grouped_dx = (
+        use_grouped_dx or use_e16_fixed_state_grouped or use_e16_flat_grouped
+    )
     direct_grouped_dx_routes = _use_direct_grouped_dx_routes(
         use_grouped_dx=use_grouped_dx,
         flat_routes=flat_routes,
     )
-    use_large_grouped_dx = use_grouped_dx and _use_large_grouped_dx_descriptor_queue(
-        tokens=tokens,
-        hidden_size=hidden_size,
-        intermediate_size=intermediate_size,
-        num_experts=num_experts,
-        topk=topk,
-        flat_routes=flat_routes,
+    use_large_grouped_dx = use_grouped_dx and (
+        use_e16_fixed_state_grouped
+        or _use_large_grouped_dx_descriptor_queue(
+            tokens=tokens,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            num_experts=num_experts,
+            topk=topk,
+            flat_routes=flat_routes,
+        )
     )
     use_hostless_grouped = _use_hostless_grouped_backward(
         flat_routes=flat_routes,
@@ -3243,6 +3979,8 @@ def _sonic_moe_backward_impl(
         use_grouped_da=use_grouped_da,
         use_grouped_dw1=use_grouped_dw1,
         use_grouped_dx=use_grouped_dx,
+        e16_fixed_state_grouped=use_e16_fixed_state_grouped,
+        e16_flat_grouped=use_e16_flat_grouped,
     )
     use_sorter_native_backward_metadata = _use_sorter_native_backward_metadata(
         flat_routes=flat_routes,
@@ -3304,6 +4042,7 @@ def _sonic_moe_backward_impl(
         has_bias=has_bias,
         compute_dtype=compute_dtype,
         activation=activation_name,
+        e16_flat_grouped=use_e16_flat_grouped,
     )
     # If even the maximum possible active set falls below the measured
     # selective-clear crossover, a normal dense memset is unconditionally the
@@ -3342,17 +4081,42 @@ def _sonic_moe_backward_impl(
             unit_size=sort_unit,
         )
 
-    # Backward owns every buffer: no forward LRU scratch is retained or read.
-    sorted_token_ids = torch.empty(max_padded, dtype=torch.int32, device=device)
-    sorted_weights = torch.empty(max_padded, dtype=torch.float32, device=device)
-    sorted_route_ids = torch.empty(max_padded, dtype=torch.int32, device=device) if flat_routes else None
-    sorted_expert_ids = torch.empty(max_blocks, dtype=torch.int32, device=device)
-    num_valid_ids = torch.empty(2, dtype=torch.int32, device=device)
-    sorting_workspace = (
-        torch.empty(workspace_elements, dtype=torch.int32, device=device) if workspace_elements else None
-    )
+    # The exact retained E16 route state owns its sorter output for the whole
+    # autograd invocation.  Reuse those tensors directly; they cannot alias the
+    # forward operator's LRU workspace.  Every other path preserves the
+    # backward-owned allocation and sorting contract.
+    if forward_sorter_metadata is not None:
+        (
+            sorted_token_ids,
+            sorted_route_ids,
+            sorted_weights,
+            sorted_expert_ids,
+            num_valid_ids,
+            expert_frequency,
+            retained_sort_unit,
+        ) = forward_sorter_metadata
+        assert retained_sort_unit == sort_unit
+        sorting_workspace = None
+    else:
+        # The ragged sorter's first dispatch initializes every padded metadata
+        # row before histogram/scatter.  Allocating with ``full(-1)`` here
+        # merely inserts an extra eager fill launch.
+        sorted_token_ids = torch.empty(max_padded, dtype=torch.int32, device=device)
+        sorted_weights = torch.empty(max_padded, dtype=torch.float32, device=device)
+        sorted_route_ids = (
+            torch.empty(max_padded, dtype=torch.int32, device=device)
+            if flat_routes
+            else None
+        )
+        sorted_expert_ids = torch.empty(max_blocks, dtype=torch.int32, device=device)
+        num_valid_ids = torch.empty(2, dtype=torch.int32, device=device)
+        sorting_workspace = (
+            torch.empty(workspace_elements, dtype=torch.int32, device=device)
+            if workspace_elements
+            else None
+        )
+        expert_frequency = torch.empty(num_experts, dtype=torch.int32, device=device)
     sorter_dummy = torch.empty(4, dtype=torch.int32, device=device)
-    expert_frequency = torch.empty(num_experts, dtype=torch.int32, device=device)
     active_expert_capacity = active_expert_descriptor_capacity(routes, num_experts)
     # A compact descriptor builder can emit this queue in its existing two
     # launches.  Other routing regimes select metadata-direct or standalone
@@ -3363,10 +4127,32 @@ def _sonic_moe_backward_impl(
             dtype=torch.int32,
             device=device,
         )
-        if (use_grouped_dw1 or use_grouped_dw2) and (use_compact_w1 or use_large_grouped_dx)
+        if (use_grouped_dw1 or use_grouped_dw2)
+        and (use_compact_w1 or use_large_grouped_dx)
         else None
     )
-    if use_compact_w1:
+    if use_e16_exact_queue:
+        exact_queue_max_rows = None if flat_routes else tokens
+        exact_tile_queue_bound = exact_m_tile_queue_upper_bound(
+            routes,
+            num_experts,
+            _E16_EXACT_BM,
+            max_expert_rows=exact_queue_max_rows,
+        )
+        exact_tile_queue_storage = torch.empty(
+            exact_m_tile_queue_elements(
+                routes,
+                num_experts,
+                _E16_EXACT_BM,
+                max_expert_rows=exact_queue_max_rows,
+            ),
+            dtype=torch.int32,
+            device=device,
+        )
+    else:
+        exact_tile_queue_bound = 0
+        exact_tile_queue_storage = None
+    if use_compact_w1 and not use_e16_deduplicated_metadata:
         if flat_routes:
             compact_w1_bound = ragged_compact_m_tile_descriptor_upper_bound(
                 routes,
@@ -3407,20 +4193,29 @@ def _sonic_moe_backward_impl(
         large_dx_total = None
         large_dx_descriptors = None
     if use_fused_forward_state_prepare:
-        if use_large_grouped_dx:
+        if use_e16_deduplicated_metadata:
+            assert exact_tile_queue_storage is not None
+            state_row_schedule = exact_tile_queue_storage
+            state_schedule_block_m = _E16_EXACT_BM
+            state_schedule_bound = exact_tile_queue_bound
+            state_schedule_exact_queue = True
+        elif use_large_grouped_dx:
             assert large_dx_storage is not None
             state_row_schedule = large_dx_storage
             state_schedule_block_m = _LARGE_GROUPED_DX_BM
             state_schedule_bound = large_dx_bound
+            state_schedule_exact_queue = False
         else:
             assert compact_w1_storage is not None
             state_row_schedule = compact_w1_storage
             state_schedule_block_m = _COMPACT_W1_BM
             state_schedule_bound = compact_w1_bound
+            state_schedule_exact_queue = False
     else:
         state_row_schedule = None
         state_schedule_block_m = 0
         state_schedule_bound = 0
+        state_schedule_exact_queue = False
     sorted_hidden_shape = (max_padded, hidden_size)
     x_sorted = (
         None
@@ -3474,19 +4269,44 @@ def _sonic_moe_backward_impl(
         if use_fused_da_dscore or use_hostless_grouped or not use_grouped_da
         else torch.zeros_like(activation)
     )
-    # Exact-row derivatives skip sentinel rows, so zeroing dZ supplies the
-    # at-most-(BM-1) tails consumed by compact BM16 or production BM64 dX.
-    dz_factory = torch.zeros if use_hostless_grouped or use_fused_da_dscore else torch.empty
+    # Compact descriptor paths may consume their rounded row tails and need
+    # zero dZ there.  The exact E16 queue carries a valid-row count per tile;
+    # its derivative and both downstream GEMMs mask those tails, so an eager
+    # 28 MiB memset is unnecessary.
+    dz_needs_zero = (
+        (use_hostless_grouped or use_fused_da_dscore)
+        and not use_e16_deduplicated_metadata
+    )
+    dz_factory = torch.zeros if dz_needs_zero else torch.empty
     dz = dz_factory(
         (max_padded, projection_size),
         dtype=hidden_states.dtype,
         device=device,
     )
-    dx_sorted = None if direct_grouped_dx_routes else torch.empty_like(dy)
-    dx_routes = (
-        None if flat_routes else torch.empty((tokens, topk, hidden_size), dtype=hidden_states.dtype, device=device)
+    dx_sorted = (
+        None
+        if direct_grouped_dx_routes or use_flat_segmented_dx
+        else (torch.zeros_like(dy) if use_e16_flat_grouped else torch.empty_like(dy))
     )
-    dx_accum = torch.empty((tokens, hidden_size), dtype=torch.float32, device=device) if flat_routes else None
+    if use_flat_segmented_dx:
+        dx_routes = torch.empty(
+            (routes, hidden_size),
+            dtype=hidden_states.dtype,
+            device=device,
+        )
+    elif flat_routes:
+        dx_routes = None
+    else:
+        dx_routes = torch.empty(
+            (tokens, topk, hidden_size),
+            dtype=hidden_states.dtype,
+            device=device,
+        )
+    dx_accum = (
+        torch.empty((tokens, hidden_size), dtype=torch.float32, device=device)
+        if flat_routes and not use_flat_segmented_dx
+        else None
+    )
 
     dx = torch.empty_like(hidden_states, memory_format=torch.contiguous_format)
     # The grouped pair is initialized from routing metadata below, before its
@@ -3515,6 +4335,17 @@ def _sonic_moe_backward_impl(
 
     with torch.cuda.device(device):
         stream = torch.cuda.current_stream(device)
+        if forward_sorter_metadata is not None:
+            assert forward_state_data is not None
+            route_preactivation, producer_stream, ready_event = forward_state_data
+            if int(stream.cuda_stream) != producer_stream:
+                stream.wait_event(ready_event)
+            # The state, rather than a reusable forward workspace, owns these
+            # allocations.  Track their lifetime on the consuming stream just
+            # like the retained preactivation tensor.
+            route_preactivation.record_stream(stream)
+            for metadata_tensor in forward_sorter_metadata[:-1]:
+                metadata_tensor.record_stream(stream)
         if has_bias:
             clear_bias_gradients = _compile_bias_gradient_clear(
                 projection_size,
@@ -3528,24 +4359,25 @@ def _sonic_moe_backward_impl(
         if flat_routes:
             assert token_arg is not None
             assert sorted_route_ids is not None
-            assert sorting_workspace is not None
-            moe_ragged_sorting_flydsl(
-                token_arg,
-                ids_arg,
-                weights_arg,
-                expert_frequency,
-                sorting_workspace,
-                sorted_token_ids,
-                sorted_weights,
-                sorted_expert_ids,
-                num_valid_ids,
-                sorter_dummy,
-                num_experts,
-                tokens=tokens,
-                max_padded_routes=max_padded,
-                unit_size=sort_unit,
-                sorted_route_ids=sorted_route_ids,
-            )
+            if forward_sorter_metadata is None:
+                assert sorting_workspace is not None
+                moe_ragged_sorting_flydsl(
+                    token_arg,
+                    ids_arg,
+                    weights_arg,
+                    expert_frequency,
+                    sorting_workspace,
+                    sorted_token_ids,
+                    sorted_weights,
+                    sorted_expert_ids,
+                    num_valid_ids,
+                    sorter_dummy,
+                    num_experts,
+                    tokens=tokens,
+                    max_padded_routes=max_padded,
+                    unit_size=sort_unit,
+                    sorted_route_ids=sorted_route_ids,
+                )
         else:
             if not use_sorter_native_backward_metadata:
                 route_grid = max(1, (routes + _BLOCK_THREADS - 1) // _BLOCK_THREADS)
@@ -3576,6 +4408,29 @@ def _sonic_moe_backward_impl(
                 ),
             )
 
+        if use_e16_exact_queue:
+            assert exact_tile_queue_storage is not None
+            build_exact_m_tile_queue(
+                expert_frequency,
+                sorted_expert_ids,
+                num_valid_ids,
+                exact_tile_queue_storage,
+                block_m=_E16_EXACT_BM,
+                sorted_block_m=sort_unit,
+                queue_capacity=exact_tile_queue_bound,
+                active_expert_storage=(
+                    active_expert_storage
+                    if use_e16_deduplicated_metadata
+                    else None
+                ),
+                active_expert_capacity=(
+                    active_expert_capacity
+                    if use_e16_deduplicated_metadata
+                    else None
+                ),
+                stream=stream,
+            )
+
         if use_large_grouped_dx and not use_sorter_native_backward_metadata:
             assert large_dx_descriptors is not None
             assert large_dx_total is not None
@@ -3599,7 +4454,7 @@ def _sonic_moe_backward_impl(
         # required to recompute preactivation.  Keep the generic fallback for
         # non-SwiGLU/FP16 shapes until their epilogues are enabled here.
         if use_grouped_w1:
-            if use_compact_w1:
+            if use_compact_w1 and not use_e16_deduplicated_metadata:
                 assert compact_w1_descriptors is not None
                 assert compact_w1_total is not None
                 build_compact_m_tile_descriptors(
@@ -3660,7 +4515,7 @@ def _sonic_moe_backward_impl(
             frequencies = None
             segments: list[tuple[int, int, int]] = []
             padded_rows = 0
-            max_expert_rows = tokens
+            max_expert_rows = routes if flat_routes else tokens
         else:
             frequencies, segments, padded_rows, max_expert_rows = _materialize_expert_segments(
                 expert_frequency, sort_unit
@@ -3803,6 +4658,8 @@ def _sonic_moe_backward_impl(
                     state_schedule_block_m,
                     use_fused_da_dscore,
                     store_x_sorted=not use_direct_grouped_dw1_rhs,
+                    flat_routes=flat_routes,
+                    exact_tile_queue=state_schedule_exact_queue,
                 )
                 assert state_row_schedule is not None
                 state_prepare_grid = min(
@@ -3819,8 +4676,10 @@ def _sonic_moe_backward_impl(
                     dy,
                     sorted_weights,
                     sorted_token_ids,
+                    sorted_route_ids if sorted_route_ids is not None else sorted_token_ids,
                     state_row_schedule,
                     tokens,
+                    routes,
                     state_prepare_grid,
                     stream,
                 )
@@ -3869,79 +4728,115 @@ def _sonic_moe_backward_impl(
             )
 
         if use_grouped_da:
-            if use_hostless_grouped and active_expert_storage is not None:
-                grouped_da_profiles = _grouped_da_hostless_profiles(
-                    tokens=tokens,
-                    hidden_size=hidden_size,
-                    intermediate_size=intermediate_size,
-                    num_experts=num_experts,
-                    topk=topk,
-                    max_expert_rows=max_expert_rows,
-                )
-                active_count_ptr = active_expert_storage.data_ptr()
-            else:
-                grouped_da_profiles = (
-                    (
-                        *_grouped_da_tuning(max_expert_rows, hidden_size),
-                        False,
-                        0,
-                        None,
-                        _GROUPED_DA_STAGES,
-                        None,
-                    ),
-                )
-                # Unguarded specializations do not dereference this argument.
-                active_count_ptr = expert_frequency.data_ptr()
-
-            for (
-                grouped_da_bm,
-                grouped_da_bn,
-                grouped_da_bk,
-                grouped_da_mw,
-                grouped_da_nw,
-                grouped_da_queue_direct,
-                min_active_experts,
-                max_active_experts,
-                grouped_da_stages,
-                grouped_da_grid_cap,
-            ) in grouped_da_profiles:
-                grouped_da = _compile_grouped_da(
+            if use_e16_exact_queue:
+                assert exact_tile_queue_storage is not None
+                grouped_da = _compile_e16_exact_grouped_da(
                     hidden_size,
                     intermediate_size,
                     num_experts,
+                    device_index,
+                )
+                grouped_da_grid = max(
+                    1,
+                    min(
+                        _GROUPED_DX_GRID_CAP,
+                        exact_tile_queue_bound
+                        * (intermediate_size // _E16_EXACT_DA_BN),
+                    ),
+                )
+                _run_compiled(
+                    grouped_da,
+                    dy.data_ptr(),
+                    w2_arg.data_ptr(),
+                    exact_tile_queue_storage.data_ptr(),
+                    sorted_expert_ids.data_ptr(),
+                    num_valid_ids.data_ptr(),
+                    da.data_ptr(),
+                    int(grouped_da_grid),
+                    stream,
+                )
+            else:
+                if use_hostless_grouped and active_expert_storage is not None:
+                    grouped_da_profiles = _grouped_da_hostless_profiles(
+                        tokens=tokens,
+                        hidden_size=hidden_size,
+                        intermediate_size=intermediate_size,
+                        num_experts=num_experts,
+                        topk=topk,
+                        max_expert_rows=max_expert_rows,
+                    )
+                    active_count_ptr = active_expert_storage.data_ptr()
+                else:
+                    grouped_da_profiles = (
+                        (
+                            *_grouped_da_tuning(max_expert_rows, hidden_size),
+                            False,
+                            0,
+                            None,
+                            _GROUPED_DA_STAGES,
+                            None,
+                        ),
+                    )
+                    # Unguarded specializations do not dereference this argument.
+                    active_count_ptr = expert_frequency.data_ptr()
+
+                for (
                     grouped_da_bm,
                     grouped_da_bn,
                     grouped_da_bk,
                     grouped_da_mw,
                     grouped_da_nw,
-                    device_index,
                     grouped_da_queue_direct,
                     min_active_experts,
                     max_active_experts,
-                    stages=grouped_da_stages,
-                    persistent=grouped_da_grid_cap is not None,
-                )
-                if grouped_da_queue_direct:
-                    guarded_capacity = active_expert_capacity
-                    if max_active_experts is not None:
-                        guarded_capacity = min(guarded_capacity, max_active_experts)
-                    grouped_da_grid = guarded_capacity * (intermediate_size // grouped_da_bn)
-                else:
-                    grouped_da_grid = num_experts * (intermediate_size // grouped_da_bn)
-                    if grouped_da_grid_cap is not None:
-                        grouped_da_grid = min(grouped_da_grid, grouped_da_grid_cap)
-                _run_compiled(
-                    grouped_da,
-                    dy.data_ptr(),
-                    w2_arg.data_ptr(),
-                    expert_frequency.data_ptr(),
-                    sorted_expert_ids.data_ptr(),
-                    num_valid_ids.data_ptr(),
-                    active_count_ptr,
-                    da.data_ptr(),
-                    int(grouped_da_grid),
-                    stream,
-                )
+                    grouped_da_stages,
+                    grouped_da_grid_cap,
+                ) in grouped_da_profiles:
+                    grouped_da = _compile_grouped_da(
+                        hidden_size,
+                        intermediate_size,
+                        num_experts,
+                        grouped_da_bm,
+                        grouped_da_bn,
+                        grouped_da_bk,
+                        grouped_da_mw,
+                        grouped_da_nw,
+                        device_index,
+                        grouped_da_queue_direct,
+                        min_active_experts,
+                        max_active_experts,
+                        stages=grouped_da_stages,
+                        persistent=grouped_da_grid_cap is not None,
+                    )
+                    if grouped_da_queue_direct:
+                        guarded_capacity = active_expert_capacity
+                        if max_active_experts is not None:
+                            guarded_capacity = min(
+                                guarded_capacity, max_active_experts
+                            )
+                        grouped_da_grid = guarded_capacity * (
+                            intermediate_size // grouped_da_bn
+                        )
+                    else:
+                        grouped_da_grid = num_experts * (
+                            intermediate_size // grouped_da_bn
+                        )
+                        if grouped_da_grid_cap is not None:
+                            grouped_da_grid = min(
+                                grouped_da_grid, grouped_da_grid_cap
+                            )
+                    _run_compiled(
+                        grouped_da,
+                        dy.data_ptr(),
+                        w2_arg.data_ptr(),
+                        expert_frequency.data_ptr(),
+                        sorted_expert_ids.data_ptr(),
+                        num_valid_ids.data_ptr(),
+                        active_count_ptr,
+                        da.data_ptr(),
+                        int(grouped_da_grid),
+                        stream,
+                    )
 
         if use_grouped_w2 and not use_fused_da_dscore:
             assert projection is not None
@@ -4018,11 +4913,23 @@ def _sonic_moe_backward_impl(
                 interleaved_w1,
                 device_index,
                 state_schedule_block_m,
+                flat_routes=flat_routes,
+                device_padded_rows=use_e16_deduplicated_metadata,
             )
             assert state_row_schedule is not None
+            derivative_schedule = (
+                num_valid_ids
+                if use_e16_deduplicated_metadata
+                else state_row_schedule
+            )
+            derivative_work_bound = (
+                max_padded
+                if use_e16_deduplicated_metadata
+                else state_schedule_bound * state_schedule_block_m
+            )
             derivative_grid = min(
                 _HOSTLESS_ROW_GRID_CAP,
-                max(1, state_schedule_bound * state_schedule_block_m),
+                max(1, derivative_work_bound),
             )
             _run_compiled(
                 fused_derivative,
@@ -4033,9 +4940,11 @@ def _sonic_moe_backward_impl(
                 dz,
                 sorted_weights,
                 sorted_token_ids,
+                sorted_route_ids if sorted_route_ids is not None else sorted_token_ids,
                 droute_weights,
-                state_row_schedule,
+                derivative_schedule,
                 tokens,
+                routes,
                 derivative_grid,
                 stream,
             )
@@ -4157,7 +5066,23 @@ def _sonic_moe_backward_impl(
             # Every scheduled tail stays inside the sorter's 64-row padding,
             # and the fixed-K route epilogue ignores non-sentinel rows.  Ragged
             # routing retains the separate sorted-output reduction below.
-            if use_large_grouped_dx:
+            if use_e16_exact_queue:
+                assert exact_tile_queue_storage is not None
+                grouped_dx_bm = _E16_EXACT_BM
+                grouped_dx_profiles = (
+                    (
+                        _E16_EXACT_DX_BN,
+                        _E16_EXACT_N_WAVES,
+                        0,
+                        None,
+                        False,
+                        None,
+                    ),
+                )
+                grouped_dx_m_tiles = exact_tile_queue_bound
+                grouped_dx_compact = True
+                grouped_dx_schedule = exact_tile_queue_storage
+            elif use_large_grouped_dx:
                 grouped_dx_bm = _LARGE_GROUPED_DX_BM
                 if use_grouped_dx_m_reuse:
                     grouped_dx_profiles = (
@@ -4232,11 +5157,18 @@ def _sonic_moe_backward_impl(
                     min_active_experts,
                     max_active_experts,
                     store_route_slots=direct_grouped_dx_routes,
+                    store_route_ids=use_flat_segmented_dx,
                     top_k=topk,
                     expert_m_reuse=expert_m_reuse,
                     expert_m_reuse_threshold=expert_m_reuse_threshold,
+                    exact_tile_queue=use_e16_exact_queue,
                 )
-                if expert_m_reuse:
+                if use_e16_exact_queue:
+                    assert exact_tile_queue_storage is not None
+                    profile_m_tiles = grouped_dx_m_tiles
+                    profile_schedule = exact_tile_queue_storage
+                    profile_eids = sorted_expert_ids
+                elif expert_m_reuse:
                     assert active_expert_storage is not None
                     profile_m_tiles = 2 * active_expert_capacity
                     profile_schedule = active_expert_storage
@@ -4278,11 +5210,19 @@ def _sonic_moe_backward_impl(
                         else num_valid_ids.data_ptr()
                     ),
                     *((expert_frequency.data_ptr(),) if expert_m_reuse_threshold is not None else ()),
-                    (dx_routes if direct_grouped_dx_routes else dx_sorted).data_ptr(),
+                    (
+                        dx_routes
+                        if direct_grouped_dx_routes or use_flat_segmented_dx
+                        else dx_sorted
+                    ).data_ptr(),
                     *(
                         (sorted_token_ids.data_ptr(), tokens)
                         if direct_grouped_dx_routes
-                        else ()
+                        else (
+                            (sorted_route_ids.data_ptr(), routes)
+                            if use_flat_segmented_dx
+                            else ()
+                        )
                     ),
                     grouped_dx_grid,
                     stream,
@@ -4335,49 +5275,75 @@ def _sonic_moe_backward_impl(
 
         if flat_routes:
             assert sorted_route_ids is not None
-            assert dx_accum is not None
-            assert dx_sorted is not None
-            assert dout_sorted is not None
-            assert projection is not None
-            route_score_backward = _compile_route_score_backward(
-                hidden_size,
-                compute_dtype,
-                device_index,
-            )
-            _run_compiled(
-                route_score_backward,
-                dout_sorted,
-                projection,
-                sorted_token_ids,
-                sorted_route_ids,
-                droute_weights,
-                tokens,
-                routes,
-                padded_rows,
-                stream,
-            )
+            flat_padded_rows = max_padded if use_e16_flat_grouped else padded_rows
+            if not use_fused_da_dscore:
+                assert dout_sorted is not None
+                assert projection is not None
+                route_score_backward = _compile_route_score_backward(
+                    hidden_size,
+                    compute_dtype,
+                    device_index,
+                )
+                _run_compiled(
+                    route_score_backward,
+                    dout_sorted,
+                    projection,
+                    sorted_token_ids,
+                    sorted_route_ids,
+                    droute_weights,
+                    tokens,
+                    routes,
+                    flat_padded_rows,
+                    stream,
+                )
 
-            reduce_routes = _compile_ragged_dx_reduction(
-                hidden_size,
-                compute_dtype,
-                device_index,
-            )
-            output_elements = tokens * hidden_size
-            scatter_elements = padded_rows * hidden_size
-            clear_grid = max(1, (output_elements + _BLOCK_THREADS - 1) // _BLOCK_THREADS)
-            scatter_grid = max(1, (scatter_elements + _BLOCK_THREADS - 1) // _BLOCK_THREADS)
-            _run_compiled(
-                reduce_routes,
-                dx_sorted,
-                sorted_token_ids,
-                dx_accum,
-                dx,
-                tokens,
-                padded_rows,
-                clear_grid,
-                scatter_grid,
-                stream,
-            )
+            if use_flat_segmented_dx:
+                assert token_arg is not None
+                assert dx_routes is not None
+                reduce_routes = _compile_flat_segmented_dx_reduction(
+                    hidden_size,
+                    routes,
+                    compute_dtype,
+                    device_index,
+                )
+                segmented_grid = max(
+                    1,
+                    min(_E16_FLAT_SEGMENTED_DX_GRID_CAP, tokens),
+                )
+                _run_compiled(
+                    reduce_routes,
+                    dx_routes,
+                    token_arg,
+                    dx,
+                    tokens,
+                    routes,
+                    segmented_grid,
+                    stream,
+                )
+            else:
+                assert dx_accum is not None
+                assert dx_sorted is not None
+                reduce_routes = _compile_ragged_dx_reduction(
+                    hidden_size,
+                    compute_dtype,
+                    device_index,
+                )
+                output_elements = tokens * hidden_size
+                scatter_elements = flat_padded_rows * hidden_size
+                clear_grid = max(1, (output_elements + _BLOCK_THREADS - 1) // _BLOCK_THREADS)
+                scatter_grid = max(1, (scatter_elements + _BLOCK_THREADS - 1) // _BLOCK_THREADS)
+                _run_compiled(
+                    reduce_routes,
+                    dx_sorted,
+                    sorted_token_ids,
+                    dx_accum,
+                    dx,
+                    tokens,
+                    flat_padded_rows,
+                    clear_grid,
+                    scatter_grid,
+                    stream,
+                )
         else:
             if not use_fused_da_dscore:
                 assert projection is not None
@@ -4543,6 +5509,8 @@ def sonic_moe_backward_routes(
     b1: torch.Tensor | None = None,
     b2: torch.Tensor | None = None,
     interleaved_w1: bool = False,
+    forward_state: object | None = None,
+    token_indices_sorted: bool = False,
 ) -> tuple[torch.Tensor, ...]:
     """Differentiate SonicMoE over a flat variable-count route list.
 
@@ -4555,9 +5523,28 @@ def sonic_moe_backward_routes(
     ``interleaved_w1`` has the same GLU W1/B1 input and gradient-layout
     contract as :func:`sonic_moe_backward`.
 
+    ``forward_state`` may be the invocation-owned route-order state returned
+    by :meth:`SonicMoE.forward_routes_training`.  State reuse is currently
+    restricted to the audited bias-free BF16/SwiGLU E16 training bucket and
+    removes both forward-projection recomputations from backward.  Newer state
+    objects also carry invocation-owned sorter metadata; when all six tensors
+    validate, backward reuses them and skips the ragged sorter.  Older or
+    partial states safely retain the established backward-owned sort.
+
+    Set ``token_indices_sorted=True`` only when ``token_indices`` is known to
+    be nondecreasing.  The audited E16 retained-state path then uses a
+    segmented dX reducer; the default supports arbitrary route order through
+    the established atomic scatter.
+
     Token and expert ids must be in range. Value validation remains an unchecked
     hot-path precondition; the compatibility adapter validates it before launch.
     """
+
+    if not isinstance(token_indices_sorted, bool):
+        raise TypeError(
+            "token_indices_sorted must be bool, got "
+            f"{type(token_indices_sorted).__name__}"
+        )
 
     validated = _validate_backward_route_inputs(
         hidden_states,
@@ -4572,6 +5559,28 @@ def sonic_moe_backward_routes(
         b2,
         interleaved_w1,
     )
+    if forward_state is None:
+        forward_state_data = None
+        forward_sorter_metadata = None
+    else:
+        (
+            route_preactivation,
+            producer_stream,
+            ready_event,
+            forward_sorter_metadata,
+        ) = _validate_routes_forward_state(
+            forward_state,
+            hidden_states,
+            validated[4],
+            config,
+            interleaved_w1,
+            b1 is not None,
+        )
+        forward_state_data = (
+            route_preactivation,
+            producer_stream,
+            ready_event,
+        )
     return _sonic_moe_backward_impl(
         hidden_states,
         w1,
@@ -4585,6 +5594,9 @@ def sonic_moe_backward_routes(
         b1=b1,
         b2=b2,
         interleaved_w1=interleaved_w1,
+        forward_state_data=forward_state_data,
+        forward_sorter_metadata=forward_sorter_metadata,
+        token_indices_sorted=token_indices_sorted,
     )
 
 

@@ -18,13 +18,16 @@ from kernels.moe.sonic import (
     SonicMoE,
     SonicMoEConfig,
     SonicMoEForwardState,
+    SonicMoERoutesForwardState,
     SonicMoEWeights,
     SonicMoEWorkspace,
     _get_stage1_launcher,
     _get_stage1_training_launcher,
     _get_stage2_launcher,
     _quantize_mxfp4_weight,
+    _retain_e16_flat_sorter_metadata,
     _stage2_stages,
+    _training_stage1_tile_m,
     _training_stage1_tuning,
     _validate_training_preactivation_extent,
     prepare_sonic_bf16_weights,
@@ -56,6 +59,54 @@ def _config(**overrides):
     }
     values.update(overrides)
     return SonicMoEConfig(**values)
+
+
+@pytest.mark.parametrize(
+    ("overrides", "expected"),
+    (
+        ({}, True),
+        ({"tokens": 8191}, False),
+        ({"routes": 8191}, False),
+        ({"hidden_size": 4096}, False),
+        ({"intermediate_size": 960}, False),
+        ({"num_experts": 64}, False),
+        ({"activation": "geglu"}, False),
+        ({"compute_dtype": "fp16"}, False),
+        ({"has_bias": True}, False),
+    ),
+)
+def test_sonic_moe_e16_flat_sorter_metadata_retention_is_narrow(overrides, expected):
+    values = {
+        "tokens": 8192,
+        "routes": 8192,
+        "hidden_size": 2048,
+        "intermediate_size": 768,
+        "num_experts": 16,
+        "top_k": 1,
+        "tile_m": 128,
+        "tile_n": 192,
+        "tile_k": 64,
+        "down_tile_m": 64,
+        "down_tile_n": 256,
+        "down_tile_k": 64,
+        "activation": "swiglu",
+        "compute_dtype": "bf16",
+        "has_bias": False,
+    }
+    values.update(overrides)
+    has_bias = values.pop("has_bias")
+    tokens = values.pop("tokens")
+    routes = values.pop("routes")
+    config = SonicMoEConfig(**values)
+    assert (
+        _retain_e16_flat_sorter_metadata(
+            config,
+            tokens,
+            routes,
+            has_bias=has_bias,
+        )
+        is expected
+    )
 
 
 def _gfx950_device():
@@ -129,6 +180,29 @@ def _fixed_topk_preactivation_oracle(x, w1, topk_ids, *, b1=None, interleaved=Fa
     if interleaved:
         gate, up = preactivation.chunk(2, dim=-1)
         preactivation = torch.stack((gate, up), dim=-1).reshape(tokens, top_k, -1)
+    return preactivation
+
+
+def _flat_routes_preactivation_oracle(
+    x,
+    w1,
+    token_indices,
+    expert_indices,
+    *,
+    b1=None,
+    interleaved=False,
+):
+    """Logical GEMM oracle in the caller's original flat-route order."""
+
+    selected_w1 = w1[expert_indices.long()].float()
+    route_x = x[token_indices.long()].float()
+    preactivation = torch.bmm(selected_w1, route_x.unsqueeze(-1)).squeeze(-1)
+    if b1 is not None:
+        preactivation = preactivation + b1[expert_indices.long()].float()
+    preactivation = preactivation.to(torch.bfloat16)
+    if interleaved:
+        gate, up = preactivation.chunk(2, dim=-1)
+        preactivation = torch.stack((gate, up), dim=-1).reshape(preactivation.shape)
     return preactivation
 
 
@@ -228,6 +302,195 @@ def test_sonic_moe_training_forward_state_matches_route_order_gemm(interleaved_w
     _assert_close(out, expected_out)
 
 
+@pytest.mark.parametrize("interleaved_w1", (False, True), ids=("separate", "interleaved"))
+def test_sonic_moe_routes_training_state_preserves_original_route_order(interleaved_w1):
+    """Ragged state uses route ids, not a false fixed-K token/slot mapping."""
+
+    config = _config(stage1_lds_swizzle=True)
+    x, w1, w2, _ = _make_case(seed=401)
+    token_indices = torch.tensor(
+        [0, 0, 2, 3, 3, 3, 6],
+        dtype=torch.int32,
+        device=x.device,
+    )
+    expert_indices = torch.tensor(
+        [2, 2, 1, 3, 0, 3, 1],
+        dtype=torch.int32,
+        device=x.device,
+    )
+    route_weights = torch.tensor(
+        [0.25, -0.5, 1.0, 0.0, 0.75, 0.125, 1.25],
+        dtype=torch.float32,
+        device=x.device,
+    )
+    op = SonicMoE(config, prepare_sonic_bf16_weights(w1, w2, config))
+    frequency = torch.empty(NUM_EXPERTS, dtype=torch.int32, device=x.device)
+    out = torch.empty_like(x)
+
+    returned, state = op.forward_routes_training(
+        x,
+        token_indices,
+        expert_indices,
+        route_weights,
+        out=out,
+        interleaved_w1=interleaved_w1,
+        expert_frequency_out=frequency,
+    )
+    expected_state = _flat_routes_preactivation_oracle(
+        x,
+        w1,
+        token_indices,
+        expert_indices,
+        interleaved=interleaved_w1,
+    )
+    gate, up = _flat_routes_preactivation_oracle(
+        x,
+        w1,
+        token_indices,
+        expert_indices,
+    ).chunk(2, dim=-1)
+    activated = (torch.nn.functional.silu(gate.float()) * up.float()).to(torch.bfloat16)
+    projected = torch.bmm(
+        w2[expert_indices.long()].float(),
+        activated.float().unsqueeze(-1),
+    ).squeeze(-1)
+    expected_out = torch.zeros_like(x, dtype=torch.float32)
+    expected_out.index_add_(
+        0,
+        token_indices.long(),
+        projected * route_weights[:, None],
+    )
+    expected_out = expected_out.to(torch.bfloat16)
+    torch.cuda.synchronize()
+
+    assert returned is out
+    assert isinstance(state, SonicMoERoutesForwardState)
+    assert state.preactivation.shape == (route_weights.numel(), 2 * INTERMEDIATE_SIZE)
+    assert state.tokens == TOKENS
+    assert state.routes == route_weights.numel()
+    assert state.hidden_size == HIDDEN_SIZE
+    assert state.intermediate_size == INTERMEDIATE_SIZE
+    assert state.num_experts == NUM_EXPERTS
+    assert state.activation == "swiglu"
+    assert state.compute_dtype == "bf16"
+    assert state.interleaved_w1 is interleaved_w1
+    assert state.has_bias is False
+    assert state.ready_event.query()
+    assert state.sorted_token_ids is None
+    assert state.sorted_route_ids is None
+    assert state.sorted_weights is None
+    assert state.sorted_expert_ids is None
+    assert state.num_valid_ids is None
+    assert state.expert_frequency is None
+    assert op.workspace is not None and op.workspace.sorted_route_ids is not None
+    assert state.preactivation.untyped_storage().data_ptr() not in op.workspace.storage_ptrs
+    assert torch.equal(
+        frequency,
+        torch.bincount(expert_indices.long(), minlength=NUM_EXPERTS).to(torch.int32),
+    )
+    torch.testing.assert_close(state.preactivation.float(), expected_state.float(), rtol=3e-2, atol=5e-2)
+    _assert_close(out, expected_out)
+
+
+@pytest.mark.large_shape
+def test_sonic_moe_e16_routes_training_state_owns_sorter_metadata():
+    """The exact training state keeps metadata beyond workspace reuse."""
+
+    tokens = routes = 8192
+    hidden_size, intermediate_size, num_experts = 2048, 768, 16
+    device = _gfx950_device()
+    config = SonicMoEConfig(
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+        num_experts=num_experts,
+        top_k=1,
+        tile_m=128,
+        tile_n=192,
+        tile_k=64,
+        down_tile_m=64,
+        down_tile_n=256,
+        down_tile_k=64,
+        stage1_xcd_swizzle=8,
+        stage2_xcd_swizzle=0,
+        stage2_pipeline_stages=2,
+        stage1_write_padded_rows=True,
+        stage1_lds_swizzle=True,
+    )
+    x = torch.zeros((tokens, hidden_size), dtype=torch.bfloat16, device=device)
+    w1 = torch.zeros(
+        (num_experts, 2 * intermediate_size, hidden_size),
+        dtype=torch.bfloat16,
+        device=device,
+    )
+    w2 = torch.zeros(
+        (num_experts, hidden_size, intermediate_size),
+        dtype=torch.bfloat16,
+        device=device,
+    )
+    route_id = torch.arange(routes, dtype=torch.int64, device=device)
+    token_indices = torch.randperm(tokens, device=device).to(torch.int32)
+    expert_indices = ((route_id * 13 + 5) % num_experts).to(torch.int32)
+    route_weights = torch.linspace(
+        0.25,
+        1.0,
+        routes,
+        dtype=torch.float32,
+        device=device,
+    )
+    frequency = torch.empty(num_experts, dtype=torch.int32, device=device)
+    op = SonicMoE(config, prepare_sonic_bf16_weights(w1, w2, config))
+
+    _, state = op.forward_routes_training(
+        x,
+        token_indices,
+        expert_indices,
+        route_weights,
+        expert_frequency_out=frequency,
+    )
+    torch.cuda.synchronize(device)
+
+    metadata = (
+        state.sorted_token_ids,
+        state.sorted_route_ids,
+        state.sorted_weights,
+        state.sorted_expert_ids,
+        state.num_valid_ids,
+        state.expert_frequency,
+    )
+    assert all(isinstance(tensor, torch.Tensor) for tensor in metadata)
+    assert state.expert_frequency is not frequency
+    assert op.workspace is not None
+    for tensor in metadata:
+        assert isinstance(tensor, torch.Tensor)
+        assert tensor.untyped_storage().data_ptr() not in op.workspace.storage_ptrs
+
+    assert state.num_valid_ids is not None
+    assert state.sorted_route_ids is not None
+    assert state.sorted_token_ids is not None
+    assert state.sorted_weights is not None
+    assert state.sorted_expert_ids is not None
+    padded_rows = int(state.num_valid_ids[0].item())
+    sorted_route_ids = state.sorted_route_ids[:padded_rows]
+    live = sorted_route_ids >= 0
+    live_route_ids = sorted_route_ids[live].long()
+    sorted_rows = torch.arange(padded_rows, device=device)[live]
+    sorted_experts = state.sorted_expert_ids[
+        sorted_rows // config.route_tile_m
+    ]
+    assert torch.equal(
+        state.sorted_token_ids[:padded_rows][live],
+        token_indices[live_route_ids],
+    )
+    assert torch.equal(sorted_experts, expert_indices[live_route_ids])
+    assert torch.equal(
+        state.sorted_weights[:padded_rows][live],
+        route_weights[live_route_ids],
+    )
+    assert torch.equal(
+        frequency,
+        torch.bincount(expert_indices.long(), minlength=num_experts).to(torch.int32),
+    )
+    assert torch.equal(state.expert_frequency, frequency)
 def test_sonic_moe_training_states_are_invocation_owned_and_not_overwritten():
     config = _config()
     x_a, w1, w2, logits_a = _make_case(seed=277)
@@ -585,6 +848,63 @@ def test_sonic_moe_training_stage1_t4096_policy_is_targeted():
     )
 
 
+def test_sonic_moe_training_stage1_e16_flat_m_policy_is_exact():
+    qwen3 = SonicMoEConfig(
+        hidden_size=2048,
+        intermediate_size=768,
+        num_experts=16,
+        top_k=1,
+        tile_m=128,
+        tile_n=192,
+        tile_k=64,
+        down_tile_m=64,
+        down_tile_n=256,
+        down_tile_k=64,
+        stage1_xcd_swizzle=8,
+        stage2_xcd_swizzle=0,
+        stage2_pipeline_stages=2,
+        stage1_write_padded_rows=True,
+        stage1_lds_swizzle=True,
+        renormalize=False,
+    )
+
+    assert _training_stage1_tile_m(qwen3, 8192, 8192, False) == 64
+    assert _training_stage1_tile_m(qwen3, 8192, None, False) == 128
+    assert _training_stage1_tile_m(qwen3, 8191, 8191, False) == 128
+    assert _training_stage1_tile_m(qwen3, 8192, 8191, False) == 128
+    assert _training_stage1_tile_m(qwen3, 8192, 8192, True) == 128
+
+    fallbacks = (
+        replace(qwen3, hidden_size=4096),
+        replace(qwen3, intermediate_size=1536),
+        replace(qwen3, num_experts=8),
+        replace(qwen3, top_k=2),
+        replace(qwen3, tile_m=64),
+        replace(qwen3, tile_n=128),
+        replace(qwen3, tile_k=128),
+        replace(qwen3, down_tile_m=128),
+        replace(qwen3, down_tile_n=128),
+        replace(qwen3, down_tile_k=128),
+        replace(qwen3, stage1_b_cache_mod=2),
+        replace(qwen3, stage2_b_cache_mod=2),
+        replace(qwen3, stage1_xcd_swizzle=0),
+        replace(qwen3, stage2_xcd_swizzle=8),
+        replace(qwen3, waves_per_eu=1),
+        replace(qwen3, persistent_stage2=True),
+        replace(qwen3, stage2_pipeline_stages=1),
+        replace(qwen3, stage2_output_mode="reduce"),
+        replace(qwen3, stage1_write_padded_rows=False),
+        replace(qwen3, stage1_lds_swizzle=False),
+        replace(qwen3, activation="relu"),
+        replace(qwen3, compute_dtype="fp16"),
+    )
+    for fallback in fallbacks:
+        assert (
+            _training_stage1_tile_m(fallback, 8192, 8192, False)
+            == fallback.tile_m
+        )
+
+
 def test_sonic_moe_training_stage1_launcher_accepts_private_overrides(monkeypatch):
     import kernels.moe.sonic as sonic_module
 
@@ -606,6 +926,8 @@ def test_sonic_moe_training_stage1_launcher_accepts_private_overrides(monkeypatc
             0,
             64,
             2,
+            False,
+            32,
         )
         assert launcher is _get_stage1_training_launcher(
             config,
@@ -615,7 +937,11 @@ def test_sonic_moe_training_stage1_launcher_accepts_private_overrides(monkeypatc
             0,
             64,
             2,
+            False,
+            32,
         )
+        assert compile_calls[-1]["BM"] == 32
+        assert compile_calls[-1]["SORTED_BM"] == config.route_tile_m
         assert compile_calls[-1]["TILE_N"] == 64
         assert compile_calls[-1]["waves_per_eu"] == 2
     finally:
@@ -637,6 +963,33 @@ def test_sonic_moe_training_stage1_private_override_is_numerically_exact(monkeyp
         sonic_module,
         "_training_stage1_tuning",
         lambda _config, _tokens, _has_bias: (64, 2),
+    )
+    output, state = op.forward_topk_training(x, ids, weights)
+
+    _assert_close(output, expected_out)
+    torch.testing.assert_close(
+        state.preactivation.float(),
+        expected_state.float(),
+        rtol=3e-2,
+        atol=5e-2,
+    )
+
+
+def test_sonic_moe_training_stage1_private_m_override_recomputes_grid(monkeypatch):
+    import kernels.moe.sonic as sonic_module
+
+    config = _config(tile_m=32, down_tile_m=32)
+    x, w1, w2, router_logits = _make_case(seed=314)
+    ids, weights = _topk_from_logits(router_logits, config)
+    prepared = prepare_sonic_bf16_weights(w1, w2, config)
+    op = SonicMoE(config, prepared)
+    expected_out = sonic_moe_reference(x, w1, w2, router_logits, config)
+    expected_state = _fixed_topk_preactivation_oracle(x, w1, ids)
+
+    monkeypatch.setattr(
+        sonic_module,
+        "_training_stage1_tile_m",
+        lambda _config, _tokens, _routes, _has_bias: 16,
     )
     output, state = op.forward_topk_training(x, ids, weights)
 

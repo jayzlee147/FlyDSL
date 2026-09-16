@@ -140,10 +140,12 @@ def _gemm1_body_a16w4(
     arg_cumsum,
     arg_out,
     arg_route_preactivation,
+    arg_sorted_route_ids,
     bx_i32,
     lane,
     wave,
     i32_ntok,
+    i32_nroutes,
     f32_situ_beta,
     f32_situ_beta_rcp,
     f32_situ_linbeta,
@@ -171,6 +173,7 @@ def _gemm1_body_a16w4(
     store_preactivation=False,
     store_route_preactivation=False,
     route_preactivation_interleaved=False,
+    route_preactivation_by_route_id=False,
     skip_epilogue_id_reload=False,
     a_lds_swizzle=False,
 ):
@@ -188,9 +191,12 @@ def _gemm1_body_a16w4(
 
     The independent ``store_route_preactivation`` specialization keeps the
     ordinary activation output intact and additionally stores its exact A16
-    gate/up rounding boundary in compact fixed-K route order ``[T, K, 2I]``.
-    It is used only by the training-forward API; inference does not carry the
-    extra pointer or execute an extra store.
+    gate/up rounding boundary in compact route order.  Fixed-K sorting
+    reconstructs the route from the token/slot packed in ``arg_mind``.  Flat
+    sorting instead selects ``route_preactivation_by_route_id`` and supplies
+    original route ids through ``arg_sorted_route_ids``.  It is used only by
+    the training-forward API; inference does not carry the extra pointers or
+    execute an extra store.
     """
     _is_int4 = w_dtype == "int4"
     _is_dense = w_dtype in ("bf16", "fp16")
@@ -331,8 +337,12 @@ def _gemm1_body_a16w4(
     if const_expr(store_route_preactivation):
         route_preactivation_rsrc = buffer_ops.create_buffer_resource_from_addr(
             _raw(fx.Int64(arg_route_preactivation)),
-            num_records_bytes=_raw(fx.Int64(i32_ntok) * fx.Int64(TOPK * N_OUT * 2)),
+            num_records_bytes=_raw(fx.Int64(i32_nroutes) * fx.Int64(N_OUT * 2)),
         )
+        if const_expr(route_preactivation_by_route_id):
+            sorted_route_ids_rsrc = buffer_ops.create_buffer_resource_from_addr(
+                _raw(fx.Int64(arg_sorted_route_ids)),
+            )
 
     # ---- A gather rows (per-thread) -------------------------------------------
     # a_load_threads (256 at k_wave=1) cooperatively load one k-group's BM x TILE_K
@@ -974,11 +984,26 @@ def _gemm1_body_a16w4(
                     if const_expr(_is_glu and round_preact_bf16):
                         u = fx.Float32(u.to(elem_dtype))
                     if const_expr(store_route_preactivation):
-                        # The sorter packs the original fixed-K slot in the
-                        # high byte.  Scatter directly to invocation-owned
-                        # compact route order, excluding expert padding rows.
-                        route_slot = (fused >> fx.Int32(24)) & fx.Int32(0xFF)
-                        route_base = (token * fx.Int32(TOPK) + route_slot) * fx.Int32(N_OUT)
+                        # Fixed-K sorting packs the original slot in the high
+                        # byte.  The flat sorter emits a separate original
+                        # route id because arbitrary routing has no bounded
+                        # slot dimension.  Both forms write directly to caller
+                        # route order; ``valid`` excludes padding rows.
+                        if const_expr(route_preactivation_by_route_id):
+                            route_row = fx.Int32(
+                                buffer_ops.buffer_load(
+                                    _raw(sorted_route_ids_rsrc),
+                                    sorted_row,
+                                    vec_width=1,
+                                    dtype=T.i32,
+                                )
+                            )
+                            route_valid = valid & (route_row < i32_nroutes)
+                        else:
+                            route_slot = (fused >> fx.Int32(24)) & fx.Int32(0xFF)
+                            route_row = token * fx.Int32(TOPK) + route_slot
+                            route_valid = valid
+                        route_base = route_row * fx.Int32(N_OUT)
                         if const_expr(route_preactivation_interleaved):
                             route_gate_col = col_g_list[ni] * fx.Int32(2)
                             route_up_col = route_gate_col + fx.Int32(1)
@@ -989,13 +1014,13 @@ def _gemm1_body_a16w4(
                             g.to(elem_dtype),
                             _raw(route_preactivation_rsrc),
                             _raw(route_base + route_gate_col),
-                            mask=valid,
+                            mask=route_valid,
                         )
                         buffer_ops.buffer_store(
                             u.to(elem_dtype),
                             _raw(route_preactivation_rsrc),
                             _raw(route_base + route_up_col),
-                            mask=valid,
+                            mask=route_valid,
                         )
                     y = _stage1_activation_f32(g, u, act)
                 if const_expr(not store_preactivation):
@@ -1044,6 +1069,7 @@ def compile_gemm1_a16w4_port(
     store_preactivation=False,
     store_route_preactivation=False,
     route_preactivation_interleaved=False,
+    route_preactivation_by_route_id=False,
     expert_grid=False,
     compact_grid=False,
     persist=False,
@@ -1091,8 +1117,11 @@ def compile_gemm1_a16w4_port(
     ``store_route_preactivation`` is a forward-training-only dual-output
     specialization.  The regular activation output remains sorted for stage 2,
     while an additional pointer receives rounded gate/up values in compact
-    fixed-K route order. ``route_preactivation_interleaved`` selects
-    ``[g0,u0,...]`` instead of the default ``[gate...,up...]`` last dimension.
+    route order. ``route_preactivation_interleaved`` selects ``[g0,u0,...]``
+    instead of the default ``[gate...,up...]`` last dimension.  Fixed-K mode
+    recovers route order from packed token/slot ids;
+    ``route_preactivation_by_route_id=True`` consumes a separate sorted-route-id
+    pointer for arbitrary flat routes.
 
     ``a_lds_swizzle`` uses an XOR-permuted GMEM gather plus the inverse LDS
     read address. The direct-to-LDS destination remains linear because gfx950
@@ -1126,6 +1155,7 @@ def compile_gemm1_a16w4_port(
     assert isinstance(store_preactivation, bool), "store_preactivation must be bool"
     assert isinstance(store_route_preactivation, bool), "store_route_preactivation must be bool"
     assert isinstance(route_preactivation_interleaved, bool), "route_preactivation_interleaved must be bool"
+    assert isinstance(route_preactivation_by_route_id, bool), "route_preactivation_by_route_id must be bool"
     assert isinstance(skip_epilogue_id_reload, bool), "skip_epilogue_id_reload must be bool"
     assert isinstance(a_lds_swizzle, bool), "a_lds_swizzle must be bool"
     assert isinstance(expert_grid, bool), "expert_grid must be bool"
@@ -1137,6 +1167,9 @@ def compile_gemm1_a16w4_port(
     assert not (
         store_preactivation and store_route_preactivation
     ), "exclusive stored-preactivation output cannot be combined with the forward dual output"
+    assert not route_preactivation_by_route_id or store_route_preactivation, (
+        "route_preactivation_by_route_id requires store_route_preactivation"
+    )
     _K = D_HIDDEN
     _INTER = D_INTER
     _is_glu = act in ("silu", "swiglu", "geglu", "reglu", "situv2")
@@ -1216,6 +1249,7 @@ def compile_gemm1_a16w4_port(
     _preact_tag = "_storepreact" if store_preactivation else ""
     _route_preact_tag = (
         ("_routepreact_int" if route_preactivation_interleaved else "_routepreact_sep")
+        + ("_rid" if route_preactivation_by_route_id else "")
         if store_route_preactivation
         else ""
     )
@@ -1253,6 +1287,8 @@ def compile_gemm1_a16w4_port(
         f32_swiglu_limit: fx.Float32,
         arg_out: fx.Int64,
         arg_route_preactivation: fx.Int64,
+        arg_sorted_route_ids: fx.Int64,
+        i32_nroutes: fx.Int32,
     ):
         lds_raw_ptr = fx.SharedAllocator().allocate(SharedStorage).peek().raw.ptr
         tx_i32 = fx.Int32(gpu.thread_id("x"))
@@ -1296,10 +1332,12 @@ def compile_gemm1_a16w4_port(
                 arg_cumsum,
                 arg_out,
                 arg_route_preactivation,
+                arg_sorted_route_ids,
                 tile,
                 lane,
                 wave,
                 i32_ntok,
+                i32_nroutes,
                 f32_situ_beta,
                 f32_situ_beta_rcp,
                 f32_situ_linbeta,
@@ -1326,6 +1364,7 @@ def compile_gemm1_a16w4_port(
                 store_preactivation=store_preactivation,
                 store_route_preactivation=store_route_preactivation,
                 route_preactivation_interleaved=route_preactivation_interleaved,
+                route_preactivation_by_route_id=route_preactivation_by_route_id,
                 skip_epilogue_id_reload=skip_epilogue_id_reload,
                 a_lds_swizzle=a_lds_swizzle,
             )
@@ -1426,6 +1465,8 @@ def compile_gemm1_a16w4_port(
             f32_swiglu_limit: fx.Float32,
             arg_out: fx.Int64,
             arg_route_preactivation: fx.Int64,
+            arg_sorted_route_ids: fx.Int64,
+            i32_nroutes: fx.Int32,
         ):
             _gemm1_kernel_body(
                 arg_x,
@@ -1443,6 +1484,8 @@ def compile_gemm1_a16w4_port(
                 f32_swiglu_limit,
                 arg_out,
                 arg_route_preactivation,
+                arg_sorted_route_ids,
+                i32_nroutes,
             )
 
         @flyc.jit
@@ -1463,6 +1506,8 @@ def compile_gemm1_a16w4_port(
             f32_swiglu_limit: fx.Float32,
             arg_out: fx.Int64,
             arg_route_preactivation: fx.Int64,
+            arg_sorted_route_ids: fx.Int64,
+            i32_nroutes: fx.Int32,
             stream: fx.Stream,
         ):
             grid_x = fx.Int64(i32_grid)
@@ -1482,6 +1527,8 @@ def compile_gemm1_a16w4_port(
                 f32_swiglu_limit,
                 arg_out,
                 arg_route_preactivation,
+                arg_sorted_route_ids,
+                i32_nroutes,
                 value_attrs={"rocdl.waves_per_eu": waves_per_eu} if waves_per_eu else None,
             ).launch(grid=(grid_x, 1, 1), block=(256, 1, 1), stream=stream)
 
@@ -1520,6 +1567,8 @@ def compile_gemm1_a16w4_port(
             f32_swiglu_limit,
             arg_out,
             fx.Int64(0),
+            fx.Int64(0),
+            fx.Int32(0),
         )
 
     @flyc.jit

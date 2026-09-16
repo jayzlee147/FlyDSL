@@ -31,6 +31,10 @@ if torch is None or not torch.cuda.is_available():
     pytest.skip("CUDA/ROCm not available.", allow_module_level=True)
 
 from flydsl.runtime.device import is_rdna_arch  # noqa: E402
+from kernels.moe.moe_ragged_sorting_kernel import (  # noqa: E402
+    _ragged_cf_cache,
+    moe_ragged_sorting_flydsl,
+)
 
 if is_rdna_arch():
     pytest.skip("MoE sorting kernel requires CDNA (MI300X/MI350X).", allow_module_level=True)
@@ -48,6 +52,147 @@ from kernels.moe.topk_gating_softmax_kernel import (  # noqa: E402
 
 WARMUP_ITERS = 3
 RUN_BENCH = os.environ.get("MOE_SORTING_BENCH", "0") == "1"
+
+
+def test_ragged_sorting_cache_separates_scratch_tensor_rank():
+    """Forward output and backward scratch must not share a compiled ABI."""
+
+    device = torch.device("cuda")
+    tokens, experts, unit_size = 7, 4, 16
+    token_indices = torch.tensor(
+        [0, 0, 2, 3, 3, 3, 6],
+        dtype=torch.int32,
+        device=device,
+    )
+    expert_indices = torch.tensor(
+        [2, 2, 1, 3, 0, 3, 1],
+        dtype=torch.int32,
+        device=device,
+    )
+    route_weights = torch.arange(
+        1,
+        token_indices.numel() + 1,
+        dtype=torch.float32,
+        device=device,
+    )
+    routes = int(token_indices.numel())
+    max_padded = routes + experts * (unit_size - 1)
+    max_blocks = (max_padded + unit_size - 1) // unit_size
+
+    def run(moe_buf):
+        frequency = torch.empty(experts, dtype=torch.int32, device=device)
+        cursors = torch.empty_like(frequency)
+        sorted_ids = torch.empty(max_padded, dtype=torch.int32, device=device)
+        sorted_weights = torch.empty(max_padded, dtype=torch.float32, device=device)
+        sorted_routes = torch.empty(max_padded, dtype=torch.int32, device=device)
+        sorted_experts = torch.empty(max_blocks, dtype=torch.int32, device=device)
+        valid = torch.empty(2, dtype=torch.int32, device=device)
+        moe_ragged_sorting_flydsl(
+            token_indices,
+            expert_indices,
+            route_weights,
+            frequency,
+            cursors,
+            sorted_ids,
+            sorted_weights,
+            sorted_experts,
+            valid,
+            moe_buf,
+            experts,
+            tokens=tokens,
+            max_padded_routes=max_padded,
+            unit_size=unit_size,
+            sorted_route_ids=sorted_routes,
+        )
+        return frequency
+
+    _ragged_cf_cache.clear()
+    forward_frequency = run(
+        torch.empty((tokens, 64), dtype=torch.bfloat16, device=device)
+    )
+    backward_frequency = run(torch.empty(4, dtype=torch.int32, device=device))
+    torch.cuda.synchronize(device)
+
+    expected = torch.bincount(expert_indices.long(), minlength=experts).to(torch.int32)
+    assert torch.equal(forward_frequency, expected)
+    assert torch.equal(backward_frequency, expected)
+    assert {key[-2] for key in _ragged_cf_cache} == {1, 2}
+
+
+def test_ragged_sorting_mirrors_frequency_in_prefix_dispatch():
+    """A retained private count can update the public output without a copy."""
+
+    device = torch.device("cuda")
+    tokens, experts, unit_size = 7, 4, 16
+    token_indices = torch.tensor(
+        [0, 0, 2, 3, 3, 3, 6],
+        dtype=torch.int32,
+        device=device,
+    )
+    expert_indices = torch.tensor(
+        [2, 2, 1, 3, 0, 3, 1],
+        dtype=torch.int32,
+        device=device,
+    )
+    route_weights = torch.ones(
+        token_indices.numel(),
+        dtype=torch.float32,
+        device=device,
+    )
+    routes = int(token_indices.numel())
+    max_padded = routes + experts * (unit_size - 1)
+    max_blocks = (max_padded + unit_size - 1) // unit_size
+    frequency = torch.full((experts,), -1, dtype=torch.int32, device=device)
+    mirror = torch.full_like(frequency, -2)
+    cursors = torch.empty_like(frequency)
+    sorted_ids = torch.empty(max_padded, dtype=torch.int32, device=device)
+    sorted_weights = torch.empty(max_padded, dtype=torch.float32, device=device)
+    sorted_routes = torch.empty(max_padded, dtype=torch.int32, device=device)
+    sorted_experts = torch.empty(max_blocks, dtype=torch.int32, device=device)
+    valid = torch.empty(2, dtype=torch.int32, device=device)
+    moe_buf = torch.empty((tokens, 64), dtype=torch.bfloat16, device=device)
+
+    moe_ragged_sorting_flydsl(
+        token_indices,
+        expert_indices,
+        route_weights,
+        frequency,
+        cursors,
+        sorted_ids,
+        sorted_weights,
+        sorted_experts,
+        valid,
+        moe_buf,
+        experts,
+        tokens=tokens,
+        max_padded_routes=max_padded,
+        unit_size=unit_size,
+        sorted_route_ids=sorted_routes,
+        expert_frequency_mirror=mirror,
+    )
+    torch.cuda.synchronize(device)
+
+    expected = torch.bincount(expert_indices.long(), minlength=experts).to(torch.int32)
+    assert torch.equal(frequency, expected)
+    assert torch.equal(mirror, expected)
+    with pytest.raises(ValueError, match="must not alias"):
+        moe_ragged_sorting_flydsl(
+            token_indices,
+            expert_indices,
+            route_weights,
+            frequency,
+            cursors,
+            sorted_ids,
+            sorted_weights,
+            sorted_experts,
+            valid,
+            moe_buf,
+            experts,
+            tokens=tokens,
+            max_padded_routes=max_padded,
+            unit_size=unit_size,
+            expert_frequency_mirror=frequency,
+        )
 
 
 def _call_flydsl(topk_ids, topk_weights, E, model_dim=4096, topk=None, unit_size=UNIT_SIZE, expert_mask=None):

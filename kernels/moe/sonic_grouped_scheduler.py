@@ -14,6 +14,17 @@ One device thread handles one expert.  It locates that expert's first sorted
 metadata block, atomically reserves ``ceil(frequency / block_m)`` descriptor
 slots, and writes the corresponding global M-block indices.  Descriptor order
 is deliberately unspecified; grouped GEMMs must treat it as a work queue.
+
+For GEMM M tiles wider than the sorter's metadata unit, the legacy scalar
+descriptor is insufficient: a tile can start at a row that is not aligned to
+``block_m`` and the final tile can contain fewer than ``block_m`` real rows.
+The exact queue API therefore stores a self-contained record for every tile:
+
+``queue = [count, (expert, first_sorted_row, valid_rows) * capacity]``.
+
+Unlike an active-expert queue, this schedule exposes every M tile as an
+independent work item.  A grouped GEMM can consequently map one CTA to one
+``(M tile, N tile)`` without serializing all M tiles of a hot expert.
 """
 
 from __future__ import annotations
@@ -29,7 +40,6 @@ from flydsl.expr.typing import T
 from kernels.common import buffer_ops
 from kernels.common.mem_ops import atomic_add
 from kernels.common.tensor_shim import _run_compiled
-
 
 _BLOCK_THREADS = 256
 _MAX_SIGNED_I32 = (1 << 31) - 1
@@ -120,6 +130,494 @@ def ragged_compact_m_tile_descriptor_upper_bound(
     """Upper bound for flat ragged routing, including duplicate edges."""
 
     return compact_m_tile_descriptor_upper_bound(routes, num_experts, block_m)
+
+
+def exact_m_tile_queue_upper_bound(
+    routes: int,
+    num_experts: int,
+    block_m: int,
+    *,
+    max_expert_rows: int | None = None,
+) -> int:
+    """Return the required record capacity for an exact M-tile queue."""
+
+    return compact_m_tile_descriptor_upper_bound(
+        routes,
+        num_experts,
+        block_m,
+        max_expert_rows=max_expert_rows,
+    )
+
+
+def exact_m_tile_queue_elements(
+    routes: int,
+    num_experts: int,
+    block_m: int,
+    *,
+    max_expert_rows: int | None = None,
+) -> int:
+    """Return int32 storage elements for the exact queue's counter and records."""
+
+    capacity = exact_m_tile_queue_upper_bound(
+        routes,
+        num_experts,
+        block_m,
+        max_expert_rows=max_expert_rows,
+    )
+    return 1 + 3 * capacity
+
+
+@functools.lru_cache(maxsize=128)
+def compile_exact_m_tile_queue_builder(
+    num_experts: int,
+    block_m: int,
+    sorted_block_m: int,
+    device_index: int,
+    emit_active_experts: bool = False,
+):
+    """Compile a device-side exact M-tile queue builder.
+
+    The returned launcher writes the counter-first ABI
+    ``[count, (expert, first_row, valid_rows) * capacity]``.  ``first_row`` is
+    an exact sorted-row offset, so ``block_m`` need not divide
+    ``sorted_block_m``.  When ``emit_active_experts`` is true, the same scan
+    also fills ``[active_count, (expert, first_row) * active_capacity]`` for
+    grouped TN contractions.
+    """
+
+    del device_index
+    if num_experts <= 0:
+        raise ValueError(f"num_experts must be positive, got {num_experts}")
+    if block_m <= 0:
+        raise ValueError(f"block_m must be positive, got {block_m}")
+    if sorted_block_m <= 0:
+        raise ValueError(f"sorted_block_m must be positive, got {sorted_block_m}")
+
+    max_metadata_blocks = _MAX_SIGNED_I32 // sorted_block_m
+    lower_bound_steps = max(1, max_metadata_blocks.bit_length())
+
+    @flyc.kernel(known_block_size=[_BLOCK_THREADS, 1, 1])
+    def clear_queue_kernel(
+        queue: fx.Tensor,
+        active_expert_storage: fx.Tensor,
+    ):
+        if gpu.thread_idx.x == fx.Int32(0):
+            queue_rsrc = buffer_ops.create_buffer_resource(queue, max_size=True)
+            buffer_ops.buffer_store(fx.Int32(0), queue_rsrc, fx.Int32(0))
+            if const_expr(emit_active_experts):
+                active_rsrc = buffer_ops.create_buffer_resource(
+                    active_expert_storage,
+                    max_size=True,
+                )
+                buffer_ops.buffer_store(fx.Int32(0), active_rsrc, fx.Int32(0))
+
+    @flyc.kernel(known_block_size=[_BLOCK_THREADS, 1, 1])
+    def clamp_queue_counts_kernel(
+        queue: fx.Tensor,
+        i32_queue_capacity: fx.Int32,
+        active_expert_storage: fx.Tensor,
+        i32_active_expert_capacity: fx.Int32,
+    ):
+        if gpu.thread_idx.x == fx.Int32(0):
+            queue_rsrc = buffer_ops.create_buffer_resource(queue, max_size=True)
+            required_records = fx.Int32(
+                buffer_ops.buffer_load(
+                    queue_rsrc,
+                    fx.Int32(0),
+                    vec_width=1,
+                    dtype=T.i32,
+                )
+            )
+            stored_records = (required_records < i32_queue_capacity).select(
+                required_records,
+                i32_queue_capacity,
+            )
+            buffer_ops.buffer_store(stored_records, queue_rsrc, fx.Int32(0))
+            if const_expr(emit_active_experts):
+                active_rsrc = buffer_ops.create_buffer_resource(
+                    active_expert_storage,
+                    max_size=True,
+                )
+                required_active = fx.Int32(
+                    buffer_ops.buffer_load(
+                        active_rsrc,
+                        fx.Int32(0),
+                        vec_width=1,
+                        dtype=T.i32,
+                    )
+                )
+                stored_active = (
+                    required_active < i32_active_expert_capacity
+                ).select(
+                    required_active,
+                    i32_active_expert_capacity,
+                )
+                buffer_ops.buffer_store(
+                    stored_active,
+                    active_rsrc,
+                    fx.Int32(0),
+                )
+
+    @flyc.kernel(known_block_size=[_BLOCK_THREADS, 1, 1])
+    def build_queue_kernel(
+        expert_frequency: fx.Tensor,
+        sorted_expert_ids: fx.Tensor,
+        num_valid_ids: fx.Tensor,
+        queue: fx.Tensor,
+        i32_queue_capacity: fx.Int32,
+        active_expert_storage: fx.Tensor,
+        i32_active_expert_capacity: fx.Int32,
+    ):
+        if const_expr(num_experts <= _BLOCK_THREADS):
+            # The Qwen3 E16 target fits in one workgroup, so clear and build in
+            # one dispatch.  The barrier makes the counter visible before any
+            # expert reserves records.
+            if gpu.thread_idx.x == fx.Int32(0):
+                queue_rsrc = buffer_ops.create_buffer_resource(queue, max_size=True)
+                buffer_ops.buffer_store(fx.Int32(0), queue_rsrc, fx.Int32(0))
+                if const_expr(emit_active_experts):
+                    active_rsrc = buffer_ops.create_buffer_resource(
+                        active_expert_storage,
+                        max_size=True,
+                    )
+                    buffer_ops.buffer_store(fx.Int32(0), active_rsrc, fx.Int32(0))
+            gpu.barrier()
+        expert = gpu.block_idx.x * fx.Int32(_BLOCK_THREADS) + gpu.thread_idx.x
+        if expert < fx.Int32(num_experts):
+            frequency_rsrc = buffer_ops.create_buffer_resource(expert_frequency, max_size=True)
+            frequency = fx.Int32(
+                buffer_ops.buffer_load(frequency_rsrc, expert, vec_width=1, dtype=T.i32)
+            )
+            if frequency > fx.Int32(0):
+                valid_rsrc = buffer_ops.create_buffer_resource(num_valid_ids, max_size=True)
+                padded_rows = fx.Int32(
+                    buffer_ops.buffer_load(valid_rsrc, fx.Int32(0), vec_width=1, dtype=T.i32)
+                )
+                metadata_blocks = padded_rows // fx.Int32(sorted_block_m)
+                expert_ids_rsrc = buffer_ops.create_buffer_resource(
+                    sorted_expert_ids,
+                    max_size=True,
+                )
+
+                lo = fx.Int32(0)
+                hi = metadata_blocks
+                for _ in range_constexpr(lower_bound_steps):
+                    searching = lo < hi
+                    mid = (lo + hi) // fx.Int32(2)
+                    safe_mid = searching.select(mid, fx.Int32(0))
+                    mid_expert = fx.Int32(
+                        buffer_ops.buffer_load(
+                            expert_ids_rsrc,
+                            safe_mid,
+                            vec_width=1,
+                            dtype=T.i32,
+                        )
+                    )
+                    move_right = searching & (mid_expert < expert)
+                    lo = move_right.select(mid + fx.Int32(1), lo)
+                    move_left = searching & (mid_expert >= expert)
+                    hi = move_left.select(mid, hi)
+
+                in_metadata = lo < metadata_blocks
+                safe_lo = in_metadata.select(lo, fx.Int32(0))
+                found_expert = fx.Int32(
+                    buffer_ops.buffer_load(
+                        expert_ids_rsrc,
+                        safe_lo,
+                        vec_width=1,
+                        dtype=T.i32,
+                    )
+                )
+                if in_metadata & (found_expert == expert):
+                    if const_expr(emit_active_experts):
+                        active_slot = atomic_add(
+                            active_expert_storage,
+                            fx.Int32(0),
+                            fx.Int32(1),
+                            dtype_bytes=4,
+                        )
+                        active_index = fx.Int32(active_slot)
+                        if active_index < i32_active_expert_capacity:
+                            active_rsrc = buffer_ops.create_buffer_resource(
+                                active_expert_storage,
+                                max_size=True,
+                            )
+                            active_offset = fx.Int32(1) + active_index * fx.Int32(2)
+                            buffer_ops.buffer_store(expert, active_rsrc, active_offset)
+                            buffer_ops.buffer_store(
+                                lo * fx.Int32(sorted_block_m),
+                                active_rsrc,
+                                active_offset + fx.Int32(1),
+                            )
+                    tile_count = (frequency + fx.Int32(block_m - 1)) // fx.Int32(block_m)
+                    reservation = atomic_add(
+                        queue,
+                        fx.Int32(0),
+                        tile_count,
+                        dtype_bytes=4,
+                    )
+                    output_start = fx.Int32(reservation)
+                    first_sorted_row = lo * fx.Int32(sorted_block_m)
+                    queue_rsrc = buffer_ops.create_buffer_resource(queue, max_size=True)
+                    for local_tile in range(0, tile_count, 1):
+                        local_row = fx.Int32(local_tile) * fx.Int32(block_m)
+                        output_index = output_start + fx.Int32(local_tile)
+                        if output_index < i32_queue_capacity:
+                            record_offset = fx.Int32(1) + output_index * fx.Int32(3)
+                            remaining_rows = frequency - local_row
+                            valid_rows = (remaining_rows < fx.Int32(block_m)).select(
+                                remaining_rows,
+                                fx.Int32(block_m),
+                            )
+                            buffer_ops.buffer_store(expert, queue_rsrc, record_offset)
+                            buffer_ops.buffer_store(
+                                first_sorted_row + local_row,
+                                queue_rsrc,
+                                record_offset + fx.Int32(1),
+                            )
+                            buffer_ops.buffer_store(
+                                valid_rows,
+                                queue_rsrc,
+                                record_offset + fx.Int32(2),
+                            )
+
+        if const_expr(num_experts <= _BLOCK_THREADS):
+            # Every reservation belongs to this workgroup.  Clamp the published
+            # counts only after all record writes complete so consumers never
+            # observe more records than fit in the caller-provided capacities.
+            gpu.barrier()
+            if gpu.thread_idx.x == fx.Int32(0):
+                queue_rsrc = buffer_ops.create_buffer_resource(queue, max_size=True)
+                required_records = fx.Int32(
+                    buffer_ops.buffer_load(
+                        queue_rsrc,
+                        fx.Int32(0),
+                        vec_width=1,
+                        dtype=T.i32,
+                    )
+                )
+                stored_records = (required_records < i32_queue_capacity).select(
+                    required_records,
+                    i32_queue_capacity,
+                )
+                buffer_ops.buffer_store(stored_records, queue_rsrc, fx.Int32(0))
+                if const_expr(emit_active_experts):
+                    active_rsrc = buffer_ops.create_buffer_resource(
+                        active_expert_storage,
+                        max_size=True,
+                    )
+                    required_active = fx.Int32(
+                        buffer_ops.buffer_load(
+                            active_rsrc,
+                            fx.Int32(0),
+                            vec_width=1,
+                            dtype=T.i32,
+                        )
+                    )
+                    stored_active = (
+                        required_active < i32_active_expert_capacity
+                    ).select(
+                        required_active,
+                        i32_active_expert_capacity,
+                    )
+                    buffer_ops.buffer_store(
+                        stored_active,
+                        active_rsrc,
+                        fx.Int32(0),
+                    )
+
+    @flyc.jit
+    def launch(
+        expert_frequency: fx.Tensor,
+        sorted_expert_ids: fx.Tensor,
+        num_valid_ids: fx.Tensor,
+        queue: fx.Tensor,
+        i32_queue_capacity: fx.Int32,
+        active_expert_storage: fx.Tensor,
+        i32_active_expert_capacity: fx.Int32,
+        stream: fx.Stream = fx.Stream(None),
+    ):
+        if num_experts > _BLOCK_THREADS:
+            clear_queue_kernel(queue, active_expert_storage).launch(
+                grid=(1, 1, 1),
+                block=(_BLOCK_THREADS, 1, 1),
+                stream=stream,
+            )
+        build_queue_kernel(
+            expert_frequency,
+            sorted_expert_ids,
+            num_valid_ids,
+            queue,
+            i32_queue_capacity,
+            active_expert_storage,
+            i32_active_expert_capacity,
+        ).launch(
+            grid=((num_experts + _BLOCK_THREADS - 1) // _BLOCK_THREADS, 1, 1),
+            block=(_BLOCK_THREADS, 1, 1),
+            stream=stream,
+        )
+        if num_experts > _BLOCK_THREADS:
+            # Multiple workgroups cannot finalize a shared count in-kernel.
+            # A same-stream one-thread dispatch publishes the saturated count
+            # after every builder workgroup and record write has completed.
+            clamp_queue_counts_kernel(
+                queue,
+                i32_queue_capacity,
+                active_expert_storage,
+                i32_active_expert_capacity,
+            ).launch(
+                grid=(1, 1, 1),
+                block=(_BLOCK_THREADS, 1, 1),
+                stream=stream,
+            )
+
+    return launch
+
+
+def build_exact_m_tile_queue(
+    expert_frequency: torch.Tensor,
+    sorted_expert_ids: torch.Tensor,
+    num_valid_ids: torch.Tensor,
+    queue: torch.Tensor,
+    *,
+    block_m: int,
+    sorted_block_m: int,
+    queue_capacity: int | None = None,
+    active_expert_storage: torch.Tensor | None = None,
+    active_expert_capacity: int | None = None,
+    stream: torch.cuda.Stream | None = None,
+) -> torch.Tensor:
+    """Asynchronously build a self-contained exact M-tile work queue.
+
+    ``queue`` is contiguous int32 storage with room for one counter plus three
+    integers per record.  A short ``queue_capacity`` truncates record writes
+    and the published counter to the number of stored records.  Optional
+    ``active_expert_storage`` uses the existing
+    ``[count, (expert, first_row) * capacity]`` ABI and is populated by the
+    same device scan.
+    """
+
+    tensors = {
+        "expert_frequency": expert_frequency,
+        "sorted_expert_ids": sorted_expert_ids,
+        "num_valid_ids": num_valid_ids,
+        "queue": queue,
+    }
+    device = expert_frequency.device
+    if device.type != "cuda":
+        raise ValueError("exact M-tile queue construction requires a ROCm device")
+    for name, tensor in tensors.items():
+        if tensor.device != device:
+            raise ValueError(f"{name} must be on {device}, got {tensor.device}")
+        if tensor.dtype != torch.int32:
+            raise ValueError(f"{name} must have dtype torch.int32, got {tensor.dtype}")
+        if not tensor.is_contiguous():
+            raise ValueError(f"{name} must be contiguous")
+    if expert_frequency.ndim != 1 or expert_frequency.numel() <= 0:
+        raise ValueError("expert_frequency must be a non-empty rank-1 tensor")
+    if sorted_expert_ids.ndim != 1:
+        raise ValueError("sorted_expert_ids must be rank 1")
+    if num_valid_ids.ndim != 1 or num_valid_ids.numel() < 1:
+        raise ValueError("num_valid_ids must contain at least one element")
+    if queue.ndim != 1 or queue.numel() < 1 or (queue.numel() - 1) % 3:
+        raise ValueError(
+            "queue must use the counter-first "
+            "[count, (expert, first_row, valid_rows) * capacity] ABI"
+        )
+    if active_expert_storage is not None:
+        if active_expert_storage.device != device:
+            raise ValueError(
+                f"active_expert_storage must be on {device}, got {active_expert_storage.device}"
+            )
+        if active_expert_storage.dtype != torch.int32:
+            raise ValueError(
+                "active_expert_storage must have dtype torch.int32, "
+                f"got {active_expert_storage.dtype}"
+            )
+        if not active_expert_storage.is_contiguous():
+            raise ValueError("active_expert_storage must be contiguous")
+        if (
+            active_expert_storage.ndim != 1
+            or active_expert_storage.numel() < 1
+            or (active_expert_storage.numel() - 1) % 2
+        ):
+            raise ValueError(
+                "active_expert_storage must use the counter-first "
+                "[count, (expert, first_row) * capacity] ABI"
+            )
+    elif active_expert_capacity is not None:
+        raise ValueError("active_expert_capacity requires active_expert_storage")
+    if not isinstance(block_m, int) or isinstance(block_m, bool) or block_m <= 0:
+        raise ValueError(f"block_m must be a positive int, got {block_m}")
+    if (
+        not isinstance(sorted_block_m, int)
+        or isinstance(sorted_block_m, bool)
+        or sorted_block_m <= 0
+    ):
+        raise ValueError(
+            f"sorted_block_m must be a positive int, got {sorted_block_m}"
+        )
+
+    storage_capacity = (queue.numel() - 1) // 3
+    capacity = storage_capacity if queue_capacity is None else queue_capacity
+    if not isinstance(capacity, int) or isinstance(capacity, bool):
+        raise TypeError(
+            f"queue_capacity must be an int or None, got {type(capacity).__name__}"
+        )
+    if capacity < 0 or capacity > storage_capacity or capacity > _MAX_SIGNED_I32:
+        raise ValueError(
+            "queue_capacity must be in "
+            f"[0, {min(storage_capacity, _MAX_SIGNED_I32)}], got {capacity}"
+        )
+
+    if active_expert_storage is None:
+        active_capacity = 0
+        active_storage_arg = queue
+    else:
+        active_storage_capacity = (active_expert_storage.numel() - 1) // 2
+        active_capacity = (
+            active_storage_capacity
+            if active_expert_capacity is None
+            else active_expert_capacity
+        )
+        if not isinstance(active_capacity, int) or isinstance(active_capacity, bool):
+            raise TypeError(
+                "active_expert_capacity must be an int or None, "
+                f"got {type(active_capacity).__name__}"
+            )
+        if (
+            active_capacity < 0
+            or active_capacity > active_storage_capacity
+            or active_capacity > _MAX_SIGNED_I32
+        ):
+            raise ValueError(
+                "active_expert_capacity must be in "
+                f"[0, {min(active_storage_capacity, _MAX_SIGNED_I32)}], "
+                f"got {active_capacity}"
+            )
+        active_storage_arg = active_expert_storage
+
+    if stream is None:
+        stream = torch.cuda.current_stream(device)
+    launcher = compile_exact_m_tile_queue_builder(
+        int(expert_frequency.numel()),
+        block_m,
+        sorted_block_m,
+        device.index or 0,
+        active_expert_storage is not None,
+    )
+    _run_compiled(
+        launcher,
+        expert_frequency,
+        sorted_expert_ids,
+        num_valid_ids,
+        queue,
+        capacity,
+        active_storage_arg,
+        active_capacity,
+        stream,
+    )
+    return queue
 
 
 @functools.lru_cache(maxsize=128)
@@ -424,9 +922,13 @@ def build_compact_m_tile_descriptors(
 
 
 __all__ = [
+    "build_exact_m_tile_queue",
     "build_compact_m_tile_descriptors",
     "compact_m_tile_descriptor_upper_bound",
     "compile_compact_m_tile_descriptor_builder",
+    "compile_exact_m_tile_queue_builder",
+    "exact_m_tile_queue_elements",
+    "exact_m_tile_queue_upper_bound",
     "fixed_compact_m_tile_descriptor_upper_bound",
     "ragged_compact_m_tile_descriptor_upper_bound",
 ]

@@ -114,6 +114,18 @@ def _validate_training_preactivation_extent(tokens: int, top_k: int, intermediat
         )
 
 
+def _validate_routes_training_preactivation_extent(routes: int, intermediate_size: int) -> None:
+    """Keep flat route-order state below the signed-i32 store limit."""
+
+    state_bytes = routes * 2 * intermediate_size * 2
+    if state_bytes > _MAX_SIGNED_I32:
+        raise ValueError(
+            "flat training preactivation exceeds the kernel's signed 32-bit "
+            "masked-store byte-offset limit: "
+            f"routes={routes}, intermediate_size={intermediate_size}"
+        )
+
+
 @dataclass(frozen=True)
 class SonicMoEConfig:
     """Static shape and tile configuration for :class:`SonicMoE`.
@@ -512,6 +524,43 @@ class SonicMoEForwardState:
     ready_event: torch.cuda.Event
 
 
+@dataclass(frozen=True)
+class SonicMoERoutesForwardState:
+    """Invocation-owned training state for an arbitrary flat route list.
+
+    ``preactivation`` has shape ``[routes, 2 * intermediate_size]`` and is in
+    the original caller route order, even though Stage 1 computes in
+    expert-sorted order.  The ragged sorter emits the inverse route mapping so
+    Stage 1 can write this compact state directly without a separate gather or
+    permutation kernel.  The exact Qwen3 E16 bucket also retains the six
+    optional sorter outputs below.  Those tensors are invocation-owned and
+    allow backward to skip sorting; other shapes leave them as ``None``.
+    """
+
+    preactivation: torch.Tensor
+    tokens: int
+    routes: int
+    hidden_size: int
+    intermediate_size: int
+    num_experts: int
+    activation: str
+    compute_dtype: str
+    interleaved_w1: bool
+    has_bias: bool
+    producer_stream: int
+    ready_event: torch.cuda.Event
+    # Exact Qwen3 E16 training calls retain their forward sorter outputs so
+    # backward can consume the same invocation-owned metadata without running
+    # the four-launch ragged sorter again.  Generic route shapes leave these
+    # optional fields unset and retain the established backward-owned sort.
+    sorted_token_ids: torch.Tensor | None = None
+    sorted_route_ids: torch.Tensor | None = None
+    sorted_weights: torch.Tensor | None = None
+    sorted_expert_ids: torch.Tensor | None = None
+    num_valid_ids: torch.Tensor | None = None
+    expert_frequency: torch.Tensor | None = None
+
+
 @dataclass
 class SonicMoEWorkspace:
     """Reusable routing, intermediate, and output buffers for one route shape."""
@@ -526,6 +575,7 @@ class SonicMoEWorkspace:
     stage1_max_m_blocks: int
     stage2_max_m_blocks: int
     sorted_token_ids: torch.Tensor
+    sorted_route_ids: torch.Tensor | None
     sorted_weights: torch.Tensor
     sorted_expert_ids: torch.Tensor
     num_valid_ids: torch.Tensor
@@ -560,6 +610,8 @@ class SonicMoEWorkspace:
             self.intermediate,
             self.output,
         ]
+        if self.sorted_route_ids is not None:
+            tensors.append(self.sorted_route_ids)
         if self.route_output is not None:
             tensors.append(self.route_output)
         if self.sorting_workspace is not None:
@@ -641,6 +693,11 @@ class SonicMoEWorkspace:
             # Keep a one-element backing allocation for the all-empty ragged
             # case so raw buffer descriptors never receive a null data pointer.
             sorted_token_ids=torch.empty(max(1, max_padded), dtype=torch.int32, device=device),
+            sorted_route_ids=(
+                torch.empty(max(1, max_padded), dtype=torch.int32, device=device)
+                if routes is not None
+                else None
+            ),
             sorted_weights=torch.empty(max(1, max_padded), dtype=torch.float32, device=device),
             sorted_expert_ids=torch.empty(max(1, max_blocks), dtype=torch.int32, device=device),
             num_valid_ids=torch.empty(2, dtype=torch.int32, device=device),
@@ -1274,10 +1331,13 @@ def _get_stage1_training_launcher(
     device_index: int,
     tile_n_override: int | None = None,
     waves_per_eu_override: int | None = None,
+    route_preactivation_by_route_id: bool = False,
+    tile_m_override: int | None = None,
 ):
-    """Compile the BF16 fixed-K dual-output Stage-1 specialization."""
+    """Compile the BF16 dual-output Stage-1 specialization."""
 
     del device_index
+    tile_m = config.tile_m if tile_m_override is None else tile_m_override
     tile_n = config.tile_n if tile_n_override is None else tile_n_override
     waves_per_eu = (
         config.waves_per_eu
@@ -1285,7 +1345,7 @@ def _get_stage1_training_launcher(
         else waves_per_eu_override
     )
     return compile_gemm1_a16w4_port(
-        BM=config.tile_m,
+        BM=tile_m,
         SORTED_BM=config.route_tile_m,
         D_HIDDEN=config.hidden_size,
         D_INTER=config.intermediate_size,
@@ -1306,6 +1366,7 @@ def _get_stage1_training_launcher(
         has_bias=has_bias,
         store_route_preactivation=True,
         route_preactivation_interleaved=interleaved_w1,
+        route_preactivation_by_route_id=route_preactivation_by_route_id,
         a_lds_swizzle=config.stage1_lds_swizzle,
     )
 
@@ -1345,6 +1406,76 @@ def _training_stage1_tuning(
     ):
         return 128, 2
     return config.tile_n, config.waves_per_eu
+
+
+def _training_stage1_tile_m(
+    config: SonicMoEConfig,
+    tokens: int,
+    routes: int | None,
+    has_bias: bool,
+) -> int:
+    """Select the measured flat-route training Stage-1 M tile.
+
+    Qwen3-30B-A3B's EP8 local route bucket benefits from a BM64 compute tile
+    while retaining the BM128 sorter layout.  The smaller tile lowers the
+    dual-output kernel from 370 to 250 VGPRs on gfx950 without changing route
+    padding or the Stage-2 launch.  Keep the gate deliberately exact so fixed-K
+    calls, inference, nearby ragged shapes, and explicitly retuned configs use
+    the requested ``config.tile_m`` unchanged.
+    """
+
+    if (
+        routes == tokens == 8192
+        and config.hidden_size == 2048
+        and config.intermediate_size == 768
+        and config.num_experts == 16
+        and config.top_k == 1
+        and (config.tile_m, config.tile_n, config.tile_k) == (128, 192, 64)
+        and (
+            config.stage2_tile_m,
+            config.stage2_tile_n,
+            config.stage2_tile_k,
+        )
+        == (64, 256, 64)
+        and config.route_tile_m == 128
+        and config.stage1_k_wave == 1
+        and config.stage1_b_cache_mod in (None, 0)
+        and config.stage2_b_cache_mod in (None, 0)
+        and config.stage1_xcd_swizzle == 8
+        and config.stage2_xcd_swizzle == 0
+        and config.waves_per_eu is None
+        and not config.persistent_stage1
+        and not config.persistent_stage2
+        and config.stage2_pipeline_stages == 2
+        and config.stage2_output_mode == "atomic"
+        and config.stage1_write_padded_rows
+        and config.stage1_lds_swizzle
+        and config.activation == "swiglu"
+        and config.compute_dtype == "bf16"
+        and not has_bias
+    ):
+        return 64
+    return config.tile_m
+
+
+def _retain_e16_flat_sorter_metadata(
+    config: SonicMoEConfig,
+    tokens: int,
+    routes: int,
+    *,
+    has_bias: bool,
+) -> bool:
+    """Keep sorter output only for the audited Qwen3 EP8 training bucket."""
+
+    return (
+        tokens == routes == 8192
+        and config.hidden_size == 2048
+        and config.intermediate_size == 768
+        and config.num_experts == 16
+        and config.activation == "swiglu"
+        and config.compute_dtype == "bf16"
+        and not has_bias
+    )
 
 
 @functools.lru_cache(maxsize=256)
@@ -1632,8 +1763,15 @@ class SonicMoE:
         )
 
         stage2_stages = _stage2_stages(cfg, tokens)
+        exact_e16_flat = (
+            workspace.routes == 8192
+            and tokens == 8192
+            and cfg.hidden_size == 2048
+            and cfg.intermediate_size == 768
+            and cfg.num_experts == 16
+        )
         if (
-            workspace.routes is not None
+            (workspace.routes is not None and not exact_e16_flat)
             or self.weights.weight_dtype != "bf16"
             or self.weights.has_bias
             or output_mode != "atomic"
@@ -1701,19 +1839,56 @@ class SonicMoE:
         route_preactivation: torch.Tensor,
         *,
         interleaved_w1: bool,
+        sorted_token_ids: torch.Tensor | None = None,
+        sorted_route_ids: torch.Tensor | None = None,
+        sorted_weights: torch.Tensor | None = None,
+        sorted_expert_ids: torch.Tensor | None = None,
+        num_valid_ids: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Training-only grouped forward with the Stage-1 dual output."""
 
         cfg = self.config
         tokens = workspace.tokens
         stream = torch.cuda.current_stream(hidden_states.device)
-        output_mode = cfg.stage2_output_mode
+        flat_routes = workspace.routes is not None
+        # A flat route list has no fixed slot dimension for the reduce output;
+        # it always uses the weighted atomic scatter path.
+        output_mode = cfg.stage2_output_mode if not flat_routes else "atomic"
         if output_mode == "reduce" and workspace.route_output is None:
             raise RuntimeError("reduce stage2 output requires a fixed-top-k route workspace")
+        sorted_token_ids = (
+            workspace.sorted_token_ids
+            if sorted_token_ids is None
+            else sorted_token_ids
+        )
+        sorted_route_ids = (
+            workspace.sorted_route_ids
+            if sorted_route_ids is None
+            else sorted_route_ids
+        )
+        sorted_weights = (
+            workspace.sorted_weights if sorted_weights is None else sorted_weights
+        )
+        sorted_expert_ids = (
+            workspace.sorted_expert_ids
+            if sorted_expert_ids is None
+            else sorted_expert_ids
+        )
+        num_valid_ids = (
+            workspace.num_valid_ids if num_valid_ids is None else num_valid_ids
+        )
+        if flat_routes and sorted_route_ids is None:
+            raise RuntimeError("flat-route training requires sorted route ids")
 
         training_tile_n, training_waves_per_eu = _training_stage1_tuning(
             cfg,
             tokens,
+            self.weights.has_bias,
+        )
+        training_tile_m = _training_stage1_tile_m(
+            cfg,
+            tokens,
+            workspace.routes,
             self.weights.has_bias,
         )
         stage1 = _get_stage1_training_launcher(
@@ -1724,12 +1899,14 @@ class SonicMoE:
             hidden_states.device.index or 0,
             training_tile_n,
             training_waves_per_eu,
+            flat_routes,
+            training_tile_m,
         )
         grid1 = gemm1_a16w4_grid(
-            cfg.tile_m,
+            training_tile_m,
             INTER=cfg.intermediate_size,
             TILE_N=training_tile_n,
-            max_m_blocks=workspace.stage1_max_m_blocks,
+            max_m_blocks=workspace.max_padded_tokens // training_tile_m,
             persist=cfg.persistent_stage1,
         )
         _run_compiled(
@@ -1738,9 +1915,9 @@ class SonicMoE:
             self.weights.gate_up.data_ptr(),
             self.weights.dummy_scale.data_ptr(),
             (self.weights.dummy_scale if self.weights.stage1_bias is None else self.weights.stage1_bias).data_ptr(),
-            workspace.sorted_expert_ids.data_ptr(),
-            workspace.num_valid_ids.data_ptr(),
-            workspace.sorted_token_ids.data_ptr(),
+            sorted_expert_ids.data_ptr(),
+            num_valid_ids.data_ptr(),
+            sorted_token_ids.data_ptr(),
             tokens,
             int(grid1),
             1.0,
@@ -1750,11 +1927,32 @@ class SonicMoE:
             float("inf"),
             workspace.intermediate.data_ptr(),
             route_preactivation.data_ptr(),
+            (
+                self.weights.dummy_scale
+                if sorted_route_ids is None
+                else sorted_route_ids
+            ).data_ptr(),
+            (
+                tokens * cfg.top_k
+                if workspace.routes is None
+                else int(workspace.routes)
+            ),
             stream,
         )
 
         stage2_stages = _stage2_stages(cfg, tokens)
-        if self.weights.has_bias or output_mode != "atomic":
+        exact_e16_flat = (
+            workspace.routes == 8192
+            and tokens == 8192
+            and cfg.hidden_size == 2048
+            and cfg.intermediate_size == 768
+            and cfg.num_experts == 16
+        )
+        if (
+            (flat_routes and not exact_e16_flat)
+            or self.weights.has_bias
+            or output_mode != "atomic"
+        ):
             stage2_stages = 1
         stage2 = _get_stage2_launcher(
             cfg,
@@ -1778,10 +1976,10 @@ class SonicMoE:
             self.weights.down.data_ptr(),
             self.weights.dummy_scale.data_ptr(),
             (self.weights.dummy_scale if self.weights.stage2_bias is None else self.weights.stage2_bias).data_ptr(),
-            workspace.sorted_expert_ids.data_ptr(),
-            workspace.num_valid_ids.data_ptr(),
-            workspace.sorted_token_ids.data_ptr(),
-            workspace.sorted_weights.data_ptr(),
+            sorted_expert_ids.data_ptr(),
+            num_valid_ids.data_ptr(),
+            sorted_token_ids.data_ptr(),
+            sorted_weights.data_ptr(),
             tokens,
             workspace.stage2_max_m_blocks,
             int(grid2),
@@ -2121,6 +2319,237 @@ class SonicMoE:
             if routes == 0:
                 return output
             return self._run_grouped_gemms(hidden_states, workspace, output)
+
+    def forward_routes_training(
+        self,
+        hidden_states: torch.Tensor,
+        token_indices: torch.Tensor,
+        expert_indices: torch.Tensor,
+        route_weights: torch.Tensor,
+        out: torch.Tensor | None = None,
+        *,
+        interleaved_w1: bool = False,
+        expert_frequency_out: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, SonicMoERoutesForwardState]:
+        """Run arbitrary flat routes and retain route-order W1 preactivation.
+
+        The saved BF16 tensor has shape ``[routes, 2 * intermediate_size]``.
+        Its row ``r`` corresponds exactly to input route ``r`` even though the
+        grouped GEMM executes in expert-sorted order.  Duplicate
+        ``(token, expert)`` edges and tokens with variable route counts remain
+        independent.
+
+        Like :meth:`forward_topk_training`, this low-level raw-pointer API is
+        intended for an autograd adapter and does not itself attach a
+        ``grad_fn``.  It currently supports dense BF16 SwiGLU weights.
+        """
+
+        if not isinstance(interleaved_w1, bool):
+            raise TypeError("interleaved_w1 must be bool")
+        if self.weights.weight_dtype != "bf16" or self.config.compute_dtype != "bf16":
+            raise NotImplementedError(
+                "forward_routes_training currently supports only dense BF16 weights and compute"
+            )
+        if self.config.activation != "swiglu":
+            raise NotImplementedError(
+                "forward_routes_training currently supports only activation='swiglu'"
+            )
+        if not hidden_states.is_cuda:
+            raise ValueError("hidden_states must be on a ROCm device")
+        with torch.cuda.device(hidden_states.device):
+            if torch.cuda.is_current_stream_capturing():
+                raise RuntimeError(
+                    "forward_routes_training does not support graph capture without a "
+                    "graph-private preallocated state slot; capture support is not enabled"
+                )
+            return self._forward_routes_training_on_current_device(
+                hidden_states,
+                token_indices,
+                expert_indices,
+                route_weights,
+                out,
+                interleaved_w1=interleaved_w1,
+                expert_frequency_out=expert_frequency_out,
+            )
+
+    def _forward_routes_training_on_current_device(
+        self,
+        hidden_states: torch.Tensor,
+        token_indices: torch.Tensor,
+        expert_indices: torch.Tensor,
+        route_weights: torch.Tensor,
+        out: torch.Tensor | None,
+        *,
+        interleaved_w1: bool,
+        expert_frequency_out: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, SonicMoERoutesForwardState]:
+        tokens = self._validate_training_hidden(hidden_states)
+        if token_indices.ndim != 1 or expert_indices.ndim != 1 or route_weights.ndim != 1:
+            raise ValueError("token_indices, expert_indices, and route_weights must be one-dimensional")
+        routes = int(route_weights.numel())
+        if int(token_indices.numel()) != routes or int(expert_indices.numel()) != routes:
+            raise ValueError("token_indices, expert_indices, and route_weights must have equal length")
+        if routes > _MAX_SIGNED_I32:
+            raise ValueError(f"route count exceeds the sorting kernel's signed 32-bit limit: {routes}")
+        if (
+            not token_indices.is_cuda
+            or not expert_indices.is_cuda
+            or not route_weights.is_cuda
+            or token_indices.device != hidden_states.device
+            or expert_indices.device != hidden_states.device
+            or route_weights.device != hidden_states.device
+        ):
+            raise ValueError("route tensors must be on the same ROCm device as hidden_states")
+        if token_indices.dtype != torch.int32 or expert_indices.dtype != torch.int32:
+            raise TypeError(
+                "token_indices/expert_indices must be int32, got "
+                f"{token_indices.dtype}/{expert_indices.dtype}"
+            )
+        if route_weights.dtype != torch.float32:
+            raise TypeError(f"route_weights must be float32, got {route_weights.dtype}")
+        if not token_indices.is_contiguous() or not expert_indices.is_contiguous() or not route_weights.is_contiguous():
+            raise ValueError("route tensors must be contiguous")
+
+        _validate_routes_training_preactivation_extent(
+            routes,
+            self.config.intermediate_size,
+        )
+        workspace = self.reserve(tokens, routes=routes)
+        output = self._validate_out(
+            out,
+            workspace,
+            hidden_states,
+            token_indices,
+            expert_indices,
+            route_weights,
+            *self.weights.tensors,
+        )
+        retain_sorter_metadata = _retain_e16_flat_sorter_metadata(
+            self.config,
+            tokens,
+            routes,
+            has_bias=self.weights.has_bias,
+        )
+        frequency = (
+            torch.empty_like(workspace.expert_frequency)
+            if retain_sorter_metadata
+            else workspace.expert_frequency
+        )
+        frequency_mirror = None
+        if expert_frequency_out is not None:
+            validated_frequency_out = self._validate_expert_frequency_out(
+                expert_frequency_out,
+                workspace,
+                output,
+                hidden_states,
+                token_indices,
+                expert_indices,
+                route_weights,
+                *self.weights.tensors,
+            )
+            if retain_sorter_metadata:
+                frequency_mirror = validated_frequency_out
+            else:
+                frequency = validated_frequency_out
+        if retain_sorter_metadata:
+            sorted_token_ids = torch.empty_like(workspace.sorted_token_ids)
+            sorted_route_ids = torch.empty_like(workspace.sorted_route_ids)
+            sorted_weights = torch.empty_like(workspace.sorted_weights)
+            sorted_expert_ids = torch.empty_like(workspace.sorted_expert_ids)
+            num_valid_ids = torch.empty_like(workspace.num_valid_ids)
+        else:
+            sorted_token_ids = workspace.sorted_token_ids
+            sorted_route_ids = workspace.sorted_route_ids
+            sorted_weights = workspace.sorted_weights
+            sorted_expert_ids = workspace.sorted_expert_ids
+            num_valid_ids = workspace.num_valid_ids
+        preactivation = torch.empty(
+            (routes, 2 * self.config.intermediate_size),
+            dtype=torch.bfloat16,
+            device=hidden_states.device,
+        )
+        if preactivation.untyped_storage().data_ptr() in workspace.storage_ptrs:
+            raise RuntimeError("training preactivation unexpectedly aliases reusable workspace storage")
+
+        assert workspace.sorting_workspace is not None
+        assert workspace.sorted_route_ids is not None
+        stream = torch.cuda.current_stream(hidden_states.device)
+        ready_event = torch.cuda.Event()
+        with workspace._launch_lock:
+            moe_ragged_sorting_flydsl(
+                token_indices,
+                expert_indices,
+                route_weights,
+                frequency,
+                workspace.sorting_workspace,
+                sorted_token_ids,
+                sorted_weights,
+                sorted_expert_ids,
+                num_valid_ids,
+                output,
+                self.config.num_experts,
+                tokens=tokens,
+                max_padded_routes=workspace.max_padded_tokens,
+                unit_size=self.config.route_tile_m,
+                sorted_route_ids=sorted_route_ids,
+                expert_frequency_mirror=frequency_mirror,
+            )
+            result = output
+            if routes:
+                result = self._run_grouped_gemms_training(
+                    hidden_states,
+                    workspace,
+                    output,
+                    preactivation,
+                    interleaved_w1=interleaved_w1,
+                    sorted_token_ids=sorted_token_ids,
+                    sorted_route_ids=sorted_route_ids,
+                    sorted_weights=sorted_weights,
+                    sorted_expert_ids=sorted_expert_ids,
+                    num_valid_ids=num_valid_ids,
+                )
+            self._record_training_forward_stream(
+                stream,
+                hidden_states,
+                token_indices,
+                expert_indices,
+                route_weights,
+                result,
+                preactivation,
+                *self.weights.tensors,
+                sorted_token_ids,
+                sorted_route_ids,
+                sorted_weights,
+                sorted_expert_ids,
+                num_valid_ids,
+                workspace.sorting_workspace,
+                workspace.intermediate,
+                frequency,
+                frequency_mirror,
+            )
+            ready_event.record(stream)
+
+        state = SonicMoERoutesForwardState(
+            preactivation=preactivation,
+            tokens=tokens,
+            routes=routes,
+            hidden_size=self.config.hidden_size,
+            intermediate_size=self.config.intermediate_size,
+            num_experts=self.config.num_experts,
+            activation=self.config.activation,
+            compute_dtype=self.config.compute_dtype,
+            interleaved_w1=interleaved_w1,
+            has_bias=self.weights.has_bias,
+            producer_stream=int(stream.cuda_stream),
+            ready_event=ready_event,
+            sorted_token_ids=(sorted_token_ids if retain_sorter_metadata else None),
+            sorted_route_ids=(sorted_route_ids if retain_sorter_metadata else None),
+            sorted_weights=(sorted_weights if retain_sorter_metadata else None),
+            sorted_expert_ids=(sorted_expert_ids if retain_sorter_metadata else None),
+            num_valid_ids=(num_valid_ids if retain_sorter_metadata else None),
+            expert_frequency=(frequency if retain_sorter_metadata else None),
+        )
+        return result, state
 
     @staticmethod
     def _record_training_forward_stream(
@@ -2562,6 +2991,7 @@ __all__ = [
     "SonicMoE",
     "SonicMoEConfig",
     "SonicMoEForwardState",
+    "SonicMoERoutesForwardState",
     "SonicMoEWeights",
     "SonicMoEWorkspace",
     "prepare_sonic_bf16_weights",

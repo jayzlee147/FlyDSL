@@ -33,7 +33,6 @@ from flydsl.expr.typing import T
 from kernels.common import buffer_ops
 from kernels.common.mem_ops import atomic_add
 
-
 BLOCK_SIZE = 256
 UNIT_SIZE = 32
 
@@ -47,6 +46,7 @@ def _compile_moe_ragged_sorting(
     num_experts: int,
     unit_size: int = UNIT_SIZE,
     emit_route_ids: bool = False,
+    mirror_expert_frequency: bool = False,
 ):
     """Build the four-kernel flat-route counting sort."""
 
@@ -54,7 +54,6 @@ def _compile_moe_ragged_sorting(
         raise ValueError(f"num_experts must be positive, got {num_experts}")
     if unit_size <= 0:
         raise ValueError(f"unit_size must be positive, got {unit_size}")
-
     @flyc.kernel(known_block_size=[BLOCK_SIZE, 1, 1])
     def clear_kernel(
         expert_frequency: fx.Tensor,
@@ -136,6 +135,7 @@ def _compile_moe_ragged_sorting(
     @flyc.kernel(known_block_size=[BLOCK_SIZE, 1, 1])
     def padded_prefix_kernel(
         expert_frequency: fx.Tensor,
+        expert_frequency_mirror: fx.Tensor,
         expert_cursors: fx.Tensor,
         sorted_expert_ids: fx.Tensor,
         num_valid_ids: fx.Tensor,
@@ -149,6 +149,11 @@ def _compile_moe_ragged_sorting(
         # deterministic; the route-heavy work remains fully parallel.
         if gpu.thread_idx.x == c_zero:
             freq_rsrc = buffer_ops.create_buffer_resource(expert_frequency, max_size=True)
+            if const_expr(mirror_expert_frequency):
+                mirror_rsrc = buffer_ops.create_buffer_resource(
+                    expert_frequency_mirror,
+                    max_size=True,
+                )
             cursor_rsrc = buffer_ops.create_buffer_resource(expert_cursors, max_size=True)
             sorted_e_rsrc = buffer_ops.create_buffer_resource(sorted_expert_ids, max_size=True)
             nvalid_rsrc = buffer_ops.create_buffer_resource(num_valid_ids, max_size=True)
@@ -157,10 +162,11 @@ def _compile_moe_ragged_sorting(
             for expert_id in range_constexpr(num_experts):
                 expert = fx.Int32(expert_id)
                 count = buffer_ops.buffer_load(freq_rsrc, expert, vec_width=1, dtype=T.i32)
+                if const_expr(mirror_expert_frequency):
+                    buffer_ops.buffer_store(count, mirror_rsrc, expert)
                 blocks = (count + c_unit - c_one) // c_unit
                 padded = (count == c_zero).select(c_zero, blocks * c_unit)
                 buffer_ops.buffer_store(offset, cursor_rsrc, expert)
-
                 block_start = offset // c_unit
                 for block in range(
                     fx.Index(0),
@@ -218,6 +224,7 @@ def _compile_moe_ragged_sorting(
         expert_indices: fx.Tensor,
         route_weights: fx.Tensor,
         expert_frequency: fx.Tensor,
+        expert_frequency_mirror: fx.Tensor,
         expert_cursors: fx.Tensor,
         sorted_token_ids: fx.Tensor,
         sorted_weights: fx.Tensor,
@@ -260,6 +267,7 @@ def _compile_moe_ragged_sorting(
 
         prefix = padded_prefix_kernel(
             expert_frequency,
+            expert_frequency_mirror,
             expert_cursors,
             sorted_expert_ids,
             num_valid_ids,
@@ -313,6 +321,7 @@ def moe_ragged_sorting_flydsl(
     max_padded_routes: int,
     unit_size: int = UNIT_SIZE,
     sorted_route_ids: torch.Tensor | None = None,
+    expert_frequency_mirror: torch.Tensor | None = None,
 ):
     """Group a flat route list into the metadata consumed by grouped GEMMs.
 
@@ -320,7 +329,9 @@ def moe_ragged_sorting_flydsl(
     int32 and route weights contiguous float32.  Bounds validation intentionally
     stays in the higher-level API so this launch path does not synchronize.
     ``expert_frequency`` receives the exact route occurrence count for each
-    expert and is not overwritten by the prefix phase.
+    expert and is not overwritten by the prefix phase.  An optional distinct
+    ``expert_frequency_mirror`` receives the same counts from the existing
+    prefix dispatch, avoiding a separate device-copy launch.
     """
 
     routes = int(route_weights.numel())
@@ -340,7 +351,27 @@ def moe_ragged_sorting_flydsl(
                 "sorted_route_ids must be contiguous with at least "
                 f"{max_padded_routes} elements"
             )
-
+    if expert_frequency_mirror is not None:
+        if not isinstance(expert_frequency_mirror, torch.Tensor):
+            raise TypeError("expert_frequency_mirror must be a torch.Tensor")
+        if expert_frequency_mirror.device != token_indices.device:
+            raise ValueError("expert_frequency_mirror must be on the route tensor device")
+        if (
+            expert_frequency_mirror.dtype != torch.int32
+            or not expert_frequency_mirror.is_contiguous()
+            or tuple(expert_frequency_mirror.shape) != (num_experts,)
+        ):
+            raise ValueError(
+                "expert_frequency_mirror must be contiguous int32 with shape "
+                f"({num_experts},)"
+            )
+        if (
+            expert_frequency_mirror.untyped_storage().data_ptr()
+            == expert_frequency.untyped_storage().data_ptr()
+        ):
+            raise ValueError(
+                "expert_frequency_mirror must not alias expert_frequency"
+            )
     device = token_indices.device
     stream = torch.cuda.current_stream(device)
     moe_buf_i32 = moe_buf.view(torch.int32)
@@ -356,13 +387,20 @@ def moe_ragged_sorting_flydsl(
         num_experts=num_experts,
         unit_size=unit_size,
         emit_route_ids=sorted_route_ids is not None,
+        mirror_expert_frequency=expert_frequency_mirror is not None,
     )
     sorted_route_ids_arg = expert_cursors if sorted_route_ids is None else sorted_route_ids
+    expert_frequency_mirror_arg = (
+        expert_frequency
+        if expert_frequency_mirror is None
+        else expert_frequency_mirror
+    )
     args = (
         token_indices,
         expert_indices,
         route_weights,
         expert_frequency,
+        expert_frequency_mirror_arg,
         expert_cursors,
         sorted_token_ids,
         sorted_weights,
@@ -377,7 +415,18 @@ def moe_ragged_sorting_flydsl(
         clear_grid,
         route_grid,
     )
-    cache_key = (num_experts, unit_size, sorted_route_ids is not None, device.index)
+    # ``moe_buf`` is intentionally an opaque scratch owner: forward passes its
+    # rank-2 output tensor while backward passes a compact rank-1 int32 buffer.
+    # FlyDSL specializes Tensor argument rank in the compiled launcher ABI, so
+    # those two call sites must not reuse the same cached function.
+    cache_key = (
+        num_experts,
+        unit_size,
+        sorted_route_ids is not None,
+        expert_frequency_mirror is not None,
+        moe_buf_i32.ndim,
+        device.index,
+    )
     _launch_cached(_ragged_cf_cache, cache_key, launch_fn, args, stream)
 
     return (
