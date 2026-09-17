@@ -203,7 +203,14 @@ _E16_DW2_SMALL_TILE_N = 64
 # profile instead of forcing them through the balanced 256x256 tile.  The
 # frequency predicate is evaluated from the existing device queue, and is
 # combined with the sparse-shard predicate inside the small-profile launch.
-_E16_DW2_HOT_EXPERT_MIN_ROWS = 16384
+_E16_DW2_HOT_EXPERT_MIN_ROWS = 1408
+# Keep the small profile selective as the shard grows.  Eleven sixty-fourths
+# (17.2%) preserves the measured R8192 crossover and prevents several merely
+# above-average experts from overwhelming the high-parallelism profile at
+# R16384.  Both operands are host-known shape values; selection of individual
+# experts remains device-side.
+_E16_DW2_HOT_EXPERT_ROUTE_FRACTION_NUMERATOR = 11
+_E16_DW2_HOT_EXPERT_ROUTE_FRACTION_DENOMINATOR = 64
 # dW2 consumes the same hot descriptors before dW1 and reuses the leading
 # portion of dW1's larger FP32 partial workspace on the same stream.  The
 # smaller dW2 contraction crosses over later than dW1.  Requiring 64K total
@@ -408,6 +415,24 @@ def _launch_grouped_dw2(
         and hidden_size == 2048
         and intermediate_size == 768
     ):
+        # The split-K companion already owns every expert above its boundary.
+        # Clamp the regular-profile crossover to that boundary so lowering the
+        # small-tile threshold for normal batches cannot retile split-K's cold
+        # complement at R65536 and above.
+        load_scaled_hot_rows = max(
+            _E16_DW2_HOT_EXPERT_MIN_ROWS,
+            (
+                max_expert_rows * _E16_DW2_HOT_EXPERT_ROUTE_FRACTION_NUMERATOR
+                + _E16_DW2_HOT_EXPERT_ROUTE_FRACTION_DENOMINATOR
+                - 1
+            )
+            // _E16_DW2_HOT_EXPERT_ROUTE_FRACTION_DENOMINATOR,
+        )
+        hot_profile_min_rows = (
+            max(load_scaled_hot_rows, _E16_DW1_SPLIT_MIN_HOT_ROWS)
+            if hot_split_state is not None
+            else load_scaled_hot_rows
+        )
         wide_dw2 = _grouped_dw2_tuning(
             max_expert_rows,
             hidden_size,
@@ -425,7 +450,7 @@ def _launch_grouped_dw2(
                 _grouped_dw2_stages(max_expert_rows),
                 0,
                 _E16_DW2_SMALL_TILE_MAX_ACTIVE_EXPERTS,
-                _E16_DW2_HOT_EXPERT_MIN_ROWS,
+                hot_profile_min_rows,
                 None,
                 True,
             ),
@@ -435,7 +460,7 @@ def _launch_grouped_dw2(
                 _E16_DW2_SMALL_TILE_MAX_ACTIVE_EXPERTS + 1,
                 None,
                 0,
-                _E16_DW2_HOT_EXPERT_MIN_ROWS - 1,
+                hot_profile_min_rows - 1,
                 False,
             ),
         )

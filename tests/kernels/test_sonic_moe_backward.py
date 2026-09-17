@@ -236,7 +236,15 @@ def test_e16_exact_dx_large_routes_use_full_logical_grid(routes, expected_grid):
     assert _e16_exact_dx_grid(2048, routes) == expected_grid
 
 
-def test_e16_dw2_dual_profile_dispatch_is_device_guarded(monkeypatch):
+@pytest.mark.parametrize(
+    ("max_expert_rows", "expected_hot_rows"),
+    ((8192, 1408), (16384, 2816), (65536, 11264)),
+)
+def test_e16_dw2_dual_profile_dispatch_is_device_guarded(
+    monkeypatch,
+    max_expert_rows,
+    expected_hot_rows,
+):
     calls = []
 
     def _tracked_grouped_tn(*args, **kwargs):
@@ -261,7 +269,7 @@ def test_e16_dw2_dual_profile_dispatch_is_device_guarded(monkeypatch):
         active_queue,
         use_hostless_grouped=True,
         use_tn_metadata_direct=False,
-        max_expert_rows=65536,
+        max_expert_rows=max_expert_rows,
         hidden_size=2048,
         intermediate_size=768,
         active_experts=16,
@@ -281,8 +289,8 @@ def test_e16_dw2_dual_profile_dispatch_is_device_guarded(monkeypatch):
         )
         for _, kwargs in calls
     ] == [
-        (128, 64, 0, 4, 16384, None, True),
-        (256, 256, 5, None, 0, 16383, False),
+        (128, 64, 0, 4, expected_hot_rows, None, True),
+        (256, 256, 5, None, 0, expected_hot_rows - 1, False),
     ]
 
 
