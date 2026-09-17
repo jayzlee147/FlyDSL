@@ -63,6 +63,7 @@ def compile_sonic_grouped_a16w16_nn(
     expert_m_reuse: bool = False,
     expert_m_reuse_threshold: int | None = None,
     exact_tile_queue: bool = False,
+    gather_a_rows: bool = False,
 ):
     """Compile a BF16 grouped NN GEMM with a device-derived M schedule.
 
@@ -98,6 +99,9 @@ def compile_sonic_grouped_a16w16_nn(
     ``[count, (expert, first_row, valid_rows) * capacity]`` ABI.  It allows an
     M tile wider than ``sorted_block_m`` and assigns every M/N tile pair its own
     logical work item instead of serializing an expert's M tiles in one CTA.
+    ``gather_a_rows=True`` keeps that schedule but sources each A row through
+    its packed sorter token ID.  This lets expert-major identity backward read
+    token-major ``grad_output`` directly without materializing a padded copy.
     """
 
     del device_index
@@ -119,6 +123,8 @@ def compile_sonic_grouped_a16w16_nn(
         raise ValueError("expert_m_reuse must be a bool")
     if not isinstance(exact_tile_queue, bool):
         raise ValueError("exact_tile_queue must be a bool")
+    if not isinstance(gather_a_rows, bool):
+        raise ValueError("gather_a_rows must be a bool")
     if expert_m_reuse_threshold is not None and (
         not isinstance(expert_m_reuse_threshold, int)
         or isinstance(expert_m_reuse_threshold, bool)
@@ -139,6 +145,8 @@ def compile_sonic_grouped_a16w16_nn(
         raise ValueError("exact_tile_queue and other queue schedules are mutually exclusive")
     if exact_tile_queue and not compact_grid:
         raise ValueError("exact_tile_queue requires compact_grid=True")
+    if gather_a_rows and not exact_tile_queue:
+        raise ValueError("gather_a_rows requires exact_tile_queue=True")
     if expert_m_reuse_threshold is not None and not compact_grid:
         raise ValueError("expert_m_reuse_threshold requires compact_grid=True")
     if expert_m_reuse_threshold is not None and not store_route_slots:
@@ -227,6 +235,7 @@ def compile_sonic_grouped_a16w16_nn(
         f"_amin{min_active_experts}_amax{max_active_experts}"
         f"_{'routeid' if store_route_ids else (f'routek{top_k}' if store_route_slots else 'sorted')}"
         f"{schedule_suffix}"
+        f"_gathera{int(gather_a_rows)}"
     )
 
     @fx.struct
@@ -346,15 +355,23 @@ def compile_sonic_grouped_a16w16_nn(
 
         def _run_tile(m_row, n_block, expert, valid_rows):
             n_col = n_block * fx.Int32(block_n)
-            a_addr = fx.Int64(arg_a) + fx.Int64(m_row) * fx.Int64(contraction_size * elem_bytes)
+            a_addr = fx.Int64(arg_a)
+            a_records_bytes = fx.Int64(i32_tokens) * fx.Int64(
+                contraction_size * elem_bytes
+            )
+            if const_expr(not gather_a_rows):
+                a_addr = a_addr + fx.Int64(m_row) * fx.Int64(
+                    contraction_size * elem_bytes
+                )
+                a_records_bytes = fx.Int64(valid_rows) * fx.Int64(
+                    contraction_size * elem_bytes
+                )
             b_addr = fx.Int64(arg_b) + fx.Int64(expert) * fx.Int64(
                 contraction_size * output_size * elem_bytes
             )
             a_rsrc = buffer_ops.create_buffer_resource_from_addr(
                 _raw(a_addr),
-                num_records_bytes=_raw(
-                    fx.Int64(valid_rows) * fx.Int64(contraction_size * elem_bytes)
-                ),
+                num_records_bytes=_raw(a_records_bytes),
             )
             b_rsrc = buffer_ops.create_buffer_resource_from_addr(
                 _raw(b_addr),
@@ -362,20 +379,85 @@ def compile_sonic_grouped_a16w16_nn(
             )
             frag_c.fill(0.0)
 
+            gathered_a_tokens = []
+            gathered_a_source_lanes = []
+            if const_expr(gather_a_rows):
+                gather_lane = tid % fx.Int32(GFX950_WAVE_SIZE)
+                for load_iter in range_constexpr(a_load_iters):
+                    global_tid = fx.Int32(a_load_threads * load_iter) + tid
+                    local_row = global_tid // fx.Int32(ldg_x_threads)
+                    row_valid = local_row < valid_rows
+                    safe_sorted_row = row_valid.select(
+                        m_row + local_row,
+                        m_row,
+                    )
+                    token_lane = fx.Int32(0)
+                    if gather_lane % fx.Int32(ldg_x_threads) == fx.Int32(0):
+                        packed = fx.Int32(
+                            _global_i32_at(arg_sorted_token_ids, safe_sorted_row)
+                        )
+                        token = packed & fx.Int32(0x00FFFFFF)
+                        token_lane = (row_valid & (token < i32_tokens)).select(
+                            token,
+                            i32_tokens,
+                        )
+                    gathered_a_tokens.append(token_lane)
+                    gathered_a_source_lanes.append(
+                        gather_lane - gather_lane % fx.Int32(ldg_x_threads)
+                    )
+
             def _load_a(k_tile, stage):
-                _async_load(
-                    smem_a + stage * block_m * block_k,
-                    a_rsrc,
-                    a_lds_layout,
-                    valid_rows,
-                    block_m,
-                    fx.Int32(0),
-                    contraction_size,
-                    a_load_threads,
-                    a_load_iters,
-                    False,
-                    k_tile,
-                )
+                if const_expr(gather_a_rows):
+                    lds_ptr = make_wave_lds_ptr(
+                        smem_a + stage * block_m * block_k,
+                        get_wave_lds_offset(tid, async_load_bytes),
+                    )
+                    for load_iter in range_constexpr(a_load_iters):
+                        global_tid = fx.Int32(a_load_threads * load_iter) + tid
+                        local_row = global_tid // fx.Int32(ldg_x_threads)
+                        k_local_idx = (
+                            global_tid % fx.Int32(ldg_x_threads)
+                        ) * fx.Int32(async_load_vec_size)
+                        global_k_idx = k_tile * fx.Int32(block_k) + swizzled_col_idx(
+                            local_row,
+                            k_local_idx,
+                            a_lds_layout,
+                            block_k,
+                        )
+                        token = fx.Int32(
+                            rocdl.ds_bpermute(
+                                T.i32,
+                                gathered_a_source_lanes[load_iter] * fx.Int32(4),
+                                gathered_a_tokens[load_iter],
+                            )
+                        )
+                        global_byte = (
+                            token * fx.Int32(contraction_size) + global_k_idx
+                        ) * fx.Int32(elem_bytes)
+                        buffer_load_lds_inline(
+                            a_rsrc,
+                            lds_ptr,
+                            global_byte,
+                            async_load_bytes,
+                        )
+                        if load_iter < a_load_iters - 1:
+                            lds_ptr = lds_ptr + fx.Int32(
+                                a_load_threads * async_load_bytes
+                            )
+                else:
+                    _async_load(
+                        smem_a + stage * block_m * block_k,
+                        a_rsrc,
+                        a_lds_layout,
+                        valid_rows,
+                        block_m,
+                        fx.Int32(0),
+                        contraction_size,
+                        a_load_threads,
+                        a_load_iters,
+                        False,
+                        k_tile,
+                    )
 
             def _load_b(k_tile, stage):
                 _async_load(
@@ -775,7 +857,7 @@ def compile_sonic_grouped_a16w16_nn(
                 stream=stream,
             )
 
-    elif store_route_slots or store_route_ids:
+    elif store_route_slots or store_route_ids or gather_a_rows:
 
         @flyc.jit
         def launch(

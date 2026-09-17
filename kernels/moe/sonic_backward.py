@@ -182,6 +182,9 @@ _E16_FLAT_GROUPED_MIN_ROUTES = 64
 _E16_EXACT_BM = 128
 _E16_EXACT_BK = 64
 _E16_EXACT_DA_BN = 192
+# Expert-major identity rows can be gathered by the exact dA GEMM itself,
+# avoiding a full unscaled grad-output copy before the contraction.
+_E16_DIRECT_DA_RHS_ENABLED = True
 # BN128 was 15% faster than the screenshot's BN256 tile in the balanced
 # single-contraction sweep and also exposes twice as much N parallelism for a
 # hot expert.  Both contractions share the same BM128 exact-tile queue.
@@ -1181,6 +1184,7 @@ def _compile_e16_exact_grouped_da(
     intermediate_size: int,
     num_experts: int,
     device_index: int,
+    gather_a_rows: bool = False,
 ):
     """Build Qwen3 E16's exact-queue ``dY @ W2`` contraction."""
 
@@ -1197,6 +1201,7 @@ def _compile_e16_exact_grouped_da(
         compact_grid=True,
         device_index=device_index,
         exact_tile_queue=True,
+        gather_a_rows=gather_a_rows,
     )
 
 
@@ -2344,17 +2349,20 @@ def _compile_fused_activation_derivative_dscore_scale_dy(
     flat_routes: bool = False,
     device_padded_rows: bool = False,
     materialize_activation: bool = False,
+    separate_dy_source: bool = False,
 ):
     """Fuse the post-dA row work for the BF16 SwiGLU state fast path.
 
     On entry ``da`` contains the unscaled, A16-materialized contraction
-    ``q = dout @ W2`` and ``dy`` contains the gathered, unscaled ``dout``.
+    ``q = dout @ W2`` and the dy source contains the unscaled ``dout``.
     Each workgroup owns a sorted route and performs three operations while the
     same row is resident:
 
     * multiply q by the FP32 route weight before applying the SwiGLU Jacobian;
     * reduce ``dot(q, activation)`` directly into route-order FP32 dscore;
-    * scale dy in place to restore the established A16 dW2 input contract.
+    * scale the dy source into ``dy`` to restore the established A16 dW2 input
+      contract.  Expert-major identity routes can read ``grad_output`` directly
+      and thereby skip the otherwise redundant pre-dA copy.
 
     A route is owned by exactly one workgroup, so dscore needs neither an
     initialization launch nor atomics.  This is intentionally separate from
@@ -2379,6 +2387,7 @@ def _compile_fused_activation_derivative_dscore_scale_dy(
         route_preactivation: fx.Tensor,
         activation: fx.Tensor,
         da: fx.Tensor,
+        dy_source: fx.Tensor,
         dy: fx.Tensor,
         dz: fx.Tensor,
         sorted_weights: fx.Tensor,
@@ -2396,6 +2405,12 @@ def _compile_fused_activation_derivative_dscore_scale_dy(
         activation_rsrc = buffer_ops.create_buffer_resource(activation, max_size=True)
         da_rsrc = buffer_ops.create_buffer_resource(da, max_size=True)
         dy_rsrc = buffer_ops.create_buffer_resource(dy, max_size=True)
+        dy_source_rsrc = dy_rsrc
+        if const_expr(separate_dy_source):
+            dy_source_rsrc = buffer_ops.create_buffer_resource(
+                dy_source,
+                max_size=True,
+            )
         dz_rsrc = buffer_ops.create_buffer_resource(dz, max_size=True)
         weights_rsrc = buffer_ops.create_buffer_resource(sorted_weights, max_size=True)
         ids_rsrc = buffer_ops.create_buffer_resource(sorted_token_ids, max_size=True)
@@ -2418,7 +2433,7 @@ def _compile_fused_activation_derivative_dscore_scale_dy(
                     result = result + gpu.shuffle_xor(result, offset, _WARP_SIZE)
             return result
 
-        def process_row(row, route_row):
+        def process_row(row, route_row, token):
             route_weight = fx.Float32(buffer_ops.buffer_load(weights_rsrc, row, vec_width=1, dtype=T.f32))
             thread_dot = zero_f32
             route_base = route_row * fx.Int32(projection_size)
@@ -2486,14 +2501,16 @@ def _compile_fused_activation_derivative_dscore_scale_dy(
                 # per scalar element.
                 dwords_per_row = hidden_size // 2
                 vectors_per_row = hidden_size // _DY_COPY_BF16_ELEMENTS
-                row_dword_base = row * fx.Int32(dwords_per_row)
+                source_row = token if separate_dy_source else row
+                source_dword_base = source_row * fx.Int32(dwords_per_row)
+                destination_dword_base = row * fx.Int32(dwords_per_row)
                 for base in range_constexpr(0, vectors_per_row, _BLOCK_THREADS):
                     vector_index = tid + fx.Int32(base)
                     if vector_index < fx.Int32(vectors_per_row):
                         dword_offset = vector_index * fx.Int32(_DY_COPY_DWORDS)
                         dout_raw = buffer_ops.buffer_load(
-                            dy_rsrc,
-                            row_dword_base + dword_offset,
+                            dy_source_rsrc,
+                            source_dword_base + dword_offset,
                             vec_width=_DY_COPY_DWORDS,
                             dtype=T.i32,
                         )
@@ -2505,23 +2522,25 @@ def _compile_fused_activation_derivative_dscore_scale_dy(
                         buffer_ops.buffer_store(
                             scaled_vector.bitcast(fx.Int32),
                             dy_rsrc,
-                            row_dword_base + dword_offset,
+                            destination_dword_base + dword_offset,
                         )
             else:
                 for base in range_constexpr(0, hidden_size, _BLOCK_THREADS):
                     column = tid + fx.Int32(base)
                     if column < fx.Int32(hidden_size):
-                        offset = row * fx.Int32(hidden_size) + column
+                        source_row = token if separate_dy_source else row
+                        source_offset = source_row * fx.Int32(hidden_size) + column
+                        destination_offset = row * fx.Int32(hidden_size) + column
                         dout_value = buffer_ops.buffer_load(
-                            dy_rsrc,
-                            offset,
+                            dy_source_rsrc,
+                            source_offset,
                             vec_width=1,
                             dtype=elem_dtype,
                         ).extf(T.f32)
                         buffer_ops.buffer_store(
                             fx.Float32(dout_value * route_weight).to(elem_dtype),
                             dy_rsrc,
-                            offset,
+                            destination_offset,
                         )
 
             reduced = wave_reduce_add(thread_dot)
@@ -2566,7 +2585,7 @@ def _compile_fused_activation_derivative_dscore_scale_dy(
                 route_row = token * fx.Int32(topk) + slot
                 route_valid = (token < i32_tokens) & (slot < fx.Int32(topk))
             if route_valid:
-                process_row(row, route_row)
+                process_row(row, route_row, token)
 
         if const_expr(device_padded_rows):
             padded_rows = fx.Int32(
@@ -2610,6 +2629,7 @@ def _compile_fused_activation_derivative_dscore_scale_dy(
         route_preactivation: fx.Tensor,
         activation: fx.Tensor,
         da: fx.Tensor,
+        dy_source: fx.Tensor,
         dy: fx.Tensor,
         dz: fx.Tensor,
         sorted_weights: fx.Tensor,
@@ -2626,6 +2646,7 @@ def _compile_fused_activation_derivative_dscore_scale_dy(
             route_preactivation,
             activation,
             da,
+            dy_source,
             dy,
             dz,
             sorted_weights,
@@ -4306,6 +4327,16 @@ def _sonic_moe_backward_impl(
         activation=activation_name,
         e16_flat_grouped=use_e16_flat_grouped,
     )
+    # Expert-major identity routes already have the same row order as
+    # grad_output.  Let grouped dA and the fused derivative read that tensor
+    # directly instead of first copying it bit-for-bit into ``dy``.
+    use_direct_grouped_da_rhs = (
+        _E16_DIRECT_DA_RHS_ENABLED
+        and use_flat_identity_dx
+        and use_fused_forward_state_prepare
+        and use_fused_da_dscore
+        and use_e16_exact_queue
+    )
     use_e16_hot_dw1_splitk = (
         _E16_DW1_SPLITK_ENABLED
         and use_e16_flat_grouped
@@ -4995,41 +5026,42 @@ def _sonic_moe_backward_impl(
             if int(stream.cuda_stream) != producer_stream:
                 stream.wait_event(ready_event)
             if use_fused_forward_state_prepare:
-                fused_prepare = _compile_fused_forward_state_prepare(
-                    hidden_size,
-                    intermediate_size,
-                    topk,
-                    interleaved_w1,
-                    device_index,
-                    state_schedule_block_m,
-                    use_fused_da_dscore,
-                    store_x_sorted=not use_direct_grouped_dw1_rhs,
-                    flat_routes=flat_routes,
-                    exact_tile_queue=state_schedule_exact_queue,
-                    defer_activation=use_e16_exact_queue,
-                )
-                assert state_row_schedule is not None
-                state_prepare_grid = min(
-                    hostless_row_grid_cap,
-                    max(1, state_schedule_bound * state_schedule_block_m),
-                )
-                _run_compiled(
-                    fused_prepare,
-                    x_arg,
-                    dout_arg,
-                    route_preactivation,
-                    x_arg if x_sorted is None else x_sorted,
-                    activation,
-                    dy,
-                    sorted_weights,
-                    sorted_token_ids,
-                    sorted_route_ids if sorted_route_ids is not None else sorted_token_ids,
-                    state_row_schedule,
-                    tokens,
-                    routes,
-                    state_prepare_grid,
-                    stream,
-                )
+                if not use_direct_grouped_da_rhs:
+                    fused_prepare = _compile_fused_forward_state_prepare(
+                        hidden_size,
+                        intermediate_size,
+                        topk,
+                        interleaved_w1,
+                        device_index,
+                        state_schedule_block_m,
+                        use_fused_da_dscore,
+                        store_x_sorted=not use_direct_grouped_dw1_rhs,
+                        flat_routes=flat_routes,
+                        exact_tile_queue=state_schedule_exact_queue,
+                        defer_activation=use_e16_exact_queue,
+                    )
+                    assert state_row_schedule is not None
+                    state_prepare_grid = min(
+                        hostless_row_grid_cap,
+                        max(1, state_schedule_bound * state_schedule_block_m),
+                    )
+                    _run_compiled(
+                        fused_prepare,
+                        x_arg,
+                        dout_arg,
+                        route_preactivation,
+                        x_arg if x_sorted is None else x_sorted,
+                        activation,
+                        dy,
+                        sorted_weights,
+                        sorted_token_ids,
+                        sorted_route_ids if sorted_route_ids is not None else sorted_token_ids,
+                        state_row_schedule,
+                        tokens,
+                        routes,
+                        state_prepare_grid,
+                        stream,
+                    )
             else:
                 assert preactivation is not None
                 assert dout_sorted is not None
@@ -5087,6 +5119,7 @@ def _sonic_moe_backward_impl(
                     intermediate_size,
                     num_experts,
                     device_index,
+                    gather_a_rows=use_direct_grouped_da_rhs,
                 )
                 grouped_da_grid = max(
                     1,
@@ -5096,14 +5129,27 @@ def _sonic_moe_backward_impl(
                         * (intermediate_size // _E16_EXACT_DA_BN),
                     ),
                 )
-                _run_compiled(
-                    grouped_da,
-                    dy.data_ptr(),
+                grouped_da_args = (
+                    (
+                        dout_arg.data_ptr()
+                        if use_direct_grouped_da_rhs
+                        else dy.data_ptr()
+                    ),
                     w2_arg.data_ptr(),
                     exact_tile_queue_storage.data_ptr(),
                     sorted_expert_ids.data_ptr(),
                     num_valid_ids.data_ptr(),
                     da.data_ptr(),
+                )
+                if use_direct_grouped_da_rhs:
+                    grouped_da_args = (
+                        *grouped_da_args,
+                        sorted_token_ids.data_ptr(),
+                        tokens,
+                    )
+                _run_compiled(
+                    grouped_da,
+                    *grouped_da_args,
                     int(grouped_da_grid),
                     stream,
                 )
@@ -5268,6 +5314,7 @@ def _sonic_moe_backward_impl(
                 flat_routes=flat_routes,
                 device_padded_rows=use_e16_deduplicated_metadata,
                 materialize_activation=use_e16_exact_queue,
+                separate_dy_source=use_direct_grouped_da_rhs,
             )
             assert state_row_schedule is not None
             derivative_schedule = (
@@ -5289,6 +5336,7 @@ def _sonic_moe_backward_impl(
                 route_preactivation,
                 activation,
                 da,
+                dout_arg if use_direct_grouped_da_rhs else dy,
                 dy,
                 dz,
                 sorted_weights,
