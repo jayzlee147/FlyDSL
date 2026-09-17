@@ -912,6 +912,10 @@ def test_e16_direct_grouped_dw1_rhs_retains_bn128_parallelism():
     ) == (128, 128, 32, 0, 2, 2)
 
 
+def test_e16_direct_dw1_narrow_profile_is_reserved_for_one_or_two_experts():
+    assert sonic_backward_module._E16_DW1_NARROW_MAX_ACTIVE_EXPERTS == 2
+
+
 @pytest.mark.parametrize(
     ("overrides", "expected"),
     (

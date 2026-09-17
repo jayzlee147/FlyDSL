@@ -225,11 +225,12 @@ _E16_DW2_SPLIT_BK = 64
 _E16_DW2_SPLIT_M_WAVES = 4
 _E16_DW2_SPLIT_N_WAVES = 4
 _E16_DW2_SPLIT_STAGES = 2
-# Direct token-major dW1 is limited by output-tile parallelism when only a few
-# experts are live.  BN64 doubles its N grid and wins for one-to-four experts;
-# balanced routing retains BN128.  Both profiles consume the same device queue
-# and use disjoint guards, so this selection never reads the count on the host.
-_E16_DW1_NARROW_MAX_ACTIVE_EXPERTS = 4
+# Direct token-major dW1 is limited by output-tile parallelism when only one or
+# two experts are live.  BN64 doubles its N grid for those sparse shards, while
+# three or more active experts provide enough work for the more efficient
+# BN128 profile.  Both profiles consume the same device queue and use disjoint
+# guards, so this selection never reads the count on the host.
+_E16_DW1_NARROW_MAX_ACTIVE_EXPERTS = 2
 _E16_DW1_SPLITK_ENABLED = True
 # Keep split-queue setup off the latency-sensitive <=16K route buckets even
 # when the per-expert crossover is tuned below that host-known route count.
