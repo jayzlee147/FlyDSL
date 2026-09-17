@@ -199,6 +199,53 @@ def test_e16_flat_grouped_backward_enables_hostless_dispatch():
     )
 
 
+def test_e16_dw2_dual_profile_dispatch_is_device_guarded(monkeypatch):
+    calls = []
+
+    def _tracked_grouped_tn(*args, **kwargs):
+        calls.append((args[3], kwargs))
+        return args[4]
+
+    monkeypatch.setattr(
+        sonic_backward_module,
+        "grouped_tn_from_queue_flydsl",
+        _tracked_grouped_tn,
+    )
+    frequency = torch.zeros(16, dtype=torch.int32)
+    active_queue = torch.zeros(33, dtype=torch.int32)
+    output = torch.empty(1, dtype=torch.bfloat16)
+    sonic_backward_module._launch_grouped_dw2(
+        torch.empty((0, 2048), dtype=torch.bfloat16),
+        torch.empty((0, 768), dtype=torch.bfloat16),
+        frequency,
+        torch.empty(0, dtype=torch.int32),
+        torch.empty(2, dtype=torch.int32),
+        output,
+        active_queue,
+        use_hostless_grouped=True,
+        use_tn_metadata_direct=False,
+        max_expert_rows=65536,
+        hidden_size=2048,
+        intermediate_size=768,
+        active_experts=16,
+        stream=None,
+    )
+
+    assert all(queue is active_queue for queue, _ in calls)
+    assert [
+        (
+            kwargs["block_m"],
+            kwargs["block_n"],
+            kwargs["min_active_experts"],
+            kwargs["max_active_experts"],
+        )
+        for _, kwargs in calls
+    ] == [
+        (128, 128, 0, 4),
+        (256, 256, 5, None),
+    ]
+
+
 @pytest.mark.parametrize(
     (
         "e16_flat_grouped",

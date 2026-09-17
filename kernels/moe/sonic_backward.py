@@ -185,6 +185,12 @@ _E16_EXACT_DA_BN = 192
 _E16_EXACT_DX_BN = 128
 _E16_EXACT_N_WAVES = 4
 _E16_FLAT_SEGMENTED_DX_GRID_CAP = 1024
+# A hot E16 shard exposes only 24 output tiles with the default 256x256 dW2
+# profile.  The 128x128 profile raises that to 96 tiles and is materially
+# faster for one/few active experts, while the wider tile remains better for a
+# balanced shard.  Select entirely from the device-resident active queue count
+# so dynamic routing never synchronizes to the host.
+_E16_DW2_SMALL_TILE_MAX_ACTIVE_EXPERTS = 4
 
 _RoutesSorterMetadata = tuple[
     torch.Tensor,  # sorted_token_ids
@@ -331,6 +337,38 @@ def _launch_grouped_dw2(
     """Launch the tuned grouped dW2 profiles after dy becomes available."""
 
     if (
+        use_hostless_grouped
+        and not use_tn_metadata_direct
+        and int(expert_frequency.numel()) == 16
+        and hidden_size == 2048
+        and intermediate_size == 768
+    ):
+        wide_dw2 = _grouped_dw2_tuning(
+            max_expert_rows,
+            hidden_size,
+            intermediate_size,
+            active_experts=16,
+        )
+        grouped_dw2_profiles = (
+            (
+                128,
+                128,
+                _GROUPED_DW2_BK,
+                0,
+                2,
+                2,
+                _grouped_dw2_stages(max_expert_rows),
+                0,
+                _E16_DW2_SMALL_TILE_MAX_ACTIVE_EXPERTS,
+            ),
+            (
+                *wide_dw2,
+                _grouped_dw2_stages(max_expert_rows),
+                _E16_DW2_SMALL_TILE_MAX_ACTIVE_EXPERTS + 1,
+                None,
+            ),
+        )
+    elif (
         use_hostless_grouped
         and not use_tn_metadata_direct
         and int(expert_frequency.numel()) <= _GROUPED_DW2_SPARSE_EXPERTS
