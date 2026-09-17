@@ -187,6 +187,7 @@ _E16_EXACT_DA_BN = 192
 # hot expert.  Both contractions share the same BM128 exact-tile queue.
 _E16_EXACT_DX_BN = 128
 _E16_EXACT_N_WAVES = 4
+_E16_EXACT_DX_FULL_GRID_MIN_ROUTES = 65536
 _E16_FLAT_SEGMENTED_DX_GRID_CAP = 1024
 # A hot E16 shard exposes only 24 output tiles with the default 256x256 dW2
 # profile.  The 128x128 profile raises that to 96 tiles and is materially
@@ -639,6 +640,14 @@ _LARGE_GROUPED_DX_SHAPES = frozenset(
 # in which every contraction and row transform already consumes a device queue
 # or device-resident extent.
 _HOSTLESS_LARGE_STATE_SHAPES = frozenset({(4096, 3584, 512, 896, 16)})
+
+
+def _e16_exact_dx_grid(logical_grid: int, routes: int) -> int:
+    """Return the E16 exact dX launch size for a host-known route count."""
+
+    if routes >= _E16_EXACT_DX_FULL_GRID_MIN_ROUTES:
+        return logical_grid
+    return min(_GROUPED_DX_GRID_CAP, logical_grid)
 
 
 def _grouped_da_hostless_profiles(
@@ -5610,12 +5619,14 @@ def _sonic_moe_backward_impl(
                     profile_m_tiles = grouped_dx_m_tiles
                     profile_schedule = grouped_dx_schedule
                     profile_eids = sorted_expert_ids
+                grouped_dx_logical_grid = profile_m_tiles * (
+                    hidden_size // grouped_dx_bn
+                )
                 grouped_dx_grid = max(
                     1,
-                    min(
-                        _GROUPED_DX_GRID_CAP,
-                        profile_m_tiles * (hidden_size // grouped_dx_bn),
-                    ),
+                    _e16_exact_dx_grid(grouped_dx_logical_grid, routes)
+                    if use_e16_exact_queue
+                    else min(_GROUPED_DX_GRID_CAP, grouped_dx_logical_grid),
                 )
                 _run_compiled(
                     grouped_dx,

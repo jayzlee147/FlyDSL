@@ -25,6 +25,7 @@ from kernels.moe.sonic import (
 )
 from kernels.moe.sonic_backward import (
     _compile_flat_segmented_dx_reduction,
+    _e16_exact_dx_grid,
     _grouped_da_hostless_profiles,
     _grouped_da_tuning,
     _grouped_dw1_tuning,
@@ -197,6 +198,14 @@ def test_e16_flat_grouped_backward_enables_hostless_dispatch():
         use_grouped_dx=True,
         e16_flat_grouped=True,
     )
+
+
+@pytest.mark.parametrize(
+    ("routes", "expected_grid"),
+    ((65535, 1024), (65536, 2048), (134000, 2048)),
+)
+def test_e16_exact_dx_large_routes_use_full_logical_grid(routes, expected_grid):
+    assert _e16_exact_dx_grid(2048, routes) == expected_grid
 
 
 def test_e16_dw2_dual_profile_dispatch_is_device_guarded(monkeypatch):
