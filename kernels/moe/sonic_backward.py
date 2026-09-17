@@ -1884,6 +1884,7 @@ def _compile_fused_forward_state_prepare(
     store_x_sorted: bool = True,
     flat_routes: bool = False,
     exact_tile_queue: bool = False,
+    defer_activation: bool = False,
 ):
     """Gather the exact live rows and prepare retained-state backward inputs.
 
@@ -2031,30 +2032,31 @@ def _compile_fused_forward_state_prepare(
                                 destination,
                             )
 
-                route_base = route_row * fx.Int32(projection_size)
-                activation_base = row * fx.Int32(intermediate_size)
-                for base in range_constexpr(0, intermediate_size, _BLOCK_THREADS):
-                    column = tid + fx.Int32(base)
-                    if column < fx.Int32(intermediate_size):
-                        relative_gate = column * fx.Int32(projection_column_stride)
-                        gate = buffer_ops.buffer_load(
-                            route_preact_rsrc,
-                            route_base + relative_gate,
-                            vec_width=1,
-                            dtype=elem_dtype,
-                        ).extf(T.f32)
-                        up = buffer_ops.buffer_load(
-                            route_preact_rsrc,
-                            route_base + relative_gate + fx.Int32(up_column_offset),
-                            vec_width=1,
-                            dtype=elem_dtype,
-                        ).extf(T.f32)
-                        activation_f32 = _activation_f32(gate, up, "swiglu")
-                        buffer_ops.buffer_store(
-                            fx.Float32(activation_f32).to(elem_dtype),
-                            activation_rsrc,
-                            activation_base + column,
-                        )
+                if const_expr(not defer_activation):
+                    route_base = route_row * fx.Int32(projection_size)
+                    activation_base = row * fx.Int32(intermediate_size)
+                    for base in range_constexpr(0, intermediate_size, _BLOCK_THREADS):
+                        column = tid + fx.Int32(base)
+                        if column < fx.Int32(intermediate_size):
+                            relative_gate = column * fx.Int32(projection_column_stride)
+                            gate = buffer_ops.buffer_load(
+                                route_preact_rsrc,
+                                route_base + relative_gate,
+                                vec_width=1,
+                                dtype=elem_dtype,
+                            ).extf(T.f32)
+                            up = buffer_ops.buffer_load(
+                                route_preact_rsrc,
+                                route_base + relative_gate + fx.Int32(up_column_offset),
+                                vec_width=1,
+                                dtype=elem_dtype,
+                            ).extf(T.f32)
+                            activation_f32 = _activation_f32(gate, up, "swiglu")
+                            buffer_ops.buffer_store(
+                                fx.Float32(activation_f32).to(elem_dtype),
+                                activation_rsrc,
+                                activation_base + column,
+                            )
 
         schedule_rsrc = buffer_ops.create_buffer_resource(schedule, max_size=True)
         total_tiles = fx.Int32(
@@ -2249,6 +2251,7 @@ def _compile_fused_activation_derivative_dscore_scale_dy(
     schedule_block_m: int = _COMPACT_W1_BM,
     flat_routes: bool = False,
     device_padded_rows: bool = False,
+    materialize_activation: bool = False,
 ):
     """Fuse the post-dA row work for the BF16 SwiGLU state fast path.
 
@@ -2347,20 +2350,36 @@ def _compile_fused_activation_derivative_dscore_scale_dy(
                         vec_width=1,
                         dtype=elem_dtype,
                     ).extf(T.f32)
-                    activation_value = buffer_ops.buffer_load(
-                        activation_rsrc,
-                        act_offset,
-                        vec_width=1,
-                        dtype=elem_dtype,
-                    ).extf(T.f32)
                     q = buffer_ops.buffer_load(da_rsrc, act_offset, vec_width=1, dtype=elem_dtype).extf(T.f32)
+                    if const_expr(materialize_activation):
+                        sigmoid = _sigmoid_f32(gate)
+                        one = fx.Float32(1.0)
+                        activated_gate = gate * sigmoid
+                        derivative = sigmoid * (one + gate * (one - sigmoid))
+                        activation_bf16 = fx.Float32(activated_gate * up).to(elem_dtype)
+                        buffer_ops.buffer_store(
+                            activation_bf16,
+                            activation_rsrc,
+                            act_offset,
+                        )
+                        activation_value = fx.Float32(activation_bf16)
+                        scaled_q = q * route_weight
+                        dz_gate = scaled_q * up * derivative
+                        dz_up = scaled_q * activated_gate
+                    else:
+                        activation_value = buffer_ops.buffer_load(
+                            activation_rsrc,
+                            act_offset,
+                            vec_width=1,
+                            dtype=elem_dtype,
+                        ).extf(T.f32)
+                        dz_gate, dz_up = _activation_backward_f32(
+                            gate,
+                            up,
+                            q * route_weight,
+                            "swiglu",
+                        )
                     thread_dot = thread_dot + q * activation_value
-                    dz_gate, dz_up = _activation_backward_f32(
-                        gate,
-                        up,
-                        q * route_weight,
-                        "swiglu",
-                    )
                     buffer_ops.buffer_store(fx.Float32(dz_gate).to(elem_dtype), dz_rsrc, sorted_gate_offset)
                     buffer_ops.buffer_store(
                         fx.Float32(dz_up).to(elem_dtype),
@@ -4817,6 +4836,7 @@ def _sonic_moe_backward_impl(
                     store_x_sorted=not use_direct_grouped_dw1_rhs,
                     flat_routes=flat_routes,
                     exact_tile_queue=state_schedule_exact_queue,
+                    defer_activation=use_e16_exact_queue,
                 )
                 assert state_row_schedule is not None
                 state_prepare_grid = min(
@@ -5072,6 +5092,7 @@ def _sonic_moe_backward_impl(
                 state_schedule_block_m,
                 flat_routes=flat_routes,
                 device_padded_rows=use_e16_deduplicated_metadata,
+                materialize_activation=use_e16_exact_queue,
             )
             assert state_row_schedule is not None
             derivative_schedule = (
