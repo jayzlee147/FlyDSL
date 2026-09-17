@@ -35,8 +35,11 @@ from kernels.moe.sonic_backward import (
     _grouped_dx_tuning,
     _grouped_w1_tuning,
     _hostless_row_grid_cap,
+    _is_current_stream_capturing_conservatively,
+    _launch_overlapped_e16_dw1_dx,
     _use_direct_grouped_dw1_rhs,
     _use_direct_grouped_dx_routes,
+    _use_e16_dw_dx_overlap,
     _use_e16_fixed_state_grouped_backward,
     _use_e16_flat_grouped_backward,
     _use_e16_flat_segmented_dx,
@@ -226,6 +229,158 @@ def test_e16_flat_grouped_backward_enables_hostless_dispatch():
         use_grouped_dx=True,
         e16_flat_grouped=True,
     )
+
+
+@pytest.mark.parametrize(
+    ("overrides", "expected"),
+    (
+        ({}, True),
+        ({"routes": 65535}, False),
+        ({"e16_flat_grouped": False}, False),
+        ({"reuse_forward_preactivation": False}, False),
+        ({"flat_identity_dx": False}, False),
+        ({"use_grouped_dw1": False}, False),
+        ({"use_grouped_dx": False}, False),
+    ),
+)
+def test_e16_dw_dx_overlap_policy_is_large_expert_major_only(overrides, expected):
+    kwargs = {
+        "e16_flat_grouped": True,
+        "reuse_forward_preactivation": True,
+        "flat_identity_dx": True,
+        "use_grouped_dw1": True,
+        "use_grouped_dx": True,
+        "routes": 65536,
+    }
+    kwargs.update(overrides)
+    assert _use_e16_dw_dx_overlap(**kwargs) is expected
+
+
+def test_e16_dw_dx_overlap_global_kill_switch(monkeypatch):
+    monkeypatch.setattr(
+        sonic_backward_module,
+        "_E16_DW_DX_OVERLAP_ENABLED",
+        False,
+    )
+    assert not _use_e16_dw_dx_overlap(
+        e16_flat_grouped=True,
+        reuse_forward_preactivation=True,
+        flat_identity_dx=True,
+        use_grouped_dw1=True,
+        use_grouped_dx=True,
+        routes=65536,
+    )
+
+
+def test_e16_dw_dx_overlap_fork_join_and_allocator_lifetime(monkeypatch):
+    operations = []
+
+    class FakeStream:
+        def __init__(self, name):
+            self.name = name
+
+        def wait_event(self, event):
+            operations.append((self.name, "wait_event", event.name))
+
+        def wait_stream(self, stream):
+            operations.append((self.name, "wait_stream", stream.name))
+
+    class FakeEvent:
+        def __init__(self, name):
+            self.name = name
+
+        def record(self, stream):
+            operations.append((self.name, "record", stream.name))
+
+    class FakeTensor:
+        def __init__(self, name):
+            self.name = name
+
+        def record_stream(self, stream):
+            operations.append((self.name, "record_stream", stream.name))
+
+    main = FakeStream("main")
+    auxiliary = FakeStream("aux")
+    events = iter((FakeEvent("fork"), FakeEvent("done")))
+    monkeypatch.setattr(
+        sonic_backward_module,
+        "_e16_dx_auxiliary_stream",
+        lambda _device_index: auxiliary,
+    )
+    monkeypatch.setattr(torch.cuda, "Event", lambda: next(events))
+
+    _launch_overlapped_e16_dw1_dx(
+        lambda stream: operations.append(("dw1", stream.name)),
+        lambda stream: operations.append(("dx", stream.name)),
+        (FakeTensor("dz"), None, FakeTensor("dx")),
+        stream=main,
+        device_index=0,
+    )
+
+    assert operations == [
+        ("fork", "record", "main"),
+        ("aux", "wait_event", "fork"),
+        ("dz", "record_stream", "aux"),
+        ("dx", "record_stream", "aux"),
+        ("dx", "aux"),
+        ("done", "record", "aux"),
+        ("dw1", "main"),
+        ("main", "wait_event", "done"),
+    ]
+
+
+def test_e16_dw_dx_overlap_joins_partial_auxiliary_launch_on_error(monkeypatch):
+    operations = []
+
+    class FakeStream:
+        def __init__(self, name):
+            self.name = name
+
+        def wait_event(self, _event):
+            operations.append((self.name, "wait_event"))
+
+        def wait_stream(self, stream):
+            operations.append((self.name, "wait_stream", stream.name))
+
+    class FakeEvent:
+        def record(self, stream):
+            operations.append(("event", "record", stream.name))
+
+    main = FakeStream("main")
+    auxiliary = FakeStream("aux")
+    monkeypatch.setattr(
+        sonic_backward_module,
+        "_e16_dx_auxiliary_stream",
+        lambda _device_index: auxiliary,
+    )
+    monkeypatch.setattr(torch.cuda, "Event", FakeEvent)
+
+    def _failing_dx(stream):
+        operations.append(("dx", stream.name))
+        raise RuntimeError("launch validation failed")
+
+    with pytest.raises(RuntimeError, match="launch validation failed"):
+        _launch_overlapped_e16_dw1_dx(
+            lambda stream: operations.append(("dw1", stream.name)),
+            _failing_dx,
+            (),
+            stream=main,
+            device_index=0,
+        )
+
+    assert operations[-1] == ("main", "wait_stream", "aux")
+    assert not any(operation[0] == "dw1" for operation in operations)
+
+
+@pytest.mark.parametrize("capture_result", (True, RuntimeError("query failed")))
+def test_e16_dw_dx_capture_query_is_conservative(monkeypatch, capture_result):
+    def _query():
+        if isinstance(capture_result, Exception):
+            raise capture_result
+        return capture_result
+
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", _query)
+    assert _is_current_stream_capturing_conservatively()
 
 
 @pytest.mark.parametrize(

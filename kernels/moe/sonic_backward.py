@@ -26,6 +26,7 @@ host-dispatched fallback.
 
 import functools
 import math
+from collections.abc import Callable
 from typing import TYPE_CHECKING
 
 import torch
@@ -244,6 +245,11 @@ _E16_DW1_SPLIT_BK = 32
 _E16_DW1_SPLIT_M_WAVES = 2
 _E16_DW1_SPLIT_N_WAVES = 4
 _E16_DW1_SPLIT_STAGES = 2
+# dW1 and dX are independent after the retained-state derivative has produced
+# dZ.  Large expert-major shards can overlap them profitably; smaller shards
+# keep the serial path because the two-event fork/join cost is not amortized.
+_E16_DW_DX_OVERLAP_ENABLED = True
+_E16_DW_DX_OVERLAP_MIN_ROUTES = 65536
 
 _RoutesSorterMetadata = tuple[
     torch.Tensor,  # sorted_token_ids
@@ -265,6 +271,28 @@ def _use_e16_dw1_dual_profile(
     """Select device-guarded narrow/dense direct-dW1 profiles."""
 
     return direct_rhs and e16_flat_grouped and not metadata_direct
+
+
+def _use_e16_dw_dx_overlap(
+    *,
+    e16_flat_grouped: bool,
+    reuse_forward_preactivation: bool,
+    flat_identity_dx: bool,
+    use_grouped_dw1: bool,
+    use_grouped_dx: bool,
+    routes: int,
+) -> bool:
+    """Select the audited large-route dW1/dX stream overlap."""
+
+    return (
+        _E16_DW_DX_OVERLAP_ENABLED
+        and e16_flat_grouped
+        and reuse_forward_preactivation
+        and flat_identity_dx
+        and use_grouped_dw1
+        and use_grouped_dx
+        and routes >= _E16_DW_DX_OVERLAP_MIN_ROUTES
+    )
 
 
 def _use_e16_fixed_state_grouped_backward(
@@ -4108,6 +4136,66 @@ def _ptr(tensor: torch.Tensor):
     return flyc.from_c_void_p(fx.Uint8, tensor.data_ptr())
 
 
+def _is_current_stream_capturing_conservatively() -> bool:
+    """Disable auxiliary launches when capture state cannot be proven safe."""
+
+    try:
+        return bool(torch.cuda.is_current_stream_capturing())
+    except RuntimeError:
+        return True
+
+
+@functools.lru_cache(maxsize=None)
+def _e16_dx_auxiliary_stream(device_index: int) -> torch.cuda.Stream:
+    """Return the process-local high-priority stream for large E16 dX."""
+
+    with torch.cuda.device(device_index):
+        return torch.cuda.Stream(device=device_index, priority=-1)
+
+
+def _record_optional_tensors_on_stream(
+    stream: torch.cuda.Stream,
+    *tensors: torch.Tensor | None,
+) -> None:
+    """Extend allocator ownership for tensors consumed by an auxiliary stream."""
+
+    for tensor in tensors:
+        if tensor is not None:
+            tensor.record_stream(stream)
+
+
+def _launch_overlapped_e16_dw1_dx(
+    launch_dw1: Callable[[torch.cuda.Stream], None],
+    launch_dx: Callable[[torch.cuda.Stream], None],
+    auxiliary_tensors: tuple[torch.Tensor | None, ...],
+    *,
+    stream: torch.cuda.Stream,
+    device_index: int,
+) -> None:
+    """Fork dX to an auxiliary stream, run dW1, then join on ``stream``."""
+
+    auxiliary_stream = _e16_dx_auxiliary_stream(device_index)
+    fork_event = torch.cuda.Event()
+    done_event = torch.cuda.Event()
+    fork_event.record(stream)
+    auxiliary_stream.wait_event(fork_event)
+    _record_optional_tensors_on_stream(auxiliary_stream, *auxiliary_tensors)
+    done_recorded = False
+    try:
+        launch_dx(auxiliary_stream)
+        done_event.record(auxiliary_stream)
+        done_recorded = True
+        launch_dw1(stream)
+    finally:
+        if done_recorded:
+            stream.wait_event(done_event)
+        else:
+            # If host-side launch validation raised after enqueuing any dX
+            # work, still restore current-stream completion semantics before
+            # propagating the error.
+            stream.wait_stream(auxiliary_stream)
+
+
 def _sonic_moe_backward_impl(
     hidden_states: torch.Tensor,
     w1: torch.Tensor,
@@ -5450,7 +5538,9 @@ def _sonic_moe_backward_impl(
                 stream,
             )
 
-        if use_grouped_dw1:
+        def _launch_selected_grouped_dw1(
+            launch_stream: torch.cuda.Stream,
+        ) -> None:
             grouped_dw1_rhs = x_arg if use_direct_grouped_dw1_rhs else x_sorted
             assert grouped_dw1_rhs is not None
             grouped_dw1_active_storage = active_expert_storage
@@ -5528,7 +5618,7 @@ def _sonic_moe_backward_impl(
                     "k_padding": profile_k_padding,
                     "m_waves": profile_m_waves,
                     "n_waves": profile_n_waves,
-                    "stream": stream,
+                    "stream": launch_stream,
                 }
                 if use_e16_hot_dw1_splitk:
                     grouped_dw1_kwargs["max_expert_rows"] = (
@@ -5584,17 +5674,19 @@ def _sonic_moe_backward_impl(
                     m_waves=_E16_DW1_SPLIT_M_WAVES,
                     n_waves=_E16_DW1_SPLIT_N_WAVES,
                     stages=_E16_DW1_SPLIT_STAGES,
-                    stream=stream,
+                    stream=launch_stream,
                 )
                 finalize_hot_splitk_flydsl(
                     hot_split_storage,
                     hot_expert_storage,
                     hot_dw1_partials,
                     dw1,
-                    stream=stream,
+                    stream=launch_stream,
                 )
 
-        if use_grouped_dx:
+        def _launch_selected_grouped_dx(
+            launch_stream: torch.cuda.Stream,
+        ) -> None:
             # Compact queues round real expert rows to their selected BM.
             # Every scheduled tail stays inside the sorter's 64-row padding,
             # and the fixed-K route epilogue ignores non-sentinel rows.  Ragged
@@ -5760,8 +5852,47 @@ def _sonic_moe_backward_impl(
                         )
                     ),
                     grouped_dx_grid,
-                    stream,
+                    launch_stream,
                 )
+
+        use_e16_dw_dx_overlap = _use_e16_dw_dx_overlap(
+            e16_flat_grouped=use_e16_flat_grouped,
+            reuse_forward_preactivation=reuse_forward_preactivation,
+            flat_identity_dx=use_flat_identity_dx,
+            use_grouped_dw1=use_grouped_dw1,
+            use_grouped_dx=use_grouped_dx,
+            routes=routes,
+        )
+        if (
+            use_e16_dw_dx_overlap
+            and not _is_current_stream_capturing_conservatively()
+        ):
+            _launch_overlapped_e16_dw1_dx(
+                _launch_selected_grouped_dw1,
+                _launch_selected_grouped_dx,
+                (
+                    dz,
+                    w1_arg,
+                    exact_tile_queue_storage,
+                    large_dx_storage,
+                    compact_w1_storage,
+                    sorted_expert_ids,
+                    expert_frequency,
+                    num_valid_ids,
+                    active_expert_storage,
+                    sorted_token_ids,
+                    sorted_route_ids,
+                    dx_routes,
+                    dx_sorted,
+                ),
+                stream=stream,
+                device_index=device_index,
+            )
+        else:
+            if use_grouped_dw1:
+                _launch_selected_grouped_dw1(stream)
+            if use_grouped_dx:
+                _launch_selected_grouped_dx(stream)
 
         # Each expert owns a disjoint output slice, so no atomics or
         # cross-expert reductions are needed for dW1 or routed dX.
