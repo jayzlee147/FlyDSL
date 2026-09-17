@@ -14,7 +14,11 @@ import pytest
 import torch
 
 from flydsl.runtime.device import get_rocm_arch
-from kernels.moe.moe_2stage_a16wmix.gemm1 import compile_gemm1_a16w4_port
+from kernels.moe import sonic as sonic_module
+from kernels.moe.moe_2stage_a16wmix.gemm1 import (
+    _get_gemm1_composition_hook,
+    compile_gemm1_a16w4_port,
+)
 from kernels.moe.sonic import (
     SonicMoE,
     SonicMoEConfig,
@@ -23,6 +27,7 @@ from kernels.moe.sonic import (
     SonicMoERoutesForwardState,
     SonicMoEWeights,
     SonicMoEWorkspace,
+    _get_e16_metadata_stage1_master_launcher,
     _get_stage1_launcher,
     _get_stage1_training_launcher,
     _get_stage2_launcher,
@@ -165,6 +170,55 @@ def _assert_close(actual, expected):
     assert actual.dtype == expected.dtype
     assert actual.device == expected.device
     torch.testing.assert_close(actual.float(), expected.float(), rtol=3e-2, atol=5e-2)
+
+
+def _make_e16_identity_route_case(routes, counts, *, seed):
+    """Build a small-GEMM E16 case which still exercises production metadata."""
+
+    assert len(counts) == 16 and sum(counts) == routes
+    device = _gfx950_device()
+    generator = torch.Generator(device=device).manual_seed(seed)
+    hidden = torch.randn(
+        (routes, HIDDEN_SIZE),
+        device=device,
+        dtype=torch.bfloat16,
+        generator=generator,
+    )
+    token_indices = torch.arange(routes, dtype=torch.int32, device=device)
+    expert_indices = torch.repeat_interleave(
+        torch.arange(16, dtype=torch.int32, device=device),
+        torch.tensor(counts, dtype=torch.int64, device=device),
+    ).contiguous()
+    offsets = [0]
+    for count in counts:
+        offsets.append(offsets[-1] + count)
+    expert_offsets = torch.tensor(offsets, dtype=torch.int32, device=device)
+    route_weights = torch.linspace(
+        0.25,
+        1.0,
+        routes,
+        dtype=torch.float32,
+        device=device,
+    )
+    return hidden, token_indices, expert_indices, route_weights, expert_offsets
+
+
+def _make_e16_weights(config, *, seed):
+    device = _gfx950_device()
+    generator = torch.Generator(device=device).manual_seed(seed)
+    w1 = torch.randn(
+        (16, 2 * INTERMEDIATE_SIZE, HIDDEN_SIZE),
+        device=device,
+        dtype=torch.bfloat16,
+        generator=generator,
+    )
+    w2 = torch.randn(
+        (16, HIDDEN_SIZE, INTERMEDIATE_SIZE),
+        device=device,
+        dtype=torch.bfloat16,
+        generator=generator,
+    )
+    return prepare_sonic_bf16_weights(w1, w2, config)
 
 
 def _prepare_dense_weights(w1, w2, config, *, b1=None, b2=None):
@@ -1078,6 +1132,34 @@ def test_sonic_moe_training_stage1_launcher_accepts_private_overrides(monkeypatc
         _get_stage1_training_launcher.cache_clear()
 
 
+def test_sonic_moe_training_stage1_composition_hook_has_stable_signature():
+    config = _config()
+    launcher = _get_stage1_training_launcher(config, 0, False, False, 0)
+    kernel, waves_per_eu = _get_gemm1_composition_hook(launcher)
+    assert waves_per_eu == config.waves_per_eu
+    assert tuple(kernel._sig.parameters) == (
+        "arg_x",
+        "arg_bq",
+        "arg_bscale",
+        "arg_bias",
+        "arg_eids",
+        "arg_cumsum",
+        "arg_mind",
+        "i32_ntok",
+        "f32_situ_beta",
+        "f32_situ_beta_rcp",
+        "f32_situ_linbeta",
+        "f32_situ_linbeta_rcp",
+        "f32_swiglu_limit",
+        "arg_out",
+        "arg_route_preactivation",
+        "arg_sorted_route_ids",
+        "i32_nroutes",
+    )
+    with pytest.raises(ValueError, match="does not expose"):
+        _get_gemm1_composition_hook(lambda: None)
+
+
 def test_sonic_moe_training_stage1_private_override_is_numerically_exact(monkeypatch):
     import kernels.moe.sonic as sonic_module
 
@@ -1957,6 +2039,179 @@ def test_sonic_moe_expert_major_identity_routes_match_generic_and_reuse_capacity
     assert first_capacity.output is None
     assert actual.untyped_storage().data_ptr() != later.untyped_storage().data_ptr()
     _assert_close(actual, expected)
+
+
+@pytest.mark.parametrize("shared", (False, True), ids=("private", "shared"))
+def test_sonic_moe_e16_master_matches_fallback_across_dynamic_routes(
+    monkeypatch,
+    shared,
+):
+    """Dynamic route counts neither specialize correctness nor cache exact grids."""
+
+    config = _config(
+        num_experts=16,
+        top_k=1,
+        stage1_write_padded_rows=True,
+        stage1_lds_swizzle=True,
+    )
+    prepared = _make_e16_weights(config, seed=20260917)
+    reference = SonicMoE(config, prepared)
+    pool = SonicMoEDynamicWorkspacePool() if shared else None
+    candidate = SonicMoE(
+        config,
+        prepared,
+        shared_dynamic_workspace_pool=pool,
+    )
+    original_launch = SonicMoE._launch_e16_identity_metadata_and_stage1
+    observed = []
+    _get_e16_metadata_stage1_master_launcher.cache_clear()
+
+    def tracked_launch(operator, *args, **kwargs):
+        launched = original_launch(operator, *args, **kwargs)
+        observed.append((operator, int(args[1].routes), launched))
+        return launched
+
+    monkeypatch.setattr(
+        SonicMoE,
+        "_launch_e16_identity_metadata_and_stage1",
+        tracked_launch,
+    )
+    for case_index, (routes, active_experts) in enumerate(
+        ((257, 16), (4097, 4), (129, 16), (1024, 4))
+    ):
+        quotient, remainder = divmod(routes, active_experts)
+        counts = [
+            quotient + (expert < remainder) for expert in range(active_experts)
+        ] + [0] * (16 - active_experts)
+        args = _make_e16_identity_route_case(
+            routes,
+            counts,
+            seed=20261000 + case_index,
+        )
+        hidden, token_indices, expert_indices, route_weights, expert_offsets = args
+        expected_frequency = torch.empty(16, dtype=torch.int32, device=hidden.device)
+        actual_frequency = torch.empty_like(expected_frequency)
+
+        monkeypatch.setattr(sonic_module, "_FUSE_E16_METADATA_STAGE1_DISPATCH", False)
+        expected, expected_state = reference.forward_routes_training(
+            hidden,
+            token_indices,
+            expert_indices,
+            route_weights,
+            expert_frequency_out=expected_frequency,
+            expert_offsets=expert_offsets,
+            token_indices_identity=True,
+        )
+        monkeypatch.setattr(sonic_module, "_FUSE_E16_METADATA_STAGE1_DISPATCH", True)
+        actual, actual_state = candidate.forward_routes_training(
+            hidden,
+            token_indices,
+            expert_indices,
+            route_weights,
+            expert_frequency_out=actual_frequency,
+            expert_offsets=expert_offsets,
+            token_indices_identity=True,
+        )
+        torch.cuda.synchronize(hidden.device)
+
+        assert torch.equal(actual, expected)
+        assert torch.equal(actual_state.preactivation, expected_state.preactivation)
+        assert torch.equal(actual_frequency, expected_frequency)
+        assert torch.equal(
+            actual_frequency,
+            torch.tensor(counts, dtype=torch.int32, device=hidden.device),
+        )
+
+    assert [routes for op, routes, launched in observed if op is candidate and launched] == [
+        257,
+        4097,
+        129,
+        1024,
+    ]
+    assert not hasattr(candidate, "_training_forward_launch_plans")
+    assert _get_e16_metadata_stage1_master_launcher.cache_info().currsize == 2
+    if pool is None:
+        assert len(candidate._dynamic_route_workspaces) == 1
+    else:
+        assert len(pool) == 1
+
+
+def test_sonic_moe_e16_master_is_stream_correct(monkeypatch):
+    config = _config(
+        num_experts=16,
+        top_k=1,
+        stage1_write_padded_rows=True,
+        stage1_lds_swizzle=True,
+    )
+    prepared = _make_e16_weights(config, seed=20260919)
+    reference = SonicMoE(config, prepared)
+    candidate = SonicMoE(config, prepared)
+    cases = []
+    for case_index, routes in enumerate((257, 513)):
+        quotient, remainder = divmod(routes, 16)
+        counts = [quotient + (expert < remainder) for expert in range(16)]
+        cases.append(
+            _make_e16_identity_route_case(
+                routes,
+                counts,
+                seed=20261100 + case_index,
+            )
+        )
+
+    monkeypatch.setattr(sonic_module, "_FUSE_E16_METADATA_STAGE1_DISPATCH", False)
+    expected = [
+        reference.forward_routes_training(
+            hidden,
+            token_indices,
+            expert_indices,
+            route_weights,
+            expert_offsets=expert_offsets,
+            token_indices_identity=True,
+        )[0].clone()
+        for hidden, token_indices, expert_indices, route_weights, expert_offsets in cases
+    ]
+    torch.cuda.synchronize(cases[0][0].device)
+
+    monkeypatch.setattr(sonic_module, "_FUSE_E16_METADATA_STAGE1_DISPATCH", True)
+    streams = [torch.cuda.Stream(device=cases[0][0].device) for _ in cases]
+    current = torch.cuda.current_stream(cases[0][0].device)
+    actual = []
+    states = []
+    for stream, case in zip(streams, cases):
+        stream.wait_stream(current)
+        with torch.cuda.stream(stream):
+            output, state = candidate.forward_routes_training(
+                case[0],
+                case[1],
+                case[2],
+                case[3],
+                expert_offsets=case[4],
+                token_indices_identity=True,
+            )
+        actual.append(output)
+        states.append(state)
+    for stream in streams:
+        current.wait_stream(stream)
+    current.synchronize()
+
+    for output, expected_output in zip(actual, expected):
+        assert torch.equal(output, expected_output)
+    assert [state.producer_stream for state in states] == [
+        int(stream.cuda_stream) for stream in streams
+    ]
+    assert len(candidate._dynamic_route_workspaces) == 2
+
+
+def test_sonic_moe_e896_cannot_enter_e16_master_dispatch(monkeypatch):
+    monkeypatch.setattr(sonic_module, "_FUSE_E16_METADATA_STAGE1_DISPATCH", True)
+    fake_operator = type("FakeOperator", (), {"config": type("C", (), {"num_experts": 896})()})()
+    fake_workspace = type("FakeWorkspace", (), {"routes": 65536})()
+    assert not SonicMoE._launch_e16_identity_metadata_and_stage1(
+        fake_operator,
+        None,
+        fake_workspace,
+        *([None] * 13),
+    )
 
 
 @pytest.mark.parametrize("dtype", (torch.bfloat16, torch.float16), ids=("bf16", "fp16"))

@@ -41,7 +41,9 @@ import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl.runtime.device import get_rocm_arch
 from kernels.common.tensor_shim import _run_compiled
+from kernels.moe import moe_ragged_sorting_kernel as _route_sorting_module
 from kernels.moe.moe_2stage_a16wmix.gemm1 import (
+    _get_gemm1_composition_hook,
     compile_gemm1_a16w4_port,
     gemm1_a16w4_grid,
 )
@@ -51,6 +53,9 @@ from kernels.moe.moe_2stage_a16wmix.gemm2 import (
 )
 from kernels.moe.moe_gemm_2stage.moe_reduce import compile_moe_reduction
 from kernels.moe.moe_ragged_sorting_kernel import (
+    BLOCK_SIZE as _ROUTE_METADATA_BLOCK_SIZE,
+    _compile_moe_expert_major_sorting,
+    _get_expert_major_identity_kernel,
     moe_expert_major_sorting_flydsl,
     moe_ragged_sorting_flydsl,
 )
@@ -78,6 +83,7 @@ _E16_FLAT_GROUPED_MIN_ROUTES = 64
 # 64K avoids the measured small-route Stage-2 crossover.
 _E16_LARGE_EXPERT_MAJOR_FORWARD_MIN_ROUTES = 65536
 _DEFAULT_MAX_CACHED_WORKSPACES = 8
+_FUSE_E16_METADATA_STAGE1_DISPATCH = True
 _SUPPORTED_ROUTER_DTYPES = {
     torch.float32: "f32",
     torch.float16: "f16",
@@ -811,6 +817,18 @@ class SonicMoEWorkspace:
                 else None
             ),
         )
+
+
+@dataclass(frozen=True)
+class _TrainingForwardLaunchPlan:
+    """Host-side launch choices which are invariant across one route bucket."""
+
+    stage1: object
+    stage2: object
+    reduce: object | None
+    grid1: int
+    grid2: int
+    output_mode: str
 
 
 @dataclass
@@ -1880,6 +1898,109 @@ def _get_stage2_launcher(
     )
 
 
+@functools.lru_cache(maxsize=128)
+def _get_e16_metadata_stage1_master_launcher(
+    sorter_launcher,
+    stage1_launcher,
+    *,
+    num_experts: int,
+    identity_partitions: int,
+):
+    """Compose the E16 identity metadata kernel and Stage 1 in one dispatch."""
+
+    metadata_kernel = _get_expert_major_identity_kernel(sorter_launcher)
+    stage1_kernel, stage1_waves_per_eu = _get_gemm1_composition_hook(
+        stage1_launcher
+    )
+
+    @flyc.jit
+    def launch_metadata_stage1(
+        route_weights: fx.Tensor,
+        expert_offsets: fx.Tensor,
+        expert_frequency: fx.Tensor,
+        expert_frequency_mirror: fx.Tensor,
+        expert_padded_offsets: fx.Tensor,
+        sorted_token_ids: fx.Tensor,
+        sorted_weights: fx.Tensor,
+        sorted_route_ids: fx.Tensor,
+        sorted_expert_ids: fx.Tensor,
+        num_valid_ids: fx.Tensor,
+        moe_buf_i32: fx.Tensor,
+        i32_routes: fx.Int32,
+        i32_tokens: fx.Int32,
+        i32_moe_buf_elems: fx.Int32,
+        arg_x: fx.Int64,
+        arg_bq: fx.Int64,
+        arg_bscale: fx.Int64,
+        arg_bias: fx.Int64,
+        arg_eids: fx.Int64,
+        arg_cumsum: fx.Int64,
+        arg_mind: fx.Int64,
+        i32_ntok: fx.Int32,
+        i32_stage1_grid: fx.Int32,
+        f32_situ_beta: fx.Float32,
+        f32_situ_beta_rcp: fx.Float32,
+        f32_situ_linbeta: fx.Float32,
+        f32_situ_linbeta_rcp: fx.Float32,
+        f32_swiglu_limit: fx.Float32,
+        arg_out: fx.Int64,
+        arg_route_preactivation: fx.Int64,
+        arg_sorted_route_ids: fx.Int64,
+        i32_nroutes: fx.Int32,
+        stream: fx.Stream,
+    ):
+        metadata_kernel(
+            route_weights,
+            expert_offsets,
+            expert_frequency,
+            expert_frequency_mirror,
+            expert_padded_offsets,
+            sorted_token_ids,
+            sorted_weights,
+            sorted_route_ids,
+            sorted_expert_ids,
+            num_valid_ids,
+            moe_buf_i32,
+            i32_routes,
+            i32_tokens,
+            i32_moe_buf_elems,
+        ).launch(
+            grid=(num_experts * identity_partitions, 1, 1),
+            block=(_ROUTE_METADATA_BLOCK_SIZE, 1, 1),
+            stream=stream,
+        )
+        stage1_kernel(
+            arg_x,
+            arg_bq,
+            arg_bscale,
+            arg_bias,
+            arg_eids,
+            arg_cumsum,
+            arg_mind,
+            i32_ntok,
+            f32_situ_beta,
+            f32_situ_beta_rcp,
+            f32_situ_linbeta,
+            f32_situ_linbeta_rcp,
+            f32_swiglu_limit,
+            arg_out,
+            arg_route_preactivation,
+            arg_sorted_route_ids,
+            i32_nroutes,
+            value_attrs=(
+                {"rocdl.waves_per_eu": stage1_waves_per_eu}
+                if stage1_waves_per_eu
+                else None
+            ),
+        ).launch(
+            grid=(fx.Int64(i32_stage1_grid), 1, 1),
+            block=(256, 1, 1),
+            stream=stream,
+        )
+
+    return launch_metadata_stage1
+
+
 class SonicMoE:
     """Reusable gfx950 SonicMoE A16 forward operator.
 
@@ -2330,6 +2451,239 @@ class SonicMoE:
             )
         return out
 
+    def _prepare_grouped_gemms_training(
+        self,
+        workspace: SonicMoEWorkspace,
+        *,
+        interleaved_w1: bool,
+        token_indices_identity: bool,
+    ) -> _TrainingForwardLaunchPlan:
+        """Resolve launch choices before expert-major metadata dispatch.
+
+        The sorter kernels take only a few microseconds for E16.  Resolving
+        cached JIT launchers, tuning policy, and grids after enqueueing them can
+        therefore leave a visible device bubble before Stage 1.  This helper
+        moves that host work ahead of the sorter.  The returned plan is
+        invocation-local: real EP training has highly variable route counts,
+        so caching exact runtime grids here would merely churn a small LRU.
+        """
+
+        cfg = self.config
+        tokens = workspace.tokens
+        flat_routes = workspace.routes is not None
+        output_mode = (
+            cfg.stage2_output_mode
+            if not flat_routes
+            else ("identity" if token_indices_identity else "atomic")
+        )
+        if output_mode == "reduce" and workspace.route_output is None:
+            raise RuntimeError(
+                "reduce stage2 output requires a fixed-top-k route workspace"
+            )
+
+        training_tile_n, training_waves_per_eu = _training_stage1_tuning(
+            cfg,
+            tokens,
+            self.weights.has_bias,
+        )
+        training_tile_m = _training_stage1_tile_m(
+            cfg,
+            tokens,
+            workspace.routes,
+            self.weights.has_bias,
+        )
+        if _use_e16_4096_expert_major_forward_tuning(
+            cfg,
+            tokens,
+            workspace.routes,
+            self.weights.has_bias,
+            token_indices_identity=token_indices_identity,
+        ):
+            training_tile_n = 64
+            training_waves_per_eu = None
+        use_large_e16_expert_major_tuning = (
+            _use_e16_large_expert_major_forward_tuning(
+                cfg,
+                tokens,
+                workspace.routes,
+                self.weights.has_bias,
+                token_indices_identity=token_indices_identity,
+            )
+        )
+        if use_large_e16_expert_major_tuning:
+            training_tile_m = 64
+            training_tile_n = 128
+            training_waves_per_eu = None
+
+        stage1_cache_mod = _stage1_cache_mod(cfg, tokens)
+        stage2_cfg = (
+            replace(cfg, down_tile_n=128, stage2_pipeline_stages=1)
+            if use_large_e16_expert_major_tuning
+            else cfg
+        )
+        stage2_stages = _stage2_stages(stage2_cfg, tokens)
+        dynamic_e16_flat = (
+            workspace.routes is not None
+            and _is_e16_flat_training_shape(
+                cfg,
+                tokens,
+                int(workspace.routes),
+                has_bias=self.weights.has_bias,
+            )
+        )
+        if (
+            (flat_routes and not dynamic_e16_flat)
+            or self.weights.has_bias
+            or output_mode not in ("atomic", "identity")
+        ):
+            stage2_stages = 1
+        stage2_cache_mod = _stage2_cache_mod(stage2_cfg, tokens)
+        grid1 = gemm1_a16w4_grid(
+            training_tile_m,
+            INTER=cfg.intermediate_size,
+            TILE_N=training_tile_n,
+            max_m_blocks=workspace.max_padded_tokens // training_tile_m,
+            persist=cfg.persistent_stage1,
+        )
+        grid2 = gemm2_a16w4_grid(
+            stage2_cfg.stage2_tile_m,
+            N_OUT=stage2_cfg.hidden_size,
+            TILE_N=stage2_cfg.stage2_tile_n,
+            max_m_blocks=workspace.stage2_max_m_blocks,
+            persist=stage2_cfg.persistent_stage2,
+        )
+        device_index = self.weights.device.index or 0
+        stage1 = _get_stage1_training_launcher(
+            cfg,
+            stage1_cache_mod,
+            self.weights.has_bias,
+            interleaved_w1,
+            device_index,
+            training_tile_n,
+            training_waves_per_eu,
+            flat_routes,
+            training_tile_m,
+        )
+        stage2 = _get_stage2_launcher(
+            stage2_cfg,
+            stage2_cache_mod,
+            "bf16",
+            self.weights.has_bias,
+            output_mode,
+            stage2_stages,
+            device_index,
+        )
+        reduce = (
+            compile_moe_reduction(
+                topk=cfg.top_k,
+                model_dim=cfg.hidden_size,
+                dtype_str="bf16",
+            )
+            if output_mode == "reduce"
+            else None
+        )
+        return _TrainingForwardLaunchPlan(
+            stage1=stage1,
+            stage2=stage2,
+            reduce=reduce,
+            grid1=int(grid1),
+            grid2=int(grid2),
+            output_mode=output_mode,
+        )
+
+    def _launch_e16_identity_metadata_and_stage1(
+        self,
+        hidden_states: torch.Tensor,
+        workspace: SonicMoEWorkspace,
+        out: torch.Tensor,
+        route_preactivation: torch.Tensor,
+        route_weights: torch.Tensor,
+        expert_offsets: torch.Tensor,
+        frequency: torch.Tensor,
+        frequency_mirror: torch.Tensor | None,
+        sorted_token_ids: torch.Tensor,
+        sorted_route_ids: torch.Tensor,
+        sorted_weights: torch.Tensor,
+        sorted_expert_ids: torch.Tensor,
+        num_valid_ids: torch.Tensor,
+        launch_plan: _TrainingForwardLaunchPlan,
+        stream: torch.cuda.Stream,
+    ) -> bool:
+        """Enqueue identity metadata and training Stage 1 with one host call."""
+
+        if not _FUSE_E16_METADATA_STAGE1_DISPATCH:
+            return False
+        routes = int(workspace.routes or 0)
+        single_launch, identity_partitions = (
+            _route_sorting_module._expert_major_identity_fusion_parameters(
+                self.config.num_experts,
+                True,
+                routes,
+            )
+        )
+        if not single_launch:
+            return False
+
+        sorter_launcher = _compile_moe_expert_major_sorting(
+            num_experts=self.config.num_experts,
+            unit_size=self.config.route_tile_m,
+            emit_route_ids=True,
+            mirror_expert_frequency=frequency_mirror is not None,
+            token_indices_identity=True,
+            clear_output=False,
+            single_launch_identity=True,
+            identity_partitions=identity_partitions,
+        )
+        master = _get_e16_metadata_stage1_master_launcher(
+            sorter_launcher,
+            launch_plan.stage1,
+            num_experts=self.config.num_experts,
+            identity_partitions=identity_partitions,
+        )
+        mirror_arg = frequency if frequency_mirror is None else frequency_mirror
+        output_i32 = out.view(torch.int32)
+        _run_compiled(
+            master,
+            route_weights,
+            expert_offsets,
+            frequency,
+            mirror_arg,
+            workspace.sorting_workspace,
+            sorted_token_ids,
+            sorted_weights,
+            sorted_route_ids,
+            sorted_expert_ids,
+            num_valid_ids,
+            output_i32,
+            routes,
+            workspace.tokens,
+            int(output_i32.numel()),
+            hidden_states.data_ptr(),
+            self.weights.gate_up.data_ptr(),
+            self.weights.dummy_scale.data_ptr(),
+            (
+                self.weights.dummy_scale
+                if self.weights.stage1_bias is None
+                else self.weights.stage1_bias
+            ).data_ptr(),
+            sorted_expert_ids.data_ptr(),
+            num_valid_ids.data_ptr(),
+            sorted_token_ids.data_ptr(),
+            workspace.tokens,
+            launch_plan.grid1,
+            1.0,
+            1.0,
+            1.0,
+            1.0,
+            float("inf"),
+            workspace.intermediate.data_ptr(),
+            route_preactivation.data_ptr(),
+            sorted_route_ids.data_ptr(),
+            routes,
+            stream,
+        )
+        return True
+
     def _run_grouped_gemms_training(
         self,
         hidden_states: torch.Tensor,
@@ -2344,6 +2698,8 @@ class SonicMoE:
         sorted_expert_ids: torch.Tensor | None = None,
         num_valid_ids: torch.Tensor | None = None,
         token_indices_identity: bool = False,
+        launch_plan: _TrainingForwardLaunchPlan | None = None,
+        stage1_enqueued: bool = False,
     ) -> torch.Tensor:
         """Training-only grouped forward with the Stage-1 dual output."""
 
@@ -2351,15 +2707,13 @@ class SonicMoE:
         tokens = workspace.tokens
         stream = torch.cuda.current_stream(hidden_states.device)
         flat_routes = workspace.routes is not None
-        # A flat route list has no fixed slot dimension for the reduce output;
-        # it always uses the weighted atomic scatter path.
-        output_mode = (
-            cfg.stage2_output_mode
-            if not flat_routes
-            else ("identity" if token_indices_identity else "atomic")
-        )
-        if output_mode == "reduce" and workspace.route_output is None:
-            raise RuntimeError("reduce stage2 output requires a fixed-top-k route workspace")
+        if launch_plan is None:
+            launch_plan = self._prepare_grouped_gemms_training(
+                workspace,
+                interleaved_w1=interleaved_w1,
+                token_indices_identity=token_indices_identity,
+            )
+        output_mode = launch_plan.output_mode
         sorted_token_ids = (
             workspace.sorted_token_ids
             if sorted_token_ids is None
@@ -2384,137 +2738,44 @@ class SonicMoE:
         if flat_routes and sorted_route_ids is None:
             raise RuntimeError("flat-route training requires sorted route ids")
 
-        training_tile_n, training_waves_per_eu = _training_stage1_tuning(
-            cfg,
-            tokens,
-            self.weights.has_bias,
-        )
-        training_tile_m = _training_stage1_tile_m(
-            cfg,
-            tokens,
-            workspace.routes,
-            self.weights.has_bias,
-        )
-        if _use_e16_4096_expert_major_forward_tuning(
-            cfg,
-            tokens,
-            workspace.routes,
-            self.weights.has_bias,
-            token_indices_identity=token_indices_identity,
-        ):
-            # Preserve BM128 sorter/compute/state metadata while increasing N
-            # parallelism.  Stage 2 remains unchanged.
-            training_tile_n = 64
-            training_waves_per_eu = None
-        use_large_e16_expert_major_tuning = (
-            _use_e16_large_expert_major_forward_tuning(
-                cfg,
+        if not stage1_enqueued:
+            _run_compiled(
+                launch_plan.stage1,
+                hidden_states.data_ptr(),
+                self.weights.gate_up.data_ptr(),
+                self.weights.dummy_scale.data_ptr(),
+                (
+                    self.weights.dummy_scale
+                    if self.weights.stage1_bias is None
+                    else self.weights.stage1_bias
+                ).data_ptr(),
+                sorted_expert_ids.data_ptr(),
+                num_valid_ids.data_ptr(),
+                sorted_token_ids.data_ptr(),
                 tokens,
-                workspace.routes,
-                self.weights.has_bias,
-                token_indices_identity=token_indices_identity,
+                launch_plan.grid1,
+                1.0,
+                1.0,
+                1.0,
+                1.0,
+                float("inf"),
+                workspace.intermediate.data_ptr(),
+                route_preactivation.data_ptr(),
+                (
+                    self.weights.dummy_scale
+                    if sorted_route_ids is None
+                    else sorted_route_ids
+                ).data_ptr(),
+                (
+                    tokens * cfg.top_k
+                    if workspace.routes is None
+                    else int(workspace.routes)
+                ),
+                stream,
             )
-        )
-        if use_large_e16_expert_major_tuning:
-            # Keep BM128 sorter metadata so forward state remains ABI-stable;
-            # the Stage-1 launcher natively walks two BM64 compute tiles per
-            # descriptor.  BN128 cuts the dual-output kernel to 162 VGPRs.
-            training_tile_m = 64
-            training_tile_n = 128
-            training_waves_per_eu = None
-        stage1 = _get_stage1_training_launcher(
-            cfg,
-            _stage1_cache_mod(cfg, tokens),
-            self.weights.has_bias,
-            interleaved_w1,
-            hidden_states.device.index or 0,
-            training_tile_n,
-            training_waves_per_eu,
-            flat_routes,
-            training_tile_m,
-        )
-        grid1 = gemm1_a16w4_grid(
-            training_tile_m,
-            INTER=cfg.intermediate_size,
-            TILE_N=training_tile_n,
-            max_m_blocks=workspace.max_padded_tokens // training_tile_m,
-            persist=cfg.persistent_stage1,
-        )
-        _run_compiled(
-            stage1,
-            hidden_states.data_ptr(),
-            self.weights.gate_up.data_ptr(),
-            self.weights.dummy_scale.data_ptr(),
-            (self.weights.dummy_scale if self.weights.stage1_bias is None else self.weights.stage1_bias).data_ptr(),
-            sorted_expert_ids.data_ptr(),
-            num_valid_ids.data_ptr(),
-            sorted_token_ids.data_ptr(),
-            tokens,
-            int(grid1),
-            1.0,
-            1.0,
-            1.0,
-            1.0,
-            float("inf"),
-            workspace.intermediate.data_ptr(),
-            route_preactivation.data_ptr(),
-            (
-                self.weights.dummy_scale
-                if sorted_route_ids is None
-                else sorted_route_ids
-            ).data_ptr(),
-            (
-                tokens * cfg.top_k
-                if workspace.routes is None
-                else int(workspace.routes)
-            ),
-            stream,
-        )
 
-        stage2_cfg = cfg
-        if use_large_e16_expert_major_tuning:
-            # The narrower N tile supplies enough output parallelism for long
-            # expert segments.  A serial A pipeline is faster for this exact
-            # H2048/I768 identity-store path and uses only 64 KiB of LDS.
-            stage2_cfg = replace(
-                cfg,
-                down_tile_n=128,
-                stage2_pipeline_stages=1,
-            )
-        stage2_stages = _stage2_stages(stage2_cfg, tokens)
-        dynamic_e16_flat = (
-            workspace.routes is not None
-            and _is_e16_flat_training_shape(
-                cfg,
-                tokens,
-                int(workspace.routes),
-                has_bias=self.weights.has_bias,
-            )
-        )
-        if (
-            (flat_routes and not dynamic_e16_flat)
-            or self.weights.has_bias
-            or output_mode not in ("atomic", "identity")
-        ):
-            stage2_stages = 1
-        stage2 = _get_stage2_launcher(
-            stage2_cfg,
-            _stage2_cache_mod(stage2_cfg, tokens),
-            "bf16",
-            self.weights.has_bias,
-            output_mode,
-            stage2_stages,
-            hidden_states.device.index or 0,
-        )
-        grid2 = gemm2_a16w4_grid(
-            stage2_cfg.stage2_tile_m,
-            N_OUT=stage2_cfg.hidden_size,
-            TILE_N=stage2_cfg.stage2_tile_n,
-            max_m_blocks=workspace.stage2_max_m_blocks,
-            persist=stage2_cfg.persistent_stage2,
-        )
         _run_compiled(
-            stage2,
+            launch_plan.stage2,
             workspace.intermediate.data_ptr(),
             self.weights.down.data_ptr(),
             self.weights.dummy_scale.data_ptr(),
@@ -2525,17 +2786,14 @@ class SonicMoE:
             sorted_weights.data_ptr(),
             tokens,
             workspace.stage2_max_m_blocks,
-            int(grid2),
+            launch_plan.grid2,
             (workspace.route_output if output_mode == "reduce" else out).data_ptr(),
             stream,
         )
         if output_mode == "reduce":
             assert workspace.route_output is not None
-            reduce = compile_moe_reduction(
-                topk=cfg.top_k,
-                model_dim=cfg.hidden_size,
-                dtype_str="bf16",
-            )
+            reduce = launch_plan.reduce
+            assert reduce is not None
             route_output_ptr = flyc.from_c_void_p(fx.Uint8, workspace.route_output.data_ptr())
             out_ptr = flyc.from_c_void_p(fx.Uint8, out.data_ptr())
             unused_ptr = flyc.from_c_void_p(fx.Uint8, self.weights.dummy_scale.data_ptr())
@@ -3099,34 +3357,62 @@ class SonicMoE:
         if preactivation.untyped_storage().data_ptr() in workspace.storage_ptrs:
             raise RuntimeError("training preactivation unexpectedly aliases reusable workspace storage")
 
+        launch_plan = self._prepare_grouped_gemms_training(
+            workspace,
+            interleaved_w1=interleaved_w1,
+            token_indices_identity=token_indices_identity,
+        )
         assert workspace.sorting_workspace is not None
         assert workspace.sorted_route_ids is not None
         stream = torch.cuda.current_stream(hidden_states.device)
         ready_event = torch.cuda.Event()
         with workspace._launch_lock:
+            stage1_enqueued = False
             if expert_major:
                 assert expert_offsets is not None
-                moe_expert_major_sorting_flydsl(
-                    token_indices,
-                    expert_indices,
-                    route_weights,
-                    expert_offsets,
-                    frequency,
-                    workspace.sorting_workspace,
-                    sorted_token_ids,
-                    sorted_weights,
-                    sorted_expert_ids,
-                    num_valid_ids,
-                    output,
-                    self.config.num_experts,
-                    tokens=tokens,
-                    max_padded_routes=workspace.max_padded_tokens,
-                    unit_size=self.config.route_tile_m,
-                    sorted_route_ids=sorted_route_ids,
-                    expert_frequency_mirror=frequency_mirror,
-                    token_indices_identity=token_indices_identity,
-                    clear_output=not token_indices_identity,
+                stage1_enqueued = (
+                    token_indices_identity
+                    and routes > 0
+                    and self._launch_e16_identity_metadata_and_stage1(
+                        hidden_states,
+                        workspace,
+                        output,
+                        preactivation,
+                        route_weights,
+                        expert_offsets,
+                        frequency,
+                        frequency_mirror,
+                        sorted_token_ids,
+                        sorted_route_ids,
+                        sorted_weights,
+                        sorted_expert_ids,
+                        num_valid_ids,
+                        launch_plan,
+                        stream,
+                    )
                 )
+                if not stage1_enqueued:
+                    moe_expert_major_sorting_flydsl(
+                        token_indices,
+                        expert_indices,
+                        route_weights,
+                        expert_offsets,
+                        frequency,
+                        workspace.sorting_workspace,
+                        sorted_token_ids,
+                        sorted_weights,
+                        sorted_expert_ids,
+                        num_valid_ids,
+                        output,
+                        self.config.num_experts,
+                        tokens=tokens,
+                        max_padded_routes=workspace.max_padded_tokens,
+                        unit_size=self.config.route_tile_m,
+                        sorted_route_ids=sorted_route_ids,
+                        expert_frequency_mirror=frequency_mirror,
+                        token_indices_identity=token_indices_identity,
+                        clear_output=not token_indices_identity,
+                    )
             else:
                 moe_ragged_sorting_flydsl(
                     token_indices,
@@ -3160,6 +3446,8 @@ class SonicMoE:
                     sorted_expert_ids=sorted_expert_ids,
                     num_valid_ids=num_valid_ids,
                     token_indices_identity=token_indices_identity,
+                    launch_plan=launch_plan,
+                    stage1_enqueued=stage1_enqueued,
                 )
             self._record_training_forward_stream(
                 stream,
@@ -3352,6 +3640,11 @@ class SonicMoE:
         if preactivation.untyped_storage().data_ptr() in workspace.storage_ptrs:
             raise RuntimeError("training preactivation unexpectedly aliases reusable workspace storage")
 
+        launch_plan = self._prepare_grouped_gemms_training(
+            workspace,
+            interleaved_w1=interleaved_w1,
+            token_indices_identity=False,
+        )
         stream = torch.cuda.current_stream(hidden_states.device)
         ready_event = torch.cuda.Event()
         with workspace._launch_lock:
@@ -3375,6 +3668,7 @@ class SonicMoE:
                 output,
                 preactivation,
                 interleaved_w1=interleaved_w1,
+                launch_plan=launch_plan,
             )
             self._record_training_forward_stream(
                 stream,

@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (C) 2025-2026 FlyDSL Project Contributors
 
+import weakref
+
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl._mlir import ir
@@ -36,6 +38,18 @@ from .utils import (
 # compile-time opt-in so the established one-CTA-per-tile kernels remain
 # byte-for-byte unchanged unless a caller explicitly selects this schedule.
 NUM_CU = 256
+
+
+_GEMM1_COMPOSITION_HOOKS = weakref.WeakKeyDictionary()
+
+
+def _get_gemm1_composition_hook(launcher):
+    """Return the kernel and launch attributes for an internal master launch."""
+
+    try:
+        return _GEMM1_COMPOSITION_HOOKS[launcher]
+    except KeyError as error:
+        raise ValueError("launcher does not expose a GEMM1 composition hook") from error
 
 
 def _silu_mul_batch(gs, us):
@@ -1532,6 +1546,10 @@ def compile_gemm1_a16w4_port(
                 value_attrs={"rocdl.waves_per_eu": waves_per_eu} if waves_per_eu else None,
             ).launch(grid=(grid_x, 1, 1), block=(256, 1, 1), stream=stream)
 
+        _GEMM1_COMPOSITION_HOOKS[launch_gemm1_route_preactivation] = (
+            gemm1_kernel_route_preactivation,
+            waves_per_eu,
+        )
         return launch_gemm1_route_preactivation
 
     @flyc.kernel(name=f"gemm1_a16w4_port_{name_suffix}", known_block_size=[256, 1, 1])

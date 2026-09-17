@@ -31,8 +31,12 @@ if torch is None or not torch.cuda.is_available():
     pytest.skip("CUDA/ROCm not available.", allow_module_level=True)
 
 from flydsl.runtime.device import is_rdna_arch  # noqa: E402
+from kernels.moe import moe_ragged_sorting_kernel as ragged_sorting_module  # noqa: E402
 from kernels.moe.moe_ragged_sorting_kernel import (  # noqa: E402
+    _compile_moe_expert_major_sorting,
     _expert_major_cf_cache,
+    _expert_major_identity_fusion_parameters,
+    _get_expert_major_identity_kernel,
     _ragged_cf_cache,
     moe_expert_major_sorting_flydsl,
     moe_ragged_sorting_flydsl,
@@ -54,6 +58,148 @@ from kernels.moe.topk_gating_softmax_kernel import (  # noqa: E402
 
 WARMUP_ITERS = 3
 RUN_BENCH = os.environ.get("MOE_SORTING_BENCH", "0") == "1"
+
+
+@pytest.mark.parametrize(
+    ("experts", "identity", "routes", "expected"),
+    (
+        (16, True, 0, (True, 1)),
+        (16, True, 4096, (True, 1)),
+        (16, True, 4097, (True, 2)),
+        (16, True, 8193, (True, 4)),
+        (16, True, 16385, (True, 8)),
+        (16, True, 32769, (True, 16)),
+        (16, True, 1 << 20, (True, 16)),
+        (16, False, 65536, (False, 1)),
+        (15, True, 8192, (False, 1)),
+        (896, True, 65536, (False, 1)),
+    ),
+)
+def test_expert_major_identity_fusion_policy_is_e16_only(
+    experts,
+    identity,
+    routes,
+    expected,
+):
+    assert (
+        _expert_major_identity_fusion_parameters(experts, identity, routes)
+        == expected
+    )
+
+
+def test_expert_major_identity_composition_hook_has_stable_signature():
+    launcher = _compile_moe_expert_major_sorting(
+        num_experts=16,
+        unit_size=64,
+        emit_route_ids=True,
+        mirror_expert_frequency=True,
+        token_indices_identity=True,
+        clear_output=False,
+        single_launch_identity=True,
+        identity_partitions=2,
+    )
+    kernel = _get_expert_major_identity_kernel(launcher)
+    assert tuple(kernel._sig.parameters) == (
+        "route_weights",
+        "expert_offsets",
+        "expert_frequency",
+        "expert_frequency_mirror",
+        "expert_padded_offsets",
+        "sorted_token_ids",
+        "sorted_weights",
+        "sorted_route_ids",
+        "sorted_expert_ids",
+        "num_valid_ids",
+        "moe_buf_i32",
+        "i32_routes",
+        "i32_tokens",
+        "i32_moe_buf_elems",
+    )
+    with pytest.raises(ValueError, match="does not expose"):
+        _get_expert_major_identity_kernel(lambda: None)
+
+
+def test_e16_partitioned_identity_metadata_is_bitwise_legacy(monkeypatch):
+    device = torch.device("cuda")
+    counts = (2049, 1024, 512, 256, 128, 64, 32, 16, 8, 4, 2, 1, 1, 0, 0, 0)
+    experts, unit_size = len(counts), 64
+    routes = sum(counts)
+    offsets = [0]
+    for count in counts:
+        offsets.append(offsets[-1] + count)
+    padded = sum(
+        ((count + unit_size - 1) // unit_size) * unit_size for count in counts
+    )
+    token_indices = torch.arange(routes, dtype=torch.int32, device=device)
+    expert_indices = torch.repeat_interleave(
+        torch.arange(experts, dtype=torch.int32, device=device),
+        torch.tensor(counts, dtype=torch.int64, device=device),
+    ).contiguous()
+    route_weights = torch.linspace(
+        0.25,
+        1.0,
+        routes,
+        dtype=torch.float32,
+        device=device,
+    )
+    expert_offsets = torch.tensor(offsets, dtype=torch.int32, device=device)
+
+    def run(single_launch):
+        monkeypatch.setattr(
+            ragged_sorting_module,
+            "_E16_EXPERT_MAJOR_SINGLE_LAUNCH",
+            single_launch,
+        )
+        frequency = torch.empty(experts, dtype=torch.int32, device=device)
+        mirror = torch.empty_like(frequency)
+        padded_offsets = torch.empty_like(frequency)
+        sorted_ids = torch.empty(padded, dtype=torch.int32, device=device)
+        sorted_weights = torch.empty(padded, dtype=torch.float32, device=device)
+        sorted_routes = torch.empty(padded, dtype=torch.int32, device=device)
+        sorted_experts = torch.empty(
+            padded // unit_size,
+            dtype=torch.int32,
+            device=device,
+        )
+        valid = torch.empty(2, dtype=torch.int32, device=device)
+        moe_expert_major_sorting_flydsl(
+            token_indices,
+            expert_indices,
+            route_weights,
+            expert_offsets,
+            frequency,
+            padded_offsets,
+            sorted_ids,
+            sorted_weights,
+            sorted_experts,
+            valid,
+            torch.empty(1, dtype=torch.int32, device=device),
+            experts,
+            tokens=routes,
+            max_padded_routes=padded,
+            unit_size=unit_size,
+            sorted_route_ids=sorted_routes,
+            expert_frequency_mirror=mirror,
+            token_indices_identity=True,
+        )
+        return (
+            frequency,
+            mirror,
+            padded_offsets,
+            sorted_ids,
+            sorted_weights,
+            sorted_routes,
+            sorted_experts,
+            valid,
+        )
+
+    legacy = run(False)
+    partitioned = run(True)
+    torch.cuda.synchronize(device)
+    assert all(
+        torch.equal(actual, expected)
+        for actual, expected in zip(partitioned, legacy)
+    )
 
 
 def test_ragged_sorting_cache_separates_scratch_tensor_rank():
@@ -203,15 +349,17 @@ def test_ragged_sorting_mirrors_frequency_in_prefix_dispatch():
         (3, 0, 5, 1),
         (16, 17, 31, 2),
         (65, 1, 0, 33),
+        (8192, *([0] * 15)),
     ),
 )
 def test_expert_major_sorting_dynamic_padded_abi(counts):
-    """Two-launch expert-major adapter matches the flat ragged-sorter ABI.
+    """Expert-major adapters match the flat ragged-sorter ABI.
 
     The route count and load distribution deliberately vary while E/unit stay
-    fixed, exercising a single compiled specialization without baking R into
-    its cache key.  Input rows are already expert-major but token ids retain
-    the public ``arange(R)`` sorted-token contract.
+    fixed, exercising runtime R without baking it into the generic cache key.
+    The 16-expert case exercises the partitioned identity specialization.
+    Input rows are already expert-major but token ids retain the public
+    ``arange(R)`` sorted-token contract.
     """
 
     device = torch.device("cuda")

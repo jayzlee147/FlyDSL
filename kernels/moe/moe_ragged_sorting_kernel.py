@@ -22,6 +22,7 @@ edges well-defined: every input edge occupies its own output slot.
 from __future__ import annotations
 
 import functools
+import weakref
 
 import torch
 
@@ -35,10 +36,50 @@ from kernels.common.mem_ops import atomic_add
 
 BLOCK_SIZE = 256
 UNIT_SIZE = 32
+_E16_EXPERT_MAJOR_SINGLE_LAUNCH = True
+_E16_EXPERT_MAJOR_MAX_PARTITIONS = 16
 
 
 _ragged_cf_cache = {}
 _expert_major_cf_cache = {}
+_EXPERT_MAJOR_IDENTITY_KERNELS = weakref.WeakKeyDictionary()
+
+
+def _get_expert_major_identity_kernel(launcher):
+    """Return the explicitly registered identity metadata composition kernel."""
+
+    try:
+        return _EXPERT_MAJOR_IDENTITY_KERNELS[launcher]
+    except KeyError as error:
+        raise ValueError(
+            "launcher does not expose an expert-major identity composition kernel"
+        ) from error
+
+
+def _expert_major_identity_fusion_parameters(
+    num_experts: int,
+    token_indices_identity: bool,
+    routes: int,
+) -> tuple[bool, int]:
+    """Return whether to fuse E16 identity metadata and its CTA count."""
+
+    single_launch = (
+        _E16_EXPERT_MAJOR_SINGLE_LAUNCH
+        if num_experts == 16 and token_indices_identity
+        else False
+    )
+    identity_partitions = 1
+    if single_launch:
+        target_partitions = max(
+            1,
+            (routes + num_experts * BLOCK_SIZE - 1)
+            // (num_experts * BLOCK_SIZE),
+        )
+        identity_partitions = min(
+            _E16_EXPERT_MAJOR_MAX_PARTITIONS,
+            1 << (target_partitions - 1).bit_length(),
+        )
+    return single_launch, identity_partitions
 
 
 @functools.lru_cache(maxsize=128)
@@ -449,13 +490,17 @@ def _compile_moe_expert_major_sorting(
     mirror_expert_frequency: bool,
     token_indices_identity: bool,
     clear_output: bool,
+    single_launch_identity: bool,
+    identity_partitions: int,
 ):
-    """Build the two-launch expert-major metadata adapter.
+    """Build the expert-major metadata adapter.
 
     ``expert_offsets`` describes the already expert-major input as half-open
     route intervals.  Unlike :func:`_compile_moe_ragged_sorting`, this path
     has no histogram or atomic scatter: its first launch derives the padded
-    ABI layout, and its second launch copies each route into that layout.
+    ABI layout, and its second launch copies each route into that layout.  The
+    E16 identity specialization instead derives both pieces per expert in one
+    partitioned launch.
     Runtime route count is an ordinary scalar argument and is deliberately not
     part of the compile-cache key.
     """
@@ -464,6 +509,184 @@ def _compile_moe_expert_major_sorting(
         raise ValueError(f"num_experts must be positive, got {num_experts}")
     if unit_size <= 0:
         raise ValueError(f"unit_size must be positive, got {unit_size}")
+    if identity_partitions <= 0:
+        raise ValueError(
+            f"identity_partitions must be positive, got {identity_partitions}"
+        )
+
+    @flyc.kernel(known_block_size=[BLOCK_SIZE, 1, 1])
+    def identity_expert_pack_kernel(
+        route_weights: fx.Tensor,
+        expert_offsets: fx.Tensor,
+        expert_frequency: fx.Tensor,
+        expert_frequency_mirror: fx.Tensor,
+        expert_padded_offsets: fx.Tensor,
+        sorted_token_ids: fx.Tensor,
+        sorted_weights: fx.Tensor,
+        sorted_route_ids: fx.Tensor,
+        sorted_expert_ids: fx.Tensor,
+        num_valid_ids: fx.Tensor,
+        moe_buf_i32: fx.Tensor,
+        i32_routes: fx.Int32,
+        i32_tokens: fx.Int32,
+        i32_moe_buf_elems: fx.Int32,
+    ):
+        """Build E16 identity-route metadata with one expert-centric launch.
+
+        Every CTA owns one expert.  Since ``expert_offsets`` already provides
+        disjoint expert intervals, the CTA can derive its padded destination
+        without the cross-CTA dependency that required the old prefix launch.
+        Lane zero computes the small E16 padded prefix and broadcasts it
+        through 16 bytes of LDS while the lanes cooperatively copy routes.
+        """
+
+        c_zero = fx.Int32(0)
+        c_one = fx.Int32(1)
+        c_unit = fx.Int32(unit_size)
+        c_block = fx.Int32(BLOCK_SIZE)
+        expert = gpu.block_idx.x // fx.Int32(identity_partitions)
+        partition = gpu.block_idx.x % fx.Int32(identity_partitions)
+        thread = gpu.thread_idx.x
+        offsets_rsrc = buffer_ops.create_buffer_resource(expert_offsets, max_size=True)
+        frequency_rsrc = buffer_ops.create_buffer_resource(expert_frequency, max_size=True)
+        padded_offsets_rsrc = buffer_ops.create_buffer_resource(
+            expert_padded_offsets, max_size=True
+        )
+        weights_in_rsrc = buffer_ops.create_buffer_resource(route_weights, max_size=True)
+        ids_out_rsrc = buffer_ops.create_buffer_resource(sorted_token_ids, max_size=True)
+        weights_out_rsrc = buffer_ops.create_buffer_resource(sorted_weights, max_size=True)
+        experts_out_rsrc = buffer_ops.create_buffer_resource(sorted_expert_ids, max_size=True)
+        valid_rsrc = buffer_ops.create_buffer_resource(num_valid_ids, max_size=True)
+        if const_expr(emit_route_ids):
+            route_ids_rsrc = buffer_ops.create_buffer_resource(sorted_route_ids, max_size=True)
+        if const_expr(mirror_expert_frequency):
+            mirror_rsrc = buffer_ops.create_buffer_resource(
+                expert_frequency_mirror, max_size=True
+            )
+        if const_expr(clear_output):
+            output_rsrc = buffer_ops.create_buffer_resource(moe_buf_i32, max_size=True)
+
+        # begin, count, padded row count, and padded output offset.  Only lane
+        # zero computes the short E16 prefix; LDS broadcasts it to the CTA.
+        shared = fx.SharedAllocator().allocate(16, alignment=16).peek()
+        metadata = fx.recast_iter(fx.Int32, shared.ptr)
+        if thread == c_zero:
+            begin_lane0 = buffer_ops.buffer_load(
+                offsets_rsrc, expert, vec_width=1, dtype=T.i32
+            )
+            end_lane0 = buffer_ops.buffer_load(
+                offsets_rsrc, expert + c_one, vec_width=1, dtype=T.i32
+            )
+            count_lane0 = end_lane0 - begin_lane0
+            blocks_lane0 = (count_lane0 + c_unit - c_one) // c_unit
+            padded_lane0 = (count_lane0 == c_zero).select(
+                c_zero, blocks_lane0 * c_unit
+            )
+            padded_offset_lane0 = begin_lane0
+            prefix_begin = buffer_ops.buffer_load(
+                offsets_rsrc, c_zero, vec_width=1, dtype=T.i32
+            )
+            for prefix_expert_id in range_constexpr(num_experts):
+                prefix_expert = fx.Int32(prefix_expert_id)
+                prefix_end = buffer_ops.buffer_load(
+                    offsets_rsrc,
+                    prefix_expert + c_one,
+                    vec_width=1,
+                    dtype=T.i32,
+                )
+                prefix_count = prefix_end - prefix_begin
+                prefix_blocks = (prefix_count + c_unit - c_one) // c_unit
+                prefix_padded = (prefix_count == c_zero).select(
+                    c_zero, prefix_blocks * c_unit
+                )
+                prefix_padding = prefix_padded - prefix_count
+                padded_offset_lane0 = padded_offset_lane0 + (
+                    prefix_expert < expert
+                ).select(prefix_padding, c_zero)
+                prefix_begin = prefix_end
+            fx.ptr_store(begin_lane0, metadata)
+            fx.ptr_store(count_lane0, metadata + fx.Int64(1))
+            fx.ptr_store(padded_lane0, metadata + fx.Int64(2))
+            fx.ptr_store(padded_offset_lane0, metadata + fx.Int64(3))
+        gpu.barrier()
+        begin = fx.Int32(fx.ptr_load(metadata))
+        count = fx.Int32(fx.ptr_load(metadata + fx.Int64(1)))
+        padded = fx.Int32(fx.ptr_load(metadata + fx.Int64(2)))
+        padded_offset = fx.Int32(fx.ptr_load(metadata + fx.Int64(3)))
+        blocks = padded // c_unit
+
+        if (partition == c_zero) & (thread == c_zero):
+            buffer_ops.buffer_store(count, frequency_rsrc, expert)
+            buffer_ops.buffer_store(padded_offset, padded_offsets_rsrc, expert)
+            if const_expr(mirror_expert_frequency):
+                buffer_ops.buffer_store(count, mirror_rsrc, expert)
+            if expert == fx.Int32(num_experts - 1):
+                buffer_ops.buffer_store(padded_offset + padded, valid_rsrc, c_zero)
+                buffer_ops.buffer_store(i32_tokens, valid_rsrc, c_one)
+
+        if partition == c_zero:
+            block_start = padded_offset // c_unit
+            block_iters = (blocks + c_block - c_one) // c_block
+            for iteration in range(
+                fx.Index(0),
+                ArithValue(block_iters).index_cast(T.index),
+                fx.Index(1),
+            ):
+                block = thread + fx.Int32(iteration) * c_block
+                if block < blocks:
+                    buffer_ops.buffer_store(
+                        expert,
+                        experts_out_rsrc,
+                        block_start + block,
+                    )
+
+            padding_rows = padded - count
+            padding_iters = (padding_rows + c_block - c_one) // c_block
+            for iteration in range(
+                fx.Index(0),
+                ArithValue(padding_iters).index_cast(T.index),
+                fx.Index(1),
+            ):
+                padding = thread + fx.Int32(iteration) * c_block
+                if padding < padding_rows:
+                    output_row = padded_offset + count + padding
+                    buffer_ops.buffer_store(i32_tokens, ids_out_rsrc, output_row)
+                    buffer_ops.buffer_store(fx.Float32(0.0), weights_out_rsrc, output_row)
+                    if const_expr(emit_route_ids):
+                        buffer_ops.buffer_store(i32_routes, route_ids_rsrc, output_row)
+
+        partition_stride = fx.Int32(identity_partitions * BLOCK_SIZE)
+        partition_start = partition * c_block
+        route_iters = (count + partition_stride - c_one) // partition_stride
+        for iteration in range(
+            fx.Index(0),
+            ArithValue(route_iters).index_cast(T.index),
+            fx.Index(1),
+        ):
+            local_row = partition_start + thread + fx.Int32(iteration) * partition_stride
+            if local_row < count:
+                route = begin + local_row
+                output_row = padded_offset + local_row
+                weight_bits = buffer_ops.buffer_load(
+                    weights_in_rsrc, route, vec_width=1, dtype=T.i32
+                )
+                buffer_ops.buffer_store(route, ids_out_rsrc, output_row)
+                buffer_ops.buffer_store(weight_bits, weights_out_rsrc, output_row)
+                if const_expr(emit_route_ids):
+                    buffer_ops.buffer_store(route, route_ids_rsrc, output_row)
+
+        if const_expr(clear_output):
+            global_thread = gpu.block_idx.x * c_block + thread
+            global_stride = fx.Int32(num_experts * identity_partitions * BLOCK_SIZE)
+            clear_iters = (i32_moe_buf_elems + global_stride - c_one) // global_stride
+            for iteration in range(
+                fx.Index(0),
+                ArithValue(clear_iters).index_cast(T.index),
+                fx.Index(1),
+            ):
+                output_index = global_thread + fx.Int32(iteration) * global_stride
+                if output_index < i32_moe_buf_elems:
+                    buffer_ops.buffer_store(c_zero, output_rsrc, output_index)
 
     @flyc.kernel(known_block_size=[BLOCK_SIZE, 1, 1])
     def prefix_and_padding_kernel(
@@ -641,6 +864,30 @@ def _compile_moe_expert_major_sorting(
         i32_route_grid: fx.Int32,
         stream: fx.Stream = fx.Stream(None),
     ):
+        if const_expr(single_launch_identity):
+            fused = identity_expert_pack_kernel(
+                route_weights,
+                expert_offsets,
+                expert_frequency,
+                expert_frequency_mirror,
+                expert_padded_offsets,
+                sorted_token_ids,
+                sorted_weights,
+                sorted_route_ids,
+                sorted_expert_ids,
+                num_valid_ids,
+                moe_buf_i32,
+                i32_routes,
+                i32_tokens,
+                i32_moe_buf_elems,
+            )
+            fused.launch(
+                grid=(num_experts * identity_partitions, 1, 1),
+                block=(BLOCK_SIZE, 1, 1),
+                stream=stream,
+            )
+            return
+
         prefix = prefix_and_padding_kernel(
             expert_offsets,
             expert_frequency,
@@ -675,6 +922,9 @@ def _compile_moe_expert_major_sorting(
             stream=stream,
         )
 
+    _EXPERT_MAJOR_IDENTITY_KERNELS[launch_expert_major_sorting] = (
+        identity_expert_pack_kernel
+    )
     return launch_expert_major_sorting
 
 
@@ -714,8 +964,9 @@ def moe_expert_major_sorting_flydsl(
     have the exact flat ragged-sorter ABI: padded token
     ids use ``tokens`` as sentinel, padded weights are zero, optional route ids
     use ``R`` as sentinel, and ``num_valid_ids == [P, tokens]`` where
-    ``P = sum_e ceil(count_e / unit_size) * unit_size``.  It always launches
-    exactly two kernels: one prefix/padding CTA and one parallel pack CTA.
+    ``P = sum_e ceil(count_e / unit_size) * unit_size``.  Generic calls launch
+    one prefix/padding CTA and one parallel pack CTA; E16 identity calls use a
+    single partitioned expert-centric kernel.
     Set ``clear_output`` only when ``moe_buf`` owns an output/scratch tensor
     that must be zeroed as part of the second CTA launch.
     """
@@ -818,6 +1069,11 @@ def moe_expert_major_sorting_flydsl(
     stream = torch.cuda.current_stream(device)
     moe_buf_i32 = moe_buf.view(torch.int32)
     route_grid = max(1, (routes + BLOCK_SIZE - 1) // BLOCK_SIZE)
+    single_launch_identity, identity_partitions = _expert_major_identity_fusion_parameters(
+        num_experts,
+        token_indices_identity,
+        routes,
+    )
     launch_fn = _compile_moe_expert_major_sorting(
         num_experts=num_experts,
         unit_size=unit_size,
@@ -825,6 +1081,8 @@ def moe_expert_major_sorting_flydsl(
         mirror_expert_frequency=expert_frequency_mirror is not None,
         token_indices_identity=token_indices_identity,
         clear_output=clear_output,
+        single_launch_identity=single_launch_identity,
+        identity_partitions=identity_partitions,
     )
     sorted_route_ids_arg = expert_frequency if sorted_route_ids is None else sorted_route_ids
     expert_frequency_mirror_arg = expert_frequency if expert_frequency_mirror is None else expert_frequency_mirror
@@ -854,6 +1112,8 @@ def moe_expert_major_sorting_flydsl(
         expert_frequency_mirror is not None,
         token_indices_identity,
         clear_output,
+        single_launch_identity,
+        identity_partitions,
         moe_buf_i32.ndim,
         device.index,
     )
