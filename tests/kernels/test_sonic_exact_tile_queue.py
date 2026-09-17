@@ -16,6 +16,7 @@ from kernels.moe.sonic_grouped_scheduler import (
     exact_m_tile_queue_elements,
     exact_m_tile_queue_upper_bound,
 )
+from kernels.moe.sonic_grouped_tn import hot_split_descriptor_capacity
 
 pytestmark = [pytest.mark.l2_device, pytest.mark.rocm_lower]
 
@@ -275,6 +276,96 @@ def test_exact_queue_builder_also_emits_active_expert_queue():
     assert active_queue[0].item() == len(expected_active)
     actual_active = active_queue[1 : 1 + 2 * len(expected_active)].reshape(-1, 2)
     assert sorted(map(tuple, actual_active.cpu().tolist())) == expected_active
+
+
+def test_exact_queue_builder_also_emits_hot_split_queues():
+    device = _gfx950_device()
+    frequencies = [0, 65, 128, 129, 256]
+    routes = sum(frequencies)
+    split_rows = 64
+    min_hot_rows = 128
+    frequency, sorted_experts, num_valid = _metadata_from_frequencies(
+        frequencies,
+        device,
+    )
+    queue_capacity = exact_m_tile_queue_upper_bound(
+        routes,
+        len(frequencies),
+        128,
+    )
+    queue = torch.empty((1 + 3 * queue_capacity,), dtype=torch.int32, device=device)
+    active_capacity = min(routes, len(frequencies))
+    active_queue = torch.full(
+        (1 + 2 * active_capacity,),
+        _CANARY,
+        dtype=torch.int32,
+        device=device,
+    )
+    split_capacity = hot_split_descriptor_capacity(
+        routes,
+        len(frequencies),
+        split_rows,
+        min_hot_rows,
+    )
+    split_queue = torch.full(
+        (1 + 3 * split_capacity,),
+        _CANARY,
+        dtype=torch.int32,
+        device=device,
+    )
+    hot_capacity = min(len(frequencies), routes // min_hot_rows)
+    hot_queue = torch.full(
+        (1 + 3 * hot_capacity,),
+        _CANARY,
+        dtype=torch.int32,
+        device=device,
+    )
+
+    build_exact_m_tile_queue(
+        frequency,
+        sorted_experts,
+        num_valid,
+        queue,
+        block_m=128,
+        sorted_block_m=_SORTED_BLOCK_M,
+        active_expert_storage=active_queue,
+        active_expert_capacity=active_capacity,
+        hot_split_storage=split_queue,
+        hot_expert_storage=hot_queue,
+        split_rows=split_rows,
+        min_hot_rows=min_hot_rows,
+    )
+    torch.cuda.synchronize(device)
+
+    first_rows = {}
+    first_row = 0
+    for expert, count in enumerate(frequencies):
+        first_rows[expert] = first_row
+        first_row += math.ceil(count / _SORTED_BLOCK_M) * _SORTED_BLOCK_M
+
+    assert split_queue[0].item() == 9
+    assert hot_queue[0].item() == 3
+    split_descriptors = split_queue[1 : 1 + 3 * int(split_queue[0])].view(-1, 3)
+    hot_descriptors = hot_queue[1 : 1 + 3 * int(hot_queue[0])].view(-1, 3)
+    observed = {}
+    for expert, first_partition, partition_count in hot_descriptors.cpu().tolist():
+        observed[expert] = split_descriptors[
+            first_partition : first_partition + partition_count
+        ].cpu().tolist()
+    assert observed == {
+        2: [[2, first_rows[2], 64], [2, first_rows[2] + 64, 64]],
+        3: [
+            [3, first_rows[3], 64],
+            [3, first_rows[3] + 64, 64],
+            [3, first_rows[3] + 128, 1],
+        ],
+        4: [
+            [4, first_rows[4], 64],
+            [4, first_rows[4] + 64, 64],
+            [4, first_rows[4] + 128, 64],
+            [4, first_rows[4] + 192, 64],
+        ],
+    }
 
 
 def test_exact_queue_clamps_short_active_expert_capacity():

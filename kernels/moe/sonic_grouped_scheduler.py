@@ -174,6 +174,9 @@ def compile_exact_m_tile_queue_builder(
     sorted_block_m: int,
     device_index: int,
     emit_active_experts: bool = False,
+    emit_hot_splits: bool = False,
+    split_rows: int = 0,
+    min_hot_rows: int = 0,
 ):
     """Compile a device-side exact M-tile queue builder.
 
@@ -182,7 +185,8 @@ def compile_exact_m_tile_queue_builder(
     an exact sorted-row offset, so ``block_m`` need not divide
     ``sorted_block_m``.  When ``emit_active_experts`` is true, the same scan
     also fills ``[active_count, (expert, first_row) * active_capacity]`` for
-    grouped TN contractions.
+    grouped TN contractions.  ``emit_hot_splits`` additionally emits compact
+    split-K and hot-expert queues during the same E16 device scan.
     """
 
     del device_index
@@ -192,6 +196,16 @@ def compile_exact_m_tile_queue_builder(
         raise ValueError(f"block_m must be positive, got {block_m}")
     if sorted_block_m <= 0:
         raise ValueError(f"sorted_block_m must be positive, got {sorted_block_m}")
+    if emit_hot_splits and (
+        not emit_active_experts
+        or num_experts > _BLOCK_THREADS
+        or split_rows <= 0
+        or min_hot_rows < split_rows
+    ):
+        raise ValueError(
+            "hot split emission requires active experts, one workgroup, and "
+            "0 < split_rows <= min_hot_rows"
+        )
 
     max_metadata_blocks = _MAX_SIGNED_I32 // sorted_block_m
     lower_bound_steps = max(1, max_metadata_blocks.bit_length())
@@ -267,6 +281,10 @@ def compile_exact_m_tile_queue_builder(
         i32_queue_capacity: fx.Int32,
         active_expert_storage: fx.Tensor,
         i32_active_expert_capacity: fx.Int32,
+        hot_split_storage: fx.Tensor,
+        i32_hot_split_capacity: fx.Int32,
+        hot_expert_storage: fx.Tensor,
+        i32_hot_expert_capacity: fx.Int32,
     ):
         if const_expr(num_experts <= _BLOCK_THREADS):
             # The Qwen3 E16 target fits in one workgroup, so clear and build in
@@ -281,6 +299,17 @@ def compile_exact_m_tile_queue_builder(
                         max_size=True,
                     )
                     buffer_ops.buffer_store(fx.Int32(0), active_rsrc, fx.Int32(0))
+                if const_expr(emit_hot_splits):
+                    split_rsrc = buffer_ops.create_buffer_resource(
+                        hot_split_storage,
+                        max_size=True,
+                    )
+                    hot_rsrc = buffer_ops.create_buffer_resource(
+                        hot_expert_storage,
+                        max_size=True,
+                    )
+                    buffer_ops.buffer_store(fx.Int32(0), split_rsrc, fx.Int32(0))
+                    buffer_ops.buffer_store(fx.Int32(0), hot_rsrc, fx.Int32(0))
             gpu.barrier()
         expert = gpu.block_idx.x * fx.Int32(_BLOCK_THREADS) + gpu.thread_idx.x
         if expert < fx.Int32(num_experts):
@@ -358,6 +387,74 @@ def compile_exact_m_tile_queue_builder(
                     )
                     output_start = fx.Int32(reservation)
                     first_sorted_row = lo * fx.Int32(sorted_block_m)
+                    if const_expr(emit_hot_splits):
+                        if frequency >= fx.Int32(min_hot_rows):
+                            partition_count = (
+                                frequency + fx.Int32(split_rows - 1)
+                            ) // fx.Int32(split_rows)
+                            first_partition = fx.Int32(
+                                atomic_add(
+                                    hot_split_storage,
+                                    fx.Int32(0),
+                                    partition_count,
+                                    dtype_bytes=4,
+                                )
+                            )
+                            hot_slot = fx.Int32(
+                                atomic_add(
+                                    hot_expert_storage,
+                                    fx.Int32(0),
+                                    fx.Int32(1),
+                                    dtype_bytes=4,
+                                )
+                            )
+                            if hot_slot < i32_hot_expert_capacity:
+                                hot_rsrc = buffer_ops.create_buffer_resource(
+                                    hot_expert_storage,
+                                    max_size=True,
+                                )
+                                hot_offset = fx.Int32(1) + hot_slot * fx.Int32(3)
+                                buffer_ops.buffer_store(expert, hot_rsrc, hot_offset)
+                                buffer_ops.buffer_store(
+                                    first_partition,
+                                    hot_rsrc,
+                                    hot_offset + fx.Int32(1),
+                                )
+                                buffer_ops.buffer_store(
+                                    partition_count,
+                                    hot_rsrc,
+                                    hot_offset + fx.Int32(2),
+                                )
+                            split_rsrc = buffer_ops.create_buffer_resource(
+                                hot_split_storage,
+                                max_size=True,
+                            )
+                            for local_partition in range(0, partition_count, 1):
+                                partition = first_partition + fx.Int32(local_partition)
+                                if partition < i32_hot_split_capacity:
+                                    local_row = fx.Int32(local_partition) * fx.Int32(
+                                        split_rows
+                                    )
+                                    remaining = frequency - local_row
+                                    valid_rows = (
+                                        remaining < fx.Int32(split_rows)
+                                    ).select(remaining, fx.Int32(split_rows))
+                                    split_offset = fx.Int32(1) + partition * fx.Int32(3)
+                                    buffer_ops.buffer_store(
+                                        expert,
+                                        split_rsrc,
+                                        split_offset,
+                                    )
+                                    buffer_ops.buffer_store(
+                                        first_sorted_row + local_row,
+                                        split_rsrc,
+                                        split_offset + fx.Int32(1),
+                                    )
+                                    buffer_ops.buffer_store(
+                                        valid_rows,
+                                        split_rsrc,
+                                        split_offset + fx.Int32(2),
+                                    )
                     queue_rsrc = buffer_ops.create_buffer_resource(queue, max_size=True)
                     for local_tile in range(0, tile_count, 1):
                         local_row = fx.Int32(local_tile) * fx.Int32(block_m)
@@ -425,6 +522,47 @@ def compile_exact_m_tile_queue_builder(
                         active_rsrc,
                         fx.Int32(0),
                     )
+                if const_expr(emit_hot_splits):
+                    split_rsrc = buffer_ops.create_buffer_resource(
+                        hot_split_storage,
+                        max_size=True,
+                    )
+                    hot_rsrc = buffer_ops.create_buffer_resource(
+                        hot_expert_storage,
+                        max_size=True,
+                    )
+                    required_splits = fx.Int32(
+                        buffer_ops.buffer_load(
+                            split_rsrc,
+                            fx.Int32(0),
+                            vec_width=1,
+                            dtype=T.i32,
+                        )
+                    )
+                    required_hot = fx.Int32(
+                        buffer_ops.buffer_load(
+                            hot_rsrc,
+                            fx.Int32(0),
+                            vec_width=1,
+                            dtype=T.i32,
+                        )
+                    )
+                    buffer_ops.buffer_store(
+                        (required_splits < i32_hot_split_capacity).select(
+                            required_splits,
+                            i32_hot_split_capacity,
+                        ),
+                        split_rsrc,
+                        fx.Int32(0),
+                    )
+                    buffer_ops.buffer_store(
+                        (required_hot < i32_hot_expert_capacity).select(
+                            required_hot,
+                            i32_hot_expert_capacity,
+                        ),
+                        hot_rsrc,
+                        fx.Int32(0),
+                    )
 
     @flyc.jit
     def launch(
@@ -435,6 +573,10 @@ def compile_exact_m_tile_queue_builder(
         i32_queue_capacity: fx.Int32,
         active_expert_storage: fx.Tensor,
         i32_active_expert_capacity: fx.Int32,
+        hot_split_storage: fx.Tensor,
+        i32_hot_split_capacity: fx.Int32,
+        hot_expert_storage: fx.Tensor,
+        i32_hot_expert_capacity: fx.Int32,
         stream: fx.Stream = fx.Stream(None),
     ):
         if num_experts > _BLOCK_THREADS:
@@ -451,6 +593,10 @@ def compile_exact_m_tile_queue_builder(
             i32_queue_capacity,
             active_expert_storage,
             i32_active_expert_capacity,
+            hot_split_storage,
+            i32_hot_split_capacity,
+            hot_expert_storage,
+            i32_hot_expert_capacity,
         ).launch(
             grid=((num_experts + _BLOCK_THREADS - 1) // _BLOCK_THREADS, 1, 1),
             block=(_BLOCK_THREADS, 1, 1),
@@ -485,6 +631,10 @@ def build_exact_m_tile_queue(
     queue_capacity: int | None = None,
     active_expert_storage: torch.Tensor | None = None,
     active_expert_capacity: int | None = None,
+    hot_split_storage: torch.Tensor | None = None,
+    hot_expert_storage: torch.Tensor | None = None,
+    split_rows: int | None = None,
+    min_hot_rows: int | None = None,
     stream: torch.cuda.Stream | None = None,
 ) -> torch.Tensor:
     """Asynchronously build a self-contained exact M-tile work queue.
@@ -494,7 +644,8 @@ def build_exact_m_tile_queue(
     and the published counter to the number of stored records.  Optional
     ``active_expert_storage`` uses the existing
     ``[count, (expert, first_row) * capacity]`` ABI and is populated by the
-    same device scan.
+    same device scan.  Optional ``hot_split_storage`` and
+    ``hot_expert_storage`` emit split-K metadata in that same scan.
     """
 
     tensors = {
@@ -547,6 +698,43 @@ def build_exact_m_tile_queue(
             )
     elif active_expert_capacity is not None:
         raise ValueError("active_expert_capacity requires active_expert_storage")
+
+    emit_hot_splits = hot_split_storage is not None or hot_expert_storage is not None
+    if emit_hot_splits:
+        if hot_split_storage is None or hot_expert_storage is None:
+            raise ValueError("hot split and hot expert storage must be supplied together")
+        if active_expert_storage is None:
+            raise ValueError("hot split emission requires active_expert_storage")
+        if split_rows is None or min_hot_rows is None:
+            raise ValueError("hot split emission requires split_rows and min_hot_rows")
+        if split_rows <= 0 or min_hot_rows < split_rows:
+            raise ValueError("hot split emission requires 0 < split_rows <= min_hot_rows")
+        for name, tensor, record_width in (
+            ("hot_split_storage", hot_split_storage, 3),
+            ("hot_expert_storage", hot_expert_storage, 3),
+        ):
+            if tensor.device != device or tensor.dtype != torch.int32:
+                raise ValueError(f"{name} must be int32 on {device}")
+            if (
+                not tensor.is_contiguous()
+                or tensor.ndim != 1
+                or tensor.numel() < 1
+                or (tensor.numel() - 1) % record_width
+            ):
+                raise ValueError(f"{name} has an invalid counter-first ABI")
+        hot_split_capacity = (hot_split_storage.numel() - 1) // 3
+        hot_expert_capacity = (hot_expert_storage.numel() - 1) // 3
+        hot_split_arg = hot_split_storage
+        hot_expert_arg = hot_expert_storage
+    else:
+        if split_rows is not None or min_hot_rows is not None:
+            raise ValueError("split thresholds require hot split storage")
+        hot_split_capacity = 0
+        hot_expert_capacity = 0
+        hot_split_arg = queue
+        hot_expert_arg = queue
+        split_rows = 0
+        min_hot_rows = 0
     if not isinstance(block_m, int) or isinstance(block_m, bool) or block_m <= 0:
         raise ValueError(f"block_m must be a positive int, got {block_m}")
     if (
@@ -605,6 +793,9 @@ def build_exact_m_tile_queue(
         sorted_block_m,
         device.index or 0,
         active_expert_storage is not None,
+        emit_hot_splits,
+        split_rows,
+        min_hot_rows,
     )
     _run_compiled(
         launcher,
@@ -615,6 +806,10 @@ def build_exact_m_tile_queue(
         capacity,
         active_storage_arg,
         active_capacity,
+        hot_split_arg,
+        hot_split_capacity,
+        hot_expert_arg,
+        hot_expert_capacity,
         stream,
     )
     return queue

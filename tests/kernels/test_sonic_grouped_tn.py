@@ -14,13 +14,17 @@ from kernels.moe.sonic_grouped_tn import (
     active_expert_descriptor_capacity,
     active_expert_queue_elements,
     build_active_expert_queue_flydsl,
+    build_hot_split_queues_flydsl,
     compile_grouped_tn,
+    finalize_hot_splitk_flydsl,
     grouped_dw2_flydsl,
     grouped_dw2_tuning,
     grouped_tn_from_metadata_flydsl,
     grouped_tn_from_queue_flydsl,
     grouped_tn_grid_cap,
     grouped_tn_launch_grid,
+    grouped_tn_splitk_from_queue_flydsl,
+    hot_split_descriptor_capacity,
     zero_inactive_weight_grads_flydsl,
     zero_weight_grads_adaptive_flydsl,
 )
@@ -814,6 +818,365 @@ def test_grouped_dw2_policy_helpers():
         active_expert_descriptor_capacity(1.0, 8)
     with pytest.raises(ValueError):
         grouped_dw2_tuning(96, 64)
+
+
+@pytest.mark.parametrize(
+    ("routes", "experts", "split_rows", "min_hot_rows", "expected"),
+    (
+        (0, 16, 8192, 16384, 0),
+        (16383, 16, 8192, 16384, 0),
+        (16384, 16, 8192, 16384, 2),
+        (65536, 16, 8192, 16384, 11),
+        (134000, 16, 8192, 16384, 24),
+    ),
+)
+def test_hot_split_descriptor_capacity_bounds(
+    routes,
+    experts,
+    split_rows,
+    min_hot_rows,
+    expected,
+):
+    assert (
+        hot_split_descriptor_capacity(
+            routes,
+            experts,
+            split_rows,
+            min_hot_rows,
+        )
+        == expected
+    )
+
+
+def test_hot_split_descriptor_capacity_rejects_invalid_bounds():
+    with pytest.raises(TypeError):
+        hot_split_descriptor_capacity(1.0, 16, 64, 128)
+    with pytest.raises(ValueError):
+        hot_split_descriptor_capacity(-1, 16, 64, 128)
+    with pytest.raises(ValueError):
+        hot_split_descriptor_capacity(256, 16, 128, 64)
+
+
+def test_hot_split_queue_builder_preserves_cold_and_partitions_hot_experts():
+    frequencies = [0, 65, 128, 129, 256]
+    lhs, _, frequency, sorted_experts, num_valid, segments = _make_sorted_inputs(
+        frequencies,
+        128,
+        64,
+        seed=433,
+    )
+    routes = sum(frequencies)
+    active_queue = build_active_expert_queue_flydsl(
+        frequency,
+        sorted_experts,
+        num_valid,
+        routes=routes,
+    )
+    split_rows = 64
+    min_hot_rows = 128
+    active_capacity = active_expert_descriptor_capacity(routes, len(frequencies))
+    split_capacity = hot_split_descriptor_capacity(
+        routes,
+        len(frequencies),
+        split_rows,
+        min_hot_rows,
+    )
+    hot_capacity = min(len(frequencies), routes // min_hot_rows)
+    cold_queue = torch.empty(
+        1 + 2 * active_capacity,
+        dtype=torch.int32,
+        device=lhs.device,
+    )
+    split_queue = torch.empty(
+        1 + 3 * split_capacity,
+        dtype=torch.int32,
+        device=lhs.device,
+    )
+    hot_queue = torch.empty(
+        1 + 3 * hot_capacity,
+        dtype=torch.int32,
+        device=lhs.device,
+    )
+
+    returned = build_hot_split_queues_flydsl(
+        frequency,
+        active_queue,
+        routes=routes,
+        split_rows=split_rows,
+        min_hot_rows=min_hot_rows,
+        cold_queue=cold_queue,
+        split_queue=split_queue,
+        hot_queue=hot_queue,
+    )
+    torch.cuda.synchronize()
+
+    assert returned[0] is cold_queue
+    assert returned[1] is split_queue
+    assert returned[2] is hot_queue
+    assert int(cold_queue[0]) == 1
+    assert int(split_queue[0]) == 9
+    assert int(hot_queue[0]) == 3
+    first_rows = {expert: start for expert, start, _ in segments}
+    assert cold_queue[1:3].cpu().tolist() == [1, first_rows[1]]
+
+    split_descriptors = split_queue[1 : 1 + 3 * int(split_queue[0])].view(-1, 3)
+    hot_descriptors = hot_queue[1 : 1 + 3 * int(hot_queue[0])].view(-1, 3)
+    observed = {}
+    for expert, first_partition, partition_count in hot_descriptors.cpu().tolist():
+        descriptors = split_descriptors[
+            first_partition : first_partition + partition_count
+        ].cpu().tolist()
+        observed[expert] = descriptors
+    assert observed == {
+        2: [[2, first_rows[2], 64], [2, first_rows[2] + 64, 64]],
+        3: [
+            [3, first_rows[3], 64],
+            [3, first_rows[3] + 64, 64],
+            [3, first_rows[3] + 128, 1],
+        ],
+        4: [
+            [4, first_rows[4], 64],
+            [4, first_rows[4] + 64, 64],
+            [4, first_rows[4] + 128, 64],
+            [4, first_rows[4] + 192, 64],
+        ],
+    }
+
+
+def test_hot_split_grouped_tn_and_finalize_match_unsplit_reference():
+    frequencies = [129, 0, 65, 256]
+    lhs, rhs, frequency, sorted_experts, num_valid, segments = _make_sorted_inputs(
+        frequencies,
+        128,
+        64,
+        seed=439,
+    )
+    routes = sum(frequencies)
+    active_queue = build_active_expert_queue_flydsl(
+        frequency,
+        sorted_experts,
+        num_valid,
+        routes=routes,
+    )
+    split_rows = 64
+    min_hot_rows = 128
+    active_capacity = active_expert_descriptor_capacity(routes, len(frequencies))
+    split_capacity = hot_split_descriptor_capacity(
+        routes,
+        len(frequencies),
+        split_rows,
+        min_hot_rows,
+    )
+    hot_capacity = min(len(frequencies), routes // min_hot_rows)
+    cold_queue = torch.empty(
+        1 + 2 * active_capacity,
+        dtype=torch.int32,
+        device=lhs.device,
+    )
+    split_queue = torch.empty(
+        1 + 3 * split_capacity,
+        dtype=torch.int32,
+        device=lhs.device,
+    )
+    hot_queue = torch.empty(
+        1 + 3 * hot_capacity,
+        dtype=torch.int32,
+        device=lhs.device,
+    )
+    partials = torch.empty(
+        (split_capacity, 128, 64),
+        dtype=torch.float32,
+        device=lhs.device,
+    )
+    output = torch.zeros(
+        (len(frequencies), 128, 64),
+        dtype=torch.bfloat16,
+        device=lhs.device,
+    )
+    expected = torch.zeros_like(output)
+    for expert, start, rows in segments:
+        expected[expert] = (
+            lhs[start : start + rows].float().transpose(0, 1)
+            @ rhs[start : start + rows].float()
+        ).to(torch.bfloat16)
+
+    build_hot_split_queues_flydsl(
+        frequency,
+        active_queue,
+        routes=routes,
+        split_rows=split_rows,
+        min_hot_rows=min_hot_rows,
+        cold_queue=cold_queue,
+        split_queue=split_queue,
+        hot_queue=hot_queue,
+    )
+    grouped_tn_from_queue_flydsl(
+        lhs,
+        rhs,
+        frequency,
+        cold_queue,
+        output,
+        block_m=128,
+        block_n=64,
+        block_k=32,
+        m_waves=2,
+        n_waves=2,
+    )
+    grouped_tn_splitk_from_queue_flydsl(
+        lhs,
+        rhs,
+        frequency,
+        split_queue,
+        partials,
+        block_m=128,
+        block_n=64,
+        block_k=32,
+        m_waves=2,
+        n_waves=2,
+    )
+    returned = finalize_hot_splitk_flydsl(
+        split_queue,
+        hot_queue,
+        partials,
+        output,
+    )
+    torch.cuda.synchronize()
+
+    assert returned is output
+    torch.testing.assert_close(output.float(), expected.float(), rtol=3e-2, atol=5e-2)
+
+
+def test_hot_split_grouped_tn_gathers_token_major_rhs():
+    frequencies = [129, 0, 128, 193]
+    lhs, sorted_rhs, frequency, sorted_experts, num_valid, _ = _make_sorted_inputs(
+        frequencies,
+        128,
+        64,
+        seed=443,
+    )
+    routes = sum(frequencies)
+    generator = torch.Generator(device=lhs.device).manual_seed(449)
+    token_order = torch.randperm(routes, generator=generator, device=lhs.device).to(
+        torch.int32
+    )
+    token_rhs = torch.zeros(
+        (routes, sorted_rhs.shape[1]),
+        dtype=sorted_rhs.dtype,
+        device=lhs.device,
+    )
+    sorted_token_ids = torch.full(
+        (lhs.shape[0],),
+        routes,
+        dtype=torch.int32,
+        device=lhs.device,
+    )
+    sorted_row = 0
+    route_row = 0
+    for count in frequencies:
+        if not count:
+            continue
+        padded = math.ceil(count / _SORTED_BLOCK_M) * _SORTED_BLOCK_M
+        expert_tokens = token_order[route_row : route_row + count]
+        slots = torch.arange(count, dtype=torch.int32, device=lhs.device) % 4
+        sorted_token_ids[sorted_row : sorted_row + count] = expert_tokens | (slots << 24)
+        token_rhs[expert_tokens.long()] = sorted_rhs[sorted_row : sorted_row + count]
+        sorted_row += padded
+        route_row += count
+
+    active_queue = build_active_expert_queue_flydsl(
+        frequency,
+        sorted_experts,
+        num_valid,
+        routes=routes,
+    )
+    split_rows = 64
+    min_hot_rows = 128
+    active_capacity = active_expert_descriptor_capacity(routes, len(frequencies))
+    split_capacity = hot_split_descriptor_capacity(
+        routes,
+        len(frequencies),
+        split_rows,
+        min_hot_rows,
+    )
+    hot_capacity = min(len(frequencies), routes // min_hot_rows)
+    cold_queue = torch.empty(
+        1 + 2 * active_capacity,
+        dtype=torch.int32,
+        device=lhs.device,
+    )
+    split_queue = torch.empty(
+        1 + 3 * split_capacity,
+        dtype=torch.int32,
+        device=lhs.device,
+    )
+    hot_queue = torch.empty(
+        1 + 3 * hot_capacity,
+        dtype=torch.int32,
+        device=lhs.device,
+    )
+    materialized_partials = torch.empty(
+        (split_capacity, 128, 64),
+        dtype=torch.float32,
+        device=lhs.device,
+    )
+    gathered_partials = torch.empty_like(materialized_partials)
+    materialized = torch.zeros(
+        (len(frequencies), 128, 64),
+        dtype=torch.bfloat16,
+        device=lhs.device,
+    )
+    gathered = torch.zeros_like(materialized)
+
+    build_hot_split_queues_flydsl(
+        frequency,
+        active_queue,
+        routes=routes,
+        split_rows=split_rows,
+        min_hot_rows=min_hot_rows,
+        cold_queue=cold_queue,
+        split_queue=split_queue,
+        hot_queue=hot_queue,
+    )
+    tuning = {
+        "block_m": 128,
+        "block_n": 64,
+        "block_k": 32,
+        "m_waves": 2,
+        "n_waves": 2,
+        "stages": 2,
+    }
+    grouped_tn_splitk_from_queue_flydsl(
+        lhs,
+        sorted_rhs,
+        frequency,
+        split_queue,
+        materialized_partials,
+        **tuning,
+    )
+    finalize_hot_splitk_flydsl(
+        split_queue,
+        hot_queue,
+        materialized_partials,
+        materialized,
+    )
+    grouped_tn_splitk_from_queue_flydsl(
+        lhs,
+        token_rhs,
+        frequency,
+        split_queue,
+        gathered_partials,
+        sorted_token_ids=sorted_token_ids,
+        **tuning,
+    )
+    finalize_hot_splitk_flydsl(
+        split_queue,
+        hot_queue,
+        gathered_partials,
+        gathered,
+    )
+    torch.cuda.synchronize()
+
+    assert torch.equal(gathered, materialized)
 
 
 @pytest.mark.parametrize("stages", (3, 4))

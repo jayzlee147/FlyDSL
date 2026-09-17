@@ -63,6 +63,52 @@ def _global_bf16_ptr(address):
     return fx.inttoptr(pointer_type, fx.Int64(address))
 
 
+def _global_f32_ptr(address):
+    pointer_type = fx.PointerType.get(
+        fx.Float32.ir_type,
+        address_space=fx.AddressSpace.Global,
+        alignment=GFX950_DMA_BYTES,
+    )
+    return fx.inttoptr(pointer_type, fx.Int64(address))
+
+
+def hot_split_descriptor_capacity(
+    routes: int,
+    num_experts: int,
+    split_rows: int,
+    min_hot_rows: int,
+) -> int:
+    """Return a host bound for hot-expert split-K descriptors.
+
+    Only experts with at least ``min_hot_rows`` enter the split queue.  The
+    device builder emits ``ceil(frequency / split_rows)`` descriptors for each
+    such expert, so the number of hot experts itself is bounded by
+    ``routes // min_hot_rows``.
+    """
+
+    values = (
+        ("routes", routes),
+        ("num_experts", num_experts),
+        ("split_rows", split_rows),
+        ("min_hot_rows", min_hot_rows),
+    )
+    for name, value in values:
+        if not isinstance(value, int) or isinstance(value, bool):
+            raise TypeError(f"{name} must be an int, got {type(value).__name__}")
+    if routes < 0 or num_experts <= 0 or split_rows <= 0 or min_hot_rows <= 0:
+        raise ValueError("routes must be non-negative and split queue dimensions positive")
+    if min_hot_rows < split_rows:
+        raise ValueError("min_hot_rows must be at least split_rows")
+    if routes == 0:
+        return 0
+    max_hot_experts = min(num_experts, routes // min_hot_rows)
+    if max_hot_experts == 0:
+        return 0
+    # For A non-empty hot experts, sum ceil(c_e / S) is bounded by
+    # floor((R + A*(S-1))/S).
+    return (routes + max_hot_experts * (split_rows - 1)) // split_rows
+
+
 def active_expert_descriptor_capacity(routes: int, num_experts: int) -> int:
     """Return a tight host-known upper bound on active expert descriptors."""
 
@@ -517,6 +563,262 @@ def zero_weight_grads_adaptive_flydsl(
     return dw1, dw2
 
 
+@functools.lru_cache(maxsize=32)
+def compile_hot_split_queues(
+    num_experts: int,
+    split_rows: int,
+    min_hot_rows: int,
+    device_index: int,
+):
+    """Split one active-expert queue into cold and hot split-K queues.
+
+    The input ABI is ``[count, (expert, first_row)*]``.  The cold output keeps
+    that ABI.  The split output is
+    ``[count, (expert, first_row, valid_rows)*]`` and the hot-expert output is
+    ``[count, (expert, first_partition, partition_count)*]``.  All routing
+    decisions remain device-side.
+    """
+
+    del device_index
+    if num_experts <= 0 or num_experts > _BLOCK_THREADS:
+        raise ValueError("hot split queue currently requires 1..256 experts")
+    if split_rows <= 0 or min_hot_rows < split_rows:
+        raise ValueError("invalid hot split row thresholds")
+
+    @flyc.kernel(known_block_size=[_BLOCK_THREADS, 1, 1])
+    def build(
+        expert_frequency: fx.Tensor,
+        active_queue: fx.Tensor,
+        cold_queue: fx.Tensor,
+        split_queue: fx.Tensor,
+        hot_queue: fx.Tensor,
+        i32_cold_capacity: fx.Int32,
+        i32_split_capacity: fx.Int32,
+        i32_hot_capacity: fx.Int32,
+    ):
+        tid = gpu.thread_idx.x
+        active_rsrc = buffer_ops.create_buffer_resource(active_queue, max_size=True)
+        cold_rsrc = buffer_ops.create_buffer_resource(cold_queue, max_size=True)
+        split_rsrc = buffer_ops.create_buffer_resource(split_queue, max_size=True)
+        hot_rsrc = buffer_ops.create_buffer_resource(hot_queue, max_size=True)
+        frequency_rsrc = buffer_ops.create_buffer_resource(expert_frequency, max_size=True)
+        if tid == fx.Int32(0):
+            buffer_ops.buffer_store(fx.Int32(0), cold_rsrc, fx.Int32(0))
+            buffer_ops.buffer_store(fx.Int32(0), split_rsrc, fx.Int32(0))
+            buffer_ops.buffer_store(fx.Int32(0), hot_rsrc, fx.Int32(0))
+        gpu.barrier()
+
+        active_count = fx.Int32(
+            buffer_ops.buffer_load(active_rsrc, fx.Int32(0), vec_width=1, dtype=T.i32)
+        )
+        if tid < active_count:
+            source_offset = fx.Int32(1) + tid * fx.Int32(2)
+            expert = fx.Int32(
+                buffer_ops.buffer_load(active_rsrc, source_offset, vec_width=1, dtype=T.i32)
+            )
+            first_row = fx.Int32(
+                buffer_ops.buffer_load(
+                    active_rsrc,
+                    source_offset + fx.Int32(1),
+                    vec_width=1,
+                    dtype=T.i32,
+                )
+            )
+            frequency = fx.Int32(
+                buffer_ops.buffer_load(frequency_rsrc, expert, vec_width=1, dtype=T.i32)
+            )
+            if frequency >= fx.Int32(min_hot_rows):
+                partition_count = (
+                    frequency + fx.Int32(split_rows - 1)
+                ) // fx.Int32(split_rows)
+                first_partition = fx.Int32(
+                    atomic_add(
+                        split_queue,
+                        fx.Int32(0),
+                        partition_count,
+                        dtype_bytes=4,
+                    )
+                )
+                hot_slot = fx.Int32(
+                    atomic_add(hot_queue, fx.Int32(0), fx.Int32(1), dtype_bytes=4)
+                )
+                if hot_slot < i32_hot_capacity:
+                    hot_offset = fx.Int32(1) + hot_slot * fx.Int32(3)
+                    buffer_ops.buffer_store(expert, hot_rsrc, hot_offset)
+                    buffer_ops.buffer_store(
+                        first_partition,
+                        hot_rsrc,
+                        hot_offset + fx.Int32(1),
+                    )
+                    buffer_ops.buffer_store(
+                        partition_count,
+                        hot_rsrc,
+                        hot_offset + fx.Int32(2),
+                    )
+                for local_partition in range(0, partition_count, 1):
+                    partition = first_partition + fx.Int32(local_partition)
+                    if partition < i32_split_capacity:
+                        local_row = fx.Int32(local_partition) * fx.Int32(split_rows)
+                        remaining = frequency - local_row
+                        valid_rows = (remaining < fx.Int32(split_rows)).select(
+                            remaining,
+                            fx.Int32(split_rows),
+                        )
+                        split_offset = fx.Int32(1) + partition * fx.Int32(3)
+                        buffer_ops.buffer_store(expert, split_rsrc, split_offset)
+                        buffer_ops.buffer_store(
+                            first_row + local_row,
+                            split_rsrc,
+                            split_offset + fx.Int32(1),
+                        )
+                        buffer_ops.buffer_store(
+                            valid_rows,
+                            split_rsrc,
+                            split_offset + fx.Int32(2),
+                        )
+            else:
+                cold_slot = fx.Int32(
+                    atomic_add(cold_queue, fx.Int32(0), fx.Int32(1), dtype_bytes=4)
+                )
+                if cold_slot < i32_cold_capacity:
+                    cold_offset = fx.Int32(1) + cold_slot * fx.Int32(2)
+                    buffer_ops.buffer_store(expert, cold_rsrc, cold_offset)
+                    buffer_ops.buffer_store(
+                        first_row,
+                        cold_rsrc,
+                        cold_offset + fx.Int32(1),
+                    )
+
+        gpu.barrier()
+        if tid == fx.Int32(0):
+            cold_count = fx.Int32(
+                buffer_ops.buffer_load(cold_rsrc, fx.Int32(0), vec_width=1, dtype=T.i32)
+            )
+            split_count = fx.Int32(
+                buffer_ops.buffer_load(split_rsrc, fx.Int32(0), vec_width=1, dtype=T.i32)
+            )
+            hot_count = fx.Int32(
+                buffer_ops.buffer_load(hot_rsrc, fx.Int32(0), vec_width=1, dtype=T.i32)
+            )
+            buffer_ops.buffer_store(
+                (cold_count < i32_cold_capacity).select(cold_count, i32_cold_capacity),
+                cold_rsrc,
+                fx.Int32(0),
+            )
+            buffer_ops.buffer_store(
+                (split_count < i32_split_capacity).select(split_count, i32_split_capacity),
+                split_rsrc,
+                fx.Int32(0),
+            )
+            buffer_ops.buffer_store(
+                (hot_count < i32_hot_capacity).select(hot_count, i32_hot_capacity),
+                hot_rsrc,
+                fx.Int32(0),
+            )
+
+    @flyc.jit
+    def launch(
+        expert_frequency: fx.Tensor,
+        active_queue: fx.Tensor,
+        cold_queue: fx.Tensor,
+        split_queue: fx.Tensor,
+        hot_queue: fx.Tensor,
+        i32_cold_capacity: fx.Int32,
+        i32_split_capacity: fx.Int32,
+        i32_hot_capacity: fx.Int32,
+        stream: fx.Stream = fx.Stream(None),
+    ):
+        build(
+            expert_frequency,
+            active_queue,
+            cold_queue,
+            split_queue,
+            hot_queue,
+            i32_cold_capacity,
+            i32_split_capacity,
+            i32_hot_capacity,
+        ).launch(grid=(1, 1, 1), block=(_BLOCK_THREADS, 1, 1), stream=stream)
+
+    return launch
+
+
+def build_hot_split_queues_flydsl(
+    expert_frequency: torch.Tensor,
+    active_queue: torch.Tensor,
+    *,
+    routes: int,
+    split_rows: int,
+    min_hot_rows: int,
+    cold_queue: torch.Tensor,
+    split_queue: torch.Tensor,
+    hot_queue: torch.Tensor,
+    stream: torch.cuda.Stream | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Build device-side cold, split-partition, and hot-expert queues."""
+
+    num_experts = int(expert_frequency.numel())
+    cold_capacity = active_expert_descriptor_capacity(routes, num_experts)
+    split_capacity = hot_split_descriptor_capacity(
+        routes,
+        num_experts,
+        split_rows,
+        min_hot_rows,
+    )
+    hot_capacity = min(num_experts, routes // min_hot_rows)
+    tensors = (
+        expert_frequency,
+        active_queue,
+        cold_queue,
+        split_queue,
+        hot_queue,
+    )
+    if any(tensor.device != expert_frequency.device for tensor in tensors):
+        raise ValueError("hot split queue tensors must share one device")
+    if any(tensor.dtype != torch.int32 for tensor in tensors):
+        raise TypeError("hot split queue tensors must use int32")
+    if not all(tensor.is_contiguous() and tensor.ndim == 1 for tensor in tensors):
+        raise ValueError("hot split queue tensors must be contiguous vectors")
+    if active_queue.numel() < 1 + 2 * cold_capacity:
+        raise ValueError("active_queue does not cover its route bound")
+    if cold_queue.numel() < 1 + 2 * cold_capacity:
+        raise ValueError("cold_queue has insufficient capacity")
+    if split_queue.numel() < 1 + 3 * split_capacity:
+        raise ValueError("split_queue has insufficient capacity")
+    if hot_queue.numel() < 1 + 3 * hot_capacity:
+        raise ValueError("hot_queue has insufficient capacity")
+    if split_capacity == 0 or hot_capacity == 0:
+        with torch.cuda.stream(
+            torch.cuda.current_stream(expert_frequency.device) if stream is None else stream
+        ):
+            cold_queue.copy_(active_queue)
+            split_queue[:1].zero_()
+            hot_queue[:1].zero_()
+        return cold_queue, split_queue, hot_queue
+    if stream is None:
+        stream = torch.cuda.current_stream(expert_frequency.device)
+    launcher = compile_hot_split_queues(
+        num_experts,
+        split_rows,
+        min_hot_rows,
+        expert_frequency.device.index or 0,
+    )
+    _run_compiled(
+        launcher,
+        expert_frequency,
+        active_queue,
+        cold_queue,
+        split_queue,
+        hot_queue,
+        cold_capacity,
+        split_capacity,
+        hot_capacity,
+        stream,
+    )
+    for tensor in tensors:
+        tensor.record_stream(stream)
+    return cold_queue, split_queue, hot_queue
+
+
 def grouped_tn_grid_cap(
     block_m: int,
     block_n: int,
@@ -601,6 +903,7 @@ def compile_grouped_tn(
     min_expert_rows: int = 0,
     max_expert_rows: int | None = None,
     active_guard_or_expert_rows: bool = False,
+    split_k_partials: bool = False,
 ):
     """Compile the persistent grouped TN consumer for a prebuilt queue.
 
@@ -622,6 +925,10 @@ def compile_grouped_tn(
     both sparse shards and a hot expert in an otherwise dense shard.
     ``gather_rhs`` loads token-major RHS rows through packed sorter token IDs,
     eliminating their otherwise materialized sorter-order copy.
+    ``split_k_partials`` consumes
+    ``[count, (expert, first_row, valid_rows)*]`` and writes one FP32 output
+    matrix per descriptor.  A separate deterministic reduction finalizes those
+    matrices into the public BF16 gradient.
     """
 
     del device_index
@@ -677,6 +984,8 @@ def compile_grouped_tn(
         raise ValueError(
             "active_guard_or_expert_rows requires queue metadata plus active and row guards"
         )
+    if split_k_partials and metadata_direct:
+        raise ValueError("split-K partials require queue metadata")
     if block_k not in (32, 64):
         raise ValueError("grouped TN block_k must be 32 or 64")
     if stages not in (2, 3, 4):
@@ -737,6 +1046,7 @@ def compile_grouped_tn(
             f"_bm{block_m}_bn{block_n}_bk{block_k}_s{stages}_kp{k_padding}_w{m_waves}x{n_waves}"
             f"_md{int(metadata_direct)}"
             f"_gr{int(gather_rhs)}"
+            f"_skp{int(split_k_partials)}"
             f"_amin{min_active_experts}_amax{max_active_experts}"
             f"_rmin{min_expert_rows}_rmax{max_expert_rows}"
             f"_aor{int(active_guard_or_expert_rows)}"
@@ -827,7 +1137,42 @@ def compile_grouped_tn(
         def run_output_tile_unchecked(work_index):
             descriptor_index = work_index // fx.Int32(output_tiles_per_expert)
             output_tile = work_index % fx.Int32(output_tiles_per_expert)
-            if const_expr(metadata_direct):
+            if const_expr(split_k_partials):
+                descriptor_offset = fx.Int32(1) + descriptor_index * fx.Int32(3)
+                expert = rocdl.readfirstlane(
+                    T.i32,
+                    _raw(
+                        buffer_ops.buffer_load(
+                            storage_rsrc,
+                            descriptor_offset,
+                            vec_width=1,
+                            dtype=T.i32,
+                        )
+                    ),
+                )
+                first_sorted_row = rocdl.readfirstlane(
+                    T.i32,
+                    _raw(
+                        buffer_ops.buffer_load(
+                            storage_rsrc,
+                            descriptor_offset + fx.Int32(1),
+                            vec_width=1,
+                            dtype=T.i32,
+                        )
+                    ),
+                )
+                frequency = rocdl.readfirstlane(
+                    T.i32,
+                    _raw(
+                        buffer_ops.buffer_load(
+                            storage_rsrc,
+                            descriptor_offset + fx.Int32(2),
+                            vec_width=1,
+                            dtype=T.i32,
+                        )
+                    ),
+                )
+            elif const_expr(metadata_direct):
                 expert = rocdl.readfirstlane(
                     T.i32,
                     _raw(
@@ -864,10 +1209,11 @@ def compile_grouped_tn(
                         )
                     ),
                 )
-            frequency = rocdl.readfirstlane(
-                T.i32,
-                _raw(buffer_ops.buffer_load(frequency_rsrc, expert, vec_width=1, dtype=T.i32)),
-            )
+            if const_expr(not split_k_partials):
+                frequency = rocdl.readfirstlane(
+                    T.i32,
+                    _raw(buffer_ops.buffer_load(frequency_rsrc, expert, vec_width=1, dtype=T.i32)),
+                )
             padding_quantum = block_k if k_padding == 0 else k_padding
             padded_k = (
                 (frequency + fx.Int32(padding_quantum - 1))
@@ -898,16 +1244,22 @@ def compile_grouped_tn(
             block_m_offset = block_m_index * fx.Int32(block_m)
             block_n_offset = block_n_index * fx.Int32(block_n)
 
-            output_addr = output_base_addr + fx.Int64(expert) * fx.Int64(
-                output_m * output_n * in_data_bytes
+            output_owner = descriptor_index if split_k_partials else expert
+            output_data_bytes = 4 if split_k_partials else in_data_bytes
+            output_addr = output_base_addr + fx.Int64(output_owner) * fx.Int64(
+                output_m * output_n * output_data_bytes
             )
             output_rsrc = buffer_ops.create_buffer_resource_from_addr(
                 _raw(output_addr),
-                num_records_bytes=output_m * output_n * in_data_bytes,
+                num_records_bytes=output_m * output_n * output_data_bytes,
             )
             expert_out = fx.rocdl.make_buffer_tensor(
                 fx.make_view(
-                    _global_bf16_ptr(output_addr),
+                    (
+                        _global_f32_ptr(output_addr)
+                        if split_k_partials
+                        else _global_bf16_ptr(output_addr)
+                    ),
                     fx.make_layout((output_m, output_n), (output_n, 1)),
                 ),
                 max_size=False,
@@ -1204,31 +1556,50 @@ def compile_grouped_tn(
                         compute_stage(current_stage)
                 current_stage = (current_stage + fx.Int32(1)) % fx.Int32(stages)
 
-            frag_c_out = fx.make_fragment_like(frag_c, fx.BFloat16)
-            frag_c_out.store(frag_c.load().to(fx.BFloat16))
-            gpu.barrier()
-            for value_index in range_constexpr(fx.size(frag_c_out.shape).unpack()):
-                row = fx.get_scalar(thr_mma_crow[value_index])
-                column = fx.get_scalar(thr_mma_ccol[value_index])
-                s_c[row, column] = frag_c_out[value_index]
-            gpu.barrier()
-
-            vectors_per_row = block_n // cshuffle_vec_size
-            tile_vectors = block_m * vectors_per_row
-            store_iters = (tile_vectors + block_threads - 1) // block_threads
-            for store_iter in range_constexpr(store_iters):
-                vector_index = fx.Int32(block_threads * store_iter) + tid
-                if vector_index < fx.Int32(tile_vectors):
-                    local_row = vector_index // fx.Int32(vectors_per_row)
-                    local_col = (vector_index % fx.Int32(vectors_per_row)) * fx.Int32(cshuffle_vec_size)
-                    global_row = block_m_offset + local_row
-                    global_col = block_n_offset + local_col
-                    value = fx.ptr_load(
-                        smem_c + local_row * fx.Int32(block_n) + local_col,
-                        result_type=fx.Vector.make_type(cshuffle_vec_size, fx.BFloat16),
+            if const_expr(split_k_partials):
+                # Each MFMA fragment element has a unique output coordinate.
+                # Direct FP32 stores avoid doubling the C-shuffle LDS footprint
+                # beyond gfx950's 160-KiB limit.  The deterministic finalize
+                # kernel later sums partitions and performs the sole BF16 cast.
+                for value_index in range_constexpr(fx.size(frag_c.shape).unpack()):
+                    row = fx.get_scalar(thr_mma_crow[value_index])
+                    column = fx.get_scalar(thr_mma_ccol[value_index])
+                    output_offset = (
+                        (block_m_offset + row) * fx.Int32(output_n)
+                        + block_n_offset
+                        + column
                     )
-                    output_offset = global_row * fx.Int32(output_n) + global_col
-                    buffer_ops.buffer_store(value, output_rsrc, output_offset)
+                    buffer_ops.buffer_store(
+                        fx.Float32(frag_c[value_index]),
+                        output_rsrc,
+                        output_offset,
+                    )
+            else:
+                frag_c_out = fx.make_fragment_like(frag_c, fx.BFloat16)
+                frag_c_out.store(frag_c.load().to(fx.BFloat16))
+                gpu.barrier()
+                for value_index in range_constexpr(fx.size(frag_c_out.shape).unpack()):
+                    row = fx.get_scalar(thr_mma_crow[value_index])
+                    column = fx.get_scalar(thr_mma_ccol[value_index])
+                    s_c[row, column] = frag_c_out[value_index]
+                gpu.barrier()
+
+                vectors_per_row = block_n // cshuffle_vec_size
+                tile_vectors = block_m * vectors_per_row
+                store_iters = (tile_vectors + block_threads - 1) // block_threads
+                for store_iter in range_constexpr(store_iters):
+                    vector_index = fx.Int32(block_threads * store_iter) + tid
+                    if vector_index < fx.Int32(tile_vectors):
+                        local_row = vector_index // fx.Int32(vectors_per_row)
+                        local_col = (vector_index % fx.Int32(vectors_per_row)) * fx.Int32(cshuffle_vec_size)
+                        global_row = block_m_offset + local_row
+                        global_col = block_n_offset + local_col
+                        value = fx.ptr_load(
+                            smem_c + local_row * fx.Int32(block_n) + local_col,
+                            result_type=fx.Vector.make_type(cshuffle_vec_size, fx.BFloat16),
+                        )
+                        output_offset = global_row * fx.Int32(output_n) + global_col
+                        buffer_ops.buffer_store(value, output_rsrc, output_offset)
 
         def run_output_tile(work_index):
             if const_expr(min_expert_rows == 0 and max_expert_rows is None):
@@ -1370,6 +1741,287 @@ def compile_grouped_tn(
             )
 
     return launch
+
+
+def grouped_tn_splitk_from_queue_flydsl(
+    lhs_rows: torch.Tensor,
+    rhs_rows: torch.Tensor,
+    expert_frequency: torch.Tensor,
+    split_queue: torch.Tensor,
+    partials: torch.Tensor,
+    *,
+    sorted_token_ids: torch.Tensor | None = None,
+    block_m: int = 128,
+    block_n: int = 128,
+    block_k: int = 32,
+    m_waves: int = 2,
+    n_waves: int = 2,
+    stages: int = 3,
+    stream: torch.cuda.Stream | None = None,
+) -> torch.Tensor:
+    """Compute FP32 TN partials from hot-expert split descriptors."""
+
+    if lhs_rows.ndim != 2 or rhs_rows.ndim != 2 or partials.ndim != 3:
+        raise ValueError("split-K TN expects lhs[P,M], rhs[P,N], partials[S,M,N]")
+    gather_rhs = sorted_token_ids is not None
+    if not gather_rhs and lhs_rows.shape[0] != rhs_rows.shape[0]:
+        raise ValueError("split-K TN inputs must share their sorted row extent")
+    num_experts = int(expert_frequency.numel())
+    capacity, output_m, output_n = (int(value) for value in partials.shape)
+    if int(lhs_rows.shape[1]) != output_m or int(rhs_rows.shape[1]) != output_n:
+        raise ValueError("split-K TN partial width must match its inputs")
+    tensors = (lhs_rows, rhs_rows, expert_frequency, split_queue, partials)
+    if sorted_token_ids is not None:
+        tensors = (*tensors, sorted_token_ids)
+    if any(tensor.device != lhs_rows.device for tensor in tensors):
+        raise ValueError("split-K TN tensors must share one device")
+    if lhs_rows.dtype != torch.bfloat16 or rhs_rows.dtype != torch.bfloat16:
+        raise TypeError("split-K TN inputs must use BF16")
+    if expert_frequency.dtype != torch.int32 or split_queue.dtype != torch.int32:
+        raise TypeError("split-K TN metadata must use int32")
+    if sorted_token_ids is not None and sorted_token_ids.dtype != torch.int32:
+        raise TypeError("split-K gathered RHS token IDs must use int32")
+    if partials.dtype != torch.float32:
+        raise TypeError("split-K TN partials must use FP32")
+    if not all(tensor.is_contiguous() for tensor in tensors):
+        raise ValueError("split-K TN tensors must be contiguous")
+    if split_queue.ndim != 1 or split_queue.numel() < 1 or (split_queue.numel() - 1) % 3:
+        raise ValueError("split_queue must use [count, (expert,row,rows)*] ABI")
+    if capacity < (split_queue.numel() - 1) // 3:
+        raise ValueError("partials must cover split queue capacity")
+    if capacity == 0:
+        return partials
+    if partials.numel() * partials.element_size() > _MAX_BUFFER_BYTES:
+        raise ValueError("split-K partial storage exceeds one gfx950 BRSRC")
+    grid = grouped_tn_launch_grid(
+        capacity,
+        output_m,
+        output_n,
+        block_m,
+        block_n,
+        block_k,
+        stages,
+        m_waves,
+        n_waves,
+        gather_rhs,
+    )
+    if stream is None:
+        stream = torch.cuda.current_stream(lhs_rows.device)
+    launcher = compile_grouped_tn(
+        output_m,
+        output_n,
+        num_experts,
+        block_m,
+        block_n,
+        block_k,
+        0,
+        m_waves,
+        n_waves,
+        lhs_rows.device.index or 0,
+        metadata_direct=False,
+        stages=stages,
+        gather_rhs=gather_rhs,
+        split_k_partials=True,
+    )
+    if sorted_token_ids is None:
+        _run_compiled(
+            launcher,
+            lhs_rows,
+            rhs_rows,
+            expert_frequency,
+            split_queue,
+            split_queue,
+            partials,
+            grid,
+            stream,
+        )
+    else:
+        _run_compiled(
+            launcher,
+            lhs_rows,
+            rhs_rows,
+            sorted_token_ids,
+            expert_frequency,
+            split_queue,
+            split_queue,
+            partials,
+            grid,
+            stream,
+        )
+    for tensor in tensors:
+        tensor.record_stream(stream)
+    return partials
+
+
+@functools.lru_cache(maxsize=32)
+def compile_hot_split_finalize(
+    output_m: int,
+    output_n: int,
+    num_experts: int,
+    device_index: int,
+):
+    """Compile deterministic FP32-partial reduction into BF16 dW2."""
+
+    del device_index
+    vector_width = 4
+    output_elements = output_m * output_n
+    if min(output_m, output_n, num_experts) <= 0 or output_elements % vector_width:
+        raise ValueError("hot split finalize requires positive vector-aligned dimensions")
+    vectors_per_expert = output_elements // vector_width
+
+    @flyc.kernel(known_block_size=[_BLOCK_THREADS, 1, 1])
+    def finalize(
+        split_queue: fx.Tensor,
+        hot_queue: fx.Tensor,
+        partials: fx.Tensor,
+        output: fx.Tensor,
+    ):
+        tid = gpu.thread_idx.x
+        bid = gpu.block_idx.x
+        grid_size = gpu.grid_dim.x
+        split_rsrc = buffer_ops.create_buffer_resource(split_queue, max_size=True)
+        hot_rsrc = buffer_ops.create_buffer_resource(hot_queue, max_size=True)
+        partial_rsrc = buffer_ops.create_buffer_resource(partials, max_size=True)
+        output_rsrc = buffer_ops.create_buffer_resource(output, max_size=True)
+        hot_count = fx.Int32(
+            buffer_ops.buffer_load(hot_rsrc, fx.Int32(0), vec_width=1, dtype=T.i32)
+        )
+        work_bound = hot_count * fx.Int32(vectors_per_expert)
+
+        def reduce_vector(work_index):
+            hot_index = work_index // fx.Int32(vectors_per_expert)
+            vector_index = work_index % fx.Int32(vectors_per_expert)
+            hot_offset = fx.Int32(1) + hot_index * fx.Int32(3)
+            expert = fx.Int32(
+                buffer_ops.buffer_load(hot_rsrc, hot_offset, vec_width=1, dtype=T.i32)
+            )
+            first_partition = fx.Int32(
+                buffer_ops.buffer_load(
+                    hot_rsrc,
+                    hot_offset + fx.Int32(1),
+                    vec_width=1,
+                    dtype=T.i32,
+                )
+            )
+            partition_count = fx.Int32(
+                buffer_ops.buffer_load(
+                    hot_rsrc,
+                    hot_offset + fx.Int32(2),
+                    vec_width=1,
+                    dtype=T.i32,
+                )
+            )
+            element = vector_index * fx.Int32(vector_width)
+            accum = fx.Vector.filled(vector_width, 0.0, fx.Float32)
+            # Builder reserves and writes each expert's partitions in ascending
+            # row order, so this loop is deterministic despite cross-expert
+            # atomic queue placement.
+            for local_partition in range(0, partition_count, 1):
+                partition = first_partition + fx.Int32(local_partition)
+                split_offset = fx.Int32(1) + partition * fx.Int32(3)
+                descriptor_expert = fx.Int32(
+                    buffer_ops.buffer_load(
+                        split_rsrc,
+                        split_offset,
+                        vec_width=1,
+                        dtype=T.i32,
+                    )
+                )
+                partial_offset = (
+                    partition * fx.Int32(output_elements) + element
+                )
+                partial = fx.Vector(
+                    buffer_ops.buffer_load(
+                        partial_rsrc,
+                        partial_offset,
+                        vec_width=vector_width,
+                        dtype=fx.Float32,
+                    )
+                )
+                accum = accum + (descriptor_expert == expert).select(
+                    partial,
+                    fx.Vector.filled(vector_width, 0.0, fx.Float32),
+                )
+            output_offset = expert * fx.Int32(output_elements) + element
+            buffer_ops.buffer_store(
+                accum.to(fx.BFloat16),
+                output_rsrc,
+                output_offset,
+            )
+
+        work_index = bid * fx.Int32(_BLOCK_THREADS) + tid
+        stride = grid_size * fx.Int32(_BLOCK_THREADS)
+        for current in range(work_index, work_bound, stride):
+            reduce_vector(fx.Int32(current))
+
+    @flyc.jit
+    def launch(
+        split_queue: fx.Tensor,
+        hot_queue: fx.Tensor,
+        partials: fx.Tensor,
+        output: fx.Tensor,
+        i32_grid: fx.Int32,
+        stream: fx.Stream = fx.Stream(None),
+    ):
+        finalize(split_queue, hot_queue, partials, output).launch(
+            grid=(i32_grid, 1, 1),
+            block=(_BLOCK_THREADS, 1, 1),
+            stream=stream,
+        )
+
+    return launch
+
+
+def finalize_hot_splitk_flydsl(
+    split_queue: torch.Tensor,
+    hot_queue: torch.Tensor,
+    partials: torch.Tensor,
+    output: torch.Tensor,
+    *,
+    stream: torch.cuda.Stream | None = None,
+) -> torch.Tensor:
+    """Reduce hot-expert FP32 partials in partition order and cast once."""
+
+    if partials.ndim != 3 or output.ndim != 3:
+        raise ValueError("split-K finalize expects partials[S,M,N], output[E,M,N]")
+    if tuple(partials.shape[1:]) != tuple(output.shape[1:]):
+        raise ValueError("split-K partial/output matrix dimensions must match")
+    tensors = (split_queue, hot_queue, partials, output)
+    if any(tensor.device != output.device for tensor in tensors):
+        raise ValueError("split-K finalize tensors must share one device")
+    if split_queue.dtype != torch.int32 or hot_queue.dtype != torch.int32:
+        raise TypeError("split-K finalize queues must use int32")
+    if partials.dtype != torch.float32 or output.dtype != torch.bfloat16:
+        raise TypeError("split-K finalize requires FP32 partials and BF16 output")
+    if not all(tensor.is_contiguous() for tensor in tensors):
+        raise ValueError("split-K finalize tensors must be contiguous")
+    hot_capacity = (int(hot_queue.numel()) - 1) // 3
+    if hot_capacity <= 0:
+        return output
+    output_elements = int(output.shape[1]) * int(output.shape[2])
+    vector_width = 4
+    max_work = hot_capacity * (output_elements // vector_width)
+    grid = min(1024, max(1, (max_work + _BLOCK_THREADS - 1) // _BLOCK_THREADS))
+    if stream is None:
+        stream = torch.cuda.current_stream(output.device)
+    launcher = compile_hot_split_finalize(
+        int(output.shape[1]),
+        int(output.shape[2]),
+        int(output.shape[0]),
+        output.device.index or 0,
+    )
+    _run_compiled(
+        launcher,
+        split_queue,
+        hot_queue,
+        partials,
+        output,
+        grid,
+        stream,
+    )
+    for tensor in tensors:
+        tensor.record_stream(stream)
+    return output
 
 
 def build_active_expert_queue_flydsl(
@@ -1829,10 +2481,15 @@ __all__ = [
     "active_expert_descriptor_capacity",
     "active_expert_queue_elements",
     "build_active_expert_queue_flydsl",
+    "build_hot_split_queues_flydsl",
     "compile_active_expert_queue",
     "compile_grouped_tn",
+    "compile_hot_split_finalize",
+    "compile_hot_split_queues",
     "compile_inactive_weight_grad_zero",
+    "finalize_hot_splitk_flydsl",
     "grouped_dw2_flydsl",
+    "grouped_tn_splitk_from_queue_flydsl",
     "grouped_dw2_tuning",
     "grouped_tn_grid_cap",
     "grouped_tn_launch_grid",
@@ -1840,6 +2497,7 @@ __all__ = [
     "grouped_tn_from_queue_flydsl",
     "grouped_tn_flydsl",
     "grouped_tn_tuning",
+    "hot_split_descriptor_capacity",
     "zero_inactive_weight_grads_flydsl",
     "zero_weight_grads_adaptive_flydsl",
 ]

@@ -66,8 +66,11 @@ from kernels.moe.sonic_grouped_tn import (
     active_expert_descriptor_capacity,
     active_expert_queue_elements,
     build_active_expert_queue_flydsl,
+    finalize_hot_splitk_flydsl,
     grouped_tn_from_metadata_flydsl,
     grouped_tn_from_queue_flydsl,
+    grouped_tn_splitk_from_queue_flydsl,
+    hot_split_descriptor_capacity,
     zero_inactive_weight_grads_flydsl,
     zero_weight_grads_adaptive_flydsl,
 )
@@ -202,6 +205,15 @@ _E16_DW2_HOT_EXPERT_MIN_ROWS = 16384
 # balanced routing retains BN128.  Both profiles consume the same device queue
 # and use disjoint guards, so this selection never reads the count on the host.
 _E16_DW1_NARROW_MAX_ACTIVE_EXPERTS = 4
+_E16_DW1_SPLITK_ENABLED = True
+_E16_DW1_SPLIT_ROWS = 8192
+_E16_DW1_SPLIT_MIN_HOT_ROWS = 16384
+_E16_DW1_SPLIT_BM = 128
+_E16_DW1_SPLIT_BN = 256
+_E16_DW1_SPLIT_BK = 32
+_E16_DW1_SPLIT_M_WAVES = 2
+_E16_DW1_SPLIT_N_WAVES = 4
+_E16_DW1_SPLIT_STAGES = 2
 
 _RoutesSorterMetadata = tuple[
     torch.Tensor,  # sorted_token_ids
@@ -524,7 +536,6 @@ def _launch_grouped_dw2(
                 active_guard_or_expert_rows=active_guard_or_expert_rows,
                 **grouped_dw2_kwargs,
             )
-
 
 def _grouped_da_tuning(max_expert_rows: int, hidden_size: int) -> tuple[int, int, int, int, int]:
     """Return ``(BM, BN, BK, m_waves, n_waves)`` for grouped dA."""
@@ -4210,6 +4221,16 @@ def _sonic_moe_backward_impl(
         activation=activation_name,
         e16_flat_grouped=use_e16_flat_grouped,
     )
+    use_e16_hot_dw1_splitk = (
+        _E16_DW1_SPLITK_ENABLED
+        and use_e16_flat_grouped
+        and reuse_forward_preactivation
+        and token_indices_identity
+        and forward_sorter_metadata is not None
+        and use_direct_grouped_dw1_rhs
+        and use_e16_deduplicated_metadata
+        and routes > _E16_DW1_SPLIT_MIN_HOT_ROWS
+    )
     # If even the maximum possible active set falls below the measured
     # selective-clear crossover, a normal dense memset is unconditionally the
     # best choice.  This route-count test is host-known and distribution
@@ -4322,6 +4343,38 @@ def _sonic_moe_backward_impl(
     else:
         exact_tile_queue_bound = 0
         exact_tile_queue_storage = None
+    if use_e16_hot_dw1_splitk:
+        split_descriptor_capacity = hot_split_descriptor_capacity(
+            routes,
+            num_experts,
+            _E16_DW1_SPLIT_ROWS,
+            _E16_DW1_SPLIT_MIN_HOT_ROWS,
+        )
+        hot_expert_capacity = min(
+            num_experts,
+            routes // _E16_DW1_SPLIT_MIN_HOT_ROWS,
+        )
+        hot_split_storage = torch.empty(
+            1 + 3 * split_descriptor_capacity,
+            dtype=torch.int32,
+            device=device,
+        )
+        hot_expert_storage = torch.empty(
+            1 + 3 * hot_expert_capacity,
+            dtype=torch.int32,
+            device=device,
+        )
+        hot_dw1_partials = torch.empty(
+            (split_descriptor_capacity, projection_size, hidden_size),
+            dtype=torch.float32,
+            device=device,
+        )
+    else:
+        split_descriptor_capacity = 0
+        hot_expert_capacity = 0
+        hot_split_storage = None
+        hot_expert_storage = None
+        hot_dw1_partials = None
     if use_compact_w1 and not use_e16_deduplicated_metadata:
         if flat_routes:
             compact_w1_bound = ragged_compact_m_tile_descriptor_upper_bound(
@@ -4601,6 +4654,20 @@ def _sonic_moe_backward_impl(
                 active_expert_capacity=(
                     active_expert_capacity
                     if use_e16_deduplicated_metadata
+                    else None
+                ),
+                hot_split_storage=(
+                    hot_split_storage if use_e16_hot_dw1_splitk else None
+                ),
+                hot_expert_storage=(
+                    hot_expert_storage if use_e16_hot_dw1_splitk else None
+                ),
+                split_rows=(
+                    _E16_DW1_SPLIT_ROWS if use_e16_hot_dw1_splitk else None
+                ),
+                min_hot_rows=(
+                    _E16_DW1_SPLIT_MIN_HOT_ROWS
+                    if use_e16_hot_dw1_splitk
                     else None
                 ),
                 stream=stream,
@@ -5194,6 +5261,7 @@ def _sonic_moe_backward_impl(
         if use_grouped_dw1:
             grouped_dw1_rhs = x_arg if use_direct_grouped_dw1_rhs else x_sorted
             assert grouped_dw1_rhs is not None
+            grouped_dw1_active_storage = active_expert_storage
             (
                 grouped_dw1_bm,
                 grouped_dw1_bn,
@@ -5270,6 +5338,10 @@ def _sonic_moe_backward_impl(
                     "n_waves": profile_n_waves,
                     "stream": stream,
                 }
+                if use_e16_hot_dw1_splitk:
+                    grouped_dw1_kwargs["max_expert_rows"] = (
+                        _E16_DW1_SPLIT_MIN_HOT_ROWS - 1
+                    )
                 if use_tn_metadata_direct:
                     grouped_tn_from_metadata_flydsl(
                         dz,
@@ -5286,12 +5358,12 @@ def _sonic_moe_backward_impl(
                         **grouped_dw1_kwargs,
                     )
                 else:
-                    assert active_expert_storage is not None
+                    assert grouped_dw1_active_storage is not None
                     grouped_tn_from_queue_flydsl(
                         dz,
                         grouped_dw1_rhs,
                         expert_frequency,
-                        active_expert_storage,
+                        grouped_dw1_active_storage,
                         dw1,
                         sorted_token_ids=(
                             sorted_token_ids
@@ -5302,6 +5374,33 @@ def _sonic_moe_backward_impl(
                         max_active_experts=max_active_experts,
                         **grouped_dw1_kwargs,
                     )
+
+            if use_e16_hot_dw1_splitk:
+                assert hot_split_storage is not None
+                assert hot_expert_storage is not None
+                assert hot_dw1_partials is not None
+                grouped_tn_splitk_from_queue_flydsl(
+                    dz,
+                    x_arg,
+                    expert_frequency,
+                    hot_split_storage,
+                    hot_dw1_partials,
+                    sorted_token_ids=sorted_token_ids,
+                    block_m=_E16_DW1_SPLIT_BM,
+                    block_n=_E16_DW1_SPLIT_BN,
+                    block_k=_E16_DW1_SPLIT_BK,
+                    m_waves=_E16_DW1_SPLIT_M_WAVES,
+                    n_waves=_E16_DW1_SPLIT_N_WAVES,
+                    stages=_E16_DW1_SPLIT_STAGES,
+                    stream=stream,
+                )
+                finalize_hot_splitk_flydsl(
+                    hot_split_storage,
+                    hot_expert_storage,
+                    hot_dw1_partials,
+                    dw1,
+                    stream=stream,
+                )
 
         if use_grouped_dx:
             # Compact queues round real expert rows to their selected BM.
