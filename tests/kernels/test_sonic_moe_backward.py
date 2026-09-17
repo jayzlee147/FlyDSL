@@ -33,6 +33,7 @@ from kernels.moe.sonic_backward import (
     _grouped_dw2_tuning,
     _grouped_dx_tuning,
     _grouped_w1_tuning,
+    _hostless_row_grid_cap,
     _use_direct_grouped_dw1_rhs,
     _use_direct_grouped_dx_routes,
     _use_e16_fixed_state_grouped_backward,
@@ -62,6 +63,32 @@ _ACTIVATIONS = (
     "relu_sq",
 )
 _DTYPES = ((torch.bfloat16, "bf16"), (torch.float16, "fp16"))
+
+
+@pytest.mark.parametrize(
+    ("use_e16_expert_major", "routes", "expected"),
+    (
+        (True, 8190, 1024),
+        (True, 8191, 2048),
+        (True, 8192, 2048),
+        # E896 and every other non-E16-expert-major hostless path keep the
+        # original launch cap, even at production-sized route counts.
+        (False, 8192, 1024),
+        (False, 65536, 1024),
+    ),
+)
+def test_hostless_row_grid_cap_is_narrow(
+    use_e16_expert_major,
+    routes,
+    expected,
+):
+    assert (
+        _hostless_row_grid_cap(
+            use_e16_expert_major=use_e16_expert_major,
+            routes=routes,
+        )
+        == expected
+    )
 
 
 @pytest.mark.parametrize(

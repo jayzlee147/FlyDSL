@@ -715,6 +715,19 @@ _INACTIVE_WEIGHT_GRAD_ZERO_ACTIVE_RATIO = 8
 # cover latency without launching tens of thousands of idle CTAs for sparse
 # hot-expert distributions.
 _HOSTLESS_ROW_GRID_CAP = 1024
+# Qwen3's expert-major E16 route path has substantially more independent row
+# work than the E896 path.  A second gfx950 wave improves its long-route row
+# kernels, while keeping the original cap is safer for short and E896 shapes.
+_E16_EXACT_ROW_GRID_CAP = 2048
+_E16_EXACT_ROW_GRID_MIN_ROUTES = 8191
+
+
+def _hostless_row_grid_cap(*, use_e16_expert_major: bool, routes: int) -> int:
+    """Return the row-kernel grid cap for the audited hostless dataflow."""
+
+    if use_e16_expert_major and routes >= _E16_EXACT_ROW_GRID_MIN_ROUTES:
+        return _E16_EXACT_ROW_GRID_CAP
+    return _HOSTLESS_ROW_GRID_CAP
 
 
 def _grouped_dw1_tuning(
@@ -4226,6 +4239,10 @@ def _sonic_moe_backward_impl(
         e16_fixed_state_grouped=use_e16_fixed_state_grouped,
         e16_flat_grouped=use_e16_flat_grouped,
     )
+    hostless_row_grid_cap = _hostless_row_grid_cap(
+        use_e16_expert_major=(use_hostless_grouped and use_flat_identity_dx),
+        routes=routes,
+    )
     use_sorter_native_backward_metadata = _use_sorter_native_backward_metadata(
         flat_routes=flat_routes,
         has_bias=has_bias,
@@ -4914,7 +4931,7 @@ def _sonic_moe_backward_impl(
             gather_work = (max_padded if use_hostless_grouped else padded_rows) * (hidden_size // 4)
             gather_grid = max(1, (gather_work + _BLOCK_THREADS - 1) // _BLOCK_THREADS)
             if use_hostless_grouped:
-                gather_grid = min(_HOSTLESS_ROW_GRID_CAP, gather_grid)
+                gather_grid = min(hostless_row_grid_cap, gather_grid)
             _run_compiled(
                 gather,
                 x_arg,
@@ -4946,7 +4963,7 @@ def _sonic_moe_backward_impl(
                     layout="nt",
                 )
 
-        activation_grid = min(_HOSTLESS_ROW_GRID_CAP, max_padded) if use_hostless_grouped else padded_rows
+        activation_grid = min(hostless_row_grid_cap, max_padded) if use_hostless_grouped else padded_rows
         if forward_state_data is None:
             assert preactivation is not None
             assert dout_sorted is not None
@@ -4993,7 +5010,7 @@ def _sonic_moe_backward_impl(
                 )
                 assert state_row_schedule is not None
                 state_prepare_grid = min(
-                    _HOSTLESS_ROW_GRID_CAP,
+                    hostless_row_grid_cap,
                     max(1, state_schedule_bound * state_schedule_block_m),
                 )
                 _run_compiled(
@@ -5237,7 +5254,7 @@ def _sonic_moe_backward_impl(
                     layout="tn",
                 )
 
-        derivative_grid = min(_HOSTLESS_ROW_GRID_CAP, max_padded) if use_hostless_grouped else padded_rows
+        derivative_grid = min(hostless_row_grid_cap, max_padded) if use_hostless_grouped else padded_rows
         if use_fused_da_dscore:
             assert forward_state_data is not None
             route_preactivation = forward_state_data[0]
@@ -5264,7 +5281,7 @@ def _sonic_moe_backward_impl(
                 else state_schedule_bound * state_schedule_block_m
             )
             derivative_grid = min(
-                _HOSTLESS_ROW_GRID_CAP,
+                hostless_row_grid_cap,
                 max(1, derivative_work_bound),
             )
             _run_compiled(
@@ -5318,7 +5335,7 @@ def _sonic_moe_backward_impl(
             )
             assert compact_w1_storage is not None
             derivative_grid = min(
-                _HOSTLESS_ROW_GRID_CAP,
+                hostless_row_grid_cap,
                 max(1, compact_w1_bound * _COMPACT_W1_BM),
             )
             _run_compiled(
@@ -5806,7 +5823,7 @@ def _sonic_moe_backward_impl(
                     droute_weights,
                     num_valid_ids,
                     tokens,
-                    (min(_HOSTLESS_ROW_GRID_CAP, max_padded) if use_hostless_grouped else padded_rows),
+                    (min(hostless_row_grid_cap, max_padded) if use_hostless_grouped else padded_rows),
                     stream,
                 )
 
@@ -5823,7 +5840,7 @@ def _sonic_moe_backward_impl(
                 unsort_work = (max_padded if use_hostless_grouped else padded_rows) * (hidden_size // 4)
                 unsort_grid = max(1, (unsort_work + _BLOCK_THREADS - 1) // _BLOCK_THREADS)
                 if use_hostless_grouped:
-                    unsort_grid = min(_HOSTLESS_ROW_GRID_CAP, unsort_grid)
+                    unsort_grid = min(hostless_row_grid_cap, unsort_grid)
                 _run_compiled(
                     unsort,
                     dx_sorted,
