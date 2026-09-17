@@ -238,11 +238,14 @@ def test_e16_dw2_dual_profile_dispatch_is_device_guarded(monkeypatch):
             kwargs["block_n"],
             kwargs["min_active_experts"],
             kwargs["max_active_experts"],
+            kwargs["min_expert_rows"],
+            kwargs["max_expert_rows"],
+            kwargs["active_guard_or_expert_rows"],
         )
         for _, kwargs in calls
     ] == [
-        (128, 128, 0, 4),
-        (256, 256, 5, None),
+        (128, 64, 0, 4, 16384, None, True),
+        (256, 256, 5, None, 0, 16383, False),
     ]
 
 

@@ -191,6 +191,12 @@ _E16_FLAT_SEGMENTED_DX_GRID_CAP = 1024
 # balanced shard.  Select entirely from the device-resident active queue count
 # so dynamic routing never synchronizes to the host.
 _E16_DW2_SMALL_TILE_MAX_ACTIVE_EXPERTS = 4
+_E16_DW2_SMALL_TILE_N = 64
+# In a dense shard, keep isolated long experts on the same high-parallelism
+# profile instead of forcing them through the balanced 256x256 tile.  The
+# frequency predicate is evaluated from the existing device queue, and is
+# combined with the sparse-shard predicate inside the small-profile launch.
+_E16_DW2_HOT_EXPERT_MIN_ROWS = 16384
 
 _RoutesSorterMetadata = tuple[
     torch.Tensor,  # sorted_token_ids
@@ -352,7 +358,7 @@ def _launch_grouped_dw2(
         grouped_dw2_profiles = (
             (
                 128,
-                128,
+                _E16_DW2_SMALL_TILE_N,
                 _GROUPED_DW2_BK,
                 0,
                 2,
@@ -360,12 +366,18 @@ def _launch_grouped_dw2(
                 _grouped_dw2_stages(max_expert_rows),
                 0,
                 _E16_DW2_SMALL_TILE_MAX_ACTIVE_EXPERTS,
+                _E16_DW2_HOT_EXPERT_MIN_ROWS,
+                None,
+                True,
             ),
             (
                 *wide_dw2,
                 _grouped_dw2_stages(max_expert_rows),
                 _E16_DW2_SMALL_TILE_MAX_ACTIVE_EXPERTS + 1,
                 None,
+                0,
+                _E16_DW2_HOT_EXPERT_MIN_ROWS - 1,
+                False,
             ),
         )
     elif (
@@ -383,7 +395,15 @@ def _launch_grouped_dw2(
             active_experts=_GROUPED_DW2_SPARSE_EXPERTS,
         )
         grouped_dw2_profiles = (
-            (*sparse_dw2, _grouped_dw2_stages(max_expert_rows), 0, None),
+            (
+                *sparse_dw2,
+                _grouped_dw2_stages(max_expert_rows),
+                0,
+                None,
+                0,
+                None,
+                False,
+            ),
         )
     elif use_hostless_grouped and not use_tn_metadata_direct:
         # The queue count is already produced by compact W1.  Launch disjoint
@@ -400,12 +420,23 @@ def _launch_grouped_dw2(
             intermediate_size,
         )
         grouped_dw2_profiles = (
-            (*sparse_dw2, _grouped_dw2_stages(max_expert_rows), 0, _GROUPED_DW2_SPARSE_EXPERTS),
+            (
+                *sparse_dw2,
+                _grouped_dw2_stages(max_expert_rows),
+                0,
+                _GROUPED_DW2_SPARSE_EXPERTS,
+                0,
+                None,
+                False,
+            ),
             (
                 *balanced_dw2,
                 _grouped_dw2_stages(min(max_expert_rows, 4)),
                 _GROUPED_DW2_SPARSE_EXPERTS + 1,
                 None,
+                0,
+                None,
+                False,
             ),
         )
     else:
@@ -420,6 +451,9 @@ def _launch_grouped_dw2(
                 _grouped_dw2_stages(max_expert_rows),
                 0,
                 None,
+                0,
+                None,
+                False,
             ),
         )
 
@@ -433,6 +467,9 @@ def _launch_grouped_dw2(
         dw2_stages,
         min_active_experts,
         max_active_experts,
+        min_profile_rows,
+        max_profile_rows,
+        active_guard_or_expert_rows,
     ) in grouped_dw2_profiles:
         grouped_dw2_kwargs = {
             "block_m": dw2_bm,
@@ -464,6 +501,9 @@ def _launch_grouped_dw2(
                 dw2,
                 min_active_experts=min_active_experts,
                 max_active_experts=max_active_experts,
+                min_expert_rows=min_profile_rows,
+                max_expert_rows=max_profile_rows,
+                active_guard_or_expert_rows=active_guard_or_expert_rows,
                 **grouped_dw2_kwargs,
             )
 

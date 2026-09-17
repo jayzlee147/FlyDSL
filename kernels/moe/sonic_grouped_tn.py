@@ -598,6 +598,9 @@ def compile_grouped_tn(
     min_active_experts: int = 0,
     max_active_experts: int | None = None,
     gather_rhs: bool = False,
+    min_expert_rows: int = 0,
+    max_expert_rows: int | None = None,
+    active_guard_or_expert_rows: bool = False,
 ):
     """Compile the persistent grouped TN consumer for a prebuilt queue.
 
@@ -612,6 +615,11 @@ def compile_grouped_tn(
     specialization with the device-resident queue count.  Two disjoint
     guarded launches can therefore select different gfx950 tile profiles
     without synchronizing the routing distribution back to the host.
+    ``min_expert_rows`` and ``max_expert_rows`` additionally filter individual
+    queue descriptors by their device-resident frequency.  The optional OR
+    mode admits every descriptor when the active-count guard matches and only
+    row-selected descriptors otherwise; this lets one small-tile launch cover
+    both sparse shards and a hot expert in an otherwise dense shard.
     ``gather_rhs`` loads token-major RHS rows through packed sorter token IDs,
     eliminating their otherwise materialized sorter-order copy.
     """
@@ -647,6 +655,28 @@ def compile_grouped_tn(
         not isinstance(max_active_experts, int) or max_active_experts < min_active_experts
     ):
         raise ValueError("max_active_experts must be None or at least min_active_experts")
+    if (
+        not isinstance(min_expert_rows, int)
+        or isinstance(min_expert_rows, bool)
+        or min_expert_rows < 0
+    ):
+        raise ValueError("min_expert_rows must be a non-negative int")
+    if max_expert_rows is not None and (
+        not isinstance(max_expert_rows, int)
+        or isinstance(max_expert_rows, bool)
+        or max_expert_rows < min_expert_rows
+    ):
+        raise ValueError("max_expert_rows must be None or at least min_expert_rows")
+    if not isinstance(active_guard_or_expert_rows, bool):
+        raise TypeError("active_guard_or_expert_rows must be a bool")
+    if active_guard_or_expert_rows and (
+        metadata_direct
+        or max_active_experts is None
+        or (min_expert_rows == 0 and max_expert_rows is None)
+    ):
+        raise ValueError(
+            "active_guard_or_expert_rows requires queue metadata plus active and row guards"
+        )
     if block_k not in (32, 64):
         raise ValueError("grouped TN block_k must be 32 or 64")
     if stages not in (2, 3, 4):
@@ -708,6 +738,8 @@ def compile_grouped_tn(
             f"_md{int(metadata_direct)}"
             f"_gr{int(gather_rhs)}"
             f"_amin{min_active_experts}_amax{max_active_experts}"
+            f"_rmin{min_expert_rows}_rmax{max_expert_rows}"
+            f"_aor{int(active_guard_or_expert_rows)}"
         ),
         known_block_size=[block_threads, 1, 1],
     )
@@ -745,12 +777,14 @@ def compile_grouped_tn(
                 ),
             )
         work_bound = descriptor_count * fx.Int32(output_tiles_per_expert)
-        if const_expr(min_active_experts > 0):
+        if const_expr(min_active_experts > 0 and not active_guard_or_expert_rows):
             work_bound = (descriptor_count >= fx.Int32(min_active_experts)).select(
                 work_bound,
                 fx.Int32(0),
             )
-        if const_expr(max_active_experts is not None):
+        if const_expr(
+            max_active_experts is not None and not active_guard_or_expert_rows
+        ):
             work_bound = (descriptor_count <= fx.Int32(max_active_experts)).select(
                 work_bound,
                 fx.Int32(0),
@@ -790,7 +824,7 @@ def compile_grouped_tn(
         thr_mma_ccol = thr_mma.partition_C(col_coords)
         wave_offset = get_wave_lds_offset(tid, async_load_bytes)
 
-        def run_output_tile(work_index):
+        def run_output_tile_unchecked(work_index):
             descriptor_index = work_index // fx.Int32(output_tiles_per_expert)
             output_tile = work_index % fx.Int32(output_tiles_per_expert)
             if const_expr(metadata_direct):
@@ -1196,6 +1230,62 @@ def compile_grouped_tn(
                     output_offset = global_row * fx.Int32(output_n) + global_col
                     buffer_ops.buffer_store(value, output_rsrc, output_offset)
 
+        def run_output_tile(work_index):
+            if const_expr(min_expert_rows == 0 and max_expert_rows is None):
+                run_output_tile_unchecked(work_index)
+            else:
+                descriptor_index = work_index // fx.Int32(output_tiles_per_expert)
+                if const_expr(metadata_direct):
+                    expert = rocdl.readfirstlane(
+                        T.i32,
+                        _raw(
+                            buffer_ops.buffer_load(
+                                storage_rsrc,
+                                descriptor_index,
+                                vec_width=1,
+                                dtype=T.i32,
+                            )
+                        ),
+                    )
+                else:
+                    descriptor_offset = fx.Int32(1) + descriptor_index * fx.Int32(2)
+                    expert = rocdl.readfirstlane(
+                        T.i32,
+                        _raw(
+                            buffer_ops.buffer_load(
+                                storage_rsrc,
+                                descriptor_offset,
+                                vec_width=1,
+                                dtype=T.i32,
+                            )
+                        ),
+                    )
+                frequency = rocdl.readfirstlane(
+                    T.i32,
+                    _raw(
+                        buffer_ops.buffer_load(
+                            frequency_rsrc,
+                            expert,
+                            vec_width=1,
+                            dtype=T.i32,
+                        )
+                    ),
+                )
+                selected = frequency >= fx.Int32(min_expert_rows)
+                if const_expr(max_expert_rows is not None):
+                    selected = selected & (frequency <= fx.Int32(max_expert_rows))
+                if const_expr(active_guard_or_expert_rows):
+                    active_selected = descriptor_count >= fx.Int32(
+                        min_active_experts
+                    )
+                    if const_expr(max_active_experts is not None):
+                        active_selected = active_selected & (
+                            descriptor_count <= fx.Int32(max_active_experts)
+                        )
+                    selected = selected | active_selected
+                if selected:
+                    run_output_tile_unchecked(work_index)
+
         if bid < work_bound:
             run_output_tile(bid)
         for work_index in range(bid + grid_size, work_bound, grid_size):
@@ -1372,6 +1462,9 @@ def grouped_tn_from_queue_flydsl(
     stages: int = 2,
     min_active_experts: int = 0,
     max_active_experts: int | None = None,
+    min_expert_rows: int = 0,
+    max_expert_rows: int | None = None,
+    active_guard_or_expert_rows: bool = False,
     stream: torch.cuda.Stream | None = None,
 ) -> torch.Tensor:
     """Consume a prebuilt active-expert queue for one grouped TN contraction.
@@ -1382,7 +1475,9 @@ def grouped_tn_from_queue_flydsl(
     empty experts retain exact-zero gradients.  Optional tuning arguments let
     dW1 and dW2 select independent output/K tiles.  An optional inclusive
     active-expert interval makes the launch a no-op when ``queue_storage[0]``
-    falls outside it.
+    falls outside it.  Inclusive expert-row bounds can independently filter
+    queue entries without a host frequency readback.  OR mode admits an entry
+    when either its row predicate or the active-count predicate matches.
     """
 
     if lhs_rows.ndim != 2 or rhs_rows.ndim != 2 or output.ndim != 3:
@@ -1468,7 +1563,10 @@ def grouped_tn_from_queue_flydsl(
         stages,
         min_active_experts,
         max_active_experts,
-        gather_rhs,
+        gather_rhs=gather_rhs,
+        min_expert_rows=min_expert_rows,
+        max_expert_rows=max_expert_rows,
+        active_guard_or_expert_rows=active_guard_or_expert_rows,
     )
     if gather_rhs:
         _run_compiled(

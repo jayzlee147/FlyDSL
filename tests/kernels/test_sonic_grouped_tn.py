@@ -235,6 +235,95 @@ def test_grouped_tn_active_count_guards_are_mutually_exclusive(active_experts):
     assert torch.count_nonzero(rejected) == 0
 
 
+@pytest.mark.parametrize(
+    ("frequencies", "expected_hot"),
+    (
+        ([200, 10, 10, 10, 10], [0]),
+        ([40, 30, 20, 10, 0], [0, 1, 2, 3]),
+    ),
+    ids=("dense-active-hot-row", "sparse-active-fallback"),
+)
+def test_grouped_tn_expert_row_guard_combines_with_active_count(
+    frequencies,
+    expected_hot,
+):
+    lhs, rhs, frequency, sorted_experts, num_valid, segments = _make_sorted_inputs(
+        frequencies,
+        128,
+        64,
+        seed=541,
+    )
+    queue = build_active_expert_queue_flydsl(
+        frequency,
+        sorted_experts,
+        num_valid,
+        routes=sum(frequencies),
+    )
+    hot_output = torch.zeros(
+        (len(frequencies), 128, 64),
+        dtype=torch.bfloat16,
+        device=lhs.device,
+    )
+    cold_output = torch.zeros_like(hot_output)
+    expected = torch.zeros_like(hot_output)
+    for expert, start, rows in segments:
+        expected[expert] = (
+            lhs[start : start + rows].float().transpose(0, 1)
+            @ rhs[start : start + rows].float()
+        ).to(torch.bfloat16)
+
+    grouped_tn_from_queue_flydsl(
+        lhs,
+        rhs,
+        frequency,
+        queue,
+        hot_output,
+        block_m=128,
+        block_n=64,
+        block_k=32,
+        m_waves=2,
+        n_waves=2,
+        max_active_experts=4,
+        min_expert_rows=128,
+        active_guard_or_expert_rows=True,
+    )
+    grouped_tn_from_queue_flydsl(
+        lhs,
+        rhs,
+        frequency,
+        queue,
+        cold_output,
+        block_m=128,
+        block_n=64,
+        block_k=32,
+        m_waves=2,
+        n_waves=2,
+        min_active_experts=5,
+        max_expert_rows=127,
+    )
+    torch.cuda.synchronize()
+
+    expected_hot_set = set(expected_hot)
+    for expert, count in enumerate(frequencies):
+        zero = torch.zeros_like(expected[expert])
+        hot_expected = expected[expert] if expert in expected_hot_set else zero
+        cold_expected = (
+            expected[expert] if count and expert not in expected_hot_set else zero
+        )
+        torch.testing.assert_close(
+            hot_output[expert].float(),
+            hot_expected.float(),
+            rtol=3e-2,
+            atol=5e-2,
+        )
+        torch.testing.assert_close(
+            cold_output[expert].float(),
+            cold_expected.float(),
+            rtol=3e-2,
+            atol=5e-2,
+        )
+
+
 def test_grouped_tn_consumes_single_block_metadata_without_builder():
     frequencies = [0, 1, 0, 7, 63]
     dy, activation, frequency, sorted_experts, num_valid, segments = _make_sorted_inputs(
