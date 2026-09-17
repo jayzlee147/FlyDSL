@@ -602,7 +602,11 @@ class SonicMoEWorkspace:
     router_topk_expert_indices: torch.Tensor
     intermediate: torch.Tensor
     route_output: torch.Tensor | None
-    output: torch.Tensor
+    # Exact-shape workspaces own a reusable default result.  Growable
+    # expert-major workspaces deliberately do not: their active shape changes
+    # between invocations, so the public API already returns invocation-owned
+    # storage to keep earlier results alive.
+    output: torch.Tensor | None
     _launch_lock: threading.Lock = field(
         default_factory=threading.Lock,
         init=False,
@@ -624,8 +628,9 @@ class SonicMoEWorkspace:
             self.router_topk_ids,
             self.router_topk_expert_indices,
             self.intermediate,
-            self.output,
         ]
+        if self.output is not None:
+            tensors.append(self.output)
         if self.sorted_route_ids is not None:
             tensors.append(self.sorted_route_ids)
         if self.route_output is not None:
@@ -681,7 +686,7 @@ class SonicMoEWorkspace:
             router_topk_expert_indices=self.router_topk_expert_indices[:tokens],
             intermediate=self.intermediate[: max(1, max_padded)],
             route_output=None,
-            output=self.output[:tokens],
+            output=(self.output[:tokens] if self.output is not None else None),
         )
         # Views of one backing allocation must serialize through the same
         # enqueue lock even though each invocation carries its own active
@@ -697,6 +702,7 @@ class SonicMoEWorkspace:
         device: torch.device,
         *,
         routes: int | None = None,
+        reusable_output: bool = True,
     ) -> "SonicMoEWorkspace":
         if tokens <= 0:
             raise ValueError(f"tokens must be positive, got {tokens}")
@@ -795,10 +801,14 @@ class SonicMoEWorkspace:
                 if config.stage2_output_mode == "reduce" and routes is None
                 else None
             ),
-            output=torch.empty(
-                (tokens, config.hidden_size),
-                dtype=_COMPUTE_DTYPES[config.compute_dtype],
-                device=device,
+            output=(
+                torch.empty(
+                    (tokens, config.hidden_size),
+                    dtype=_COMPUTE_DTYPES[config.compute_dtype],
+                    device=device,
+                )
+                if reusable_output
+                else None
             ),
         )
 
@@ -1849,6 +1859,7 @@ class SonicMoE:
                         capacity_tokens,
                         self.weights.device,
                         routes=capacity_routes,
+                        reusable_output=False,
                     )
                 except ValueError:
                     # Geometric headroom can cross an addressing limit even
@@ -1859,6 +1870,7 @@ class SonicMoE:
                         tokens,
                         self.weights.device,
                         routes=routes,
+                        reusable_output=False,
                     )
                 capacity._launch_lock = launch_lock
                 self._dynamic_route_workspaces[key] = capacity
@@ -1920,15 +1932,16 @@ class SonicMoE:
         invocation_owned_default: bool = False,
     ) -> torch.Tensor:
         if out is None:
-            out = (
-                torch.empty(
+            if invocation_owned_default:
+                out = torch.empty(
                     (workspace.tokens, self.config.hidden_size),
                     dtype=self.weights.compute_dtype,
                     device=self.weights.device,
                 )
-                if invocation_owned_default
-                else workspace.output
-            )
+            else:
+                if workspace.output is None:
+                    raise RuntimeError("workspace does not own a reusable default output")
+                out = workspace.output
         expected = (workspace.tokens, self.config.hidden_size)
         if tuple(out.shape) != expected:
             raise ValueError(f"out must have shape {expected}, got {tuple(out.shape)}")
@@ -1947,10 +1960,18 @@ class SonicMoE:
         out_storage = out.untyped_storage().data_ptr()
         if any(out_storage == tensor.untyped_storage().data_ptr() for tensor in read_tensors):
             raise ValueError("out must not alias an input or prepared-weight storage")
-        workspace_output_storage = workspace.output.untyped_storage().data_ptr()
+        workspace_output_storage = (
+            workspace.output.untyped_storage().data_ptr()
+            if workspace.output is not None
+            else None
+        )
         if out_storage in workspace_storages and out_storage != workspace_output_storage:
             raise ValueError("out must not alias internal workspace scratch storage")
-        if out_storage == workspace_output_storage and out.data_ptr() != workspace.output.data_ptr():
+        if (
+            workspace.output is not None
+            and out_storage == workspace_output_storage
+            and out.data_ptr() != workspace.output.data_ptr()
+        ):
             raise ValueError("out must start at the internal workspace output base address")
         return out
 

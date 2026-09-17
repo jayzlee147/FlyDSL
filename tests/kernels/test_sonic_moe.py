@@ -1866,8 +1866,7 @@ def test_sonic_moe_expert_major_identity_routes_match_generic_and_reuse_capacity
     assert optimized.workspace is not None
     assert (optimized.workspace.tokens, optimized.workspace.routes) == (5, 5)
     assert optimized.workspace._launch_lock is first_capacity._launch_lock
-    assert actual.untyped_storage().data_ptr() != first_capacity.output.untyped_storage().data_ptr()
-    assert later.untyped_storage().data_ptr() != first_capacity.output.untyped_storage().data_ptr()
+    assert first_capacity.output is None
     assert actual.untyped_storage().data_ptr() != later.untyped_storage().data_ptr()
     _assert_close(actual, expected)
 
@@ -2081,16 +2080,15 @@ def test_sonic_moe_dynamic_route_workspace_grows_once_and_returns_active_views()
 
     first = op.reserve_dynamic_routes(7, 7)
     first_capacity = next(iter(op._dynamic_route_workspaces.values()))
-    first_storage = first.output.untyped_storage().data_ptr()
     grown = op.reserve_dynamic_routes(20, 20)
     grown_capacity = next(iter(op._dynamic_route_workspaces.values()))
     small = op.reserve_dynamic_routes(5, 5)
 
     assert first_capacity is not grown_capacity
-    assert first.output.untyped_storage().data_ptr() == first_storage
-    assert grown.output.untyped_storage().data_ptr() == grown_capacity.output.data_ptr()
-    assert small.output.untyped_storage().data_ptr() == grown_capacity.output.data_ptr()
-    assert tuple(small.output.shape) == (5, HIDDEN_SIZE)
+    assert first.output is None
+    assert grown.output is None
+    assert grown_capacity.output is None
+    assert small.output is None
     assert (small.tokens, small.routes) == (5, 5)
     assert small.max_padded_tokens < grown.max_padded_tokens
     assert first._launch_lock is grown._launch_lock is small._launch_lock
