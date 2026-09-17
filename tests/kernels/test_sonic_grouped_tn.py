@@ -16,6 +16,7 @@ from kernels.moe.sonic_grouped_tn import (
     build_active_expert_queue_flydsl,
     build_hot_split_queues_flydsl,
     compile_grouped_tn,
+    compile_inactive_weight_grad_zero,
     finalize_hot_splitk_flydsl,
     grouped_dw2_flydsl,
     grouped_dw2_tuning,
@@ -700,6 +701,7 @@ def test_inactive_weight_grad_zero_preserves_active_expert_slabs():
         frequency,
         dw1,
         dw2,
+        blocks_per_expert=3,
     )
     torch.cuda.synchronize()
 
@@ -711,6 +713,42 @@ def test_inactive_weight_grad_zero_preserves_active_expert_slabs():
     for expert in (1, 3):
         assert torch.all(dw1[expert] == 7)
         assert torch.all(dw2[expert] == 9)
+
+
+@pytest.mark.parametrize("blocks_per_expert", (0, -1, True, 1.5))
+def test_inactive_weight_grad_zero_rejects_invalid_block_partition(
+    blocks_per_expert,
+):
+    with pytest.raises(ValueError, match="blocks_per_expert must be a positive int"):
+        compile_inactive_weight_grad_zero(
+            8,
+            8,
+            4,
+            0,
+            blocks_per_expert=blocks_per_expert,
+        )
+
+
+def test_inactive_weight_grad_zero_rejects_oversized_block_partition():
+    with pytest.raises(ValueError, match="blocks_per_expert must not exceed 256"):
+        compile_inactive_weight_grad_zero(
+            8,
+            8,
+            4,
+            0,
+            blocks_per_expert=257,
+        )
+
+
+def test_inactive_weight_grad_zero_rejects_oversized_launch_grid():
+    with pytest.raises(ValueError, match="launch exceeds signed int32 grid capacity"):
+        compile_inactive_weight_grad_zero(
+            8,
+            8,
+            1 << 20,
+            0,
+            blocks_per_expert=2,
+        )
 
 
 @pytest.mark.parametrize("active_experts", (1, 2), ids=("dense-all", "inactive-only"))
@@ -727,6 +765,7 @@ def test_adaptive_weight_grad_zero_selects_device_count_branch(active_experts):
         dw1,
         dw2,
         dense_active_ratio=2,
+        blocks_per_expert=3,
     )
     torch.cuda.synchronize()
 

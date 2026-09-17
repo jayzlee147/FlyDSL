@@ -52,6 +52,7 @@ _MAX_BUFFER_BYTES = (1 << 32) - 1
 _TOKEN_MASK = 0x00FFFFFF
 _ZERO_VECTOR_ELEMENTS = GFX950_DMA_BYTES // 2
 _ZERO_BLOCK_THREADS = 1024
+_ZERO_MAX_BLOCKS_PER_EXPERT = _NUM_CU
 
 
 def _global_bf16_ptr(address):
@@ -268,6 +269,7 @@ def compile_inactive_weight_grad_zero(
     adaptive: bool = False,
     active_count_divisor: int = 1,
     dense_active_ratio: int = 8,
+    blocks_per_expert: int = 1,
 ):
     """Compile an expert-local zero fill for grouped BF16 weight gradients.
 
@@ -284,6 +286,19 @@ def compile_inactive_weight_grad_zero(
         raise ValueError("active_count_divisor must be positive")
     if dense_active_ratio <= 0:
         raise ValueError("dense_active_ratio must be positive")
+    if (
+        not isinstance(blocks_per_expert, int)
+        or isinstance(blocks_per_expert, bool)
+        or blocks_per_expert <= 0
+    ):
+        raise ValueError("blocks_per_expert must be a positive int")
+    if blocks_per_expert > _ZERO_MAX_BLOCKS_PER_EXPERT:
+        raise ValueError(
+            f"blocks_per_expert must not exceed {_ZERO_MAX_BLOCKS_PER_EXPERT}"
+        )
+    max_grid_blocks = _MAX_SIGNED_I32 // _ZERO_BLOCK_THREADS
+    if num_experts > max_grid_blocks // blocks_per_expert:
+        raise ValueError("inactive-gradient zero launch exceeds signed int32 grid capacity")
     if dw1_expert_elements % _ZERO_VECTOR_ELEMENTS:
         raise ValueError("dW1 expert slabs must have 128-bit size alignment")
     if dw2_expert_elements % _ZERO_VECTOR_ELEMENTS:
@@ -300,6 +315,7 @@ def compile_inactive_weight_grad_zero(
             f"sonic_zero_inactive_weight_grads_e{num_experts}"
             f"_v{dw1_vectors}x{dw2_vectors}"
             f"_a{int(adaptive)}d{active_count_divisor}r{dense_active_ratio}"
+            f"_bpe{blocks_per_expert}"
         ),
         known_block_size=[_ZERO_BLOCK_THREADS, 1, 1],
     )
@@ -309,8 +325,12 @@ def compile_inactive_weight_grad_zero(
         dw1_base: fx.Int64,
         dw2_base: fx.Int64,
     ):
-        expert = fx.Int32(gpu.block_idx.x)
+        block = fx.Int32(gpu.block_idx.x)
+        expert = block // fx.Int32(blocks_per_expert)
+        expert_block = block % fx.Int32(blocks_per_expert)
         tid = fx.Int32(gpu.thread_idx.x)
+        expert_tid = expert_block * fx.Int32(_ZERO_BLOCK_THREADS) + tid
+        expert_stride = fx.Int32(blocks_per_expert * _ZERO_BLOCK_THREADS)
         should_clear = fx.Int32(0)
         if const_expr(adaptive):
             active_rsrc = buffer_ops.create_buffer_resource(active_count_storage, max_size=True)
@@ -381,9 +401,9 @@ def compile_inactive_weight_grad_zero(
             # store rather than a typed packed-BF16 sequence.
             zero = fx.Vector.filled(GFX950_DMA_BYTES // 4, 0, fx.Int32)
             for vector_index in range(
-                tid,
+                expert_tid,
                 fx.Int32(dw1_vectors),
-                fx.Int32(_ZERO_BLOCK_THREADS),
+                expert_stride,
             ):
                 buffer_ops.buffer_store(
                     zero,
@@ -391,9 +411,9 @@ def compile_inactive_weight_grad_zero(
                     vector_index * fx.Int32(GFX950_DMA_BYTES // 4),
                 )
             for vector_index in range(
-                tid,
+                expert_tid,
                 fx.Int32(dw2_vectors),
-                fx.Int32(_ZERO_BLOCK_THREADS),
+                expert_stride,
             ):
                 buffer_ops.buffer_store(
                     zero,
@@ -415,7 +435,7 @@ def compile_inactive_weight_grad_zero(
             dw1_base,
             dw2_base,
         ).launch(
-            grid=(num_experts, 1, 1),
+            grid=(num_experts * blocks_per_expert, 1, 1),
             block=(_ZERO_BLOCK_THREADS, 1, 1),
             stream=stream,
         )
@@ -428,6 +448,7 @@ def zero_inactive_weight_grads_flydsl(
     dw1: torch.Tensor,
     dw2: torch.Tensor,
     *,
+    blocks_per_expert: int = 1,
     stream: torch.cuda.Stream | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Zero only inactive expert slabs before grouped dW1/dW2 overwrite actives."""
@@ -465,6 +486,7 @@ def zero_inactive_weight_grads_flydsl(
         dw2_expert_elements,
         num_experts,
         expert_frequency.device.index or 0,
+        blocks_per_expert=blocks_per_expert,
     )
     _run_compiled(
         launcher,
@@ -488,6 +510,7 @@ def zero_weight_grads_adaptive_flydsl(
     *,
     active_count_divisor: int = 1,
     dense_active_ratio: int = 8,
+    blocks_per_expert: int = 1,
     stream: torch.cuda.Stream | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Choose dense-all or inactive-only dW clearing from a device count.
@@ -547,6 +570,7 @@ def zero_weight_grads_adaptive_flydsl(
         True,
         active_count_divisor,
         dense_active_ratio,
+        blocks_per_expert,
     )
     _run_compiled(
         launcher,

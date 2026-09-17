@@ -770,6 +770,12 @@ _GROUPED_DW1_MAX_EXPERT_ROWS = 4096
 # written and torch's dense memset is faster.  Legacy paths reuse their host
 # frequency readback; hostless paths select from the device queue count.
 _INACTIVE_WEIGHT_GRAD_ZERO_ACTIVE_RATIO = 8
+# Each Qwen3 E16 expert owns roughly 9 MiB of BF16 dW1/dW2 output.  A single
+# 1024-thread CTA cannot expose enough independent stores when only a few
+# experts are active, so partition each expert slab across one gfx950-sized
+# grid wave.  The retained expert-major predicate keeps this tuning isolated
+# from E896 and every generic hostless path.
+_E16_INACTIVE_WEIGHT_GRAD_ZERO_BLOCKS_PER_EXPERT = 16
 
 # Device-sized row kernels use a host-known allocation bound only to size the
 # launch.  Each workgroup then walks the sorter-produced ``num_valid_ids[0]``
@@ -782,6 +788,18 @@ _HOSTLESS_ROW_GRID_CAP = 1024
 # kernels, while keeping the original cap is safer for short and E896 shapes.
 _E16_EXACT_ROW_GRID_CAP = 2048
 _E16_EXACT_ROW_GRID_MIN_ROUTES = 8191
+
+
+def _inactive_weight_grad_zero_blocks_per_expert(
+    *,
+    use_e16_deduplicated_metadata: bool,
+    num_experts: int,
+) -> int:
+    """Select the audited E16 expert-slab store partition."""
+
+    if use_e16_deduplicated_metadata and num_experts == 16:
+        return _E16_INACTIVE_WEIGHT_GRAD_ZERO_BLOCKS_PER_EXPERT
+    return 1
 
 
 def _hostless_row_grid_cap(*, use_e16_expert_major: bool, routes: int) -> int:
@@ -5028,6 +5046,10 @@ def _sonic_moe_backward_impl(
                         dw2,
                         active_count_divisor=active_count_divisor,
                         dense_active_ratio=_INACTIVE_WEIGHT_GRAD_ZERO_ACTIVE_RATIO,
+                        blocks_per_expert=_inactive_weight_grad_zero_blocks_per_expert(
+                            use_e16_deduplicated_metadata=use_e16_deduplicated_metadata,
+                            num_experts=num_experts,
+                        ),
                         stream=stream,
                     )
             else:

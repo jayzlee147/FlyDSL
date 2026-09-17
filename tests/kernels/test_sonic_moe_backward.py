@@ -35,6 +35,7 @@ from kernels.moe.sonic_backward import (
     _grouped_dx_tuning,
     _grouped_w1_tuning,
     _hostless_row_grid_cap,
+    _inactive_weight_grad_zero_blocks_per_expert,
     _is_current_stream_capturing_conservatively,
     _launch_overlapped_e16_dw1_dx,
     _use_direct_grouped_dw1_rhs,
@@ -67,6 +68,30 @@ _ACTIVATIONS = (
     "relu_sq",
 )
 _DTYPES = ((torch.bfloat16, "bf16"), (torch.float16, "fp16"))
+
+
+@pytest.mark.parametrize(
+    ("use_e16_deduplicated_metadata", "num_experts", "expected"),
+    (
+        (True, 16, 16),
+        (False, 16, 1),
+        (False, 896, 1),
+        # Keep a defensive E check if the metadata predicate broadens later.
+        (True, 896, 1),
+    ),
+)
+def test_inactive_weight_grad_zero_partition_is_retained_e16_only(
+    use_e16_deduplicated_metadata,
+    num_experts,
+    expected,
+):
+    assert (
+        _inactive_weight_grad_zero_blocks_per_expert(
+            use_e16_deduplicated_metadata=use_e16_deduplicated_metadata,
+            num_experts=num_experts,
+        )
+        == expected
+    )
 
 
 @pytest.mark.parametrize(
@@ -3318,7 +3343,7 @@ def test_sonic_moe_backward_forward_state_skips_generic_w1_and_keeps_large_dx_qu
     da_profiles = []
     dx_profiles = []
     tn_profiles = []
-    adaptive_zero_calls = 0
+    adaptive_zero_blocks_per_expert = []
 
     def _schedule_block_m(call_args, call_kwargs):
         return call_kwargs.get("schedule_block_m", call_args[5] if len(call_args) > 5 else 16)
@@ -3373,8 +3398,9 @@ def test_sonic_moe_backward_forward_state_skips_generic_w1_and_keeps_large_dx_qu
         return original_grouped_tn(*tn_args, **tn_kwargs)
 
     def _tracked_adaptive_zero(*zero_args, **zero_kwargs):
-        nonlocal adaptive_zero_calls
-        adaptive_zero_calls += 1
+        adaptive_zero_blocks_per_expert.append(
+            zero_kwargs.get("blocks_per_expert", 1)
+        )
         return original_adaptive_zero(*zero_args, **zero_kwargs)
 
     def _unexpected_legacy_kernel(*_args, **_kwargs):
@@ -3487,7 +3513,9 @@ def test_sonic_moe_backward_forward_state_skips_generic_w1_and_keeps_large_dx_qu
     assert da_profiles == [(True, 0, 32), (False, 33, None)]
     assert dx_profiles == [(0, None, False, 33)]
     assert tn_profiles == [(0, 32), (33, None), (0, None)]
-    assert adaptive_zero_calls == 1
+    # Forced non-E16 hostless paths (including production E896) retain one CTA
+    # per expert; the E16 slab partition must not broaden to them.
+    assert adaptive_zero_blocks_per_expert == [1]
     for actual_gradient, expected_gradient in zip(actual, expected):
         torch.testing.assert_close(
             actual_gradient.float(),
@@ -3959,12 +3987,20 @@ def test_sonic_moe_backward_dynamic_e16_expert_major_identity_dx_is_direct(
         )
 
     original_segmented = sonic_backward_module._compile_flat_segmented_dx_reduction
+    original_adaptive_zero = sonic_backward_module.zero_weight_grads_adaptive_flydsl
     segmented_compiles = 0
+    adaptive_zero_blocks_per_expert = []
 
     def _counted_segmented(*args, **kwargs):
         nonlocal segmented_compiles
         segmented_compiles += 1
         return original_segmented(*args, **kwargs)
+
+    def _tracked_adaptive_zero(*args, **kwargs):
+        adaptive_zero_blocks_per_expert.append(
+            kwargs.get("blocks_per_expert", 1)
+        )
+        return original_adaptive_zero(*args, **kwargs)
 
     monkeypatch.setattr(
         sonic_backward_module,
@@ -3980,6 +4016,11 @@ def test_sonic_moe_backward_dynamic_e16_expert_major_identity_dx_is_direct(
         sonic_backward_module,
         "_compile_flat_segmented_dx_reduction",
         _counted_segmented,
+    )
+    monkeypatch.setattr(
+        sonic_backward_module,
+        "zero_weight_grads_adaptive_flydsl",
+        _tracked_adaptive_zero,
     )
     direct = sonic_moe_backward_routes(
         x,
@@ -4008,6 +4049,7 @@ def test_sonic_moe_backward_dynamic_e16_expert_major_identity_dx_is_direct(
     torch.cuda.synchronize(device)
 
     assert segmented_compiles == 1
+    assert adaptive_zero_blocks_per_expert == [16, 16]
     assert state.token_indices_identity is True
     assert state.expert_major is True
     assert state.expert_frequency is not None
