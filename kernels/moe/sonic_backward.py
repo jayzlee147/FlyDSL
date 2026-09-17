@@ -548,13 +548,19 @@ def _grouped_dw1_tuning(
     intermediate_size: int,
     *,
     direct_rhs: bool = False,
+    wide_direct_rhs: bool = True,
 ) -> tuple[int, int, int, int, int, int]:
     """Return ``(BM, BN, BK, K-pad, M-waves, N-waves)`` for grouped dW1."""
 
     preferred_tile = 64 if max_expert_rows <= 1 else 128
     output_m = 2 * intermediate_size
     block_m = preferred_tile if output_m % preferred_tile == 0 else 64
-    if direct_rhs and max_expert_rows > 1 and hidden_size % 256 == 0:
+    if (
+        direct_rhs
+        and wide_direct_rhs
+        and max_expert_rows > 1
+        and hidden_size % 256 == 0
+    ):
         block_n = 256
         n_waves = 4
     else:
@@ -903,13 +909,15 @@ def _use_direct_grouped_dw1_rhs(
     intermediate_size: int,
     num_experts: int,
     topk: int,
+    flat_identity_routes: bool = False,
 ) -> bool:
     """Select token-major RHS gather for retained-state grouped dW1.
 
-    Keep the first rollout on the exact fixed-K BF16 SwiGLU path whose fused
+    Select either the exact fixed-K E896 contract or retained E16 flat routes
+    whose caller has declared identity token indices.  In both cases fused
     state preparation has no other consumer for the sorter-order hidden-state
-    copy.  Standalone, ragged, bias, and legacy contracts continue to
-    materialize ``x_sorted``.
+    copy.  Standalone, non-identity ragged, bias, and legacy contracts continue
+    to materialize ``x_sorted``.
     """
 
     return (
@@ -919,9 +927,19 @@ def _use_direct_grouped_dw1_rhs(
         and not has_bias
         and compute_dtype == "bf16"
         and activation == "swiglu"
-        and not flat_routes
-        and (tokens, hidden_size, intermediate_size, num_experts, topk)
-        == _DIRECT_GROUPED_DW1_RHS_SHAPE
+        and (
+            (
+                not flat_routes
+                and (tokens, hidden_size, intermediate_size, num_experts, topk)
+                == _DIRECT_GROUPED_DW1_RHS_SHAPE
+            )
+            or (
+                flat_routes
+                and flat_identity_routes
+                and (hidden_size, intermediate_size, num_experts, topk)
+                == (2048, 768, 16, 1)
+            )
+        )
     )
 
 
@@ -4064,6 +4082,7 @@ def _sonic_moe_backward_impl(
         intermediate_size=intermediate_size,
         num_experts=num_experts,
         topk=topk,
+        flat_identity_routes=use_flat_identity_dx,
     )
     use_fused_da_dscore = _use_fused_da_dscore(
         reuse_forward_preactivation=reuse_forward_preactivation,
@@ -5070,6 +5089,9 @@ def _sonic_moe_backward_impl(
                 hidden_size,
                 intermediate_size,
                 direct_rhs=use_direct_grouped_dw1_rhs,
+                # E16 flat identity routing trades the E896-oriented BN256
+                # profile for enough N-grid parallelism under expert skew.
+                wide_direct_rhs=not use_flat_identity_dx,
             )
             grouped_dw1_kwargs = {
                 "block_m": grouped_dw1_bm,

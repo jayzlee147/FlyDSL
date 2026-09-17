@@ -384,7 +384,7 @@ def test_e896_retained_state_hostless_policy_is_narrow(overrides, expected):
         ({"topk": 8}, False),
     ),
 )
-def test_direct_grouped_dw1_rhs_policy_is_production_e896_only(overrides, expected):
+def test_direct_grouped_dw1_rhs_policy_preserves_fixed_e896_contract(overrides, expected):
     kwargs = {
         "reuse_forward_preactivation": True,
         "use_fused_forward_state_prepare": True,
@@ -398,6 +398,45 @@ def test_direct_grouped_dw1_rhs_policy_is_production_e896_only(overrides, expect
         "intermediate_size": 512,
         "num_experts": 896,
         "topk": 16,
+    }
+    kwargs.update(overrides)
+    assert _use_direct_grouped_dw1_rhs(**kwargs) is expected
+
+
+@pytest.mark.parametrize(
+    ("overrides", "expected"),
+    (
+        ({}, True),
+        ({"flat_identity_routes": False}, False),
+        ({"reuse_forward_preactivation": False}, False),
+        ({"use_fused_forward_state_prepare": False}, False),
+        ({"use_grouped_dw1": False}, False),
+        ({"has_bias": True}, False),
+        ({"compute_dtype": "fp16"}, False),
+        ({"activation": "geglu"}, False),
+        ({"hidden_size": 4096}, False),
+        ({"intermediate_size": 1024}, False),
+        ({"num_experts": 64}, False),
+        ({"topk": 2}, False),
+    ),
+)
+def test_direct_grouped_dw1_rhs_policy_accepts_only_e16_flat_identity(
+    overrides, expected
+):
+    kwargs = {
+        "reuse_forward_preactivation": True,
+        "use_fused_forward_state_prepare": True,
+        "use_grouped_dw1": True,
+        "flat_routes": True,
+        "has_bias": False,
+        "compute_dtype": "bf16",
+        "activation": "swiglu",
+        "tokens": 65536,
+        "hidden_size": 2048,
+        "intermediate_size": 768,
+        "num_experts": 16,
+        "topk": 1,
+        "flat_identity_routes": True,
     }
     kwargs.update(overrides)
     assert _use_direct_grouped_dw1_rhs(**kwargs) is expected
@@ -484,6 +523,16 @@ def test_direct_grouped_dw1_rhs_uses_wider_n_tile():
         2,
         4,
     )
+
+
+def test_e16_direct_grouped_dw1_rhs_retains_bn128_parallelism():
+    assert _grouped_dw1_tuning(
+        65536,
+        2048,
+        768,
+        direct_rhs=True,
+        wide_direct_rhs=False,
+    ) == (128, 128, 32, 0, 2, 2)
 
 
 @pytest.mark.parametrize(
