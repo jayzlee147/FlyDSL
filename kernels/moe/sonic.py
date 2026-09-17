@@ -33,7 +33,7 @@ import functools
 import math
 import threading
 from collections import OrderedDict
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 import torch
 
@@ -72,6 +72,11 @@ _GFX950_LDS_BYTES = 160 * 1024
 _MAX_BUFFER_BYTE_OFFSET = 0xFFFFFFFF
 _MAX_SIGNED_I32 = 0x7FFFFFFF
 _E16_FLAT_GROUPED_MIN_ROUTES = 64
+# The expert-major Qwen3 training path exposes enough route-level parallelism
+# above this point for the lower-register Stage-1 tile and narrower Stage-2 N
+# tile to win for both balanced and skewed shards.  Keeping the threshold at
+# 64K avoids the measured small-route Stage-2 crossover.
+_E16_LARGE_EXPERT_MAJOR_FORWARD_MIN_ROUTES = 65536
 _DEFAULT_MAX_CACHED_WORKSPACES = 8
 _SUPPORTED_ROUTER_DTYPES = {
     torch.float32: "f32",
@@ -1524,6 +1529,51 @@ def _training_stage1_tile_m(
     return config.tile_m
 
 
+def _use_e16_large_expert_major_forward_tuning(
+    config: SonicMoEConfig,
+    tokens: int,
+    routes: int | None,
+    has_bias: bool,
+    *,
+    token_indices_identity: bool,
+) -> bool:
+    """Select the measured large-R Qwen3 expert-major training profile."""
+
+    return (
+        token_indices_identity
+        and routes is not None
+        and routes == tokens
+        and routes >= _E16_LARGE_EXPERT_MAJOR_FORWARD_MIN_ROUTES
+        and config.hidden_size == 2048
+        and config.intermediate_size == 768
+        and config.num_experts == 16
+        and config.top_k == 1
+        and (config.tile_m, config.tile_n, config.tile_k) == (128, 192, 64)
+        and (
+            config.stage2_tile_m,
+            config.stage2_tile_n,
+            config.stage2_tile_k,
+        )
+        == (64, 256, 64)
+        and config.route_tile_m == 128
+        and config.stage1_k_wave == 1
+        and config.stage1_b_cache_mod in (None, 0)
+        and config.stage2_b_cache_mod in (None, 0)
+        and config.stage1_xcd_swizzle == 8
+        and config.stage2_xcd_swizzle == 0
+        and config.waves_per_eu is None
+        and not config.persistent_stage1
+        and not config.persistent_stage2
+        and config.stage2_pipeline_stages == 2
+        and config.stage2_output_mode == "atomic"
+        and config.stage1_write_padded_rows
+        and config.stage1_lds_swizzle
+        and config.activation == "swiglu"
+        and config.compute_dtype == "bf16"
+        and not has_bias
+    )
+
+
 def _is_e16_flat_training_shape(
     config: SonicMoEConfig,
     tokens: int,
@@ -2129,6 +2179,22 @@ class SonicMoE:
             workspace.routes,
             self.weights.has_bias,
         )
+        use_large_e16_expert_major_tuning = (
+            _use_e16_large_expert_major_forward_tuning(
+                cfg,
+                tokens,
+                workspace.routes,
+                self.weights.has_bias,
+                token_indices_identity=token_indices_identity,
+            )
+        )
+        if use_large_e16_expert_major_tuning:
+            # Keep BM128 sorter metadata so forward state remains ABI-stable;
+            # the Stage-1 launcher natively walks two BM64 compute tiles per
+            # descriptor.  BN128 cuts the dual-output kernel to 162 VGPRs.
+            training_tile_m = 64
+            training_tile_n = 128
+            training_waves_per_eu = None
         stage1 = _get_stage1_training_launcher(
             cfg,
             _stage1_cache_mod(cfg, tokens),
@@ -2178,7 +2244,17 @@ class SonicMoE:
             stream,
         )
 
-        stage2_stages = _stage2_stages(cfg, tokens)
+        stage2_cfg = cfg
+        if use_large_e16_expert_major_tuning:
+            # The narrower N tile supplies enough output parallelism for long
+            # expert segments.  A serial A pipeline is faster for this exact
+            # H2048/I768 identity-store path and uses only 64 KiB of LDS.
+            stage2_cfg = replace(
+                cfg,
+                down_tile_n=128,
+                stage2_pipeline_stages=1,
+            )
+        stage2_stages = _stage2_stages(stage2_cfg, tokens)
         dynamic_e16_flat = (
             workspace.routes is not None
             and _is_e16_flat_training_shape(
@@ -2195,8 +2271,8 @@ class SonicMoE:
         ):
             stage2_stages = 1
         stage2 = _get_stage2_launcher(
-            cfg,
-            _stage2_cache_mod(cfg, tokens),
+            stage2_cfg,
+            _stage2_cache_mod(stage2_cfg, tokens),
             "bf16",
             self.weights.has_bias,
             output_mode,
@@ -2204,11 +2280,11 @@ class SonicMoE:
             hidden_states.device.index or 0,
         )
         grid2 = gemm2_a16w4_grid(
-            cfg.stage2_tile_m,
-            N_OUT=cfg.hidden_size,
-            TILE_N=cfg.stage2_tile_n,
+            stage2_cfg.stage2_tile_m,
+            N_OUT=stage2_cfg.hidden_size,
+            TILE_N=stage2_cfg.stage2_tile_n,
             max_m_blocks=workspace.stage2_max_m_blocks,
-            persist=cfg.persistent_stage2,
+            persist=stage2_cfg.persistent_stage2,
         )
         _run_compiled(
             stage2,

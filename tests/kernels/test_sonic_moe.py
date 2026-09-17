@@ -29,6 +29,7 @@ from kernels.moe.sonic import (
     _stage2_stages,
     _training_stage1_tile_m,
     _training_stage1_tuning,
+    _use_e16_large_expert_major_forward_tuning,
     _validate_training_preactivation_extent,
     prepare_sonic_bf16_weights,
     prepare_sonic_fp16_weights,
@@ -904,6 +905,66 @@ def test_sonic_moe_training_stage1_e16_flat_m_policy_is_exact():
             _training_stage1_tile_m(fallback, 8192, 8192, False)
             == fallback.tile_m
         )
+
+
+def test_sonic_moe_large_e16_expert_major_forward_tuning_is_narrow():
+    qwen3 = SonicMoEConfig(
+        hidden_size=2048,
+        intermediate_size=768,
+        num_experts=16,
+        top_k=1,
+        tile_m=128,
+        tile_n=192,
+        tile_k=64,
+        down_tile_m=64,
+        down_tile_n=256,
+        down_tile_k=64,
+        stage1_xcd_swizzle=8,
+        stage2_xcd_swizzle=0,
+        stage2_pipeline_stages=2,
+        stage1_write_padded_rows=True,
+        stage1_lds_swizzle=True,
+        renormalize=False,
+    )
+
+    def selected(config=qwen3, tokens=65536, routes=65536, has_bias=False, identity=True):
+        return _use_e16_large_expert_major_forward_tuning(
+            config,
+            tokens,
+            routes,
+            has_bias,
+            token_indices_identity=identity,
+        )
+
+    assert selected()
+    assert selected(tokens=134000, routes=134000)
+    assert not selected(tokens=65535, routes=65535)
+    assert not selected(routes=None)
+    assert not selected(routes=65537)
+    assert not selected(has_bias=True)
+    assert not selected(identity=False)
+
+    fallbacks = (
+        replace(qwen3, tile_m=64),
+        replace(qwen3, tile_n=128),
+        replace(qwen3, tile_k=128),
+        replace(qwen3, down_tile_m=128),
+        replace(qwen3, down_tile_n=128),
+        replace(qwen3, down_tile_k=128),
+        replace(qwen3, stage1_b_cache_mod=2),
+        replace(qwen3, stage2_b_cache_mod=2),
+        replace(qwen3, stage1_xcd_swizzle=0),
+        replace(qwen3, stage2_xcd_swizzle=8),
+        replace(qwen3, waves_per_eu=1),
+        replace(qwen3, persistent_stage2=True),
+        replace(qwen3, stage2_pipeline_stages=1),
+        replace(qwen3, stage2_output_mode="reduce"),
+        replace(qwen3, stage1_write_padded_rows=False),
+        replace(qwen3, stage1_lds_swizzle=False),
+        replace(qwen3, activation="relu"),
+        replace(qwen3, compute_dtype="fp16"),
+    )
+    assert all(not selected(config=config) for config in fallbacks)
 
 
 def test_sonic_moe_training_stage1_launcher_accepts_private_overrides(monkeypatch):
