@@ -249,6 +249,108 @@ def test_e16_dw2_dual_profile_dispatch_is_device_guarded(monkeypatch):
     ]
 
 
+def test_e16_dw2_split_companion_owns_hot_experts(monkeypatch):
+    regular_calls = []
+    split_calls = []
+    finalize_calls = []
+
+    def _tracked_grouped_tn(*args, **kwargs):
+        regular_calls.append((args[3], kwargs))
+        return args[4]
+
+    def _tracked_split(*args, **kwargs):
+        split_calls.append((args, kwargs))
+        return args[4]
+
+    def _tracked_finalize(*args, **kwargs):
+        finalize_calls.append((args, kwargs))
+        return args[3]
+
+    monkeypatch.setattr(
+        sonic_backward_module,
+        "grouped_tn_from_queue_flydsl",
+        _tracked_grouped_tn,
+    )
+    monkeypatch.setattr(
+        sonic_backward_module,
+        "grouped_tn_splitk_from_queue_flydsl",
+        _tracked_split,
+    )
+    monkeypatch.setattr(
+        sonic_backward_module,
+        "finalize_hot_splitk_flydsl",
+        _tracked_finalize,
+    )
+    frequency = torch.zeros(16, dtype=torch.int32)
+    active_queue = torch.zeros(33, dtype=torch.int32)
+    split_queue = torch.zeros(34, dtype=torch.int32)
+    hot_queue = torch.zeros(13, dtype=torch.int32)
+    partials = torch.empty((11, 2048, 768), dtype=torch.float32)
+    output = torch.empty((16, 2048, 768), dtype=torch.bfloat16)
+    dy = torch.empty((0, 2048), dtype=torch.bfloat16)
+    activation = torch.empty((0, 768), dtype=torch.bfloat16)
+
+    sonic_backward_module._launch_grouped_dw2(
+        dy,
+        activation,
+        frequency,
+        torch.empty(0, dtype=torch.int32),
+        torch.empty(2, dtype=torch.int32),
+        output,
+        active_queue,
+        use_hostless_grouped=True,
+        use_tn_metadata_direct=False,
+        max_expert_rows=65536,
+        hidden_size=2048,
+        intermediate_size=768,
+        active_experts=16,
+        stream=None,
+        hot_split_state=(split_queue, hot_queue, partials),
+    )
+
+    assert all(queue is active_queue for queue, _ in regular_calls)
+    assert [
+        (
+            kwargs["block_m"],
+            kwargs["block_n"],
+            kwargs["min_active_experts"],
+            kwargs["max_active_experts"],
+            kwargs["min_expert_rows"],
+            kwargs["max_expert_rows"],
+            kwargs["active_guard_or_expert_rows"],
+        )
+        for _, kwargs in regular_calls
+    ] == [
+        (128, 64, 0, 4, 0, 16383, False),
+        (256, 256, 5, None, 0, 16383, False),
+    ]
+    assert len(split_calls) == 1
+    split_args, split_kwargs = split_calls[0]
+    assert all(
+        actual is expected
+        for actual, expected in zip(
+            split_args[:5],
+            (dy, activation, frequency, split_queue, partials),
+        )
+    )
+    assert (
+        split_kwargs["block_m"],
+        split_kwargs["block_n"],
+        split_kwargs["block_k"],
+        split_kwargs["m_waves"],
+        split_kwargs["n_waves"],
+        split_kwargs["stages"],
+    ) == (256, 256, 64, 4, 4, 2)
+    assert len(finalize_calls) == 1
+    assert all(
+        actual is expected
+        for actual, expected in zip(
+            finalize_calls[0][0],
+            (split_queue, hot_queue, partials, output),
+        )
+    )
+
+
 @pytest.mark.parametrize(
     (
         "e16_flat_grouped",

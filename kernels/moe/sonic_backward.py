@@ -200,6 +200,19 @@ _E16_DW2_SMALL_TILE_N = 64
 # frequency predicate is evaluated from the existing device queue, and is
 # combined with the sparse-shard predicate inside the small-profile launch.
 _E16_DW2_HOT_EXPERT_MIN_ROWS = 16384
+# dW2 consumes the same hot descriptors before dW1 and reuses the leading
+# portion of dW1's larger FP32 partial workspace on the same stream.  The
+# smaller dW2 contraction crosses over later than dW1.  Requiring 64K total
+# routes keeps the long-tail case's hot half large enough to benefit too and
+# avoids a new dynamic-shape cliff for 16K--32K batches.
+_E16_DW2_SPLITK_ENABLED = True
+_E16_DW2_SPLIT_MIN_ROUTES = 65536
+_E16_DW2_SPLIT_BM = 256
+_E16_DW2_SPLIT_BN = 256
+_E16_DW2_SPLIT_BK = 64
+_E16_DW2_SPLIT_M_WAVES = 4
+_E16_DW2_SPLIT_N_WAVES = 4
+_E16_DW2_SPLIT_STAGES = 2
 # Direct token-major dW1 is limited by output-tile parallelism when only a few
 # experts are live.  BN64 doubles its N grid and wins for one-to-four experts;
 # balanced routing retains BN128.  Both profiles consume the same device queue
@@ -369,6 +382,12 @@ def _launch_grouped_dw2(
     intermediate_size: int,
     active_experts: int,
     stream: torch.cuda.Stream,
+    hot_split_state: tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+    ]
+    | None = None,
 ) -> None:
     """Launch the tuned grouped dW2 profiles after dy becomes available."""
 
@@ -511,6 +530,21 @@ def _launch_grouped_dw2(
             "stages": dw2_stages,
             "stream": stream,
         }
+        effective_max_profile_rows = max_profile_rows
+        effective_min_profile_rows = min_profile_rows
+        effective_active_guard = active_guard_or_expert_rows
+        if hot_split_state is not None:
+            cold_max_rows = _E16_DW1_SPLIT_MIN_HOT_ROWS - 1
+            effective_max_profile_rows = (
+                cold_max_rows
+                if max_profile_rows is None
+                else min(max_profile_rows, cold_max_rows)
+            )
+            if active_guard_or_expert_rows:
+                # With split-K owning every hot expert, the small-tile launch
+                # is selected only by active count and computes cold experts.
+                effective_min_profile_rows = 0
+                effective_active_guard = False
         if use_tn_metadata_direct:
             grouped_tn_from_metadata_flydsl(
                 dy,
@@ -531,11 +565,36 @@ def _launch_grouped_dw2(
                 dw2,
                 min_active_experts=min_active_experts,
                 max_active_experts=max_active_experts,
-                min_expert_rows=min_profile_rows,
-                max_expert_rows=max_profile_rows,
-                active_guard_or_expert_rows=active_guard_or_expert_rows,
+                min_expert_rows=effective_min_profile_rows,
+                max_expert_rows=effective_max_profile_rows,
+                active_guard_or_expert_rows=effective_active_guard,
                 **grouped_dw2_kwargs,
             )
+
+    if hot_split_state is not None:
+        split_queue, hot_queue, partials = hot_split_state
+        grouped_tn_splitk_from_queue_flydsl(
+            dy,
+            activation,
+            expert_frequency,
+            split_queue,
+            partials,
+            block_m=_E16_DW2_SPLIT_BM,
+            block_n=_E16_DW2_SPLIT_BN,
+            block_k=_E16_DW2_SPLIT_BK,
+            m_waves=_E16_DW2_SPLIT_M_WAVES,
+            n_waves=_E16_DW2_SPLIT_N_WAVES,
+            stages=_E16_DW2_SPLIT_STAGES,
+            stream=stream,
+        )
+        finalize_hot_splitk_flydsl(
+            split_queue,
+            hot_queue,
+            partials,
+            dw2,
+            stream=stream,
+        )
+
 
 def _grouped_da_tuning(max_expert_rows: int, hidden_size: int) -> tuple[int, int, int, int, int]:
     """Return ``(BM, BN, BK, m_waves, n_waves)`` for grouped dA."""
@@ -4231,6 +4290,11 @@ def _sonic_moe_backward_impl(
         and use_e16_deduplicated_metadata
         and routes > _E16_DW1_SPLIT_MIN_HOT_ROWS
     )
+    use_e16_hot_dw2_splitk = (
+        _E16_DW2_SPLITK_ENABLED
+        and use_e16_hot_dw1_splitk
+        and routes >= _E16_DW2_SPLIT_MIN_ROUTES
+    )
     # If even the maximum possible active set falls below the measured
     # selective-clear crossover, a normal dense memset is unconditionally the
     # best choice.  This route-count test is host-known and distribution
@@ -4369,12 +4433,25 @@ def _sonic_moe_backward_impl(
             dtype=torch.float32,
             device=device,
         )
+        if use_e16_hot_dw2_splitk:
+            hot_dw2_elements = (
+                split_descriptor_capacity * hidden_size * intermediate_size
+            )
+            assert hot_dw2_elements <= hot_dw1_partials.numel()
+            hot_dw2_partials = hot_dw1_partials.view(-1)[:hot_dw2_elements].view(
+                split_descriptor_capacity,
+                hidden_size,
+                intermediate_size,
+            )
+        else:
+            hot_dw2_partials = None
     else:
         split_descriptor_capacity = 0
         hot_expert_capacity = 0
         hot_split_storage = None
         hot_expert_storage = None
         hot_dw1_partials = None
+        hot_dw2_partials = None
     if use_compact_w1 and not use_e16_deduplicated_metadata:
         if flat_routes:
             compact_w1_bound = ragged_compact_m_tile_descriptor_upper_bound(
@@ -4969,6 +5046,11 @@ def _sonic_moe_backward_impl(
                 intermediate_size=intermediate_size,
                 active_experts=len(segments),
                 stream=stream,
+                hot_split_state=(
+                    (hot_split_storage, hot_expert_storage, hot_dw2_partials)
+                    if use_e16_hot_dw2_splitk
+                    else None
+                ),
             )
 
         if use_grouped_da:
@@ -5210,6 +5292,11 @@ def _sonic_moe_backward_impl(
                 intermediate_size=intermediate_size,
                 active_experts=len(segments),
                 stream=stream,
+                hot_split_state=(
+                    (hot_split_storage, hot_expert_storage, hot_dw2_partials)
+                    if use_e16_hot_dw2_splitk
+                    else None
+                ),
             )
         elif use_fused_forward_state_prepare:
             assert forward_state_data is not None
