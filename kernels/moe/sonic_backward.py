@@ -197,6 +197,11 @@ _E16_DW2_SMALL_TILE_N = 64
 # frequency predicate is evaluated from the existing device queue, and is
 # combined with the sparse-shard predicate inside the small-profile launch.
 _E16_DW2_HOT_EXPERT_MIN_ROWS = 16384
+# Direct token-major dW1 is limited by output-tile parallelism when only a few
+# experts are live.  BN64 doubles its N grid and wins for one-to-four experts;
+# balanced routing retains BN128.  Both profiles consume the same device queue
+# and use disjoint guards, so this selection never reads the count on the host.
+_E16_DW1_NARROW_MAX_ACTIVE_EXPERTS = 4
 
 _RoutesSorterMetadata = tuple[
     torch.Tensor,  # sorted_token_ids
@@ -207,6 +212,19 @@ _RoutesSorterMetadata = tuple[
     torch.Tensor,  # expert_frequency
     int,  # sorter M padding unit
 ]
+
+
+def _use_e16_dw1_dual_profile(
+    *,
+    direct_rhs: bool,
+    e16_flat_grouped: bool,
+    metadata_direct: bool,
+) -> bool:
+    """Select device-guarded narrow/dense direct-dW1 profiles."""
+
+    return direct_rhs and e16_flat_grouped and not metadata_direct
+
+
 def _use_e16_fixed_state_grouped_backward(
     *,
     compute_dtype: str,
@@ -5171,37 +5189,98 @@ def _sonic_moe_backward_impl(
                 # profile for enough N-grid parallelism under expert skew.
                 wide_direct_rhs=not use_flat_identity_dx,
             )
-            grouped_dw1_kwargs = {
-                "block_m": grouped_dw1_bm,
-                "block_n": grouped_dw1_bn,
-                "block_k": grouped_dw1_bk,
-                "k_padding": grouped_dw1_k_padding,
-                "m_waves": grouped_dw1_m_waves,
-                "n_waves": grouped_dw1_n_waves,
-                "stream": stream,
-            }
-            if use_tn_metadata_direct:
-                grouped_tn_from_metadata_flydsl(
-                    dz,
-                    grouped_dw1_rhs,
-                    expert_frequency,
-                    sorted_expert_ids,
-                    num_valid_ids,
-                    dw1,
-                    sorted_token_ids=(sorted_token_ids if use_direct_grouped_dw1_rhs else None),
-                    **grouped_dw1_kwargs,
+            if _use_e16_dw1_dual_profile(
+                direct_rhs=use_direct_grouped_dw1_rhs,
+                e16_flat_grouped=use_e16_flat_grouped,
+                metadata_direct=use_tn_metadata_direct,
+            ):
+                grouped_dw1_profiles = (
+                    (
+                        128,
+                        64,
+                        _GROUPED_DW1_BLOCK_K,
+                        0,
+                        2,
+                        2,
+                        0,
+                        _E16_DW1_NARROW_MAX_ACTIVE_EXPERTS,
+                    ),
+                    (
+                        grouped_dw1_bm,
+                        grouped_dw1_bn,
+                        grouped_dw1_bk,
+                        grouped_dw1_k_padding,
+                        grouped_dw1_m_waves,
+                        grouped_dw1_n_waves,
+                        _E16_DW1_NARROW_MAX_ACTIVE_EXPERTS + 1,
+                        None,
+                    ),
                 )
             else:
-                assert active_expert_storage is not None
-                grouped_tn_from_queue_flydsl(
-                    dz,
-                    grouped_dw1_rhs,
-                    expert_frequency,
-                    active_expert_storage,
-                    dw1,
-                    sorted_token_ids=(sorted_token_ids if use_direct_grouped_dw1_rhs else None),
-                    **grouped_dw1_kwargs,
+                grouped_dw1_profiles = (
+                    (
+                        grouped_dw1_bm,
+                        grouped_dw1_bn,
+                        grouped_dw1_bk,
+                        grouped_dw1_k_padding,
+                        grouped_dw1_m_waves,
+                        grouped_dw1_n_waves,
+                        0,
+                        None,
+                    ),
                 )
+
+            for (
+                profile_bm,
+                profile_bn,
+                profile_bk,
+                profile_k_padding,
+                profile_m_waves,
+                profile_n_waves,
+                min_active_experts,
+                max_active_experts,
+            ) in grouped_dw1_profiles:
+                grouped_dw1_kwargs = {
+                    "block_m": profile_bm,
+                    "block_n": profile_bn,
+                    "block_k": profile_bk,
+                    "k_padding": profile_k_padding,
+                    "m_waves": profile_m_waves,
+                    "n_waves": profile_n_waves,
+                    "stream": stream,
+                }
+                if use_tn_metadata_direct:
+                    grouped_tn_from_metadata_flydsl(
+                        dz,
+                        grouped_dw1_rhs,
+                        expert_frequency,
+                        sorted_expert_ids,
+                        num_valid_ids,
+                        dw1,
+                        sorted_token_ids=(
+                            sorted_token_ids
+                            if use_direct_grouped_dw1_rhs
+                            else None
+                        ),
+                        **grouped_dw1_kwargs,
+                    )
+                else:
+                    assert active_expert_storage is not None
+                    grouped_tn_from_queue_flydsl(
+                        dz,
+                        grouped_dw1_rhs,
+                        expert_frequency,
+                        active_expert_storage,
+                        dw1,
+                        sorted_token_ids=(
+                            sorted_token_ids
+                            if use_direct_grouped_dw1_rhs
+                            else None
+                        ),
+                        min_active_experts=min_active_experts,
+                        max_active_experts=max_active_experts,
+                        **grouped_dw1_kwargs,
+                    )
 
         if use_grouped_dx:
             # Compact queues round real expert rows to their selected BM.

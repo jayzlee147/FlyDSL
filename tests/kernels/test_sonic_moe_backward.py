@@ -586,6 +586,25 @@ def test_e16_direct_grouped_dw1_rhs_retains_bn128_parallelism():
 
 
 @pytest.mark.parametrize(
+    ("overrides", "expected"),
+    (
+        ({}, True),
+        ({"direct_rhs": False}, False),
+        ({"e16_flat_grouped": False}, False),
+        ({"metadata_direct": True}, False),
+    ),
+)
+def test_e16_direct_dw1_dual_profile_policy_is_narrow(overrides, expected):
+    kwargs = {
+        "direct_rhs": True,
+        "e16_flat_grouped": True,
+        "metadata_direct": False,
+    }
+    kwargs.update(overrides)
+    assert sonic_backward_module._use_e16_dw1_dual_profile(**kwargs) is expected
+
+
+@pytest.mark.parametrize(
     (
         "compute_dtype",
         "activation",
