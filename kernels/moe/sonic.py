@@ -1658,6 +1658,56 @@ def _training_stage1_tile_m(
     return config.tile_m
 
 
+def _use_e16_4096_expert_major_forward_tuning(
+    config: SonicMoEConfig,
+    tokens: int,
+    routes: int | None,
+    has_bias: bool,
+    *,
+    token_indices_identity: bool,
+) -> bool:
+    """Select the measured R4096 Qwen3 expert-major Stage-1 N tile.
+
+    BM128/BN64 wins across balanced, skewed, and hot-four expert loads at this
+    host-known route count.  The neighboring R6144 bucket regresses, so keep
+    the specialization exact rather than consulting device-side frequencies.
+    """
+
+    return (
+        token_indices_identity
+        and routes is not None
+        and routes == tokens
+        and routes == 4096
+        and config.hidden_size == 2048
+        and config.intermediate_size == 768
+        and config.num_experts == 16
+        and config.top_k == 1
+        and (config.tile_m, config.tile_n, config.tile_k) == (128, 192, 64)
+        and (
+            config.stage2_tile_m,
+            config.stage2_tile_n,
+            config.stage2_tile_k,
+        )
+        == (64, 256, 64)
+        and config.route_tile_m == 128
+        and config.stage1_k_wave == 1
+        and config.stage1_b_cache_mod in (None, 0)
+        and config.stage2_b_cache_mod in (None, 0)
+        and config.stage1_xcd_swizzle == 8
+        and config.stage2_xcd_swizzle == 0
+        and config.waves_per_eu is None
+        and not config.persistent_stage1
+        and not config.persistent_stage2
+        and config.stage2_pipeline_stages == 2
+        and config.stage2_output_mode == "atomic"
+        and config.stage1_write_padded_rows
+        and config.stage1_lds_swizzle
+        and config.activation == "swiglu"
+        and config.compute_dtype == "bf16"
+        and not has_bias
+    )
+
+
 def _use_e16_large_expert_major_forward_tuning(
     config: SonicMoEConfig,
     tokens: int,
@@ -2345,6 +2395,17 @@ class SonicMoE:
             workspace.routes,
             self.weights.has_bias,
         )
+        if _use_e16_4096_expert_major_forward_tuning(
+            cfg,
+            tokens,
+            workspace.routes,
+            self.weights.has_bias,
+            token_indices_identity=token_indices_identity,
+        ):
+            # Preserve BM128 sorter/compute/state metadata while increasing N
+            # parallelism.  Stage 2 remains unchanged.
+            training_tile_n = 64
+            training_waves_per_eu = None
         use_large_e16_expert_major_tuning = (
             _use_e16_large_expert_major_forward_tuning(
                 cfg,
