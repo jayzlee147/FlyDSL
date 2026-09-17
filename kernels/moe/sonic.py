@@ -813,6 +813,125 @@ class SonicMoEWorkspace:
         )
 
 
+@dataclass
+class _SonicMoEDynamicWorkspacePoolEntry:
+    """One shared capacity and enqueue lock for a device/stream/config key."""
+
+    capacity: SonicMoEWorkspace | None = None
+    launch_lock: threading.Lock = field(default_factory=threading.Lock)
+
+
+class SonicMoEDynamicWorkspacePool:
+    """Explicitly shared growable expert-major scratch storage.
+
+    A pool may be passed to multiple :class:`SonicMoE` instances.  Entries are
+    isolated by the full :class:`SonicMoEConfig`, device, and current stream,
+    and each entry owns one launch lock that survives capacity growth.  The
+    pool, rather than any participating operator, is the sole long-lived owner
+    of the current capacity; this prevents 48-layer models from retaining one
+    high-water allocation per layer.
+
+    Sharing is opt-in because it changes scratch lifetime and is deliberately
+    unsupported during graph capture.  Call :meth:`clear` only while users of
+    the pool are quiescent.  Dropping all operators and the pool releases its
+    tensors naturally; a still-live pool can be released explicitly with
+    :meth:`clear`.
+    """
+
+    def __init__(self, *, max_cached_workspaces: int = _DEFAULT_MAX_CACHED_WORKSPACES):
+        if isinstance(max_cached_workspaces, bool) or not isinstance(
+            max_cached_workspaces, int
+        ):
+            raise TypeError("max_cached_workspaces must be an integer")
+        if max_cached_workspaces <= 0:
+            raise ValueError("max_cached_workspaces must be positive")
+        self._max_cached_workspaces = max_cached_workspaces
+        self._entries: OrderedDict[
+            tuple[int, int, SonicMoEConfig],
+            _SonicMoEDynamicWorkspacePoolEntry,
+        ] = OrderedDict()
+        self._lock = threading.RLock()
+
+    def __len__(self) -> int:
+        with self._lock:
+            return len(self._entries)
+
+    def clear(self) -> None:
+        """Drop all cached capacities; callers must first quiesce pool users."""
+
+        with self._lock:
+            self._entries.clear()
+
+    def reserve(
+        self,
+        config: SonicMoEConfig,
+        tokens: int,
+        routes: int,
+        device: torch.device,
+    ) -> SonicMoEWorkspace:
+        """Return an active view over the key's single growable capacity."""
+
+        if tokens <= 0:
+            raise ValueError(f"tokens must be positive, got {tokens}")
+        if routes < 0:
+            raise ValueError(f"routes must be non-negative, got {routes}")
+        with torch.cuda.device(device):
+            if torch.cuda.is_current_stream_capturing():
+                raise RuntimeError(
+                    "shared dynamic SonicMoE workspaces are not graph-capture safe; "
+                    "use per-operator workspaces for captured expert-major inference"
+                )
+            stream_id = int(torch.cuda.current_stream(device).cuda_stream)
+        key = (device.index or 0, stream_id, config)
+        with self._lock:
+            entry = self._entries.get(key)
+            if entry is None:
+                entry = _SonicMoEDynamicWorkspacePoolEntry()
+                self._entries[key] = entry
+            else:
+                self._entries.move_to_end(key)
+
+            capacity = entry.capacity
+            needs_growth = (
+                capacity is None
+                or tokens > capacity.tokens
+                or capacity.routes is None
+                or routes > capacity.routes
+            )
+            if needs_growth:
+                old_tokens = 0 if capacity is None else capacity.tokens
+                old_routes = (
+                    0
+                    if capacity is None or capacity.routes is None
+                    else capacity.routes
+                )
+                capacity_tokens = max(tokens, old_tokens + max(1, old_tokens // 2))
+                capacity_routes = max(routes, old_routes + max(1, old_routes // 2))
+                try:
+                    capacity = SonicMoEWorkspace.allocate(
+                        config,
+                        capacity_tokens,
+                        device,
+                        routes=capacity_routes,
+                        reusable_output=False,
+                    )
+                except ValueError:
+                    capacity = SonicMoEWorkspace.allocate(
+                        config,
+                        tokens,
+                        device,
+                        routes=routes,
+                        reusable_output=False,
+                    )
+                capacity._launch_lock = entry.launch_lock
+                entry.capacity = capacity
+
+            while len(self._entries) > self._max_cached_workspaces:
+                self._entries.popitem(last=False)
+            assert capacity is not None
+            return capacity.flat_active_view(config, tokens, routes)
+
+
 def _preshuffle_16bit_weight(
     weight: torch.Tensor,
     dtype: torch.dtype,
@@ -1717,7 +1836,9 @@ class SonicMoE:
     Exact-shape and growable workspaces use independent LRU caches, each bounded
     by ``max_cached_workspaces``. Exact entries are keyed by ``(device, stream,
     token_count, route_count)``; dense top-k calls use a dedicated route-count
-    sentinel. Except for growable expert-major route
+    sentinel. Multiple operators may explicitly share growable expert-major
+    scratch by receiving the same :class:`SonicMoEDynamicWorkspacePool`.
+    Except for growable expert-major route
     workspaces, the returned default output aliases that workspace and is
     overwritten by the next call with the same key; pass ``out=`` when the
     caller owns output storage. Growable route workspaces span multiple active
@@ -1736,6 +1857,7 @@ class SonicMoE:
         weights: SonicMoEWeights,
         *,
         max_cached_workspaces: int = _DEFAULT_MAX_CACHED_WORKSPACES,
+        shared_dynamic_workspace_pool: SonicMoEDynamicWorkspacePool | None = None,
     ):
         prepared_shape = (
             weights.config.hidden_size,
@@ -1773,9 +1895,18 @@ class SonicMoE:
             raise TypeError("max_cached_workspaces must be an integer")
         if max_cached_workspaces <= 0:
             raise ValueError("max_cached_workspaces must be positive")
+        if shared_dynamic_workspace_pool is not None and not isinstance(
+            shared_dynamic_workspace_pool,
+            SonicMoEDynamicWorkspacePool,
+        ):
+            raise TypeError(
+                "shared_dynamic_workspace_pool must be a "
+                "SonicMoEDynamicWorkspacePool or None"
+            )
         self.config = config
         self.weights = weights
         self._max_cached_workspaces = max_cached_workspaces
+        self._shared_dynamic_workspace_pool = shared_dynamic_workspace_pool
         self._workspaces: OrderedDict[tuple[int, int, int, int], SonicMoEWorkspace] = OrderedDict()
         self._dynamic_route_workspaces: OrderedDict[
             tuple[int, int], SonicMoEWorkspace
@@ -1787,6 +1918,8 @@ class SonicMoE:
         self.workspace: SonicMoEWorkspace | None = None
 
     def clear_workspace(self) -> None:
+        """Clear operator-owned caches, but never a separately owned shared pool."""
+
         with self._workspace_lock:
             self._workspaces.clear()
             self._dynamic_route_workspaces.clear()
@@ -1834,6 +1967,18 @@ class SonicMoE:
             raise ValueError(f"tokens must be positive, got {tokens}")
         if routes < 0:
             raise ValueError(f"routes must be non-negative, got {routes}")
+        if self._shared_dynamic_workspace_pool is not None:
+            workspace = self._shared_dynamic_workspace_pool.reserve(
+                self.config,
+                tokens,
+                routes,
+                self.weights.device,
+            )
+            # Keeping an active view here would make every participating
+            # operator retain the pool's superseded capacity after another
+            # operator grows the shared entry.
+            self.workspace = None
+            return workspace
         stream_id = int(torch.cuda.current_stream(self.weights.device).cuda_stream)
         key = (self.weights.device.index or 0, stream_id)
         with self._workspace_lock:
@@ -3440,6 +3585,7 @@ def sonic_moe_mxfp4_reference(
 __all__ = [
     "SonicMoE",
     "SonicMoEConfig",
+    "SonicMoEDynamicWorkspacePool",
     "SonicMoEForwardState",
     "SonicMoERoutesForwardState",
     "SonicMoEWeights",

@@ -17,6 +17,7 @@ from kernels.moe.moe_sorting_kernel import _multiphase_cf_cache, _oneshot_cf_cac
 from kernels.moe.sonic import (
     SonicMoE,
     SonicMoEConfig,
+    SonicMoEDynamicWorkspacePool,
     SonicMoEForwardState,
     _is_e16_flat_training_shape,
     prepare_sonic_bf16_weights,
@@ -3678,9 +3679,11 @@ def test_sonic_moe_backward_e16_routes_reuses_forward_sorter_metadata(
 
 @pytest.mark.large_shape
 @pytest.mark.parametrize("routes", (64, 257))
+@pytest.mark.parametrize("shared", (False, True), ids=("private", "shared"))
 def test_sonic_moe_backward_dynamic_e16_expert_major_identity_dx_is_direct(
     monkeypatch,
     routes,
+    shared,
 ):
     """Dynamic retained E16 skips sorting and uses sort-unit-safe TN queues."""
 
@@ -3743,7 +3746,13 @@ def test_sonic_moe_backward_dynamic_e16_expert_major_identity_dx_is_direct(
         dtype=torch.float32,
         device=device,
     )
-    operator = SonicMoE(config, prepare_sonic_bf16_weights(w1, w2, config))
+    prepared = prepare_sonic_bf16_weights(w1, w2, config)
+    pool = SonicMoEDynamicWorkspacePool() if shared else None
+    operator = SonicMoE(
+        config,
+        prepared,
+        shared_dynamic_workspace_pool=pool,
+    )
     _, state = operator.forward_routes_training(
         x,
         token_indices,
@@ -3752,6 +3761,28 @@ def test_sonic_moe_backward_dynamic_e16_expert_major_identity_dx_is_direct(
         expert_offsets=expert_offsets,
         token_indices_identity=True,
     )
+    if pool is not None:
+        # A second layer may reuse and overwrite all shared scratch before the
+        # first layer's backward.  Its retained state must remain sufficient.
+        second_operator = SonicMoE(
+            config,
+            prepared,
+            shared_dynamic_workspace_pool=pool,
+        )
+        second_expert_indices = torch.zeros_like(expert_indices)
+        second_expert_offsets = torch.tensor(
+            [0, routes, *([routes] * (num_experts - 1))],
+            dtype=torch.int32,
+            device=device,
+        )
+        second_operator.forward_routes_training(
+            x.neg().contiguous(),
+            token_indices,
+            second_expert_indices,
+            route_weights.flip(0).contiguous(),
+            expert_offsets=second_expert_offsets,
+            token_indices_identity=True,
+        )
     segmented_state_values = dict(vars(state))
     segmented_state_values["token_indices_identity"] = False
     segmented_state = SimpleNamespace(**segmented_state_values)
@@ -3821,7 +3852,11 @@ def test_sonic_moe_backward_dynamic_e16_expert_major_identity_dx_is_direct(
         state.expert_frequency,
         torch.tensor(counts, dtype=torch.int32, device=device),
     )
-    assert len(operator._dynamic_route_workspaces) == 1
+    if pool is None:
+        assert len(operator._dynamic_route_workspaces) == 1
+    else:
+        assert len(pool) == 1
+        assert not operator._dynamic_route_workspaces
     for direct_gradient, segmented_gradient in zip(direct, segmented):
         assert torch.equal(direct_gradient, segmented_gradient)
 

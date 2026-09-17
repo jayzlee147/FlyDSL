@@ -31,7 +31,12 @@ import sys
 import torch
 
 from kernels.moe import sonic_backward as sonic_backward_module
-from kernels.moe.sonic import SonicMoE, SonicMoEConfig, prepare_sonic_bf16_weights
+from kernels.moe.sonic import (
+    SonicMoE,
+    SonicMoEConfig,
+    SonicMoEDynamicWorkspacePool,
+    prepare_sonic_bf16_weights,
+)
 from kernels.moe.sonic_backward import sonic_moe_backward_routes
 
 
@@ -103,7 +108,14 @@ def _e16_config() -> SonicMoEConfig:
     )
 
 
-def _build_case(routes: int, load: str, seed: int, mode: str):
+def _build_case(
+    routes: int,
+    load: str,
+    seed: int,
+    mode: str,
+    *,
+    shared_dynamic_workspace: bool = False,
+):
     device = torch.device("cuda")
     config = _e16_config()
     experts = config.num_experts
@@ -152,7 +164,12 @@ def _build_case(routes: int, load: str, seed: int, mode: str):
         device=device,
     )
     output = torch.empty_like(x)
-    operator = SonicMoE(config, prepare_sonic_bf16_weights(w1, w2, config))
+    pool = SonicMoEDynamicWorkspacePool() if shared_dynamic_workspace else None
+    operator = SonicMoE(
+        config,
+        prepare_sonic_bf16_weights(w1, w2, config),
+        shared_dynamic_workspace_pool=pool,
+    )
 
     def forward():
         kwargs = {}
@@ -208,6 +225,8 @@ def _run_qwen3_matrix(args: argparse.Namespace) -> None:
                 "--seed",
                 str(args.seed),
             ]
+            if args.shared_dynamic_workspace:
+                command.append("--shared-dynamic-workspace")
             completed = subprocess.run(
                 command,
                 check=True,
@@ -431,7 +450,11 @@ def _run_row_grid_abba_matrix(args: argparse.Namespace) -> None:
             print(json.dumps(result, sort_keys=True), flush=True)
 
 
-def _run_workspace_sequence(seed: int) -> None:
+def _run_workspace_sequence(
+    seed: int,
+    instances: int,
+    shared_dynamic_workspace: bool,
+) -> None:
     """Report growable-workspace memory while T changes in one process."""
 
     device = torch.device("cuda")
@@ -449,7 +472,16 @@ def _run_workspace_sequence(seed: int) -> None:
         device=device,
         generator=generator,
     ).mul_(0.02)
-    operator = SonicMoE(config, prepare_sonic_bf16_weights(w1, w2, config))
+    weights = prepare_sonic_bf16_weights(w1, w2, config)
+    pool = SonicMoEDynamicWorkspacePool() if shared_dynamic_workspace else None
+    operators = [
+        SonicMoE(
+            config,
+            weights,
+            shared_dynamic_workspace_pool=pool,
+        )
+        for _ in range(instances)
+    ]
     torch.cuda.synchronize(device)
     baseline_allocated = torch.cuda.memory_allocated(device)
 
@@ -458,20 +490,32 @@ def _run_workspace_sequence(seed: int) -> None:
     # of conflating it with one cache entry per exact route count.
     for routes in _QWEN3_WORKSPACE_ROUTES:
         torch.cuda.reset_peak_memory_stats(device)
-        operator.reserve_dynamic_routes(routes, routes)
+        for operator in operators:
+            operator.reserve_dynamic_routes(routes, routes)
         torch.cuda.synchronize(device)
-        capacity = next(iter(operator._dynamic_route_workspaces.values()))
+        capacity = (
+            next(iter(pool._entries.values())).capacity
+            if pool is not None
+            else next(iter(operators[-1]._dynamic_route_workspaces.values()))
+        )
+        assert capacity is not None
         allocated = torch.cuda.memory_allocated(device)
         result = {
             "baseline_allocated_mib": baseline_allocated / (1024 * 1024),
             "current_allocated_mib": allocated / (1024 * 1024),
             "device": torch.cuda.get_device_name(device),
-            "dynamic_workspace_cache_entries": len(operator._dynamic_route_workspaces),
+            "dynamic_workspace_cache_entries": (
+                len(pool)
+                if pool is not None
+                else sum(len(operator._dynamic_route_workspaces) for operator in operators)
+            ),
+            "instances": instances,
             "kind": "same-process-workspace-sequence",
             "peak_allocated_mib": torch.cuda.max_memory_allocated(device) / (1024 * 1024),
             "peak_reserved_mib": torch.cuda.max_memory_reserved(device) / (1024 * 1024),
             "routes": routes,
             "seed": seed,
+            "shared_dynamic_workspace": shared_dynamic_workspace,
             "workspace_allocated_mib": (allocated - baseline_allocated) / (1024 * 1024),
             "workspace_capacity_routes": capacity.routes,
             "workspace_capacity_tokens": capacity.tokens,
@@ -527,6 +571,17 @@ def main() -> None:
     parser.add_argument("--baseline-cap", type=int, default=1024)
     parser.add_argument("--candidate-cap", type=int, default=2048)
     parser.add_argument("--seed", type=int, default=20260917)
+    parser.add_argument(
+        "--shared-dynamic-workspace",
+        action="store_true",
+        help="opt in to a dynamic scratch pool shared by all benchmark operators",
+    )
+    parser.add_argument(
+        "--workspace-instances",
+        type=int,
+        default=1,
+        help="number of operators retained by --workspace-sequence",
+    )
     args = parser.parse_args()
     if (
         args.routes <= 0
@@ -535,8 +590,12 @@ def main() -> None:
         or args.pairs <= 0
         or args.baseline_cap <= 0
         or args.candidate_cap <= 0
+        or args.workspace_instances <= 0
     ):
-        parser.error("routes/iters/pairs/caps must be positive and warmup non-negative")
+        parser.error(
+            "routes/iters/pairs/caps/workspace-instances must be positive "
+            "and warmup non-negative"
+        )
     if args.baseline_cap == args.candidate_cap:
         parser.error("row-grid baseline and candidate caps must differ")
     if (args.row_grid_abba or args.row_grid_abba_case) and args.pairs % 2:
@@ -545,7 +604,11 @@ def main() -> None:
         _run_qwen3_matrix(args)
         return
     if args.workspace_sequence:
-        _run_workspace_sequence(args.seed)
+        _run_workspace_sequence(
+            args.seed,
+            args.workspace_instances,
+            args.shared_dynamic_workspace,
+        )
         return
     if args.row_grid_abba:
         _run_row_grid_abba_matrix(args)
@@ -560,6 +623,7 @@ def main() -> None:
         args.load,
         args.seed,
         args.mode,
+        shared_dynamic_workspace=args.shared_dynamic_workspace,
     )
 
     # Untimed compile followed by warmup.  Keep only the latest invocation's
@@ -604,6 +668,7 @@ def main() -> None:
         "load": args.load,
         "routes": routes,
         "seed": args.seed,
+        "shared_dynamic_workspace": args.shared_dynamic_workspace,
         "forward_ms_median": _median(forward_ms),
         "backward_ms_median": _median(backward_ms),
         "e2e_ms_median": _median(e2e_ms),
@@ -613,7 +678,11 @@ def main() -> None:
         "peak_allocated_mib": torch.cuda.max_memory_allocated(device) / (1024 * 1024),
         "peak_reserved_mib": torch.cuda.max_memory_reserved(device) / (1024 * 1024),
         "exact_workspace_cache_entries": len(operator._workspaces),
-        "dynamic_workspace_cache_entries": len(operator._dynamic_route_workspaces),
+        "dynamic_workspace_cache_entries": (
+            len(operator._shared_dynamic_workspace_pool)
+            if operator._shared_dynamic_workspace_pool is not None
+            else len(operator._dynamic_route_workspaces)
+        ),
     }
     print(json.dumps(result, sort_keys=True))
 

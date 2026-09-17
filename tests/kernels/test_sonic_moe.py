@@ -3,6 +3,7 @@
 
 """Correctness and API-contract tests for gfx950 SonicMoE A16W16/A16W4."""
 
+import gc
 import json
 import math
 import threading
@@ -17,6 +18,7 @@ from kernels.moe.moe_2stage_a16wmix.gemm1 import compile_gemm1_a16w4_port
 from kernels.moe.sonic import (
     SonicMoE,
     SonicMoEConfig,
+    SonicMoEDynamicWorkspacePool,
     SonicMoEForwardState,
     SonicMoERoutesForwardState,
     SonicMoEWeights,
@@ -1775,7 +1777,11 @@ def test_sonic_moe_ragged_routes_match_reference_and_frequency():
 
 
 @pytest.mark.parametrize("training", (False, True), ids=("inference", "training"))
-def test_sonic_moe_expert_major_identity_routes_match_generic_and_reuse_capacity(training):
+@pytest.mark.parametrize("shared", (False, True), ids=("private", "shared"))
+def test_sonic_moe_expert_major_identity_routes_match_generic_and_reuse_capacity(
+    training,
+    shared,
+):
     """Pre-grouped routing reuses scratch without aliasing default outputs."""
 
     config = _config(
@@ -1785,7 +1791,12 @@ def test_sonic_moe_expert_major_identity_routes_match_generic_and_reuse_capacity
     x, w1, w2, _ = _make_case(seed=20260917)
     prepared = prepare_sonic_bf16_weights(w1, w2, config)
     generic = SonicMoE(config, prepared)
-    optimized = SonicMoE(config, prepared)
+    pool = SonicMoEDynamicWorkspacePool() if shared else None
+    optimized = SonicMoE(
+        config,
+        prepared,
+        shared_dynamic_workspace_pool=pool,
+    )
     token_indices = torch.arange(TOKENS, dtype=torch.int32, device=x.device)
     counts = (2, 0, 3, 2)
     expert_indices = torch.repeat_interleave(
@@ -1842,7 +1853,12 @@ def test_sonic_moe_expert_major_identity_routes_match_generic_and_reuse_capacity
         expert_offsets=expert_offsets,
         token_indices_identity=True,
     )
-    first_capacity = next(iter(optimized._dynamic_route_workspaces.values()))
+    first_capacity = (
+        next(iter(pool._entries.values())).capacity
+        if pool is not None
+        else next(iter(optimized._dynamic_route_workspaces.values()))
+    )
+    assert first_capacity is not None
     smaller_x = x[:5].neg().contiguous()
     later = invoke(
         optimized,
@@ -1861,11 +1877,17 @@ def test_sonic_moe_expert_major_identity_routes_match_generic_and_reuse_capacity
 
     assert torch.equal(generic_frequency, expected_frequency)
     assert torch.equal(optimized_frequency, expected_frequency)
-    assert len(optimized._dynamic_route_workspaces) == 1
-    assert next(iter(optimized._dynamic_route_workspaces.values())) is first_capacity
-    assert optimized.workspace is not None
-    assert (optimized.workspace.tokens, optimized.workspace.routes) == (5, 5)
-    assert optimized.workspace._launch_lock is first_capacity._launch_lock
+    if pool is None:
+        assert len(optimized._dynamic_route_workspaces) == 1
+        assert next(iter(optimized._dynamic_route_workspaces.values())) is first_capacity
+        assert optimized.workspace is not None
+        assert (optimized.workspace.tokens, optimized.workspace.routes) == (5, 5)
+        assert optimized.workspace._launch_lock is first_capacity._launch_lock
+    else:
+        assert len(pool) == 1
+        assert not optimized._dynamic_route_workspaces
+        assert optimized.workspace is None
+        assert next(iter(pool._entries.values())).capacity is first_capacity
     assert first_capacity.output is None
     assert actual.untyped_storage().data_ptr() != later.untyped_storage().data_ptr()
     _assert_close(actual, expected)
@@ -2099,6 +2121,253 @@ def test_sonic_moe_dynamic_route_workspace_grows_once_and_returns_active_views()
     assert not op._dynamic_route_workspaces
     assert not op._dynamic_route_workspace_locks
     assert op.workspace is None
+
+
+def test_sonic_moe_shared_dynamic_workspace_reuses_and_grows_one_capacity():
+    config = _config()
+    _, w1, w2, _ = _make_case()
+    weights = prepare_sonic_bf16_weights(w1, w2, config)
+    pool = SonicMoEDynamicWorkspacePool()
+    first_op = SonicMoE(config, weights, shared_dynamic_workspace_pool=pool)
+    second_op = SonicMoE(config, weights, shared_dynamic_workspace_pool=pool)
+
+    first = first_op.reserve_dynamic_routes(7, 7)
+    entry = next(iter(pool._entries.values()))
+    first_capacity_ref = weakref.ref(entry.capacity)
+    second = second_op.reserve_dynamic_routes(7, 7)
+
+    assert len(pool) == 1
+    assert first.intermediate.untyped_storage().data_ptr() == second.intermediate.untyped_storage().data_ptr()
+    assert first._launch_lock is second._launch_lock is entry.launch_lock
+    assert not first_op._dynamic_route_workspaces
+    assert not second_op._dynamic_route_workspaces
+    assert first_op.workspace is None
+    assert second_op.workspace is None
+
+    del first, second
+    grown = second_op.reserve_dynamic_routes(20, 20)
+    assert entry.capacity is not None
+    assert (entry.capacity.tokens, entry.capacity.routes) == (20, 20)
+    assert grown._launch_lock is entry.launch_lock
+    gc.collect()
+    assert first_capacity_ref() is None
+
+    smaller = first_op.reserve_dynamic_routes(5, 5)
+    assert smaller.intermediate.untyped_storage().data_ptr() == grown.intermediate.untyped_storage().data_ptr()
+    assert len(pool) == 1
+
+
+def test_sonic_moe_shared_dynamic_workspace_serializes_across_operators(
+    monkeypatch,
+):
+    config = _config(stage1_write_padded_rows=True, stage1_lds_swizzle=True)
+    x, w1, w2, _ = _make_case()
+    weights = prepare_sonic_bf16_weights(w1, w2, config)
+    pool = SonicMoEDynamicWorkspacePool()
+    operators = (
+        SonicMoE(config, weights, shared_dynamic_workspace_pool=pool),
+        SonicMoE(config, weights, shared_dynamic_workspace_pool=pool),
+    )
+    stream = torch.cuda.Stream(device=x.device)
+    with torch.cuda.device(x.device), torch.cuda.stream(stream):
+        operators[0].reserve_dynamic_routes(TOKENS, TOKENS)
+    entry = next(iter(pool._entries.values()))
+    assert entry.capacity is not None
+
+    first_sort_entered = threading.Event()
+    second_lock_attempted = threading.Event()
+    second_sort_entered = threading.Event()
+    release_first = threading.Event()
+    order = []
+    errors = []
+
+    class TrackingLock:
+        def __init__(self):
+            self._lock = threading.Lock()
+
+        def __enter__(self):
+            if threading.current_thread().name == "sonic-shared-second":
+                second_lock_attempted.set()
+            self._lock.acquire()
+            return self
+
+        def __exit__(self, exc_type, exc_value, traceback):
+            self._lock.release()
+
+    launch_lock = TrackingLock()
+    entry.launch_lock = launch_lock
+    entry.capacity._launch_lock = launch_lock
+
+    def fake_sort(*args, **kwargs):
+        del args, kwargs
+        name = threading.current_thread().name
+        order.append((name, "sort"))
+        if name == "sonic-shared-first":
+            first_sort_entered.set()
+            if not release_first.wait(timeout=5):
+                raise TimeoutError("first shared sort was not released")
+        else:
+            second_sort_entered.set()
+
+    def fake_grouped_gemms(hidden_states, active_workspace, out, **kwargs):
+        del kwargs
+        assert hidden_states is x
+        assert active_workspace._launch_lock is launch_lock
+        order.append((threading.current_thread().name, "gemms"))
+        return out
+
+    monkeypatch.setattr(
+        "kernels.moe.sonic.moe_expert_major_sorting_flydsl",
+        fake_sort,
+    )
+    for operator in operators:
+        monkeypatch.setattr(operator, "_run_grouped_gemms", fake_grouped_gemms)
+
+    token_indices = torch.arange(TOKENS, dtype=torch.int32, device=x.device)
+    expert_indices = torch.zeros(TOKENS, dtype=torch.int32, device=x.device)
+    route_weights = torch.ones(TOKENS, dtype=torch.float32, device=x.device)
+    expert_offsets = torch.tensor(
+        [0, TOKENS, *([TOKENS] * (NUM_EXPERTS - 1))],
+        dtype=torch.int32,
+        device=x.device,
+    )
+    outputs = (torch.empty_like(x), torch.empty_like(x))
+
+    def run(operator, output):
+        try:
+            with torch.cuda.device(x.device), torch.cuda.stream(stream):
+                result = operator.forward_routes(
+                    x,
+                    token_indices,
+                    expert_indices,
+                    route_weights,
+                    out=output,
+                    expert_offsets=expert_offsets,
+                    token_indices_identity=True,
+                )
+            assert result is output
+        except Exception as error:
+            errors.append(error)
+
+    first = threading.Thread(
+        target=run,
+        args=(operators[0], outputs[0]),
+        name="sonic-shared-first",
+    )
+    second = threading.Thread(
+        target=run,
+        args=(operators[1], outputs[1]),
+        name="sonic-shared-second",
+    )
+    first.start()
+    try:
+        assert first_sort_entered.wait(timeout=5)
+        second.start()
+        assert second_lock_attempted.wait(timeout=5)
+        assert not second_sort_entered.is_set()
+        release_first.set()
+    finally:
+        release_first.set()
+        first.join(timeout=5)
+        if second.ident is not None:
+            second.join(timeout=5)
+
+    assert not first.is_alive()
+    assert not second.is_alive()
+    assert not errors
+    assert order == [
+        ("sonic-shared-first", "sort"),
+        ("sonic-shared-first", "gemms"),
+        ("sonic-shared-second", "sort"),
+        ("sonic-shared-second", "gemms"),
+    ]
+
+
+def test_sonic_moe_shared_dynamic_workspace_isolates_streams_and_configs():
+    config = _config()
+    other_config = replace(config, tile_m=32)
+    _, w1, w2, _ = _make_case()
+    weights = prepare_sonic_bf16_weights(w1, w2, config)
+    pool = SonicMoEDynamicWorkspacePool()
+    first_op = SonicMoE(config, weights, shared_dynamic_workspace_pool=pool)
+    second_op = SonicMoE(config, weights, shared_dynamic_workspace_pool=pool)
+    other_op = SonicMoE(other_config, weights, shared_dynamic_workspace_pool=pool)
+    stream_a = torch.cuda.Stream(device=w1.device)
+    stream_b = torch.cuda.Stream(device=w1.device)
+
+    with torch.cuda.stream(stream_a):
+        first = first_op.reserve_dynamic_routes(7, 7)
+        same_key = second_op.reserve_dynamic_routes(7, 7)
+        other = other_op.reserve_dynamic_routes(7, 7)
+    with torch.cuda.stream(stream_b):
+        other_stream = second_op.reserve_dynamic_routes(7, 7)
+    torch.cuda.synchronize(w1.device)
+
+    assert first.intermediate.untyped_storage().data_ptr() == same_key.intermediate.untyped_storage().data_ptr()
+    assert first._launch_lock is same_key._launch_lock
+    assert other.intermediate.untyped_storage().data_ptr() != first.intermediate.untyped_storage().data_ptr()
+    assert other._launch_lock is not first._launch_lock
+    assert other_stream.intermediate.untyped_storage().data_ptr() != first.intermediate.untyped_storage().data_ptr()
+    assert other_stream._launch_lock is not first._launch_lock
+    assert len(pool) == 3
+
+    first_exact = first_op.reserve(7, routes=7)
+    second_exact = second_op.reserve(7, routes=7)
+    assert first_exact is not second_exact
+    assert first_exact.output is not None
+    assert second_exact.output is not None
+    assert len(pool) == 3
+
+
+def test_sonic_moe_shared_dynamic_workspace_has_explicit_lifetime():
+    config = _config()
+    _, w1, w2, _ = _make_case()
+    weights = prepare_sonic_bf16_weights(w1, w2, config)
+    pool = SonicMoEDynamicWorkspacePool()
+    op = SonicMoE(config, weights, shared_dynamic_workspace_pool=pool)
+    op.reserve_dynamic_routes(7, 7)
+    capacity_ref = weakref.ref(next(iter(pool._entries.values())).capacity)
+
+    op.clear_workspace()
+    gc.collect()
+    assert len(pool) == 1
+    assert capacity_ref() is not None
+
+    pool.clear()
+    gc.collect()
+    assert len(pool) == 0
+    assert capacity_ref() is None
+
+    pool_ref = weakref.ref(pool)
+    del pool
+    assert pool_ref() is not None
+    del op
+    gc.collect()
+    assert pool_ref() is None
+
+
+def test_sonic_moe_shared_dynamic_workspace_rejects_graph_capture(monkeypatch):
+    config = _config()
+    _, w1, w2, _ = _make_case()
+    weights = prepare_sonic_bf16_weights(w1, w2, config)
+    pool = SonicMoEDynamicWorkspacePool()
+    op = SonicMoE(config, weights, shared_dynamic_workspace_pool=pool)
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
+
+    with pytest.raises(RuntimeError, match="not graph-capture safe"):
+        op.reserve_dynamic_routes(7, 7)
+
+
+@pytest.mark.parametrize(
+    ("capacity", "exception"),
+    [(0, ValueError), (-1, ValueError), (True, TypeError), (1.5, TypeError)],
+)
+def test_sonic_moe_shared_dynamic_workspace_rejects_invalid_capacity(
+    capacity,
+    exception,
+):
+    with pytest.raises(exception, match="max_cached_workspaces"):
+        SonicMoEDynamicWorkspacePool(max_cached_workspaces=capacity)
 
 
 @pytest.mark.parametrize(
