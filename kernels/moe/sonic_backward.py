@@ -223,8 +223,14 @@ _E16_DW2_SPLIT_STAGES = 2
 # and use disjoint guards, so this selection never reads the count on the host.
 _E16_DW1_NARROW_MAX_ACTIVE_EXPERTS = 4
 _E16_DW1_SPLITK_ENABLED = True
+# Keep split-queue setup off the latency-sensitive <=16K route buckets even
+# when the per-expert crossover is tuned below that host-known route count.
+_E16_DW1_SPLIT_MIN_ROUTES = 16384
 _E16_DW1_SPLIT_ROWS = 8192
-_E16_DW1_SPLIT_MIN_HOT_ROWS = 16384
+# One 8192-row partition has no parallelism benefit.  Start immediately above
+# that boundary so the 10K--12K experts in a large skewed EP shard split into
+# two independent contractions while an exact 8192-row expert stays cold.
+_E16_DW1_SPLIT_MIN_HOT_ROWS = 8193
 _E16_DW1_SPLIT_BM = 128
 _E16_DW1_SPLIT_BN = 256
 _E16_DW1_SPLIT_BK = 32
@@ -4345,7 +4351,7 @@ def _sonic_moe_backward_impl(
         and forward_sorter_metadata is not None
         and use_direct_grouped_dw1_rhs
         and use_e16_deduplicated_metadata
-        and routes > _E16_DW1_SPLIT_MIN_HOT_ROWS
+        and routes > _E16_DW1_SPLIT_MIN_ROUTES
     )
     use_e16_hot_dw2_splitk = (
         _E16_DW2_SPLITK_ENABLED

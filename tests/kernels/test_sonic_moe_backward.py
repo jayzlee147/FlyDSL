@@ -358,8 +358,8 @@ def test_e16_dw2_split_companion_owns_hot_experts(monkeypatch):
         )
         for _, kwargs in regular_calls
     ] == [
-        (128, 64, 0, 4, 0, 16383, False),
-        (256, 256, 5, None, 0, 16383, False),
+        (128, 64, 0, 4, 0, 8192, False),
+        (256, 256, 5, None, 0, 8192, False),
     ]
     assert len(split_calls) == 1
     split_args, split_kwargs = split_calls[0]
