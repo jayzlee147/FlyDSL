@@ -50,7 +50,10 @@ from kernels.moe.moe_2stage_a16wmix.gemm2 import (
     gemm2_a16w4_grid,
 )
 from kernels.moe.moe_gemm_2stage.moe_reduce import compile_moe_reduction
-from kernels.moe.moe_ragged_sorting_kernel import moe_ragged_sorting_flydsl
+from kernels.moe.moe_ragged_sorting_kernel import (
+    moe_expert_major_sorting_flydsl,
+    moe_ragged_sorting_flydsl,
+)
 from kernels.moe.moe_sorting_kernel import (
     moe_softmax_sort_flydsl,
     moe_sorting_flydsl,
@@ -68,6 +71,7 @@ from kernels.moe.topk_gating_softmax_kernel import supports_topk_gating_layout
 _GFX950_LDS_BYTES = 160 * 1024
 _MAX_BUFFER_BYTE_OFFSET = 0xFFFFFFFF
 _MAX_SIGNED_I32 = 0x7FFFFFFF
+_E16_FLAT_GROUPED_MIN_ROUTES = 64
 _DEFAULT_MAX_CACHED_WORKSPACES = 8
 _SUPPORTED_ROUTER_DTYPES = {
     torch.float32: "f32",
@@ -532,9 +536,9 @@ class SonicMoERoutesForwardState:
     the original caller route order, even though Stage 1 computes in
     expert-sorted order.  The ragged sorter emits the inverse route mapping so
     Stage 1 can write this compact state directly without a separate gather or
-    permutation kernel.  The exact Qwen3 E16 bucket also retains the six
-    optional sorter outputs below.  Those tensors are invocation-owned and
-    allow backward to skip sorting; other shapes leave them as ``None``.
+    permutation kernel.  Eligible dynamic Qwen3 E16 calls retain the six optional
+    sorter outputs below.  Those tensors are invocation-owned and allow
+    backward to skip sorting; other shapes leave them as ``None``.
     """
 
     preactivation: torch.Tensor
@@ -549,7 +553,7 @@ class SonicMoERoutesForwardState:
     has_bias: bool
     producer_stream: int
     ready_event: torch.cuda.Event
-    # Exact Qwen3 E16 training calls retain their forward sorter outputs so
+    # Eligible Qwen3 E16 training calls retain their forward sorter outputs so
     # backward can consume the same invocation-owned metadata without running
     # the four-launch ragged sorter again.  Generic route shapes leave these
     # optional fields unset and retain the established backward-owned sort.
@@ -559,6 +563,13 @@ class SonicMoERoutesForwardState:
     sorted_expert_ids: torch.Tensor | None = None
     num_valid_ids: torch.Tensor | None = None
     expert_frequency: torch.Tensor | None = None
+    # These are explicit, unchecked value contracts supplied by the caller.
+    # They let backward remove the final route-to-token reduction when each
+    # input route is already the unique row for the correspondingly numbered
+    # token.  Older state producers simply omit the fields and retain the
+    # conservative path.
+    expert_major: bool = False
+    token_indices_identity: bool = False
 
 
 @dataclass
@@ -617,6 +628,61 @@ class SonicMoEWorkspace:
         if self.sorting_workspace is not None:
             tensors.append(self.sorting_workspace)
         return frozenset(tensor.untyped_storage().data_ptr() for tensor in tensors)
+
+    def flat_active_view(
+        self,
+        config: SonicMoEConfig,
+        tokens: int,
+        routes: int,
+    ) -> "SonicMoEWorkspace":
+        """Return a current-shape view of a growable flat-route allocation."""
+
+        if self.routes is None:
+            raise ValueError("flat_active_view requires a flat-route workspace")
+        if tokens <= 0 or routes < 0 or tokens > self.tokens or routes > self.routes:
+            raise ValueError(
+                "active flat shape must fit the workspace capacity, got "
+                f"T={tokens}/R={routes} within T={self.tokens}/R={self.routes}"
+            )
+        active_experts = min(config.num_experts, routes)
+        max_blocks = (
+            routes + active_experts * (config.route_tile_m - 1)
+        ) // config.route_tile_m
+        max_padded = max_blocks * config.route_tile_m
+        if max_padded > self.max_padded_tokens:
+            raise RuntimeError("active padded route bound exceeds workspace capacity")
+
+        view = SonicMoEWorkspace(
+            tokens=tokens,
+            routes=routes,
+            route_tile_m=config.route_tile_m,
+            max_padded_tokens=max_padded,
+            max_m_blocks=max_blocks,
+            stage1_max_m_blocks=max_padded // config.tile_m,
+            stage2_max_m_blocks=max_padded // config.stage2_tile_m,
+            sorted_token_ids=self.sorted_token_ids[: max(1, max_padded)],
+            sorted_route_ids=(
+                self.sorted_route_ids[: max(1, max_padded)]
+                if self.sorted_route_ids is not None
+                else None
+            ),
+            sorted_weights=self.sorted_weights[: max(1, max_padded)],
+            sorted_expert_ids=self.sorted_expert_ids[: max(1, max_blocks)],
+            num_valid_ids=self.num_valid_ids,
+            sorting_workspace=self.sorting_workspace,
+            expert_frequency=self.expert_frequency,
+            router_topk_weights=self.router_topk_weights[:tokens],
+            router_topk_ids=self.router_topk_ids[:tokens],
+            router_topk_expert_indices=self.router_topk_expert_indices[:tokens],
+            intermediate=self.intermediate[: max(1, max_padded)],
+            route_output=None,
+            output=self.output[:tokens],
+        )
+        # Views of one backing allocation must serialize through the same
+        # enqueue lock even though each invocation carries its own active
+        # shape metadata.
+        view._launch_lock = self._launch_lock
+        return view
 
     @classmethod
     def allocate(
@@ -1458,6 +1524,31 @@ def _training_stage1_tile_m(
     return config.tile_m
 
 
+def _is_e16_flat_training_shape(
+    config: SonicMoEConfig,
+    tokens: int,
+    routes: int,
+    *,
+    has_bias: bool,
+) -> bool:
+    """Match the dynamic Qwen3-30B-A3B EP8 flat-route fast path."""
+
+    return (
+        tokens == routes
+        # Below one backward sort tile the conservative path is cheap and
+        # avoids mixing BM128 forward metadata with legacy BM64 short-route
+        # grouped kernels.
+        and routes >= _E16_FLAT_GROUPED_MIN_ROUTES
+        and config.hidden_size == 2048
+        and config.intermediate_size == 768
+        and config.num_experts == 16
+        and config.top_k == 1
+        and config.activation == "swiglu"
+        and config.compute_dtype == "bf16"
+        and not has_bias
+    )
+
+
 def _retain_e16_flat_sorter_metadata(
     config: SonicMoEConfig,
     tokens: int,
@@ -1465,17 +1556,65 @@ def _retain_e16_flat_sorter_metadata(
     *,
     has_bias: bool,
 ) -> bool:
-    """Keep sorter output only for the audited Qwen3 EP8 training bucket."""
+    """Keep sorter output for dynamic Qwen3 EP8 retained-state backward."""
 
-    return (
-        tokens == routes == 8192
-        and config.hidden_size == 2048
-        and config.intermediate_size == 768
-        and config.num_experts == 16
-        and config.activation == "swiglu"
-        and config.compute_dtype == "bf16"
-        and not has_bias
+    return _is_e16_flat_training_shape(
+        config,
+        tokens,
+        routes,
+        has_bias=has_bias,
     )
+
+
+def _validate_expert_major_routes(
+    expert_offsets: torch.Tensor | None,
+    *,
+    hidden_states: torch.Tensor,
+    routes: int,
+    num_experts: int,
+    token_indices_identity: bool,
+) -> bool:
+    """Validate the structural part of the expert-major fast-path contract.
+
+    Offset values deliberately remain an asynchronous caller precondition:
+    ``offsets[0] == 0``, ``offsets[-1] == routes``, nondecreasing offsets, and
+    expert ``e`` occupying ``[offsets[e], offsets[e + 1])``.  Checking those
+    values here would put device-to-host synchronization back on the hot path.
+    """
+
+    if not isinstance(token_indices_identity, bool):
+        raise TypeError("token_indices_identity must be bool")
+    if expert_offsets is None:
+        if token_indices_identity:
+            raise ValueError(
+                "token_indices_identity=True requires expert_offsets so the "
+                "expert-major fast path can be selected"
+            )
+        return False
+    if not isinstance(expert_offsets, torch.Tensor):
+        raise TypeError("expert_offsets must be a torch.Tensor or None")
+    expected_shape = (num_experts + 1,)
+    if tuple(expert_offsets.shape) != expected_shape:
+        raise ValueError(
+            f"expert_offsets must have shape {expected_shape}, got "
+            f"{tuple(expert_offsets.shape)}"
+        )
+    if (
+        not expert_offsets.is_cuda
+        or expert_offsets.device != hidden_states.device
+        or expert_offsets.dtype != torch.int32
+        or not expert_offsets.is_contiguous()
+    ):
+        raise ValueError(
+            "expert_offsets must be contiguous int32 on the same ROCm device "
+            "as hidden_states"
+        )
+    if token_indices_identity and routes != int(hidden_states.shape[0]):
+        raise ValueError(
+            "token_indices_identity=True requires routes == tokens, got "
+            f"{routes} and {int(hidden_states.shape[0])}"
+        )
+    return True
 
 
 @functools.lru_cache(maxsize=256)
@@ -1515,13 +1654,16 @@ def _get_stage2_launcher(
 class SonicMoE:
     """Reusable gfx950 SonicMoE A16 forward operator.
 
-    Up to ``max_cached_workspaces`` workspaces are retained in LRU order, keyed by
-    ``(device, stream, token_count, route_count)``; dense top-k calls use a
-    dedicated route-count sentinel. The returned default output aliases that
-    workspace and is overwritten by the next call with the same key; pass
-    ``out=`` when the caller owns output storage. Independent streams receive
-    independent workspaces, while calls sharing a cache key serialize their
-    complete kernel enqueue sequence. Eviction only drops the operator's
+    Exact-shape and growable workspaces use independent LRU caches, each bounded
+    by ``max_cached_workspaces``. Exact entries are keyed by ``(device, stream,
+    token_count, route_count)``; dense top-k calls use a dedicated route-count
+    sentinel. Except for growable expert-major route
+    workspaces, the returned default output aliases that workspace and is
+    overwritten by the next call with the same key; pass ``out=`` when the
+    caller owns output storage. Growable route workspaces span multiple active
+    shapes, so their default outputs are invocation-owned. Independent streams
+    receive independent workspaces, while calls sharing a cache key serialize
+    their complete kernel enqueue sequence. Eviction only drops the operator's
     reference: an in-progress call retains its workspace locally, and its
     buffers are allocated and used on the keyed stream so PyTorch's stream-aware
     allocator defers unsafe reuse. Call :meth:`clear_workspace` to release all
@@ -1575,12 +1717,20 @@ class SonicMoE:
         self.weights = weights
         self._max_cached_workspaces = max_cached_workspaces
         self._workspaces: OrderedDict[tuple[int, int, int, int], SonicMoEWorkspace] = OrderedDict()
+        self._dynamic_route_workspaces: OrderedDict[
+            tuple[int, int], SonicMoEWorkspace
+        ] = OrderedDict()
+        self._dynamic_route_workspace_locks: dict[
+            tuple[int, int], threading.Lock
+        ] = {}
         self._workspace_lock = threading.RLock()
         self.workspace: SonicMoEWorkspace | None = None
 
     def clear_workspace(self) -> None:
         with self._workspace_lock:
             self._workspaces.clear()
+            self._dynamic_route_workspaces.clear()
+            self._dynamic_route_workspace_locks.clear()
             self.workspace = None
 
     def reserve(self, tokens: int, *, routes: int | None = None) -> SonicMoEWorkspace:
@@ -1603,6 +1753,72 @@ class SonicMoE:
                     self._workspaces.popitem(last=False)
             else:
                 self._workspaces.move_to_end(key)
+            self.workspace = workspace
+            return workspace
+
+    def reserve_dynamic_routes(
+        self,
+        tokens: int,
+        routes: int,
+    ) -> SonicMoEWorkspace:
+        """Reserve one geometrically growing flat workspace per device/stream.
+
+        Expert-parallel training commonly presents a different local route
+        count on almost every microbatch.  Caching exact ``(T, R)`` shapes
+        would retain many large intermediate/output tensors and repeatedly hit
+        the allocator.  This path keeps one capacity allocation per stream and
+        returns cheap current-shape views over it.
+        """
+
+        if tokens <= 0:
+            raise ValueError(f"tokens must be positive, got {tokens}")
+        if routes < 0:
+            raise ValueError(f"routes must be non-negative, got {routes}")
+        stream_id = int(torch.cuda.current_stream(self.weights.device).cuda_stream)
+        key = (self.weights.device.index or 0, stream_id)
+        with self._workspace_lock:
+            capacity = self._dynamic_route_workspaces.get(key)
+            launch_lock = self._dynamic_route_workspace_locks.get(key)
+            if launch_lock is None:
+                launch_lock = threading.Lock()
+                self._dynamic_route_workspace_locks[key] = launch_lock
+            needs_growth = (
+                capacity is None
+                or tokens > capacity.tokens
+                or capacity.routes is None
+                or routes > capacity.routes
+            )
+            if needs_growth:
+                old_tokens = 0 if capacity is None else capacity.tokens
+                old_routes = 0 if capacity is None or capacity.routes is None else capacity.routes
+                capacity_tokens = max(tokens, old_tokens + max(1, old_tokens // 2))
+                capacity_routes = max(routes, old_routes + max(1, old_routes // 2))
+                try:
+                    capacity = SonicMoEWorkspace.allocate(
+                        self.config,
+                        capacity_tokens,
+                        self.weights.device,
+                        routes=capacity_routes,
+                    )
+                except ValueError:
+                    # Geometric headroom can cross an addressing limit even
+                    # though the requested active shape is valid.  Retain the
+                    # growable policy at the exact legal boundary.
+                    capacity = SonicMoEWorkspace.allocate(
+                        self.config,
+                        tokens,
+                        self.weights.device,
+                        routes=routes,
+                    )
+                capacity._launch_lock = launch_lock
+                self._dynamic_route_workspaces[key] = capacity
+                while len(self._dynamic_route_workspaces) > self._max_cached_workspaces:
+                    evicted_key, _ = self._dynamic_route_workspaces.popitem(last=False)
+                    self._dynamic_route_workspace_locks.pop(evicted_key, None)
+            else:
+                self._dynamic_route_workspaces.move_to_end(key)
+            assert capacity is not None
+            workspace = capacity.flat_active_view(self.config, tokens, routes)
             self.workspace = workspace
             return workspace
 
@@ -1651,9 +1867,18 @@ class SonicMoE:
         out: torch.Tensor | None,
         workspace: SonicMoEWorkspace,
         *read_tensors: torch.Tensor,
+        invocation_owned_default: bool = False,
     ) -> torch.Tensor:
         if out is None:
-            out = workspace.output
+            out = (
+                torch.empty(
+                    (workspace.tokens, self.config.hidden_size),
+                    dtype=self.weights.compute_dtype,
+                    device=self.weights.device,
+                )
+                if invocation_owned_default
+                else workspace.output
+            )
         expected = (workspace.tokens, self.config.hidden_size)
         if tuple(out.shape) != expected:
             raise ValueError(f"out must have shape {expected}, got {tuple(out.shape)}")
@@ -1718,13 +1943,19 @@ class SonicMoE:
         hidden_states: torch.Tensor,
         workspace: SonicMoEWorkspace,
         out: torch.Tensor,
+        *,
+        token_indices_identity: bool = False,
     ) -> torch.Tensor:
         cfg = self.config
         tokens = workspace.tokens
         stream = torch.cuda.current_stream(hidden_states.device)
         # Flat routes have no fixed slot dimension and may contain duplicate
         # edges, so only dense fixed-K workspaces may select the reduce path.
-        output_mode = cfg.stage2_output_mode if workspace.routes is None else "atomic"
+        output_mode = (
+            cfg.stage2_output_mode
+            if workspace.routes is None
+            else ("identity" if token_indices_identity else "atomic")
+        )
         if output_mode == "reduce" and workspace.route_output is None:
             raise RuntimeError("reduce stage2 output requires a fixed-top-k route workspace")
 
@@ -1763,18 +1994,20 @@ class SonicMoE:
         )
 
         stage2_stages = _stage2_stages(cfg, tokens)
-        exact_e16_flat = (
-            workspace.routes == 8192
-            and tokens == 8192
-            and cfg.hidden_size == 2048
-            and cfg.intermediate_size == 768
-            and cfg.num_experts == 16
+        dynamic_e16_flat = (
+            workspace.routes is not None
+            and _is_e16_flat_training_shape(
+                cfg,
+                tokens,
+                int(workspace.routes),
+                has_bias=self.weights.has_bias,
+            )
         )
         if (
-            (workspace.routes is not None and not exact_e16_flat)
+            (workspace.routes is not None and not dynamic_e16_flat)
             or self.weights.weight_dtype != "bf16"
             or self.weights.has_bias
-            or output_mode != "atomic"
+            or output_mode not in ("atomic", "identity")
         ):
             stage2_stages = 1
         stage2 = _get_stage2_launcher(
@@ -1844,6 +2077,7 @@ class SonicMoE:
         sorted_weights: torch.Tensor | None = None,
         sorted_expert_ids: torch.Tensor | None = None,
         num_valid_ids: torch.Tensor | None = None,
+        token_indices_identity: bool = False,
     ) -> torch.Tensor:
         """Training-only grouped forward with the Stage-1 dual output."""
 
@@ -1853,7 +2087,11 @@ class SonicMoE:
         flat_routes = workspace.routes is not None
         # A flat route list has no fixed slot dimension for the reduce output;
         # it always uses the weighted atomic scatter path.
-        output_mode = cfg.stage2_output_mode if not flat_routes else "atomic"
+        output_mode = (
+            cfg.stage2_output_mode
+            if not flat_routes
+            else ("identity" if token_indices_identity else "atomic")
+        )
         if output_mode == "reduce" and workspace.route_output is None:
             raise RuntimeError("reduce stage2 output requires a fixed-top-k route workspace")
         sorted_token_ids = (
@@ -1941,17 +2179,19 @@ class SonicMoE:
         )
 
         stage2_stages = _stage2_stages(cfg, tokens)
-        exact_e16_flat = (
-            workspace.routes == 8192
-            and tokens == 8192
-            and cfg.hidden_size == 2048
-            and cfg.intermediate_size == 768
-            and cfg.num_experts == 16
+        dynamic_e16_flat = (
+            workspace.routes is not None
+            and _is_e16_flat_training_shape(
+                cfg,
+                tokens,
+                int(workspace.routes),
+                has_bias=self.weights.has_bias,
+            )
         )
         if (
-            (flat_routes and not exact_e16_flat)
+            (flat_routes and not dynamic_e16_flat)
             or self.weights.has_bias
-            or output_mode != "atomic"
+            or output_mode not in ("atomic", "identity")
         ):
             stage2_stages = 1
         stage2 = _get_stage2_launcher(
@@ -2210,6 +2450,9 @@ class SonicMoE:
         route_weights: torch.Tensor,
         out: torch.Tensor | None = None,
         expert_frequency_out: torch.Tensor | None = None,
+        *,
+        expert_offsets: torch.Tensor | None = None,
+        token_indices_identity: bool = False,
     ) -> torch.Tensor:
         """Run the grouped MLP from a flat variable-K route list.
 
@@ -2223,6 +2466,14 @@ class SonicMoE:
         When supplied, ``expert_frequency_out`` must be contiguous int32 with
         shape ``[num_experts]`` and receives the number of route occurrences
         for each expert.
+
+        ``expert_offsets`` selects the pre-grouped fast path.  It must be a
+        device int32 ``[num_experts + 1]`` cumulative-length tensor describing
+        expert-major input segments.  Its values and agreement with
+        ``expert_indices`` are an unchecked hot-path precondition.  Set
+        ``token_indices_identity=True`` only when ``routes == tokens`` and
+        ``token_indices[r] == r``; Stage 2 can then store directly without
+        clearing or atomically accumulating the output.
         """
 
         if not hidden_states.is_cuda:
@@ -2235,6 +2486,8 @@ class SonicMoE:
                 route_weights,
                 out,
                 expert_frequency_out,
+                expert_offsets=expert_offsets,
+                token_indices_identity=token_indices_identity,
             )
 
     def _forward_routes_on_current_device(
@@ -2245,6 +2498,9 @@ class SonicMoE:
         route_weights: torch.Tensor,
         out: torch.Tensor | None,
         expert_frequency_out: torch.Tensor | None,
+        *,
+        expert_offsets: torch.Tensor | None,
+        token_indices_identity: bool,
     ) -> torch.Tensor:
         tokens = self._validate_hidden(hidden_states)
         if token_indices.ndim != 1 or expert_indices.ndim != 1 or route_weights.ndim != 1:
@@ -2274,7 +2530,19 @@ class SonicMoE:
         if route_weights.requires_grad:
             raise ValueError("SonicMoE is inference-only; route_weights must not require gradients")
 
-        workspace = self.reserve(tokens, routes=routes)
+        expert_major = _validate_expert_major_routes(
+            expert_offsets,
+            hidden_states=hidden_states,
+            routes=routes,
+            num_experts=self.config.num_experts,
+            token_indices_identity=token_indices_identity,
+        )
+
+        workspace = (
+            self.reserve_dynamic_routes(tokens, routes)
+            if expert_major
+            else self.reserve(tokens, routes=routes)
+        )
         output = self._validate_out(
             out,
             workspace,
@@ -2282,7 +2550,9 @@ class SonicMoE:
             token_indices,
             expert_indices,
             route_weights,
+            *((expert_offsets,) if expert_offsets is not None else ()),
             *self.weights.tensors,
+            invocation_owned_default=expert_major,
         )
 
         frequency = workspace.expert_frequency
@@ -2295,30 +2565,58 @@ class SonicMoE:
                 token_indices,
                 expert_indices,
                 route_weights,
+                *((expert_offsets,) if expert_offsets is not None else ()),
                 *self.weights.tensors,
             )
 
         assert workspace.sorting_workspace is not None
         with workspace._launch_lock:
-            moe_ragged_sorting_flydsl(
-                token_indices,
-                expert_indices,
-                route_weights,
-                frequency,
-                workspace.sorting_workspace,
-                workspace.sorted_token_ids,
-                workspace.sorted_weights,
-                workspace.sorted_expert_ids,
-                workspace.num_valid_ids,
-                output,
-                self.config.num_experts,
-                tokens=tokens,
-                max_padded_routes=workspace.max_padded_tokens,
-                unit_size=self.config.route_tile_m,
-            )
+            if expert_major:
+                assert expert_offsets is not None
+                moe_expert_major_sorting_flydsl(
+                    token_indices,
+                    expert_indices,
+                    route_weights,
+                    expert_offsets,
+                    frequency,
+                    workspace.sorting_workspace,
+                    workspace.sorted_token_ids,
+                    workspace.sorted_weights,
+                    workspace.sorted_expert_ids,
+                    workspace.num_valid_ids,
+                    output,
+                    self.config.num_experts,
+                    tokens=tokens,
+                    max_padded_routes=workspace.max_padded_tokens,
+                    unit_size=self.config.route_tile_m,
+                    token_indices_identity=token_indices_identity,
+                    clear_output=not token_indices_identity,
+                )
+            else:
+                moe_ragged_sorting_flydsl(
+                    token_indices,
+                    expert_indices,
+                    route_weights,
+                    frequency,
+                    workspace.sorting_workspace,
+                    workspace.sorted_token_ids,
+                    workspace.sorted_weights,
+                    workspace.sorted_expert_ids,
+                    workspace.num_valid_ids,
+                    output,
+                    self.config.num_experts,
+                    tokens=tokens,
+                    max_padded_routes=workspace.max_padded_tokens,
+                    unit_size=self.config.route_tile_m,
+                )
             if routes == 0:
                 return output
-            return self._run_grouped_gemms(hidden_states, workspace, output)
+            return self._run_grouped_gemms(
+                hidden_states,
+                workspace,
+                output,
+                token_indices_identity=token_indices_identity,
+            )
 
     def forward_routes_training(
         self,
@@ -2330,6 +2628,8 @@ class SonicMoE:
         *,
         interleaved_w1: bool = False,
         expert_frequency_out: torch.Tensor | None = None,
+        expert_offsets: torch.Tensor | None = None,
+        token_indices_identity: bool = False,
     ) -> tuple[torch.Tensor, SonicMoERoutesForwardState]:
         """Run arbitrary flat routes and retain route-order W1 preactivation.
 
@@ -2342,6 +2642,12 @@ class SonicMoE:
         Like :meth:`forward_topk_training`, this low-level raw-pointer API is
         intended for an autograd adapter and does not itself attach a
         ``grad_fn``.  It currently supports dense BF16 SwiGLU weights.
+
+        Passing ``expert_offsets`` selects the same expert-major contract as
+        :meth:`forward_routes` and avoids the generic counting sort.  The
+        generated padded metadata is owned by the returned state and reused by
+        backward.  ``token_indices_identity=True`` additionally selects direct
+        Stage-2 output stores and records the identity mapping in that state.
         """
 
         if not isinstance(interleaved_w1, bool):
@@ -2370,6 +2676,8 @@ class SonicMoE:
                 out,
                 interleaved_w1=interleaved_w1,
                 expert_frequency_out=expert_frequency_out,
+                expert_offsets=expert_offsets,
+                token_indices_identity=token_indices_identity,
             )
 
     def _forward_routes_training_on_current_device(
@@ -2382,6 +2690,8 @@ class SonicMoE:
         *,
         interleaved_w1: bool,
         expert_frequency_out: torch.Tensor | None,
+        expert_offsets: torch.Tensor | None,
+        token_indices_identity: bool,
     ) -> tuple[torch.Tensor, SonicMoERoutesForwardState]:
         tokens = self._validate_training_hidden(hidden_states)
         if token_indices.ndim != 1 or expert_indices.ndim != 1 or route_weights.ndim != 1:
@@ -2410,11 +2720,23 @@ class SonicMoE:
         if not token_indices.is_contiguous() or not expert_indices.is_contiguous() or not route_weights.is_contiguous():
             raise ValueError("route tensors must be contiguous")
 
+        expert_major = _validate_expert_major_routes(
+            expert_offsets,
+            hidden_states=hidden_states,
+            routes=routes,
+            num_experts=self.config.num_experts,
+            token_indices_identity=token_indices_identity,
+        )
+
         _validate_routes_training_preactivation_extent(
             routes,
             self.config.intermediate_size,
         )
-        workspace = self.reserve(tokens, routes=routes)
+        workspace = (
+            self.reserve_dynamic_routes(tokens, routes)
+            if expert_major
+            else self.reserve(tokens, routes=routes)
+        )
         output = self._validate_out(
             out,
             workspace,
@@ -2422,7 +2744,9 @@ class SonicMoE:
             token_indices,
             expert_indices,
             route_weights,
+            *((expert_offsets,) if expert_offsets is not None else ()),
             *self.weights.tensors,
+            invocation_owned_default=expert_major,
         )
         retain_sorter_metadata = _retain_e16_flat_sorter_metadata(
             self.config,
@@ -2445,6 +2769,7 @@ class SonicMoE:
                 token_indices,
                 expert_indices,
                 route_weights,
+                *((expert_offsets,) if expert_offsets is not None else ()),
                 *self.weights.tensors,
             )
             if retain_sorter_metadata:
@@ -2476,24 +2801,48 @@ class SonicMoE:
         stream = torch.cuda.current_stream(hidden_states.device)
         ready_event = torch.cuda.Event()
         with workspace._launch_lock:
-            moe_ragged_sorting_flydsl(
-                token_indices,
-                expert_indices,
-                route_weights,
-                frequency,
-                workspace.sorting_workspace,
-                sorted_token_ids,
-                sorted_weights,
-                sorted_expert_ids,
-                num_valid_ids,
-                output,
-                self.config.num_experts,
-                tokens=tokens,
-                max_padded_routes=workspace.max_padded_tokens,
-                unit_size=self.config.route_tile_m,
-                sorted_route_ids=sorted_route_ids,
-                expert_frequency_mirror=frequency_mirror,
-            )
+            if expert_major:
+                assert expert_offsets is not None
+                moe_expert_major_sorting_flydsl(
+                    token_indices,
+                    expert_indices,
+                    route_weights,
+                    expert_offsets,
+                    frequency,
+                    workspace.sorting_workspace,
+                    sorted_token_ids,
+                    sorted_weights,
+                    sorted_expert_ids,
+                    num_valid_ids,
+                    output,
+                    self.config.num_experts,
+                    tokens=tokens,
+                    max_padded_routes=workspace.max_padded_tokens,
+                    unit_size=self.config.route_tile_m,
+                    sorted_route_ids=sorted_route_ids,
+                    expert_frequency_mirror=frequency_mirror,
+                    token_indices_identity=token_indices_identity,
+                    clear_output=not token_indices_identity,
+                )
+            else:
+                moe_ragged_sorting_flydsl(
+                    token_indices,
+                    expert_indices,
+                    route_weights,
+                    frequency,
+                    workspace.sorting_workspace,
+                    sorted_token_ids,
+                    sorted_weights,
+                    sorted_expert_ids,
+                    num_valid_ids,
+                    output,
+                    self.config.num_experts,
+                    tokens=tokens,
+                    max_padded_routes=workspace.max_padded_tokens,
+                    unit_size=self.config.route_tile_m,
+                    sorted_route_ids=sorted_route_ids,
+                    expert_frequency_mirror=frequency_mirror,
+                )
             result = output
             if routes:
                 result = self._run_grouped_gemms_training(
@@ -2507,6 +2856,7 @@ class SonicMoE:
                     sorted_weights=sorted_weights,
                     sorted_expert_ids=sorted_expert_ids,
                     num_valid_ids=num_valid_ids,
+                    token_indices_identity=token_indices_identity,
                 )
             self._record_training_forward_stream(
                 stream,
@@ -2526,6 +2876,7 @@ class SonicMoE:
                 workspace.intermediate,
                 frequency,
                 frequency_mirror,
+                expert_offsets,
             )
             ready_event.record(stream)
 
@@ -2548,6 +2899,8 @@ class SonicMoE:
             sorted_expert_ids=(sorted_expert_ids if retain_sorter_metadata else None),
             num_valid_ids=(num_valid_ids if retain_sorter_metadata else None),
             expert_frequency=(frequency if retain_sorter_metadata else None),
+            expert_major=expert_major,
+            token_indices_identity=token_indices_identity,
         )
         return result, state
 

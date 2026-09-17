@@ -32,7 +32,9 @@ if torch is None or not torch.cuda.is_available():
 
 from flydsl.runtime.device import is_rdna_arch  # noqa: E402
 from kernels.moe.moe_ragged_sorting_kernel import (  # noqa: E402
+    _expert_major_cf_cache,
     _ragged_cf_cache,
+    moe_expert_major_sorting_flydsl,
     moe_ragged_sorting_flydsl,
 )
 
@@ -193,6 +195,192 @@ def test_ragged_sorting_mirrors_frequency_in_prefix_dispatch():
             unit_size=unit_size,
             expert_frequency_mirror=frequency,
         )
+
+
+@pytest.mark.parametrize(
+    "counts",
+    (
+        (3, 0, 5, 1),
+        (16, 17, 31, 2),
+        (65, 1, 0, 33),
+    ),
+)
+def test_expert_major_sorting_dynamic_padded_abi(counts):
+    """Two-launch expert-major adapter matches the flat ragged-sorter ABI.
+
+    The route count and load distribution deliberately vary while E/unit stay
+    fixed, exercising a single compiled specialization without baking R into
+    its cache key.  Input rows are already expert-major but token ids retain
+    the public ``arange(R)`` sorted-token contract.
+    """
+
+    device = torch.device("cuda")
+    experts, unit_size = len(counts), 16
+    routes = sum(counts)
+    offsets_host = [0]
+    for count in counts:
+        offsets_host.append(offsets_host[-1] + count)
+    padded = sum(((count + unit_size - 1) // unit_size) * unit_size for count in counts)
+    blocks = padded // unit_size
+
+    token_indices = torch.arange(routes, dtype=torch.int32, device=device)
+    expert_indices = torch.repeat_interleave(
+        torch.arange(experts, dtype=torch.int32, device=device),
+        torch.tensor(counts, dtype=torch.int64, device=device),
+    ).contiguous()
+    route_weights = (torch.arange(routes, dtype=torch.float32, device=device) + 0.25).contiguous()
+    expert_offsets = torch.tensor(offsets_host, dtype=torch.int32, device=device)
+    frequency = torch.full((experts,), -1, dtype=torch.int32, device=device)
+    mirror = torch.full_like(frequency, -2)
+    padded_offsets_scratch = torch.empty_like(frequency)
+    sorted_ids = torch.full((padded + unit_size,), -9, dtype=torch.int32, device=device)
+    sorted_weights = torch.full((padded + unit_size,), -1.0, dtype=torch.float32, device=device)
+    sorted_routes = torch.full((padded + unit_size,), -9, dtype=torch.int32, device=device)
+    sorted_experts = torch.full((blocks + 1,), -9, dtype=torch.int32, device=device)
+    valid = torch.full((2,), -9, dtype=torch.int32, device=device)
+    output = torch.full((routes, 8), 7, dtype=torch.bfloat16, device=device)
+
+    returned = moe_expert_major_sorting_flydsl(
+        token_indices,
+        expert_indices,
+        route_weights,
+        expert_offsets,
+        frequency,
+        padded_offsets_scratch,
+        sorted_ids,
+        sorted_weights,
+        sorted_experts,
+        valid,
+        output,
+        experts,
+        tokens=routes,
+        max_padded_routes=padded,
+        unit_size=unit_size,
+        sorted_route_ids=sorted_routes,
+        expert_frequency_mirror=mirror,
+        token_indices_identity=True,
+        clear_output=True,
+    )
+    torch.cuda.synchronize(device)
+
+    assert all(
+        actual is expected
+        for actual, expected in zip(
+            returned,
+            (sorted_ids, sorted_weights, sorted_experts, valid, frequency, output),
+        )
+    )
+    expected_frequency = torch.tensor(counts, dtype=torch.int32, device=device)
+    assert torch.equal(frequency, expected_frequency)
+    assert torch.equal(mirror, expected_frequency)
+    assert torch.equal(valid, torch.tensor([padded, routes], dtype=torch.int32, device=device))
+    assert torch.count_nonzero(output) == 0
+
+    padded_offset = 0
+    route_offset = 0
+    block = 0
+    for expert, count in enumerate(counts):
+        segment = ((count + unit_size - 1) // unit_size) * unit_size
+        if count:
+            expected_rows = torch.arange(
+                route_offset,
+                route_offset + count,
+                dtype=torch.int32,
+                device=device,
+            )
+            assert torch.equal(
+                sorted_ids[padded_offset : padded_offset + count],
+                expected_rows,
+            )
+            assert torch.equal(
+                sorted_routes[padded_offset : padded_offset + count],
+                expected_rows,
+            )
+            assert torch.equal(
+                sorted_weights[padded_offset : padded_offset + count],
+                route_weights[route_offset : route_offset + count],
+            )
+        assert torch.equal(
+            sorted_ids[padded_offset + count : padded_offset + segment],
+            torch.full((segment - count,), routes, dtype=torch.int32, device=device),
+        )
+        assert torch.equal(
+            sorted_weights[padded_offset + count : padded_offset + segment],
+            torch.zeros(segment - count, dtype=torch.float32, device=device),
+        )
+        assert torch.equal(
+            sorted_routes[padded_offset + count : padded_offset + segment],
+            torch.full((segment - count,), routes, dtype=torch.int32, device=device),
+        )
+        expected_blocks = segment // unit_size
+        assert torch.equal(
+            sorted_experts[block : block + expected_blocks],
+            torch.full((expected_blocks,), expert, dtype=torch.int32, device=device),
+        )
+        padded_offset += segment
+        route_offset += count
+        block += expected_blocks
+
+
+def test_expert_major_sorting_cache_is_dynamic_in_route_count():
+    """Different small R values share one compile-cache specialization."""
+
+    _expert_major_cf_cache.clear()
+    # The parametrized ABI test compiles three distinct runtime-R calls under
+    # one E/unit/feature key; this test keeps the cache invariant explicit.
+    test_expert_major_sorting_dynamic_padded_abi((3, 0, 5, 1))
+    test_expert_major_sorting_dynamic_padded_abi((16, 17, 31, 2))
+    assert len(_expert_major_cf_cache) == 1
+
+
+def test_expert_major_sorting_uses_explicit_token_ids_without_optional_outputs():
+    """The non-identity path does not read/write either optional ABI tensor."""
+
+    device = torch.device("cuda")
+    experts, unit_size, tokens = 2, 4, 8
+    input_tokens = torch.tensor([7, 0, 5, 3, 1], dtype=torch.int32, device=device)
+    expert_indices = torch.tensor([0, 0, 1, 1, 1], dtype=torch.int32, device=device)
+    route_weights = torch.tensor([.5, .6, .7, .8, .9], dtype=torch.float32, device=device)
+    offsets = torch.tensor([0, 2, 5], dtype=torch.int32, device=device)
+    padded = 8
+    frequency = torch.empty(experts, dtype=torch.int32, device=device)
+    padded_offsets_scratch = torch.empty_like(frequency)
+    sorted_ids = torch.empty(padded, dtype=torch.int32, device=device)
+    sorted_weights = torch.empty(padded, dtype=torch.float32, device=device)
+    sorted_experts = torch.empty(padded // unit_size, dtype=torch.int32, device=device)
+    valid = torch.empty(2, dtype=torch.int32, device=device)
+    scratch = torch.empty(4, dtype=torch.int32, device=device)
+
+    moe_expert_major_sorting_flydsl(
+        input_tokens,
+        expert_indices,
+        route_weights,
+        offsets,
+        frequency,
+        padded_offsets_scratch,
+        sorted_ids,
+        sorted_weights,
+        sorted_experts,
+        valid,
+        scratch,
+        experts,
+        tokens=tokens,
+        max_padded_routes=padded,
+        unit_size=unit_size,
+    )
+    torch.cuda.synchronize(device)
+
+    assert torch.equal(sorted_ids[:2], input_tokens[:2])
+    assert torch.equal(sorted_weights[:2], route_weights[:2])
+    assert torch.equal(sorted_ids[2:4], torch.full((2,), tokens, dtype=torch.int32, device=device))
+    assert torch.equal(sorted_weights[2:4], torch.zeros(2, dtype=torch.float32, device=device))
+    assert torch.equal(sorted_ids[4:7], input_tokens[2:])
+    assert torch.equal(sorted_weights[4:7], route_weights[2:])
+    assert torch.equal(sorted_ids[7:], torch.full((1,), tokens, dtype=torch.int32, device=device))
+    assert torch.equal(sorted_weights[7:], torch.zeros(1, dtype=torch.float32, device=device))
+    assert torch.equal(frequency, torch.tensor([2, 3], dtype=torch.int32, device=device))
+    assert torch.equal(sorted_experts, torch.tensor([0, 1], dtype=torch.int32, device=device))
+    assert torch.equal(valid, torch.tensor([8, tokens], dtype=torch.int32, device=device))
 
 
 def _call_flydsl(topk_ids, topk_weights, E, model_dim=4096, topk=None, unit_size=UNIT_SIZE, expert_mask=None):

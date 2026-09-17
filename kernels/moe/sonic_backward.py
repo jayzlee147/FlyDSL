@@ -170,10 +170,12 @@ _GROUPED_DW2_SPARSE_EXPERTS = 32
 # distributions or for standalone backward, which still recomputes W1/W2.
 _E16_FIXED_STATE_GROUPED_SHAPE = (8192, 2048, 768, 16, 1)
 
-# Balanced flat routing in the E16 training bucket has roughly 512 rows per
-# expert.  Its device queues amortize the large H/I contractions without the
-# 16-way host GEMM dispatch used by the generic ragged path.
-_E16_FLAT_GROUPED_SHAPE = (2048, 768, 16, 8192)
+# Flat Qwen3-30B-A3B routing has a dynamic local route count after EP
+# all-to-all.  Retained-state calls use the same device queues for every R;
+# the historical R8192 bucket remains enabled for standalone compatibility.
+_E16_FLAT_GROUPED_SHAPE = (2048, 768, 16)
+_E16_LEGACY_STANDALONE_ROUTES = 8192
+_E16_FLAT_GROUPED_MIN_ROUTES = 64
 _E16_EXACT_BM = 128
 _E16_EXACT_BK = 64
 _E16_EXACT_DA_BN = 192
@@ -229,16 +231,22 @@ def _use_e16_flat_grouped_backward(
     routes: int,
     flat_routes: bool,
     has_bias: bool,
+    reuse_forward_preactivation: bool = False,
 ) -> bool:
-    """Select the measured E16/H2048/I768/R8192 flat-route bucket."""
+    """Select dynamic retained E16 flat routing or the legacy R8192 path."""
 
     return (
         flat_routes
         and not has_bias
         and compute_dtype == "bf16"
         and activation == "swiglu"
-        and (hidden_size, intermediate_size, num_experts, routes)
+        and (hidden_size, intermediate_size, num_experts)
         == _E16_FLAT_GROUPED_SHAPE
+        and routes >= _E16_FLAT_GROUPED_MIN_ROUTES
+        and (
+            reuse_forward_preactivation
+            or routes == _E16_LEGACY_STANDALONE_ROUTES
+        )
     )
 
 
@@ -3454,8 +3462,9 @@ def _validate_routes_forward_state(
     int,
     torch.cuda.Event,
     _RoutesSorterMetadata | None,
+    bool,
 ]:
-    """Validate retained route-order state for the audited E16 flat path."""
+    """Validate retained route-order state for dynamic E16 flat routing."""
 
     field_names = (
         "preactivation",
@@ -3517,17 +3526,19 @@ def _validate_routes_forward_state(
                 f"forward_state.{name} must equal {expected!r}, got {value!r}"
             )
 
-    exact_shape = (
-        tokens,
-        int(config.hidden_size),
-        int(config.intermediate_size),
-        int(config.num_experts),
-        routes,
-    )
-    if exact_shape != (8192, 2048, 768, 16, 8192):
+    if (
+        tokens != routes
+        or routes <= 0
+        or (
+            int(config.hidden_size),
+            int(config.intermediate_size),
+            int(config.num_experts),
+        )
+        != _E16_FLAT_GROUPED_SHAPE
+    ):
         raise ValueError(
-            "flat forward_state reuse currently supports only the audited "
-            "T8192/R8192/H2048/I768/E16 bucket"
+            "flat forward_state reuse requires dynamic T==R with "
+            "H2048/I768/E16"
         )
     if config.activation != "swiglu" or config.compute_dtype != "bf16" or has_bias:
         raise ValueError(
@@ -3694,11 +3705,23 @@ def _validate_routes_forward_state(
                 sort_unit,
             )
 
+    token_indices_identity = getattr(
+        forward_state,
+        "token_indices_identity",
+        False,
+    )
+    if type(token_indices_identity) is not bool:
+        raise TypeError(
+            "forward_state.token_indices_identity must be bool, got "
+            f"{type(token_indices_identity).__name__}"
+        )
+
     return (
         preactivation,
         producer_stream,
         ready_event,
         sorter_metadata,
+        token_indices_identity,
     )
 
 
@@ -3825,6 +3848,7 @@ def _sonic_moe_backward_impl(
     forward_state_data: tuple[torch.Tensor, int, torch.cuda.Event] | None = None,
     forward_sorter_metadata: _RoutesSorterMetadata | None = None,
     token_indices_sorted: bool = False,
+    token_indices_identity: bool = False,
 ) -> tuple[torch.Tensor, ...]:
     """Shared sorted-expert implementation for fixed-K and flat routes."""
 
@@ -3867,6 +3891,13 @@ def _sonic_moe_backward_impl(
         routes=routes,
         flat_routes=flat_routes,
         has_bias=has_bias,
+        reuse_forward_preactivation=reuse_forward_preactivation,
+    )
+    use_flat_identity_dx = (
+        use_e16_flat_grouped
+        and reuse_forward_preactivation
+        and token_indices_identity
+        and tokens == routes
     )
     # The segmented route-order reducer uses binary search and therefore
     # requires nondecreasing token indices.  Preserve the generic atomic
@@ -3874,8 +3905,9 @@ def _sonic_moe_backward_impl(
     use_flat_segmented_dx = _use_e16_flat_segmented_dx(
         e16_flat_grouped=use_e16_flat_grouped,
         reuse_forward_preactivation=reuse_forward_preactivation,
-        token_indices_sorted=token_indices_sorted,
+        token_indices_sorted=(token_indices_sorted and not use_flat_identity_dx),
     )
+    use_flat_route_order_dx = use_flat_identity_dx or use_flat_segmented_dx
     use_e16_deduplicated_metadata = _use_e16_flat_deduplicated_metadata(
         e16_flat_grouped=use_e16_flat_grouped,
         reuse_forward_preactivation=reuse_forward_preactivation,
@@ -4081,7 +4113,7 @@ def _sonic_moe_backward_impl(
             unit_size=sort_unit,
         )
 
-    # The exact retained E16 route state owns its sorter output for the whole
+    # The retained E16 route state owns its sorter output for the whole
     # autograd invocation.  Reuse those tensors directly; they cannot alias the
     # forward operator's LRU workspace.  Every other path preserves the
     # backward-owned allocation and sorting contract.
@@ -4128,7 +4160,11 @@ def _sonic_moe_backward_impl(
             device=device,
         )
         if (use_grouped_dw1 or use_grouped_dw2)
-        and (use_compact_w1 or use_large_grouped_dx)
+        and (
+            use_compact_w1
+            or use_large_grouped_dx
+            or use_e16_deduplicated_metadata
+        )
         else None
     )
     if use_e16_exact_queue:
@@ -4285,10 +4321,16 @@ def _sonic_moe_backward_impl(
     )
     dx_sorted = (
         None
-        if direct_grouped_dx_routes or use_flat_segmented_dx
+        if direct_grouped_dx_routes or use_flat_route_order_dx
         else (torch.zeros_like(dy) if use_e16_flat_grouped else torch.empty_like(dy))
     )
-    if use_flat_segmented_dx:
+    dx = torch.empty_like(hidden_states, memory_format=torch.contiguous_format)
+    if use_flat_identity_dx:
+        # Route r is token r, so the grouped route-order epilogue already has
+        # the final dX address.  Avoid both the [R,H] temporary and the
+        # segmented reduction launch.
+        dx_routes = dx
+    elif use_flat_segmented_dx:
         dx_routes = torch.empty(
             (routes, hidden_size),
             dtype=hidden_states.dtype,
@@ -4304,11 +4346,10 @@ def _sonic_moe_backward_impl(
         )
     dx_accum = (
         torch.empty((tokens, hidden_size), dtype=torch.float32, device=device)
-        if flat_routes and not use_flat_segmented_dx
+        if flat_routes and not use_flat_route_order_dx
         else None
     )
 
-    dx = torch.empty_like(hidden_states, memory_format=torch.contiguous_format)
     # The grouped pair is initialized from routing metadata below, before its
     # first contraction; every other path retains eager zero initialization.
     grouped_weight_grads = use_grouped_dw1 and use_grouped_dw2
@@ -4556,6 +4597,7 @@ def _sonic_moe_backward_impl(
         use_tn_metadata_direct = (
             (use_grouped_dw1 or use_grouped_dw2)
             and active_expert_storage is None
+            and sort_unit == _BACKWARD_SORT_UNIT
             and (routes <= sort_unit if use_hostless_grouped else max_expert_rows <= sort_unit)
         )
         if (use_grouped_dw1 or use_grouped_dw2) and not use_tn_metadata_direct and active_expert_storage is None:
@@ -5157,7 +5199,7 @@ def _sonic_moe_backward_impl(
                     min_active_experts,
                     max_active_experts,
                     store_route_slots=direct_grouped_dx_routes,
-                    store_route_ids=use_flat_segmented_dx,
+                    store_route_ids=use_flat_route_order_dx,
                     top_k=topk,
                     expert_m_reuse=expert_m_reuse,
                     expert_m_reuse_threshold=expert_m_reuse_threshold,
@@ -5212,7 +5254,7 @@ def _sonic_moe_backward_impl(
                     *((expert_frequency.data_ptr(),) if expert_m_reuse_threshold is not None else ()),
                     (
                         dx_routes
-                        if direct_grouped_dx_routes or use_flat_segmented_dx
+                        if direct_grouped_dx_routes or use_flat_route_order_dx
                         else dx_sorted
                     ).data_ptr(),
                     *(
@@ -5220,7 +5262,7 @@ def _sonic_moe_backward_impl(
                         if direct_grouped_dx_routes
                         else (
                             (sorted_route_ids.data_ptr(), routes)
-                            if use_flat_segmented_dx
+                            if use_flat_route_order_dx
                             else ()
                         )
                     ),
@@ -5297,12 +5339,16 @@ def _sonic_moe_backward_impl(
                     stream,
                 )
 
-            if use_flat_segmented_dx:
+            if use_flat_identity_dx:
+                # The grouped dX epilogue wrote route row r directly to token
+                # row r, so no scatter/reduction remains.
+                pass
+            elif use_flat_segmented_dx:
                 assert token_arg is not None
                 assert dx_routes is not None
                 reduce_routes = _compile_flat_segmented_dx_reduction(
                     hidden_size,
-                    routes,
+                    1 << (routes - 1).bit_length(),
                     compute_dtype,
                     device_index,
                 )
@@ -5511,6 +5557,7 @@ def sonic_moe_backward_routes(
     interleaved_w1: bool = False,
     forward_state: object | None = None,
     token_indices_sorted: bool = False,
+    token_indices_identity: bool = False,
 ) -> tuple[torch.Tensor, ...]:
     """Differentiate SonicMoE over a flat variable-count route list.
 
@@ -5529,12 +5576,20 @@ def sonic_moe_backward_routes(
     removes both forward-projection recomputations from backward.  Newer state
     objects also carry invocation-owned sorter metadata; when all six tensors
     validate, backward reuses them and skips the ragged sorter.  Older or
-    partial states safely retain the established backward-owned sort.
+    partial states safely retain the established backward-owned sort.  Calls
+    below 64 routes conservatively recompute instead of reusing route-order
+    state because their generic short-route kernels use the BM64 metadata ABI.
 
     Set ``token_indices_sorted=True`` only when ``token_indices`` is known to
     be nondecreasing.  The audited E16 retained-state path then uses a
     segmented dX reducer; the default supports arbitrary route order through
     the established atomic scatter.
+
+    ``token_indices_identity=True`` is the stronger contract
+    ``routes == tokens`` and ``token_indices[r] == r``.  It lets grouped dX
+    write its final token-major result directly.  A state produced by
+    ``forward_routes_training(..., token_indices_identity=True)`` carries this
+    flag automatically, so callers normally do not need to repeat it.
 
     Token and expert ids must be in range. Value validation remains an unchecked
     hot-path precondition; the compatibility adapter validates it before launch.
@@ -5544,6 +5599,11 @@ def sonic_moe_backward_routes(
         raise TypeError(
             "token_indices_sorted must be bool, got "
             f"{type(token_indices_sorted).__name__}"
+        )
+    if not isinstance(token_indices_identity, bool):
+        raise TypeError(
+            "token_indices_identity must be bool, got "
+            f"{type(token_indices_identity).__name__}"
         )
 
     validated = _validate_backward_route_inputs(
@@ -5562,12 +5622,14 @@ def sonic_moe_backward_routes(
     if forward_state is None:
         forward_state_data = None
         forward_sorter_metadata = None
+        state_token_indices_identity = False
     else:
         (
             route_preactivation,
             producer_stream,
             ready_event,
             forward_sorter_metadata,
+            state_token_indices_identity,
         ) = _validate_routes_forward_state(
             forward_state,
             hidden_states,
@@ -5580,6 +5642,21 @@ def sonic_moe_backward_routes(
             route_preactivation,
             producer_stream,
             ready_event,
+        )
+        if validated[4] < _E16_FLAT_GROUPED_MIN_ROUTES:
+            # The retained route-order state is optimized for the dynamic E16
+            # grouped path.  Below one BM64 backward sort tile, the legacy
+            # flat state-preparation kernel cannot decode arbitrary route IDs;
+            # recomputing through the already-cheap generic path is safe.
+            forward_state_data = None
+            forward_sorter_metadata = None
+    effective_token_indices_identity = (
+        token_indices_identity or state_token_indices_identity
+    )
+    if effective_token_indices_identity and validated[0] != validated[4]:
+        raise ValueError(
+            "token_indices_identity requires routes == tokens, got "
+            f"{validated[4]} and {validated[0]}"
         )
     return _sonic_moe_backward_impl(
         hidden_states,
@@ -5597,6 +5674,7 @@ def sonic_moe_backward_routes(
         forward_state_data=forward_state_data,
         forward_sorter_metadata=forward_sorter_metadata,
         token_indices_sorted=token_indices_sorted,
+        token_indices_identity=effective_token_indices_identity,
     )
 
 

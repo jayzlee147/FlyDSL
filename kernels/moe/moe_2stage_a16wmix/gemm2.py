@@ -109,13 +109,22 @@ def _weighted_a16_epilog(
                     (fx.Int64(token_id) * fx.Int64(TOPK) + fx.Int64(slot)) * fx.Int64(N_OUT)
                     + fx.Int64(n_block_idx * fx.Int32(BN) + col_start)
                 )
+            elif const_expr(output_mode == "identity"):
+                row_base_addr = (
+                    fx.Int64(token_id) * fx.Int64(N_OUT)
+                    + fx.Int64(n_block_idx * fx.Int32(BN) + col_start)
+                )
             else:
                 row_base_addr = token_id * fx.Int32(N_OUT) + n_block_idx * fx.Int32(BN) + col_start
             for s in range_constexpr(_s_count):
                 idx0 = row_in_block * fx.Int32(BN) + col_start + fx.Int32(s * 64)
                 v2 = Vec(llvm.load(T.vec(2, T.f32), _gep3(lds_base, idx0 * fx.Int32(4))))
                 pk = Vec.from_elements([v2[0] * weight[mr], v2[1] * weight[mr]], fx.Float32).to(elem_dtype)
-                if const_expr(output_mode == "reduce"):
+                if const_expr(output_mode != "atomic"):
+                    # ``identity`` flat routing has exactly one route per
+                    # token and ``token_id == route_id``.  It therefore shares
+                    # the ordinary-store epilogue with fixed-slot reduction,
+                    # but addresses the final [tokens, N_OUT] output directly.
                     off = (row_base_addr + fx.Int64(s * 64)) * fx.Int64(2)
                     llvm.StoreOp(_raw(pk), _gep1(out_base, off), alignment=4)
                 else:
@@ -792,7 +801,9 @@ def compile_gemm2_a16w4_port(
     N_OUT = model_dim (down-proj output). D_INTER = inter_dim (contraction).
     ``output_mode='atomic'`` uses packed A16 routing-weighted atomic scatter;
     ``output_mode='reduce'`` writes one weighted A16 row per original fixed-K
-    route for a subsequent FP32 top-k reduction. ``TOPK`` is compile-time.
+    route for a subsequent FP32 top-k reduction; and ``output_mode='identity'``
+    directly stores one weighted row per token for the flat K=1 identity-route
+    contract. ``TOPK`` is compile-time.
 
     ``SORTED_BM`` is the route-sort padding and expert-metadata granularity. It
     defaults to ``BM`` and may be a multiple when this GEMM subdivides a route
@@ -819,7 +830,9 @@ def compile_gemm2_a16w4_port(
     assert isinstance(stages, int) and not isinstance(stages, bool) and stages in (1, 2), (
         f"stages must be the integer 1 or 2, got {stages!r}"
     )
-    assert output_mode in ("atomic", "reduce"), "output_mode must be 'atomic' or 'reduce'"
+    assert output_mode in ("atomic", "reduce", "identity"), (
+        "output_mode must be 'atomic', 'reduce', or 'identity'"
+    )
     assert isinstance(TOPK, int) and 0 < TOPK <= 255, "TOPK must be an integer in [1, 255]"
     assert not logical_dense_weight or w_dtype in ("bf16", "fp16"), (
         "logical_dense_weight is valid only for dense A16 weights"
@@ -860,7 +873,11 @@ def compile_gemm2_a16w4_port(
 
     _wd_tag = "" if w_dtype == "mxfp4" else f"_{w_dtype}"
     _ad_tag = "" if a_dtype == "bf16" else f"_a{a_dtype}"
-    _output_tag = "atomic" if output_mode == "atomic" else f"reduce_tk{TOPK}"
+    _output_tag = (
+        "atomic"
+        if output_mode == "atomic"
+        else (f"reduce_tk{TOPK}" if output_mode == "reduce" else "identity")
+    )
     _sorted_tag = f"_sbm{SORTED_BM}" if SORTED_BM != BM else ""
     _name = (
         f"gemm2_a16w4{_wd_tag}{_ad_tag}_port_ne{NE}_h{N_OUT}_i{_K}_bm{BM}_tn{TILE_N}"

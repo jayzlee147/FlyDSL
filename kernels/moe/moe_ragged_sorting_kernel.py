@@ -38,6 +38,7 @@ UNIT_SIZE = 32
 
 
 _ragged_cf_cache = {}
+_expert_major_cf_cache = {}
 
 
 @functools.lru_cache(maxsize=128)
@@ -439,4 +440,432 @@ def moe_ragged_sorting_flydsl(
     )
 
 
-__all__ = ["moe_ragged_sorting_flydsl"]
+@functools.lru_cache(maxsize=128)
+def _compile_moe_expert_major_sorting(
+    *,
+    num_experts: int,
+    unit_size: int,
+    emit_route_ids: bool,
+    mirror_expert_frequency: bool,
+    token_indices_identity: bool,
+    clear_output: bool,
+):
+    """Build the two-launch expert-major metadata adapter.
+
+    ``expert_offsets`` describes the already expert-major input as half-open
+    route intervals.  Unlike :func:`_compile_moe_ragged_sorting`, this path
+    has no histogram or atomic scatter: its first launch derives the padded
+    ABI layout, and its second launch copies each route into that layout.
+    Runtime route count is an ordinary scalar argument and is deliberately not
+    part of the compile-cache key.
+    """
+
+    if num_experts <= 0:
+        raise ValueError(f"num_experts must be positive, got {num_experts}")
+    if unit_size <= 0:
+        raise ValueError(f"unit_size must be positive, got {unit_size}")
+
+    @flyc.kernel(known_block_size=[BLOCK_SIZE, 1, 1])
+    def prefix_and_padding_kernel(
+        expert_offsets: fx.Tensor,
+        expert_frequency: fx.Tensor,
+        expert_frequency_mirror: fx.Tensor,
+        expert_padded_offsets: fx.Tensor,
+        sorted_token_ids: fx.Tensor,
+        sorted_weights: fx.Tensor,
+        sorted_route_ids: fx.Tensor,
+        sorted_expert_ids: fx.Tensor,
+        num_valid_ids: fx.Tensor,
+        i32_routes: fx.Int32,
+        i32_tokens: fx.Int32,
+    ):
+        """Emit counts, padded expert tiles, and only the padding rows.
+
+        A single CTA is intentional: E16's prefix is tiny and serializing it
+        makes the padded ABI deterministic without a temporary prefix buffer.
+        Real rows are written in parallel by ``pack_kernel``.
+        """
+
+        c_zero = fx.Int32(0)
+        c_one = fx.Int32(1)
+        c_unit = fx.Int32(unit_size)
+        if gpu.thread_idx.x == c_zero:
+            offsets_rsrc = buffer_ops.create_buffer_resource(expert_offsets, max_size=True)
+            frequency_rsrc = buffer_ops.create_buffer_resource(expert_frequency, max_size=True)
+            padded_offsets_rsrc = buffer_ops.create_buffer_resource(
+                expert_padded_offsets, max_size=True
+            )
+            ids_rsrc = buffer_ops.create_buffer_resource(sorted_token_ids, max_size=True)
+            weights_rsrc = buffer_ops.create_buffer_resource(sorted_weights, max_size=True)
+            experts_rsrc = buffer_ops.create_buffer_resource(sorted_expert_ids, max_size=True)
+            valid_rsrc = buffer_ops.create_buffer_resource(num_valid_ids, max_size=True)
+            if const_expr(emit_route_ids):
+                route_ids_rsrc = buffer_ops.create_buffer_resource(sorted_route_ids, max_size=True)
+            if const_expr(mirror_expert_frequency):
+                mirror_rsrc = buffer_ops.create_buffer_resource(
+                    expert_frequency_mirror, max_size=True
+                )
+
+            padded_offset = c_zero
+            for expert_id in range_constexpr(num_experts):
+                expert = fx.Int32(expert_id)
+                begin = buffer_ops.buffer_load(offsets_rsrc, expert, vec_width=1, dtype=T.i32)
+                end = buffer_ops.buffer_load(
+                    offsets_rsrc, expert + c_one, vec_width=1, dtype=T.i32
+                )
+                count = end - begin
+                blocks = (count + c_unit - c_one) // c_unit
+                padded = (count == c_zero).select(c_zero, blocks * c_unit)
+                buffer_ops.buffer_store(count, frequency_rsrc, expert)
+                buffer_ops.buffer_store(
+                    padded_offset,
+                    padded_offsets_rsrc,
+                    expert,
+                )
+                if const_expr(mirror_expert_frequency):
+                    buffer_ops.buffer_store(count, mirror_rsrc, expert)
+
+                block_start = padded_offset // c_unit
+                for block in range(
+                    fx.Index(0),
+                    ArithValue(blocks).index_cast(T.index),
+                    fx.Index(1),
+                ):
+                    buffer_ops.buffer_store(
+                        expert,
+                        experts_rsrc,
+                        block_start + fx.Int32(block),
+                    )
+
+                # The output buffers need initialization only in the tail of
+                # every non-empty expert segment.  This bounded serial work
+                # replaces the ragged sorter's whole-buffer clear launch.
+                for row in range(
+                    ArithValue(count).index_cast(T.index),
+                    ArithValue(padded).index_cast(T.index),
+                    fx.Index(1),
+                ):
+                    output_row = padded_offset + fx.Int32(row)
+                    buffer_ops.buffer_store(i32_tokens, ids_rsrc, output_row)
+                    buffer_ops.buffer_store(fx.Float32(0.0), weights_rsrc, output_row)
+                    if const_expr(emit_route_ids):
+                        buffer_ops.buffer_store(i32_routes, route_ids_rsrc, output_row)
+                padded_offset = padded_offset + padded
+
+            buffer_ops.buffer_store(padded_offset, valid_rsrc, c_zero)
+            buffer_ops.buffer_store(i32_tokens, valid_rsrc, c_one)
+
+    @flyc.kernel(known_block_size=[BLOCK_SIZE, 1, 1])
+    def pack_kernel(
+        token_indices: fx.Tensor,
+        expert_indices: fx.Tensor,
+        route_weights: fx.Tensor,
+        expert_offsets: fx.Tensor,
+        expert_padded_offsets: fx.Tensor,
+        sorted_token_ids: fx.Tensor,
+        sorted_weights: fx.Tensor,
+        sorted_route_ids: fx.Tensor,
+        moe_buf_i32: fx.Tensor,
+        i32_routes: fx.Int32,
+        i32_moe_buf_elems: fx.Int32,
+    ):
+        """Pack routes directly from contiguous expert-major intervals."""
+
+        c_zero = fx.Int32(0)
+        c_one = fx.Int32(1)
+        gid = gpu.block_idx.x * fx.Int32(BLOCK_SIZE) + gpu.thread_idx.x
+        stride = gpu.grid_dim.x * fx.Int32(BLOCK_SIZE)
+
+        if const_expr(clear_output):
+            output_rsrc = buffer_ops.create_buffer_resource(moe_buf_i32, max_size=True)
+            clear_iters = (i32_moe_buf_elems + stride - c_one) // stride
+            for iteration in range(
+                fx.Index(0),
+                ArithValue(clear_iters).index_cast(T.index),
+                fx.Index(1),
+            ):
+                output_index = gid + fx.Int32(iteration) * stride
+                if output_index < i32_moe_buf_elems:
+                    buffer_ops.buffer_store(c_zero, output_rsrc, output_index)
+
+        if gid < i32_routes:
+            experts_rsrc = buffer_ops.create_buffer_resource(expert_indices, max_size=True)
+            offsets_rsrc = buffer_ops.create_buffer_resource(expert_offsets, max_size=True)
+            padded_offsets_rsrc = buffer_ops.create_buffer_resource(
+                expert_padded_offsets, max_size=True
+            )
+            weights_in_rsrc = buffer_ops.create_buffer_resource(route_weights, max_size=True)
+            ids_out_rsrc = buffer_ops.create_buffer_resource(sorted_token_ids, max_size=True)
+            weights_out_rsrc = buffer_ops.create_buffer_resource(sorted_weights, max_size=True)
+            expert = buffer_ops.buffer_load(experts_rsrc, gid, vec_width=1, dtype=T.i32)
+            begin = buffer_ops.buffer_load(offsets_rsrc, expert, vec_width=1, dtype=T.i32)
+
+            output_offset = buffer_ops.buffer_load(
+                padded_offsets_rsrc,
+                expert,
+                vec_width=1,
+                dtype=T.i32,
+            )
+            output_index = output_offset + gid - begin
+
+            if const_expr(token_indices_identity):
+                token = gid
+            else:
+                tokens_rsrc = buffer_ops.create_buffer_resource(token_indices, max_size=True)
+                token = buffer_ops.buffer_load(tokens_rsrc, gid, vec_width=1, dtype=T.i32)
+            weight_bits = buffer_ops.buffer_load(weights_in_rsrc, gid, vec_width=1, dtype=T.i32)
+            buffer_ops.buffer_store(token, ids_out_rsrc, output_index)
+            buffer_ops.buffer_store(weight_bits, weights_out_rsrc, output_index)
+            if const_expr(emit_route_ids):
+                route_ids_rsrc = buffer_ops.create_buffer_resource(sorted_route_ids, max_size=True)
+                buffer_ops.buffer_store(gid, route_ids_rsrc, output_index)
+
+    @flyc.jit
+    def launch_expert_major_sorting(
+        token_indices: fx.Tensor,
+        expert_indices: fx.Tensor,
+        route_weights: fx.Tensor,
+        expert_offsets: fx.Tensor,
+        expert_frequency: fx.Tensor,
+        expert_frequency_mirror: fx.Tensor,
+        expert_padded_offsets: fx.Tensor,
+        sorted_token_ids: fx.Tensor,
+        sorted_weights: fx.Tensor,
+        sorted_route_ids: fx.Tensor,
+        sorted_expert_ids: fx.Tensor,
+        num_valid_ids: fx.Tensor,
+        moe_buf_i32: fx.Tensor,
+        i32_routes: fx.Int32,
+        i32_tokens: fx.Int32,
+        i32_moe_buf_elems: fx.Int32,
+        i32_route_grid: fx.Int32,
+        stream: fx.Stream = fx.Stream(None),
+    ):
+        prefix = prefix_and_padding_kernel(
+            expert_offsets,
+            expert_frequency,
+            expert_frequency_mirror,
+            expert_padded_offsets,
+            sorted_token_ids,
+            sorted_weights,
+            sorted_route_ids,
+            sorted_expert_ids,
+            num_valid_ids,
+            i32_routes,
+            i32_tokens,
+        )
+        prefix.launch(grid=(1, 1, 1), block=(BLOCK_SIZE, 1, 1), stream=stream)
+
+        pack = pack_kernel(
+            token_indices,
+            expert_indices,
+            route_weights,
+            expert_offsets,
+            expert_padded_offsets,
+            sorted_token_ids,
+            sorted_weights,
+            sorted_route_ids,
+            moe_buf_i32,
+            i32_routes,
+            i32_moe_buf_elems,
+        )
+        pack.launch(
+            grid=(i32_route_grid, 1, 1),
+            block=(BLOCK_SIZE, 1, 1),
+            stream=stream,
+        )
+
+    return launch_expert_major_sorting
+
+
+def moe_expert_major_sorting_flydsl(
+    token_indices: torch.Tensor,
+    expert_indices: torch.Tensor,
+    route_weights: torch.Tensor,
+    expert_offsets: torch.Tensor,
+    expert_frequency: torch.Tensor,
+    expert_padded_offsets: torch.Tensor,
+    sorted_token_ids: torch.Tensor,
+    sorted_weights: torch.Tensor,
+    sorted_expert_ids: torch.Tensor,
+    num_valid_ids: torch.Tensor,
+    moe_buf: torch.Tensor,
+    num_experts: int,
+    *,
+    tokens: int,
+    max_padded_routes: int,
+    unit_size: int = UNIT_SIZE,
+    sorted_route_ids: torch.Tensor | None = None,
+    expert_frequency_mirror: torch.Tensor | None = None,
+    token_indices_identity: bool = False,
+    clear_output: bool = False,
+):
+    """Build grouped-GEMM metadata from an already expert-major route list.
+
+    ``expert_offsets`` is contiguous int32 ``[E + 1]`` and defines the
+    half-open input interval for each expert.  The caller guarantees that the
+    intervals partition ``[0, R)`` and that every route in an interval has the
+    matching value in ``expert_indices``.  Keeping that value check outside
+    this asynchronous launch is deliberate: it avoids device-to-host reads on
+    the dynamic-R hot path.
+
+    ``expert_padded_offsets`` is caller-owned contiguous int32 ``[E]`` scratch
+    connecting the prefix and parallel pack launches.  The emitted tensors
+    have the exact flat ragged-sorter ABI: padded token
+    ids use ``tokens`` as sentinel, padded weights are zero, optional route ids
+    use ``R`` as sentinel, and ``num_valid_ids == [P, tokens]`` where
+    ``P = sum_e ceil(count_e / unit_size) * unit_size``.  It always launches
+    exactly two kernels: one prefix/padding CTA and one parallel pack CTA.
+    Set ``clear_output`` only when ``moe_buf`` owns an output/scratch tensor
+    that must be zeroed as part of the second CTA launch.
+    """
+
+    routes = int(route_weights.numel())
+    if num_experts <= 0 or unit_size <= 0:
+        raise ValueError("num_experts and unit_size must be positive")
+    if (
+        token_indices.ndim != 1
+        or expert_indices.ndim != 1
+        or route_weights.ndim != 1
+    ):
+        raise ValueError(
+            "token_indices, expert_indices, and route_weights must be one-dimensional"
+        )
+    if int(token_indices.numel()) != routes or int(expert_indices.numel()) != routes:
+        raise ValueError("token_indices, expert_indices, and route_weights must have equal length")
+    device = route_weights.device
+    tensors = {
+        "token_indices": token_indices,
+        "expert_indices": expert_indices,
+        "expert_offsets": expert_offsets,
+        "expert_frequency": expert_frequency,
+        "expert_padded_offsets": expert_padded_offsets,
+        "sorted_token_ids": sorted_token_ids,
+        "sorted_weights": sorted_weights,
+        "sorted_expert_ids": sorted_expert_ids,
+        "num_valid_ids": num_valid_ids,
+        "moe_buf": moe_buf,
+    }
+    if not route_weights.is_cuda:
+        raise ValueError("route tensors must be CUDA/ROCm tensors")
+    if route_weights.dtype != torch.float32 or not route_weights.is_contiguous():
+        raise ValueError("route_weights must be contiguous float32")
+    if token_indices.dtype != torch.int32 or expert_indices.dtype != torch.int32:
+        raise TypeError("token_indices and expert_indices must be int32")
+    for name, tensor in tensors.items():
+        if not isinstance(tensor, torch.Tensor):
+            raise TypeError(f"{name} must be a torch.Tensor")
+        if tensor.device != device or not tensor.is_contiguous():
+            raise ValueError(f"{name} must be contiguous on the route tensor device")
+    if expert_offsets.dtype != torch.int32 or tuple(expert_offsets.shape) != (num_experts + 1,):
+        raise ValueError(f"expert_offsets must be contiguous int32 with shape ({num_experts + 1},)")
+    if expert_frequency.dtype != torch.int32 or tuple(expert_frequency.shape) != (num_experts,):
+        raise ValueError(f"expert_frequency must be contiguous int32 with shape ({num_experts},)")
+    if (
+        expert_padded_offsets.dtype != torch.int32
+        or tuple(expert_padded_offsets.shape) != (num_experts,)
+    ):
+        raise ValueError(
+            f"expert_padded_offsets must be contiguous int32 with shape ({num_experts},)"
+        )
+    if (
+        sorted_token_ids.ndim != 1
+        or sorted_token_ids.dtype != torch.int32
+        or int(sorted_token_ids.numel()) < max_padded_routes
+    ):
+        raise ValueError("sorted_token_ids must be int32 with at least max_padded_routes elements")
+    if (
+        sorted_weights.ndim != 1
+        or sorted_weights.dtype != torch.float32
+        or int(sorted_weights.numel()) < max_padded_routes
+    ):
+        raise ValueError("sorted_weights must be float32 with at least max_padded_routes elements")
+    if (
+        sorted_expert_ids.ndim != 1
+        or sorted_expert_ids.dtype != torch.int32
+        or int(sorted_expert_ids.numel())
+        < (max_padded_routes + unit_size - 1) // unit_size
+    ):
+        raise ValueError("sorted_expert_ids has insufficient int32 block capacity")
+    if (
+        num_valid_ids.ndim != 1
+        or num_valid_ids.dtype != torch.int32
+        or int(num_valid_ids.numel()) < 2
+    ):
+        raise ValueError("num_valid_ids must have at least two int32 elements")
+    if sorted_route_ids is not None:
+        if (
+            sorted_route_ids.device != device
+            or sorted_route_ids.ndim != 1
+            or sorted_route_ids.dtype != torch.int32
+            or not sorted_route_ids.is_contiguous()
+            or int(sorted_route_ids.numel()) < max_padded_routes
+        ):
+            raise ValueError("sorted_route_ids must be contiguous int32 with at least max_padded_routes elements")
+    if expert_frequency_mirror is not None:
+        if (
+            expert_frequency_mirror.device != device
+            or expert_frequency_mirror.dtype != torch.int32
+            or not expert_frequency_mirror.is_contiguous()
+            or tuple(expert_frequency_mirror.shape) != (num_experts,)
+        ):
+            raise ValueError(f"expert_frequency_mirror must be contiguous int32 with shape ({num_experts},)")
+        if expert_frequency_mirror.untyped_storage().data_ptr() == expert_frequency.untyped_storage().data_ptr():
+            raise ValueError("expert_frequency_mirror must not alias expert_frequency")
+    if not isinstance(token_indices_identity, bool) or not isinstance(clear_output, bool):
+        raise TypeError("token_indices_identity and clear_output must be bool")
+
+    stream = torch.cuda.current_stream(device)
+    moe_buf_i32 = moe_buf.view(torch.int32)
+    route_grid = max(1, (routes + BLOCK_SIZE - 1) // BLOCK_SIZE)
+    launch_fn = _compile_moe_expert_major_sorting(
+        num_experts=num_experts,
+        unit_size=unit_size,
+        emit_route_ids=sorted_route_ids is not None,
+        mirror_expert_frequency=expert_frequency_mirror is not None,
+        token_indices_identity=token_indices_identity,
+        clear_output=clear_output,
+    )
+    sorted_route_ids_arg = expert_frequency if sorted_route_ids is None else sorted_route_ids
+    expert_frequency_mirror_arg = expert_frequency if expert_frequency_mirror is None else expert_frequency_mirror
+    args = (
+        token_indices,
+        expert_indices,
+        route_weights,
+        expert_offsets,
+        expert_frequency,
+        expert_frequency_mirror_arg,
+        expert_padded_offsets,
+        sorted_token_ids,
+        sorted_weights,
+        sorted_route_ids_arg,
+        sorted_expert_ids,
+        num_valid_ids,
+        moe_buf_i32,
+        routes,
+        int(tokens),
+        int(moe_buf_i32.numel()),
+        route_grid,
+    )
+    cache_key = (
+        num_experts,
+        unit_size,
+        sorted_route_ids is not None,
+        expert_frequency_mirror is not None,
+        token_indices_identity,
+        clear_output,
+        moe_buf_i32.ndim,
+        device.index,
+    )
+    _launch_cached(_expert_major_cf_cache, cache_key, launch_fn, args, stream)
+    return (
+        sorted_token_ids,
+        sorted_weights,
+        sorted_expert_ids,
+        num_valid_ids,
+        expert_frequency,
+        moe_buf,
+    )
+
+
+__all__ = ["moe_expert_major_sorting_flydsl", "moe_ragged_sorting_flydsl"]

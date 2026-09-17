@@ -67,6 +67,7 @@ def _config(**overrides):
         ({}, True),
         ({"tokens": 8191}, False),
         ({"routes": 8191}, False),
+        ({"tokens": 65536, "routes": 65536}, True),
         ({"hidden_size": 4096}, False),
         ({"intermediate_size": 960}, False),
         ({"num_experts": 64}, False),
@@ -394,7 +395,7 @@ def test_sonic_moe_routes_training_state_preserves_original_route_order(interlea
 
 @pytest.mark.large_shape
 def test_sonic_moe_e16_routes_training_state_owns_sorter_metadata():
-    """The exact training state keeps metadata beyond workspace reuse."""
+    """The retained training state keeps metadata beyond workspace reuse."""
 
     tokens = routes = 8192
     hidden_size, intermediate_size, num_experts = 2048, 768, 16
@@ -1712,6 +1713,104 @@ def test_sonic_moe_ragged_routes_match_reference_and_frequency():
     assert op.workspace is not None and op.workspace.max_m_blocks == 0
 
 
+@pytest.mark.parametrize("training", (False, True), ids=("inference", "training"))
+def test_sonic_moe_expert_major_identity_routes_match_generic_and_reuse_capacity(training):
+    """Pre-grouped routing reuses scratch without aliasing default outputs."""
+
+    config = _config(
+        stage1_write_padded_rows=True,
+        stage1_lds_swizzle=True,
+    )
+    x, w1, w2, _ = _make_case(seed=20260917)
+    prepared = prepare_sonic_bf16_weights(w1, w2, config)
+    generic = SonicMoE(config, prepared)
+    optimized = SonicMoE(config, prepared)
+    token_indices = torch.arange(TOKENS, dtype=torch.int32, device=x.device)
+    counts = (2, 0, 3, 2)
+    expert_indices = torch.repeat_interleave(
+        torch.arange(NUM_EXPERTS, dtype=torch.int32, device=x.device),
+        torch.tensor(counts, dtype=torch.int64, device=x.device),
+    ).contiguous()
+    expert_offsets = torch.tensor(
+        (0, 2, 2, 5, 7),
+        dtype=torch.int32,
+        device=x.device,
+    )
+    route_weights = torch.linspace(
+        0.25,
+        1.0,
+        TOKENS,
+        dtype=torch.float32,
+        device=x.device,
+    )
+    expected_frequency = torch.tensor(
+        counts,
+        dtype=torch.int32,
+        device=x.device,
+    )
+    generic_frequency = torch.empty_like(expected_frequency)
+    optimized_frequency = torch.empty_like(expected_frequency)
+
+    entrypoint = "forward_routes_training" if training else "forward_routes"
+
+    def invoke(op, hidden, tokens, experts, weights, **kwargs):
+        result = getattr(op, entrypoint)(
+            hidden,
+            tokens,
+            experts,
+            weights,
+            **kwargs,
+        )
+        return result[0] if training else result
+
+    expected = invoke(
+        generic,
+        x,
+        token_indices,
+        expert_indices,
+        route_weights,
+        expert_frequency_out=generic_frequency,
+    ).clone()
+    actual = invoke(
+        optimized,
+        x,
+        token_indices,
+        expert_indices,
+        route_weights,
+        expert_frequency_out=optimized_frequency,
+        expert_offsets=expert_offsets,
+        token_indices_identity=True,
+    )
+    first_capacity = next(iter(optimized._dynamic_route_workspaces.values()))
+    smaller_x = x[:5].neg().contiguous()
+    later = invoke(
+        optimized,
+        smaller_x,
+        token_indices[:5],
+        expert_indices[:5],
+        route_weights[:5],
+        expert_offsets=torch.tensor(
+            (0, 2, 2, 5, 5),
+            dtype=torch.int32,
+            device=x.device,
+        ),
+        token_indices_identity=True,
+    )
+    torch.cuda.synchronize(x.device)
+
+    assert torch.equal(generic_frequency, expected_frequency)
+    assert torch.equal(optimized_frequency, expected_frequency)
+    assert len(optimized._dynamic_route_workspaces) == 1
+    assert next(iter(optimized._dynamic_route_workspaces.values())) is first_capacity
+    assert optimized.workspace is not None
+    assert (optimized.workspace.tokens, optimized.workspace.routes) == (5, 5)
+    assert optimized.workspace._launch_lock is first_capacity._launch_lock
+    assert actual.untyped_storage().data_ptr() != first_capacity.output.untyped_storage().data_ptr()
+    assert later.untyped_storage().data_ptr() != first_capacity.output.untyped_storage().data_ptr()
+    assert actual.untyped_storage().data_ptr() != later.untyped_storage().data_ptr()
+    _assert_close(actual, expected)
+
+
 @pytest.mark.parametrize("dtype", (torch.bfloat16, torch.float16), ids=("bf16", "fp16"))
 def test_sonic_moe_ragged_high_fan_in_matches_fp32_reference(dtype):
     """An up-rounded token may receive many experts and A16 atomic contributions."""
@@ -1910,6 +2009,36 @@ def test_sonic_moe_workspace_cache_is_bounded_lru():
 
     op.clear_workspace()
     assert not op._workspaces
+    assert not op._dynamic_route_workspaces
+    assert op.workspace is None
+
+
+def test_sonic_moe_dynamic_route_workspace_grows_once_and_returns_active_views():
+    config = _config()
+    _, w1, w2, _ = _make_case()
+    op = SonicMoE(config, prepare_sonic_bf16_weights(w1, w2, config))
+
+    first = op.reserve_dynamic_routes(7, 7)
+    first_capacity = next(iter(op._dynamic_route_workspaces.values()))
+    first_storage = first.output.untyped_storage().data_ptr()
+    grown = op.reserve_dynamic_routes(20, 20)
+    grown_capacity = next(iter(op._dynamic_route_workspaces.values()))
+    small = op.reserve_dynamic_routes(5, 5)
+
+    assert first_capacity is not grown_capacity
+    assert first.output.untyped_storage().data_ptr() == first_storage
+    assert grown.output.untyped_storage().data_ptr() == grown_capacity.output.data_ptr()
+    assert small.output.untyped_storage().data_ptr() == grown_capacity.output.data_ptr()
+    assert tuple(small.output.shape) == (5, HIDDEN_SIZE)
+    assert (small.tokens, small.routes) == (5, 5)
+    assert small.max_padded_tokens < grown.max_padded_tokens
+    assert first._launch_lock is grown._launch_lock is small._launch_lock
+    assert len(op._dynamic_route_workspaces) == 1
+    assert not op._workspaces
+
+    op.clear_workspace()
+    assert not op._dynamic_route_workspaces
+    assert not op._dynamic_route_workspace_locks
     assert op.workspace is None
 
 
