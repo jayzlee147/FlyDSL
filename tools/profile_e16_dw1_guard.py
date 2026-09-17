@@ -60,6 +60,12 @@ def main() -> None:
     parser.add_argument("--warmup", type=int, default=8)
     parser.add_argument("--pairs", type=int, default=20)
     parser.add_argument("--profile-once", action="store_true")
+    parser.add_argument(
+        "--profile-variant",
+        choices=("baseline", "candidate"),
+        default="candidate",
+        help="variant enclosed by the rocprofv3 selected region",
+    )
     args = parser.parse_args()
 
     device = torch.device("cuda")
@@ -171,16 +177,39 @@ def main() -> None:
     del baseline, candidate
 
     if args.profile_once:
-        torch.cuda.nvtx.range_push("dw1_baseline")
-        result = backward(False)
-        torch.cuda.nvtx.range_pop()
-        del result
-        torch.cuda.nvtx.range_push("dw1_candidate")
-        result = backward(True)
-        torch.cuda.nvtx.range_pop()
-        del result
+        from tools.profile_sonic_forward import _roctx_control
+
+        candidate_enabled = args.profile_variant == "candidate"
+        _, roctx = _roctx_control()
         torch.cuda.synchronize(device)
-        backward_module._use_e16_dw1_dual_profile = original_policy
+        rc = roctx.roctxProfilerResume(0)
+        if rc:
+            raise RuntimeError(f"roctxProfilerResume failed: {rc}")
+        profile_error = None
+        range_pushed = False
+        try:
+            torch.cuda.nvtx.range_push(f"dw1_{args.profile_variant}")
+            range_pushed = True
+            result = backward(candidate_enabled)
+            torch.cuda.nvtx.range_pop()
+            range_pushed = False
+            del result
+            torch.cuda.synchronize(device)
+        except BaseException as error:
+            profile_error = error
+        finally:
+            if range_pushed:
+                try:
+                    torch.cuda.nvtx.range_pop()
+                except BaseException as error:
+                    if profile_error is None:
+                        profile_error = error
+            backward_module._use_e16_dw1_dual_profile = original_policy
+            rc = roctx.roctxProfilerPause(0)
+        if rc:
+            raise RuntimeError(f"roctxProfilerPause failed: {rc}")
+        if profile_error is not None:
+            raise profile_error
         return
 
     for iteration in range(args.warmup):
