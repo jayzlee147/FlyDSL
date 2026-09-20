@@ -907,7 +907,7 @@ def test_sonic_moe_training_stage1_t4096_policy_is_targeted():
     )
 
 
-def test_sonic_moe_training_stage1_e16_flat_m_policy_is_exact():
+def test_sonic_moe_training_stage1_e16_flat_m_policy_uses_route_interval():
     qwen3 = SonicMoEConfig(
         hidden_size=2048,
         intermediate_size=768,
@@ -927,9 +927,11 @@ def test_sonic_moe_training_stage1_e16_flat_m_policy_is_exact():
         renormalize=False,
     )
 
-    assert _training_stage1_tile_m(qwen3, 8192, 8192, False) == 64
+    for routes in (8000, 8191, 8192, 8193, 9000):
+        assert _training_stage1_tile_m(qwen3, routes, routes, False) == 64
     assert _training_stage1_tile_m(qwen3, 8192, None, False) == 128
-    assert _training_stage1_tile_m(qwen3, 8191, 8191, False) == 128
+    assert _training_stage1_tile_m(qwen3, 7999, 7999, False) == 128
+    assert _training_stage1_tile_m(qwen3, 9001, 9001, False) == 128
     assert _training_stage1_tile_m(qwen3, 8192, 8191, False) == 128
     assert _training_stage1_tile_m(qwen3, 8192, 8192, True) == 128
 
@@ -2077,7 +2079,16 @@ def test_sonic_moe_e16_master_matches_fallback_across_dynamic_routes(
         tracked_launch,
     )
     for case_index, (routes, active_experts) in enumerate(
-        ((257, 16), (4097, 4), (129, 16), (1024, 4))
+        (
+            (257, 16),
+            (4097, 4),
+            (8000, 4),
+            (8192, 4),
+            (8193, 4),
+            (9000, 4),
+            (129, 16),
+            (1024, 4),
+        )
     ):
         quotient, remainder = divmod(routes, active_experts)
         counts = [
@@ -2125,11 +2136,15 @@ def test_sonic_moe_e16_master_matches_fallback_across_dynamic_routes(
     assert [routes for op, routes, launched in observed if op is candidate and launched] == [
         257,
         4097,
+        8000,
+        8192,
+        8193,
+        9000,
         129,
         1024,
     ]
     assert not hasattr(candidate, "_training_forward_launch_plans")
-    assert _get_e16_metadata_stage1_master_launcher.cache_info().currsize == 2
+    assert _get_e16_metadata_stage1_master_launcher.cache_info().currsize == 3
     if pool is None:
         assert len(candidate._dynamic_route_workspaces) == 1
     else:

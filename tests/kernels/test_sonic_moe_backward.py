@@ -97,9 +97,12 @@ def test_inactive_weight_grad_zero_partition_is_retained_e16_only(
 @pytest.mark.parametrize(
     ("use_e16_expert_major", "routes", "expected"),
     (
-        (True, 8190, 1024),
+        (True, 7999, 1024),
+        (True, 8000, 2048),
+        (True, 8190, 2048),
         (True, 8191, 2048),
         (True, 8192, 2048),
+        (True, 9000, 2048),
         # E896 and every other non-E16-expert-major hostless path keep the
         # original launch cap, even at production-sized route counts.
         (False, 8192, 1024),
@@ -418,7 +421,7 @@ def test_e16_exact_dx_large_routes_use_full_logical_grid(routes, expected_grid):
 
 @pytest.mark.parametrize(
     ("max_expert_rows", "expected_hot_rows"),
-    ((8192, 1408), (16384, 2816), (65536, 11264)),
+    ((4096, 1408), (16384, 2816), (65536, 11264)),
 )
 def test_e16_dw2_dual_profile_dispatch_is_device_guarded(
     monkeypatch,
@@ -472,6 +475,48 @@ def test_e16_dw2_dual_profile_dispatch_is_device_guarded(
         (128, 64, 0, 4, expected_hot_rows, None, True),
         (256, 256, 5, None, 0, expected_hot_rows - 1, False),
     ]
+
+
+@pytest.mark.parametrize("max_expert_rows", (8000, 8192, 9000))
+def test_e16_dw2_production_route_interval_uses_one_wide_profile(
+    monkeypatch,
+    max_expert_rows,
+):
+    calls = []
+
+    def _tracked_grouped_tn(*args, **kwargs):
+        calls.append(kwargs)
+        return args[4]
+
+    monkeypatch.setattr(
+        sonic_backward_module,
+        "grouped_tn_from_queue_flydsl",
+        _tracked_grouped_tn,
+    )
+    output = torch.empty(1, dtype=torch.bfloat16)
+    sonic_backward_module._launch_grouped_dw2(
+        torch.empty((0, 2048), dtype=torch.bfloat16),
+        torch.empty((0, 768), dtype=torch.bfloat16),
+        torch.zeros(16, dtype=torch.int32),
+        torch.empty(0, dtype=torch.int32),
+        torch.empty(2, dtype=torch.int32),
+        output,
+        torch.zeros(33, dtype=torch.int32),
+        use_hostless_grouped=True,
+        use_tn_metadata_direct=False,
+        max_expert_rows=max_expert_rows,
+        hidden_size=2048,
+        intermediate_size=768,
+        active_experts=16,
+        stream=None,
+    )
+
+    assert len(calls) == 1
+    assert (calls[0]["block_m"], calls[0]["block_n"]) == (256, 256)
+    assert calls[0]["min_active_experts"] == 0
+    assert calls[0]["max_active_experts"] is None
+    assert calls[0]["min_expert_rows"] == 0
+    assert calls[0]["max_expert_rows"] is None
 
 
 def test_e16_dw2_split_companion_owns_hot_experts(monkeypatch):
@@ -917,9 +962,40 @@ def test_e16_direct_dw1_narrow_profile_is_reserved_for_one_or_two_experts():
 
 
 @pytest.mark.parametrize(
+    ("max_expert_rows", "expected"),
+    (
+        (7999, True),
+        (8000, False),
+        (8192, False),
+        (9000, False),
+        (9001, True),
+    ),
+)
+def test_e16_dw2_dual_profile_is_disabled_in_production_route_interval(
+    max_expert_rows,
+    expected,
+):
+    assert (
+        sonic_backward_module._use_e16_dw2_dual_profile(
+            use_hostless_grouped=True,
+            use_tn_metadata_direct=False,
+            num_experts=16,
+            hidden_size=2048,
+            intermediate_size=768,
+            max_expert_rows=max_expert_rows,
+        )
+        is expected
+    )
+
+
+@pytest.mark.parametrize(
     ("overrides", "expected"),
     (
         ({}, True),
+        ({"max_expert_rows": 8000}, False),
+        ({"max_expert_rows": 8192}, False),
+        ({"max_expert_rows": 9000}, False),
+        ({"max_expert_rows": 9001}, True),
         ({"direct_rhs": False}, False),
         ({"e16_flat_grouped": False}, False),
         ({"metadata_direct": True}, False),
@@ -930,6 +1006,7 @@ def test_e16_direct_dw1_dual_profile_policy_is_narrow(overrides, expected):
         "direct_rhs": True,
         "e16_flat_grouped": True,
         "metadata_direct": False,
+        "max_expert_rows": 4096,
     }
     kwargs.update(overrides)
     assert sonic_backward_module._use_e16_dw1_dual_profile(**kwargs) is expected

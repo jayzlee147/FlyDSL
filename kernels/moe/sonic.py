@@ -77,6 +77,8 @@ _GFX950_LDS_BYTES = 160 * 1024
 _MAX_BUFFER_BYTE_OFFSET = 0xFFFFFFFF
 _MAX_SIGNED_I32 = 0x7FFFFFFF
 _E16_FLAT_GROUPED_MIN_ROUTES = 64
+_E16_EP8_PRODUCTION_MIN_ROUTES = 8000
+_E16_EP8_PRODUCTION_MAX_ROUTES = 9000
 # The expert-major Qwen3 training path exposes enough route-level parallelism
 # above this point for the lower-register Stage-1 tile and narrower Stage-2 N
 # tile to win for both balanced and skewed shards.  Keeping the threshold at
@@ -1634,16 +1636,18 @@ def _training_stage1_tile_m(
 ) -> int:
     """Select the measured flat-route training Stage-1 M tile.
 
-    Qwen3-30B-A3B's EP8 local route bucket benefits from a BM64 compute tile
-    while retaining the BM128 sorter layout.  The smaller tile lowers the
-    dual-output kernel from 370 to 250 VGPRs on gfx950 without changing route
-    padding or the Stage-2 launch.  Keep the gate deliberately exact so fixed-K
-    calls, inference, nearby ragged shapes, and explicitly retuned configs use
-    the requested ``config.tile_m`` unchanged.
+    Qwen3-30B-A3B's EP8 local production route band benefits from a BM64
+    compute tile while retaining the BM128 sorter layout.  The smaller tile
+    lowers the dual-output kernel from 370 to 250 VGPRs on gfx950 without
+    changing route padding or the Stage-2 launch.  Keep the gate deliberately
+    shape-specific so fixed-K calls, inference, routes outside the measured
+    band, and explicitly retuned configs use ``config.tile_m`` unchanged.
     """
 
     if (
-        routes == tokens == 8192
+        routes is not None
+        and routes == tokens
+        and _E16_EP8_PRODUCTION_MIN_ROUTES <= routes <= _E16_EP8_PRODUCTION_MAX_ROUTES
         and config.hidden_size == 2048
         and config.intermediate_size == 768
         and config.num_experts == 16

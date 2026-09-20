@@ -38,6 +38,8 @@ BLOCK_SIZE = 256
 UNIT_SIZE = 32
 _E16_EXPERT_MAJOR_SINGLE_LAUNCH = True
 _E16_EXPERT_MAJOR_MAX_PARTITIONS = 16
+_E16_EP8_PRODUCTION_MIN_ROUTES = 8000
+_E16_EP8_PRODUCTION_MAX_ROUTES = 9000
 
 
 _ragged_cf_cache = {}
@@ -70,15 +72,20 @@ def _expert_major_identity_fusion_parameters(
     )
     identity_partitions = 1
     if single_launch:
-        target_partitions = max(
-            1,
-            (routes + num_experts * BLOCK_SIZE - 1)
-            // (num_experts * BLOCK_SIZE),
-        )
-        identity_partitions = min(
-            _E16_EXPERT_MAJOR_MAX_PARTITIONS,
-            1 << (target_partitions - 1).bit_length(),
-        )
+        # Keep the measured Qwen3 EP8 production band on one stable launch
+        # shape instead of dropping from four partitions to two at R=8192.
+        if _E16_EP8_PRODUCTION_MIN_ROUTES <= routes <= _E16_EP8_PRODUCTION_MAX_ROUTES:
+            identity_partitions = 4
+        else:
+            target_partitions = max(
+                1,
+                (routes + num_experts * BLOCK_SIZE - 1)
+                // (num_experts * BLOCK_SIZE),
+            )
+            identity_partitions = min(
+                _E16_EXPERT_MAJOR_MAX_PARTITIONS,
+                1 << (target_partitions - 1).bit_length(),
+            )
     return single_launch, identity_partitions
 
 

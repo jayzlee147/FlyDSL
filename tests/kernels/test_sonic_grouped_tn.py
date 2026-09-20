@@ -329,6 +329,71 @@ def test_grouped_tn_expert_row_guard_combines_with_active_count(
         )
 
 
+def test_grouped_tn_runtime_expert_row_cutoff_reuses_compiled_launcher():
+    frequencies = [40, 100, 200]
+    lhs, rhs, frequency, sorted_experts, num_valid, segments = _make_sorted_inputs(
+        frequencies,
+        128,
+        64,
+        seed=547,
+    )
+    queue = build_active_expert_queue_flydsl(
+        frequency,
+        sorted_experts,
+        num_valid,
+        routes=sum(frequencies),
+    )
+    # The final values are the historical dW2 thresholds at representative
+    # route counts in the production 8K--9K interval.
+    cutoffs = (128, 64, 1408, 1409, 1547)
+    outputs = []
+    compile_grouped_tn.cache_clear()
+    for cutoff in cutoffs:
+        output = torch.zeros(
+            (len(frequencies), 128, 64),
+            dtype=torch.bfloat16,
+            device=lhs.device,
+        )
+        grouped_tn_from_queue_flydsl(
+            lhs,
+            rhs,
+            frequency,
+            queue,
+            output,
+            block_m=128,
+            block_n=64,
+            block_k=32,
+            m_waves=2,
+            n_waves=2,
+            min_expert_rows=cutoff,
+        )
+        outputs.append(output)
+    torch.cuda.synchronize()
+
+    expected = torch.zeros_like(outputs[0])
+    for expert, start, rows in segments:
+        expected[expert] = (
+            lhs[start : start + rows].float().transpose(0, 1)
+            @ rhs[start : start + rows].float()
+        ).to(torch.bfloat16)
+    for cutoff, output in zip(cutoffs, outputs):
+        for expert, count in enumerate(frequencies):
+            selected = (
+                expected[expert]
+                if count >= cutoff
+                else torch.zeros_like(expected[expert])
+            )
+            torch.testing.assert_close(
+                output[expert].float(),
+                selected.float(),
+                rtol=3e-2,
+                atol=5e-2,
+            )
+    cache = compile_grouped_tn.cache_info()
+    assert cache.misses == 1
+    assert cache.hits == len(cutoffs) - 1
+
+
 def test_grouped_tn_consumes_single_block_metadata_without_builder():
     frequencies = [0, 1, 0, 7, 63]
     dy, activation, frequency, sorted_experts, num_valid, segments = _make_sorted_inputs(
@@ -634,6 +699,8 @@ def test_compile_grouped_tn_preserves_sorted_rhs_launcher_abi():
         "schedule_storage",
         "num_valid_ids",
         "output",
+        "i32_min_expert_rows",
+        "i32_max_expert_rows",
         "i32_grid",
         "stream",
     )
@@ -645,9 +712,39 @@ def test_compile_grouped_tn_preserves_sorted_rhs_launcher_abi():
         "schedule_storage",
         "num_valid_ids",
         "output",
+        "i32_min_expert_rows",
+        "i32_max_expert_rows",
         "i32_grid",
         "stream",
     )
+
+
+def test_compile_grouped_tn_runtime_row_bounds_share_jit_variants():
+    """Dynamic E16 route cutoffs must not create one compiler key per T."""
+
+    compile_grouped_tn.cache_clear()
+    compile_args = (2048, 768, 16, 256, 256, 32, 0, 4, 4, 0)
+    for routes in range(8000, 9001):
+        cutoff = max(1408, (routes * 11 + 63) // 64)
+        assert cutoff >= 1408
+        compile_grouped_tn(
+            *compile_args,
+            min_active_experts=0,
+            max_active_experts=4,
+            filter_expert_rows=True,
+            has_max_expert_rows=False,
+            active_guard_or_expert_rows=True,
+        )
+        compile_grouped_tn(
+            *compile_args,
+            min_active_experts=5,
+            filter_expert_rows=True,
+            has_max_expert_rows=True,
+        )
+
+    cache = compile_grouped_tn.cache_info()
+    assert cache.misses == 2
+    assert cache.currsize == 2
 
 
 def test_grouped_tn_uses_64_bit_output_base_for_last_production_expert():

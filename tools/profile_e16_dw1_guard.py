@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""ABBA the device-guarded E16 direct-dW1 tile pair on gfx950."""
+"""ABBA the device-guarded E16 dW1 or dW2 tile pair on gfx950."""
 
 from __future__ import annotations
 
@@ -23,6 +23,12 @@ def counts_for(routes: int, experts: int, load: str) -> list[int]:
     if load == "hot2":
         first = (4 * routes + 4) // 5
         return [first, routes - first, *([0] * (experts - 2))]
+    if load == "hot4":
+        quotient, remainder = divmod(routes, 4)
+        return [
+            *[quotient + int(expert < remainder) for expert in range(4)],
+            *([0] * (experts - 4)),
+        ]
     if load == "long-tail":
         first = (routes + 1) // 2
         quotient, remainder = divmod(routes - first, experts - 1)
@@ -54,11 +60,17 @@ def main() -> None:
     parser.add_argument("--routes", type=int, required=True)
     parser.add_argument(
         "--load",
-        choices=("uniform", "hot1", "hot2", "long-tail"),
+        choices=("uniform", "hot1", "hot2", "hot4", "long-tail"),
         required=True,
     )
     parser.add_argument("--warmup", type=int, default=8)
     parser.add_argument("--pairs", type=int, default=20)
+    parser.add_argument(
+        "--target",
+        choices=("dw1", "dw2"),
+        default="dw1",
+        help="device-guarded profile pair to enable for the candidate",
+    )
     parser.add_argument("--profile-once", action="store_true")
     parser.add_argument(
         "--profile-variant",
@@ -129,11 +141,18 @@ def main() -> None:
         token_indices_identity=True,
     )
 
-    original_policy = backward_module._use_e16_dw1_dual_profile
+    policy_name = (
+        "_use_e16_dw1_dual_profile"
+        if args.target == "dw1"
+        else "_use_e16_dw2_dual_profile"
+    )
+    original_policy = getattr(backward_module, policy_name)
 
     def backward(candidate: bool):
-        backward_module._use_e16_dw1_dual_profile = (
-            original_policy if candidate else lambda **_kwargs: False
+        setattr(
+            backward_module,
+            policy_name,
+            lambda **_kwargs: candidate,
         )
         return sonic_moe_backward_routes(
             x,
@@ -151,6 +170,7 @@ def main() -> None:
     baseline = backward(False)
     candidate = backward(True)
     torch.cuda.synchronize(device)
+    target_gradient = args.target
     correctness: dict[str, dict[str, float | bool]] = {}
     for name, actual, expected in zip(
         ("dx", "dw1", "dw2", "droute"),
@@ -167,9 +187,9 @@ def main() -> None:
         }
         if not metrics["finite"]:
             raise AssertionError(f"{name} contains non-finite values")
-        if name != "dw1" and not metrics["exact"]:
+        if name != target_gradient and not metrics["exact"]:
             raise AssertionError(f"{name} unexpectedly changed")
-        if name == "dw1" and (
+        if name == target_gradient and (
             metrics["max_abs"] > 0.02 or metrics["relative_l2"] > 2.0e-4
         ):
             raise AssertionError(f"{name} mismatch: {metrics}")
@@ -188,7 +208,7 @@ def main() -> None:
         profile_error = None
         range_pushed = False
         try:
-            torch.cuda.nvtx.range_push(f"dw1_{args.profile_variant}")
+            torch.cuda.nvtx.range_push(f"{args.target}_{args.profile_variant}")
             range_pushed = True
             result = backward(candidate_enabled)
             torch.cuda.nvtx.range_pop()
@@ -204,7 +224,7 @@ def main() -> None:
                 except BaseException as error:
                     if profile_error is None:
                         profile_error = error
-            backward_module._use_e16_dw1_dual_profile = original_policy
+            setattr(backward_module, policy_name, original_policy)
             rc = roctx.roctxProfilerPause(0)
         if rc:
             raise RuntimeError(f"roctxProfilerPause failed: {rc}")
@@ -235,7 +255,7 @@ def main() -> None:
                 begin.elapsed_time(end)
             )
             del result
-    backward_module._use_e16_dw1_dual_profile = original_policy
+    setattr(backward_module, policy_name, original_policy)
     baseline_summary = summary(samples["baseline"])
     candidate_summary = summary(samples["candidate"])
     print(
@@ -243,6 +263,7 @@ def main() -> None:
             {
                 "routes": routes,
                 "load": args.load,
+                "target": args.target,
                 "counts": counts,
                 "active_experts": sum(count > 0 for count in counts),
                 "correctness": correctness,

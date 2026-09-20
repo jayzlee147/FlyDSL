@@ -924,8 +924,8 @@ def compile_grouped_tn(
     min_active_experts: int = 0,
     max_active_experts: int | None = None,
     gather_rhs: bool = False,
-    min_expert_rows: int = 0,
-    max_expert_rows: int | None = None,
+    filter_expert_rows: bool = False,
+    has_max_expert_rows: bool = False,
     active_guard_or_expert_rows: bool = False,
     split_k_partials: bool = False,
 ):
@@ -942,11 +942,14 @@ def compile_grouped_tn(
     specialization with the device-resident queue count.  Two disjoint
     guarded launches can therefore select different gfx950 tile profiles
     without synchronizing the routing distribution back to the host.
-    ``min_expert_rows`` and ``max_expert_rows`` additionally filter individual
-    queue descriptors by their device-resident frequency.  The optional OR
-    mode admits every descriptor when the active-count guard matches and only
-    row-selected descriptors otherwise; this lets one small-tile launch cover
-    both sparse shards and a hot expert in an otherwise dense shard.
+    ``filter_expert_rows`` enables runtime row bounds, while
+    ``has_max_expert_rows`` controls whether the runtime upper bound is used.
+    Keeping the numeric bounds out of this cached compiler prevents dynamic
+    route counts from creating one JIT specialization per cutoff.  The
+    optional OR mode admits every descriptor when the active-count guard
+    matches and only row-selected descriptors otherwise; this lets one
+    small-tile launch cover both sparse shards and a hot expert in an otherwise
+    dense shard.
     ``gather_rhs`` loads token-major RHS rows through packed sorter token IDs,
     eliminating their otherwise materialized sorter-order copy.
     ``split_k_partials`` consumes
@@ -986,24 +989,18 @@ def compile_grouped_tn(
         not isinstance(max_active_experts, int) or max_active_experts < min_active_experts
     ):
         raise ValueError("max_active_experts must be None or at least min_active_experts")
-    if (
-        not isinstance(min_expert_rows, int)
-        or isinstance(min_expert_rows, bool)
-        or min_expert_rows < 0
-    ):
-        raise ValueError("min_expert_rows must be a non-negative int")
-    if max_expert_rows is not None and (
-        not isinstance(max_expert_rows, int)
-        or isinstance(max_expert_rows, bool)
-        or max_expert_rows < min_expert_rows
-    ):
-        raise ValueError("max_expert_rows must be None or at least min_expert_rows")
+    if not isinstance(filter_expert_rows, bool):
+        raise TypeError("filter_expert_rows must be a bool")
+    if not isinstance(has_max_expert_rows, bool):
+        raise TypeError("has_max_expert_rows must be a bool")
+    if has_max_expert_rows and not filter_expert_rows:
+        raise ValueError("has_max_expert_rows requires filter_expert_rows")
     if not isinstance(active_guard_or_expert_rows, bool):
         raise TypeError("active_guard_or_expert_rows must be a bool")
     if active_guard_or_expert_rows and (
         metadata_direct
         or max_active_experts is None
-        or (min_expert_rows == 0 and max_expert_rows is None)
+        or not filter_expert_rows
     ):
         raise ValueError(
             "active_guard_or_expert_rows requires queue metadata plus active and row guards"
@@ -1072,7 +1069,7 @@ def compile_grouped_tn(
             f"_gr{int(gather_rhs)}"
             f"_skp{int(split_k_partials)}"
             f"_amin{min_active_experts}_amax{max_active_experts}"
-            f"_rmin{min_expert_rows}_rmax{max_expert_rows}"
+            f"_rf{int(filter_expert_rows)}_rmax{int(has_max_expert_rows)}"
             f"_aor{int(active_guard_or_expert_rows)}"
         ),
         known_block_size=[block_threads, 1, 1],
@@ -1085,6 +1082,8 @@ def compile_grouped_tn(
         schedule_storage: fx.Tensor,
         num_valid_ids: fx.Tensor,
         output: fx.Tensor,
+        i32_min_expert_rows: fx.Int32,
+        i32_max_expert_rows: fx.Int32,
         tiled_mma: fx.TiledMma,
     ):
         tid = gpu.thread_idx.x
@@ -1626,7 +1625,7 @@ def compile_grouped_tn(
                         buffer_ops.buffer_store(value, output_rsrc, output_offset)
 
         def run_output_tile(work_index):
-            if const_expr(min_expert_rows == 0 and max_expert_rows is None):
+            if const_expr(not filter_expert_rows):
                 run_output_tile_unchecked(work_index)
             else:
                 descriptor_index = work_index // fx.Int32(output_tiles_per_expert)
@@ -1666,9 +1665,9 @@ def compile_grouped_tn(
                         )
                     ),
                 )
-                selected = frequency >= fx.Int32(min_expert_rows)
-                if const_expr(max_expert_rows is not None):
-                    selected = selected & (frequency <= fx.Int32(max_expert_rows))
+                selected = frequency >= i32_min_expert_rows
+                if const_expr(has_max_expert_rows):
+                    selected = selected & (frequency <= i32_max_expert_rows)
                 if const_expr(active_guard_or_expert_rows):
                     active_selected = descriptor_count >= fx.Int32(
                         min_active_experts
@@ -1698,6 +1697,8 @@ def compile_grouped_tn(
             schedule_storage: fx.Tensor,
             num_valid_ids: fx.Tensor,
             output: fx.Tensor,
+            i32_min_expert_rows: fx.Int32,
+            i32_max_expert_rows: fx.Int32,
             i32_grid: fx.Int32,
             stream: fx.Stream = fx.Stream(None),
         ):
@@ -1719,6 +1720,8 @@ def compile_grouped_tn(
                 schedule_storage,
                 num_valid_ids,
                 output,
+                i32_min_expert_rows,
+                i32_max_expert_rows,
                 tiled_mma,
             ).launch(
                 grid=(i32_grid, 1, 1),
@@ -1736,6 +1739,8 @@ def compile_grouped_tn(
             schedule_storage: fx.Tensor,
             num_valid_ids: fx.Tensor,
             output: fx.Tensor,
+            i32_min_expert_rows: fx.Int32,
+            i32_max_expert_rows: fx.Int32,
             i32_grid: fx.Int32,
             stream: fx.Stream = fx.Stream(None),
         ):
@@ -1757,6 +1762,8 @@ def compile_grouped_tn(
                 schedule_storage,
                 num_valid_ids,
                 output,
+                i32_min_expert_rows,
+                i32_max_expert_rows,
                 tiled_mma,
             ).launch(
                 grid=(i32_grid, 1, 1),
@@ -1856,6 +1863,8 @@ def grouped_tn_splitk_from_queue_flydsl(
             split_queue,
             split_queue,
             partials,
+            0,
+            _MAX_SIGNED_I32,
             grid,
             stream,
         )
@@ -1869,6 +1878,8 @@ def grouped_tn_splitk_from_queue_flydsl(
             split_queue,
             split_queue,
             partials,
+            0,
+            _MAX_SIGNED_I32,
             grid,
             stream,
         )
@@ -2195,6 +2206,26 @@ def grouped_tn_from_queue_flydsl(
         raise ValueError("token-major RHS row count exceeds packed token-id capacity")
     if gather_rhs and rhs_rows.numel() * rhs_rows.element_size() > _MAX_BUFFER_BYTES:
         raise ValueError("token-major RHS exceeds the gfx950 buffer-resource byte limit")
+    if (
+        not isinstance(min_expert_rows, int)
+        or isinstance(min_expert_rows, bool)
+        or min_expert_rows < 0
+    ):
+        raise ValueError("min_expert_rows must be a non-negative int")
+    if max_expert_rows is not None and (
+        not isinstance(max_expert_rows, int)
+        or isinstance(max_expert_rows, bool)
+        or max_expert_rows < min_expert_rows
+    ):
+        raise ValueError("max_expert_rows must be None or at least min_expert_rows")
+    filter_expert_rows = min_expert_rows != 0 or max_expert_rows is not None
+    has_max_expert_rows = max_expert_rows is not None
+    if active_guard_or_expert_rows and (
+        max_active_experts is None or not filter_expert_rows
+    ):
+        raise ValueError(
+            "active_guard_or_expert_rows requires active and row guards"
+        )
 
     capacity = (int(queue_storage.numel()) - 1) // 2
     if capacity == 0:
@@ -2240,9 +2271,12 @@ def grouped_tn_from_queue_flydsl(
         min_active_experts,
         max_active_experts,
         gather_rhs=gather_rhs,
-        min_expert_rows=min_expert_rows,
-        max_expert_rows=max_expert_rows,
+        filter_expert_rows=filter_expert_rows,
+        has_max_expert_rows=has_max_expert_rows,
         active_guard_or_expert_rows=active_guard_or_expert_rows,
+    )
+    runtime_max_expert_rows = (
+        _MAX_SIGNED_I32 if max_expert_rows is None else max_expert_rows
     )
     if gather_rhs:
         _run_compiled(
@@ -2254,6 +2288,8 @@ def grouped_tn_from_queue_flydsl(
             queue_storage,
             queue_storage,
             output,
+            min_expert_rows,
+            runtime_max_expert_rows,
             grid,
             stream,
         )
@@ -2266,6 +2302,8 @@ def grouped_tn_from_queue_flydsl(
             queue_storage,
             queue_storage,
             output,
+            min_expert_rows,
+            runtime_max_expert_rows,
             grid,
             stream,
         )
@@ -2406,6 +2444,8 @@ def grouped_tn_from_metadata_flydsl(
             sorted_expert_ids,
             num_valid_ids,
             output,
+            0,
+            _MAX_SIGNED_I32,
             grid,
             stream,
         )
@@ -2418,6 +2458,8 @@ def grouped_tn_from_metadata_flydsl(
             sorted_expert_ids,
             num_valid_ids,
             output,
+            0,
+            _MAX_SIGNED_I32,
             grid,
             stream,
         )

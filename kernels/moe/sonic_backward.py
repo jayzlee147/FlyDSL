@@ -180,6 +180,8 @@ _E16_FIXED_STATE_GROUPED_SHAPE = (8192, 2048, 768, 16, 1)
 _E16_FLAT_GROUPED_SHAPE = (2048, 768, 16)
 _E16_LEGACY_STANDALONE_ROUTES = 8192
 _E16_FLAT_GROUPED_MIN_ROUTES = 64
+_E16_EP8_PRODUCTION_MIN_ROUTES = 8000
+_E16_EP8_PRODUCTION_MAX_ROUTES = 9000
 _E16_EXACT_BM = 128
 _E16_EXACT_BK = 64
 _E16_EXACT_DA_BN = 192
@@ -263,15 +265,32 @@ _RoutesSorterMetadata = tuple[
 ]
 
 
+def _is_e16_ep8_production_routes(routes: int) -> bool:
+    """Return whether ``routes`` is in the measured per-rank training band."""
+
+    return _E16_EP8_PRODUCTION_MIN_ROUTES <= routes <= _E16_EP8_PRODUCTION_MAX_ROUTES
+
+
 def _use_e16_dw1_dual_profile(
     *,
     direct_rhs: bool,
     e16_flat_grouped: bool,
     metadata_direct: bool,
+    max_expert_rows: int,
 ) -> bool:
-    """Select device-guarded narrow/dense direct-dW1 profiles."""
+    """Select device-guarded narrow/dense direct-dW1 profiles.
 
-    return direct_rhs and e16_flat_grouped and not metadata_direct
+    The measured EP8 production band uses one BN128 launch on every rank; the
+    sparse guard's extra launch was neutral or slower there and amplified
+    arrival-time variance before the next collective.
+    """
+
+    return (
+        direct_rhs
+        and e16_flat_grouped
+        and not metadata_direct
+        and not _is_e16_ep8_production_routes(max_expert_rows)
+    )
 
 
 def _use_e16_dw_dx_overlap(
@@ -412,6 +431,31 @@ def _grouped_dw2_stages(max_expert_rows: int) -> int:
     return 3 if max_expert_rows >= _GROUPED_DW2_PIPELINE_THRESHOLD else 2
 
 
+def _use_e16_dw2_dual_profile(
+    *,
+    use_hostless_grouped: bool,
+    use_tn_metadata_direct: bool,
+    num_experts: int,
+    hidden_size: int,
+    intermediate_size: int,
+    max_expert_rows: int,
+) -> bool:
+    """Select the device-guarded E16 small/wide dW2 profile pair.
+
+    The measured EP8 production band uses one 256x256 launch on every rank.
+    Its second guarded launch was empty or slower for the observed loads.
+    """
+
+    return (
+        use_hostless_grouped
+        and not use_tn_metadata_direct
+        and num_experts == 16
+        and hidden_size == 2048
+        and intermediate_size == 768
+        and not _is_e16_ep8_production_routes(max_expert_rows)
+    )
+
+
 def _launch_grouped_dw2(
     dy: torch.Tensor,
     activation: torch.Tensor,
@@ -437,12 +481,13 @@ def _launch_grouped_dw2(
 ) -> None:
     """Launch the tuned grouped dW2 profiles after dy becomes available."""
 
-    if (
-        use_hostless_grouped
-        and not use_tn_metadata_direct
-        and int(expert_frequency.numel()) == 16
-        and hidden_size == 2048
-        and intermediate_size == 768
+    if _use_e16_dw2_dual_profile(
+        use_hostless_grouped=use_hostless_grouped,
+        use_tn_metadata_direct=use_tn_metadata_direct,
+        num_experts=int(expert_frequency.numel()),
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+        max_expert_rows=max_expert_rows,
     ):
         # The split-K companion already owns every expert above its boundary.
         # Clamp the regular-profile crossover to that boundary so lowering the
@@ -788,7 +833,11 @@ _HOSTLESS_ROW_GRID_CAP = 1024
 # work than the E896 path.  A second gfx950 wave improves its long-route row
 # kernels, while keeping the original cap is safer for short and E896 shapes.
 _E16_EXACT_ROW_GRID_CAP = 2048
-_E16_EXACT_ROW_GRID_MIN_ROUTES = 8191
+# Keep every observed Qwen3 EP8 local route count on the same row-kernel grid.
+# The production interval is 8K--9K; splitting it at 8191 made otherwise
+# similar ranks launch different amounts of row work immediately before the
+# next collective.
+_E16_EXACT_ROW_GRID_MIN_ROUTES = _E16_EP8_PRODUCTION_MIN_ROUTES
 
 
 def _inactive_weight_grad_zero_blocks_per_expert(
@@ -5587,6 +5636,7 @@ def _sonic_moe_backward_impl(
                 direct_rhs=use_direct_grouped_dw1_rhs,
                 e16_flat_grouped=use_e16_flat_grouped,
                 metadata_direct=use_tn_metadata_direct,
+                max_expert_rows=max_expert_rows,
             ):
                 grouped_dw1_profiles = (
                     (
