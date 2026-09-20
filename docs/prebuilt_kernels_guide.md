@@ -319,8 +319,10 @@ from kernels.moe.sonic import (
     prepare_sonic_bf16_weights,
     prepare_sonic_fp16_weights,
     prepare_sonic_mxfp4_weights,
+    canonical_e16_route_policy_size,
     sonic_moe_backward,
     sonic_moe_backward_routes,
+    warmup_sonic_e16_training,
 )
 
 cfg = SonicMoEConfig(
@@ -385,7 +387,58 @@ dx, dw1, dw2, droute_scores, db1, db2 = sonic_moe_backward_routes(
     b1=b1,
     b2=b2,
 )
+
+# Qwen3-30B-A3B EP training uses dynamic expert-major local route counts.
+# Compile all four finite policy families once per process/device, then let
+# the application barrier its EP group before entering the timed loop.
+# w1/w2 here are contiguous logical BF16 weights, not op.weights' preshuffled
+# forward storage; pass interleaved_w1=True consistently when applicable.
+warmup_sonic_e16_training(op, w1, w2)
+
+# Optional allocator warmup: reserve a known high-water shape separately from
+# compiler warmup. Prefer a SonicMoEDynamicWorkspacePool shared by MoE layers.
+op.reserve_dynamic_routes(max_local_routes, max_local_routes)
+
+# Derive this from the current all-to-all split metadata (or a safe shared
+# bound), not from one rank's local R and not from an exact-R JIT key.
+policy_size = canonical_e16_route_policy_size(ep_wide_max_local_routes)
+out, route_state = op.forward_routes_training(
+    expert_major_hidden_bf16,
+    token_indices_i32,
+    expert_indices_i32,
+    route_scores_f32,
+    expert_offsets=cu_seqlens_i32,
+    token_indices_identity=True,
+    route_policy_size=policy_size,
+)
+dx, dw1, dw2, droute_scores = sonic_moe_backward_routes(
+    expert_major_hidden_bf16,
+    w1,
+    w2,
+    token_indices_i32,
+    expert_indices_i32,
+    route_scores_f32,
+    grad_output_bf16,
+    cfg,
+    forward_state=route_state,
+    token_indices_sorted=True,
+)
 ```
+
+The E16 retained expert-major identity path separates actual work from tuning policy. Actual `R`
+controls every allocation, queue bound, runtime grid, and loop extent. The
+rank-shared policy is coarsened to `4096/16384/32768/65536`; it selects only a
+finite set of tile/cache/algorithm families, with the last family covering all
+larger legal values. Therefore continuously changing `R` does not create JIT
+variants. Pass the same current bucket on every EP rank to keep the host kernel
+sequence aligned. The shared maximum must cover every rank in that step;
+automatic promotion of an underestimated/stale hint is correctness-safe but
+can no longer guarantee rank-aligned topology. Avoid pinning all calls to
+XLARGE merely to cover a rare high-water mark, because its large-route tile
+family can be suboptimal for genuinely small shards even though scratch and
+launch grids are dynamically right-sized. Compile warmup uses a tiny probe and
+does not itself reserve production-size workspace; `synchronize=False` also
+requires the caller to synchronize the current stream or device before timing.
 
 `forward_topk_training` currently supports dense BF16 SwiGLU with fixed-K
 routes.  The state is tied to the exact forward invocation (including W1, B1,

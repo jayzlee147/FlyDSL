@@ -27,6 +27,8 @@ from kernels.moe.sonic import (
 from kernels.moe.sonic_backward import (
     _compile_flat_segmented_dx_reduction,
     _e16_exact_dx_grid,
+    _e16_exact_tile_launch_bound,
+    _e16_hot_split_schedule,
     _grouped_da_hostless_profiles,
     _grouped_da_tuning,
     _grouped_dw1_tuning,
@@ -44,6 +46,7 @@ from kernels.moe.sonic_backward import (
     _use_e16_fixed_state_grouped_backward,
     _use_e16_flat_grouped_backward,
     _use_e16_flat_segmented_dx,
+    _use_standalone_e16_tn_metadata_direct,
     _use_fused_da_dscore,
     _use_grouped_da,
     _use_grouped_dw1,
@@ -54,6 +57,7 @@ from kernels.moe.sonic_backward import (
     _use_grouped_w2_recompute,
     _use_hostless_grouped_backward,
 )
+from kernels.moe.sonic_dynamic_policy import E16RoutePolicy, select_e16_route_policy
 
 pytestmark = [pytest.mark.l2_device, pytest.mark.rocm_lower]
 
@@ -95,29 +99,27 @@ def test_inactive_weight_grad_zero_partition_is_retained_e16_only(
 
 
 @pytest.mark.parametrize(
-    ("use_e16_expert_major", "routes", "expected"),
+    ("use_e16_expert_major", "route_policy", "expected"),
     (
-        (True, 7999, 1024),
-        (True, 8000, 2048),
-        (True, 8190, 2048),
-        (True, 8191, 2048),
-        (True, 8192, 2048),
-        (True, 9000, 2048),
+        (True, E16RoutePolicy.SMALL, 1024),
+        (True, E16RoutePolicy.MEDIUM, 2048),
+        (True, E16RoutePolicy.LARGE, 2048),
+        (True, E16RoutePolicy.XLARGE, 2048),
         # E896 and every other non-E16-expert-major hostless path keep the
         # original launch cap, even at production-sized route counts.
-        (False, 8192, 1024),
-        (False, 65536, 1024),
+        (False, E16RoutePolicy.MEDIUM, 1024),
+        (False, E16RoutePolicy.XLARGE, 1024),
     ),
 )
 def test_hostless_row_grid_cap_is_narrow(
     use_e16_expert_major,
-    routes,
+    route_policy,
     expected,
 ):
     assert (
         _hostless_row_grid_cap(
             use_e16_expert_major=use_e16_expert_major,
-            routes=routes,
+            route_policy=route_policy,
         )
         == expected
     )
@@ -187,7 +189,12 @@ def test_e16_fixed_state_grouped_backward_enables_hostless_four_gemm_path():
         ({"hidden_size": 4096}, False),
         ({"intermediate_size": 1024}, False),
         ({"num_experts": 64}, False),
-        ({"routes": 8191}, False),
+        ({"routes": 0}, False),
+        ({"routes": 1}, True),
+        ({"routes": 17}, True),
+        ({"routes": 4097}, True),
+        ({"routes": 8191}, True),
+        ({"routes": 65536}, True),
         ({"routes": 65536, "reuse_forward_preactivation": True}, True),
         ({"flat_routes": False}, False),
         ({"has_bias": True}, False),
@@ -209,10 +216,12 @@ def test_e16_flat_grouped_backward_policy_is_narrow(overrides, expected):
     assert _use_e16_flat_grouped_backward(**kwargs) is expected
 
 
-@pytest.mark.parametrize("routes", (1, 17, 63, 64, 257))
-def test_dynamic_e16_fast_path_starts_at_one_backward_sort_tile(routes):
+@pytest.mark.parametrize("routes", (0, 1, 17, 63, 64, 257))
+def test_dynamic_e16_retained_backward_covers_every_nonempty_route_count(routes):
     config = _config(2048, 768, 16, 1, compute_dtype="bf16")
-    expected = routes >= 64
+    # Forward retains the invocation-owned metadata for every dynamic size;
+    # backward consumes it for every non-empty route count and handles R=0
+    # before launching a queue consumer.
     assert (
         _is_e16_flat_training_shape(
             config,
@@ -220,7 +229,7 @@ def test_dynamic_e16_fast_path_starts_at_one_backward_sort_tile(routes):
             routes,
             has_bias=False,
         )
-        is expected
+        is True
     )
     assert (
         _use_e16_flat_grouped_backward(
@@ -234,8 +243,78 @@ def test_dynamic_e16_fast_path_starts_at_one_backward_sort_tile(routes):
             has_bias=False,
             reuse_forward_preactivation=True,
         )
-        is expected
+        is (routes > 0)
     )
+
+
+def test_dynamic_e16_empty_retained_state_returns_zero_gradients():
+    """An empty EP rank may pass its forward state through unconditionally."""
+
+    hidden_size, intermediate_size, num_experts = 2048, 768, 16
+    device = _gfx950_device()
+    config = _config(
+        hidden_size,
+        intermediate_size,
+        num_experts,
+        1,
+        compute_dtype="bf16",
+    )
+    x = torch.empty((0, hidden_size), dtype=torch.bfloat16, device=device)
+    w1 = torch.empty(
+        (num_experts, 2 * intermediate_size, hidden_size),
+        dtype=torch.bfloat16,
+        device=device,
+    )
+    w2 = torch.empty(
+        (num_experts, hidden_size, intermediate_size),
+        dtype=torch.bfloat16,
+        device=device,
+    )
+    token_indices = torch.empty(0, dtype=torch.int32, device=device)
+    expert_indices = torch.empty(0, dtype=torch.int32, device=device)
+    route_weights = torch.empty(0, dtype=torch.float32, device=device)
+    grad_output = torch.empty_like(x)
+    stream = torch.cuda.current_stream(device)
+    ready_event = torch.cuda.Event()
+    ready_event.record(stream)
+    state = SimpleNamespace(
+        preactivation=torch.empty(
+            (0, 2 * intermediate_size),
+            dtype=torch.bfloat16,
+            device=device,
+        ),
+        tokens=0,
+        routes=0,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+        num_experts=num_experts,
+        activation="swiglu",
+        compute_dtype="bf16",
+        interleaved_w1=False,
+        has_bias=False,
+        producer_stream=int(stream.cuda_stream),
+        ready_event=ready_event,
+        token_indices_identity=True,
+        route_policy_size=4096,
+    )
+
+    dx, dw1, dw2, droute_weights = sonic_moe_backward_routes(
+        x,
+        w1,
+        w2,
+        token_indices,
+        expert_indices,
+        route_weights,
+        grad_output,
+        config,
+        forward_state=state,
+    )
+    torch.cuda.synchronize(device)
+
+    assert tuple(dx.shape) == (0, hidden_size)
+    assert tuple(droute_weights.shape) == (0,)
+    assert torch.count_nonzero(dw1) == 0
+    assert torch.count_nonzero(dw2) == 0
 
 
 def test_e16_flat_grouped_backward_enables_hostless_dispatch():
@@ -263,7 +342,7 @@ def test_e16_flat_grouped_backward_enables_hostless_dispatch():
     ("overrides", "expected"),
     (
         ({}, True),
-        ({"routes": 65535}, False),
+        ({"route_policy": E16RoutePolicy.LARGE}, False),
         ({"e16_flat_grouped": False}, False),
         ({"reuse_forward_preactivation": False}, False),
         ({"flat_identity_dx": False}, False),
@@ -271,14 +350,19 @@ def test_e16_flat_grouped_backward_enables_hostless_dispatch():
         ({"use_grouped_dx": False}, False),
     ),
 )
-def test_e16_dw_dx_overlap_policy_is_large_expert_major_only(overrides, expected):
+def test_e16_dw_dx_overlap_policy_is_large_expert_major_only(
+    monkeypatch,
+    overrides,
+    expected,
+):
+    monkeypatch.setattr(sonic_backward_module, "_E16_DW_DX_OVERLAP_ENABLED", True)
     kwargs = {
         "e16_flat_grouped": True,
         "reuse_forward_preactivation": True,
         "flat_identity_dx": True,
         "use_grouped_dw1": True,
         "use_grouped_dx": True,
-        "routes": 65536,
+        "route_policy": E16RoutePolicy.XLARGE,
     }
     kwargs.update(overrides)
     assert _use_e16_dw_dx_overlap(**kwargs) is expected
@@ -296,7 +380,7 @@ def test_e16_dw_dx_overlap_global_kill_switch(monkeypatch):
         flat_identity_dx=True,
         use_grouped_dw1=True,
         use_grouped_dx=True,
-        routes=65536,
+        route_policy=E16RoutePolicy.XLARGE,
     )
 
 
@@ -412,20 +496,163 @@ def test_e16_dw_dx_capture_query_is_conservative(monkeypatch, capture_result):
 
 
 @pytest.mark.parametrize(
-    ("routes", "expected_grid"),
-    ((65535, 1024), (65536, 2048), (134000, 2048)),
+    ("logical_grid", "grid_cap", "expected_grid"),
+    ((512, 1024, 512), (2048, 1024, 1024), (8432, 2048, 2048)),
 )
-def test_e16_exact_dx_large_routes_use_full_logical_grid(routes, expected_grid):
-    assert _e16_exact_dx_grid(2048, routes) == expected_grid
+def test_e16_exact_dx_uses_bounded_policy_grid(
+    logical_grid,
+    grid_cap,
+    expected_grid,
+):
+    assert _e16_exact_dx_grid(logical_grid, grid_cap) == expected_grid
 
 
 @pytest.mark.parametrize(
-    ("max_expert_rows", "expected_hot_rows"),
-    ((4096, 1408), (16384, 2816), (65536, 11264)),
+    ("routes", "expected_bound"),
+    (
+        (1, 1),
+        (64, 16),
+        (4096, 47),
+        (8192, 79),
+        (16384, 143),
+        (32768, 271),
+        (65536, 527),
+    ),
+)
+def test_e16_exact_launch_bound_tracks_actual_runtime_work(
+    routes,
+    expected_bound,
+):
+    assert _e16_exact_tile_launch_bound(routes, 16) == expected_bound
+
+
+@pytest.mark.parametrize(
+    ("routes", "route_policy", "expected_capacity"),
+    (
+        # A shared larger policy must not inflate short-rank scratch.  One
+        # record preserves the device-side no-op launch sequence.
+        (64, E16RoutePolicy.LARGE, 1),
+        (8192, E16RoutePolicy.XLARGE, 1),
+        (65536, E16RoutePolicy.XLARGE, 12),
+        # The open-ended class remains both actual-sized and policy-bounded.
+        (134000, E16RoutePolicy.XLARGE, 21),
+    ),
+)
+def test_e16_hot_split_scratch_uses_actual_proven_capacity(
+    routes,
+    route_policy,
+    expected_capacity,
+):
+    capacity, split_rows, min_hot_rows = _e16_hot_split_schedule(
+        routes,
+        16,
+        route_policy,
+    )
+    assert capacity == expected_capacity
+    assert split_rows >= 8192
+    assert min_hot_rows >= split_rows + 1
+    if route_policy == E16RoutePolicy.XLARGE:
+        assert min_hot_rows >= sonic_backward_module._e16_dw2_hot_profile_min_rows(
+            routes
+        )
+
+
+@pytest.mark.parametrize(
+    "routes",
+    (32769, 65536, 131072, 131073, 134000, 139279, 139280, 699050),
+)
+def test_e16_hot_split_schedule_keeps_balanced_xlarge_on_regular_path(routes):
+    """Balanced high-R shards must not pay split partial/finalize traffic."""
+
+    capacity, split_rows, min_hot_rows = _e16_hot_split_schedule(
+        routes,
+        16,
+        E16RoutePolicy.XLARGE,
+    )
+    quotient, remainder = divmod(routes, 16)
+    frequencies = [
+        quotient + int(expert < remainder)
+        for expert in range(16)
+    ]
+    descriptors = sum(
+        (frequency + split_rows - 1) // split_rows
+        for frequency in frequencies
+        if frequency >= min_hot_rows
+    )
+
+    assert descriptors == 0
+    assert descriptors <= capacity
+
+
+@pytest.mark.parametrize(
+    ("routes", "distribution"),
+    (
+        (16385, "hot1"),
+        (32768, "long_tail"),
+        (32769, "hot4"),
+        (65536, "hot1"),
+        (134000, "hot4"),
+        (134000, "long_tail"),
+        (699050, "hot1"),
+    ),
+)
+def test_e16_hot_split_schedule_bounds_skewed_descriptors(routes, distribution):
+    """Representative skew families fit the actual-R scratch capacity."""
+
+    if distribution == "hot1":
+        frequencies = [routes, *([0] * 15)]
+    elif distribution == "hot4":
+        quotient, remainder = divmod(routes, 4)
+        frequencies = [
+            *[quotient + int(expert < remainder) for expert in range(4)],
+            *([0] * 12),
+        ]
+    else:
+        head = (routes + 1) // 2
+        quotient, remainder = divmod(routes - head, 15)
+        frequencies = [
+            head,
+            *[quotient + int(expert < remainder) for expert in range(15)],
+        ]
+
+    policy = select_e16_route_policy(routes)
+    capacity, split_rows, min_hot_rows = _e16_hot_split_schedule(
+        routes,
+        16,
+        policy,
+    )
+    descriptors = sum(
+        (frequency + split_rows - 1) // split_rows
+        for frequency in frequencies
+        if frequency >= min_hot_rows
+    )
+
+    assert 0 < descriptors <= capacity
+    assert capacity == max(
+        1,
+        sonic_backward_module.hot_split_descriptor_capacity(
+            routes,
+            16,
+            split_rows,
+            min_hot_rows,
+        ),
+    )
+
+
+@pytest.mark.parametrize(
+    ("max_expert_rows", "route_policy", "expected_hot_rows"),
+    (
+        (64, E16RoutePolicy.SMALL, 1408),
+        (4096, E16RoutePolicy.SMALL, 1408),
+        (134000, E16RoutePolicy.SMALL, 1408),
+        (16384, E16RoutePolicy.LARGE, 5632),
+        (65536, E16RoutePolicy.XLARGE, 11264),
+    ),
 )
 def test_e16_dw2_dual_profile_dispatch_is_device_guarded(
     monkeypatch,
     max_expert_rows,
+    route_policy,
     expected_hot_rows,
 ):
     calls = []
@@ -453,6 +680,7 @@ def test_e16_dw2_dual_profile_dispatch_is_device_guarded(
         use_hostless_grouped=True,
         use_tn_metadata_direct=False,
         max_expert_rows=max_expert_rows,
+        route_policy=route_policy,
         hidden_size=2048,
         intermediate_size=768,
         active_experts=16,
@@ -464,6 +692,7 @@ def test_e16_dw2_dual_profile_dispatch_is_device_guarded(
         (
             kwargs["block_m"],
             kwargs["block_n"],
+            kwargs["stages"],
             kwargs["min_active_experts"],
             kwargs["max_active_experts"],
             kwargs["min_expert_rows"],
@@ -472,13 +701,21 @@ def test_e16_dw2_dual_profile_dispatch_is_device_guarded(
         )
         for _, kwargs in calls
     ] == [
-        (128, 64, 0, 4, expected_hot_rows, None, True),
-        (256, 256, 5, None, 0, expected_hot_rows - 1, False),
+        (128, 64, 3, 0, 4, expected_hot_rows, None, True),
+        (256, 256, 3, 5, None, 0, expected_hot_rows - 1, False),
     ]
 
 
-@pytest.mark.parametrize("max_expert_rows", (8000, 8192, 9000))
-def test_e16_dw2_production_route_interval_uses_one_wide_profile(
+@pytest.mark.parametrize(
+    ("routes", "expected"),
+    ((1, 1408), (8192, 1408), (8193, 1536), (9000, 1664), (16385, 2944)),
+)
+def test_e16_dw2_hot_cutoff_is_quantized_to_one_exact_m_tile(routes, expected):
+    assert sonic_backward_module._e16_dw2_hot_profile_min_rows(routes) == expected
+
+
+@pytest.mark.parametrize("max_expert_rows", (4097, 8192, 16384))
+def test_e16_dw2_medium_policy_uses_one_wide_profile(
     monkeypatch,
     max_expert_rows,
 ):
@@ -505,6 +742,7 @@ def test_e16_dw2_production_route_interval_uses_one_wide_profile(
         use_hostless_grouped=True,
         use_tn_metadata_direct=False,
         max_expert_rows=max_expert_rows,
+        route_policy=E16RoutePolicy.MEDIUM,
         hidden_size=2048,
         intermediate_size=768,
         active_experts=16,
@@ -571,6 +809,7 @@ def test_e16_dw2_split_companion_owns_hot_experts(monkeypatch):
         use_hostless_grouped=True,
         use_tn_metadata_direct=False,
         max_expert_rows=65536,
+        route_policy=E16RoutePolicy.XLARGE,
         hidden_size=2048,
         intermediate_size=768,
         active_experts=16,
@@ -677,7 +916,6 @@ def test_flat_segmented_dx_reduces_duplicate_routes_and_zero_route_tokens():
     )
     reduce_routes = _compile_flat_segmented_dx_reduction(
         hidden_size,
-        routes,
         "bf16",
         device.index or 0,
     )
@@ -902,6 +1140,14 @@ def test_short_hostless_policy_still_requires_grouped_projection_recompute():
             },
             True,
         ),
+        (
+            {
+                "use_compact_w1": False,
+                "flat_routes": True,
+                "e16_flat_grouped": True,
+            },
+            True,
+        ),
         ({"flat_routes": True}, False),
         ({"has_bias": True}, False),
         ({"compute_dtype": "fp16"}, False),
@@ -962,17 +1208,16 @@ def test_e16_direct_dw1_narrow_profile_is_reserved_for_one_or_two_experts():
 
 
 @pytest.mark.parametrize(
-    ("max_expert_rows", "expected"),
+    ("route_policy", "expected"),
     (
-        (7999, True),
-        (8000, False),
-        (8192, False),
-        (9000, False),
-        (9001, True),
+        (E16RoutePolicy.SMALL, True),
+        (E16RoutePolicy.MEDIUM, False),
+        (E16RoutePolicy.LARGE, True),
+        (E16RoutePolicy.XLARGE, True),
     ),
 )
-def test_e16_dw2_dual_profile_is_disabled_in_production_route_interval(
-    max_expert_rows,
+def test_e16_dw2_dual_profile_depends_only_on_shared_policy(
+    route_policy,
     expected,
 ):
     assert (
@@ -982,7 +1227,7 @@ def test_e16_dw2_dual_profile_is_disabled_in_production_route_interval(
             num_experts=16,
             hidden_size=2048,
             intermediate_size=768,
-            max_expert_rows=max_expert_rows,
+            route_policy=route_policy,
         )
         is expected
     )
@@ -992,10 +1237,9 @@ def test_e16_dw2_dual_profile_is_disabled_in_production_route_interval(
     ("overrides", "expected"),
     (
         ({}, True),
-        ({"max_expert_rows": 8000}, False),
-        ({"max_expert_rows": 8192}, False),
-        ({"max_expert_rows": 9000}, False),
-        ({"max_expert_rows": 9001}, True),
+        ({"route_policy": E16RoutePolicy.MEDIUM}, False),
+        ({"route_policy": E16RoutePolicy.LARGE}, True),
+        ({"route_policy": E16RoutePolicy.XLARGE}, True),
         ({"direct_rhs": False}, False),
         ({"e16_flat_grouped": False}, False),
         ({"metadata_direct": True}, False),
@@ -1006,7 +1250,7 @@ def test_e16_direct_dw1_dual_profile_policy_is_narrow(overrides, expected):
         "direct_rhs": True,
         "e16_flat_grouped": True,
         "metadata_direct": False,
-        "max_expert_rows": 4096,
+        "route_policy": E16RoutePolicy.SMALL,
     }
     kwargs.update(overrides)
     assert sonic_backward_module._use_e16_dw1_dual_profile(**kwargs) is expected
@@ -1303,6 +1547,61 @@ def test_grouped_w1_compact_queue_policy(tokens, expected_compact):
     )
     assert compact is expected_compact
     assert (bm, bn, bk, k_wave) == ((16, 128, 64, 2) if expected_compact else (16, 64, 64, 4))
+
+
+@pytest.mark.parametrize(
+    ("routes", "expected_metadata_direct"),
+    (
+        (1, True),
+        (63, True),
+        (64, True),
+        (65, False),
+        (4095, False),
+        (4096, False),
+        (4097, False),
+    ),
+)
+def test_standalone_e16_tn_metadata_family_is_one_block_bounded(
+    routes,
+    expected_metadata_direct,
+):
+    assert (
+        _use_standalone_e16_tn_metadata_direct(
+            e16_flat_grouped=True,
+            reuse_forward_preactivation=False,
+            use_hostless_grouped=True,
+            use_grouped_dw1=True,
+            use_grouped_dw2=True,
+            sort_unit=64,
+            routes=routes,
+        )
+        is expected_metadata_direct
+    )
+
+
+@pytest.mark.parametrize(
+    "override",
+    (
+        {"e16_flat_grouped": False},
+        {"reuse_forward_preactivation": True},
+        {"use_hostless_grouped": False},
+        {"use_grouped_dw1": False, "use_grouped_dw2": False},
+        {"sort_unit": 128},
+        {"routes": 0},
+    ),
+)
+def test_standalone_e16_tn_metadata_family_is_contract_narrow(override):
+    kwargs = {
+        "e16_flat_grouped": True,
+        "reuse_forward_preactivation": False,
+        "use_hostless_grouped": True,
+        "use_grouped_dw1": True,
+        "use_grouped_dw2": True,
+        "sort_unit": 64,
+        "routes": 64,
+    }
+    kwargs.update(override)
+    assert not _use_standalone_e16_tn_metadata_direct(**kwargs)
 
 
 @pytest.mark.parametrize(
@@ -2885,6 +3184,187 @@ def test_sonic_moe_backward_routes_spans_multiple_expert_tiles(dtype, compute_dt
     assert torch.count_nonzero(actual[5][2:]) == 0
 
 
+@pytest.mark.large_shape
+def test_sonic_moe_backward_standalone_e16_is_hostless_across_dynamic_routes(
+    monkeypatch,
+):
+    """Standalone E16 recompute uses one device-scheduled family for every R."""
+
+    route_counts = (1, 63, 64, 65, 4095, 4096, 4097)
+    max_routes = max(route_counts)
+    hidden_size, intermediate_size, num_experts = 2048, 768, 16
+    config = _config(
+        hidden_size,
+        intermediate_size,
+        num_experts,
+        1,
+        compute_dtype="bf16",
+        down_tile_m=64,
+    )
+    x, w1, w2, _, _, grad_output = _make_case(
+        max_routes,
+        hidden_size,
+        intermediate_size,
+        num_experts,
+        1,
+        seed=20260920,
+        dtype=torch.bfloat16,
+    )
+
+    sorter_calls = []
+    exact_queue_calls = []
+    compact_queue_calls = []
+    metadata_tn_routes = []
+    queue_tn_routes = []
+    current_routes = None
+    original_sorter = sonic_backward_module.moe_ragged_sorting_flydsl
+    original_exact_builder = sonic_backward_module.build_exact_m_tile_queue
+    original_compact_builder = sonic_backward_module.build_compact_m_tile_descriptors
+    original_metadata_tn = sonic_backward_module.grouped_tn_from_metadata_flydsl
+    original_queue_tn = sonic_backward_module.grouped_tn_from_queue_flydsl
+
+    def tracked_sorter(*args, **kwargs):
+        sorter_calls.append(int(kwargs["max_padded_routes"]))
+        return original_sorter(*args, **kwargs)
+
+    def tracked_exact_builder(*args, **kwargs):
+        exact_queue_calls.append(int(kwargs["queue_capacity"]))
+        return original_exact_builder(*args, **kwargs)
+
+    def tracked_compact_builder(*args, **kwargs):
+        compact_queue_calls.append(kwargs.get("active_expert_storage") is not None)
+        return original_compact_builder(*args, **kwargs)
+
+    def tracked_metadata_tn(*args, **kwargs):
+        metadata_tn_routes.append(current_routes)
+        return original_metadata_tn(*args, **kwargs)
+
+    def tracked_queue_tn(*args, **kwargs):
+        queue_tn_routes.append(current_routes)
+        return original_queue_tn(*args, **kwargs)
+
+    def unexpected_generic_gemm(*_args, **_kwargs):
+        raise AssertionError("dynamic standalone E16 must use grouped contractions")
+
+    def unexpected_host_segments(*_args, **_kwargs):
+        raise AssertionError("dynamic standalone E16 must not materialize host segments")
+
+    def unexpected_active_queue(*_args, **_kwargs):
+        raise AssertionError(
+            "standalone E16 must reuse metadata or the compact builder queue"
+        )
+
+    monkeypatch.setattr(
+        sonic_backward_module,
+        "moe_ragged_sorting_flydsl",
+        tracked_sorter,
+    )
+    monkeypatch.setattr(
+        sonic_backward_module,
+        "build_exact_m_tile_queue",
+        tracked_exact_builder,
+    )
+    monkeypatch.setattr(
+        sonic_backward_module,
+        "build_compact_m_tile_descriptors",
+        tracked_compact_builder,
+    )
+    monkeypatch.setattr(
+        sonic_backward_module,
+        "grouped_tn_from_metadata_flydsl",
+        tracked_metadata_tn,
+    )
+    monkeypatch.setattr(
+        sonic_backward_module,
+        "grouped_tn_from_queue_flydsl",
+        tracked_queue_tn,
+    )
+    monkeypatch.setattr(
+        sonic_backward_module,
+        "build_active_expert_queue_flydsl",
+        unexpected_active_queue,
+    )
+    monkeypatch.setattr(
+        sonic_backward_module,
+        "gemm_a16w16",
+        unexpected_generic_gemm,
+    )
+    monkeypatch.setattr(
+        sonic_backward_module,
+        "_materialize_expert_segments",
+        unexpected_host_segments,
+    )
+
+    for routes in route_counts:
+        current_routes = routes
+        route_ids = torch.arange(routes, device=x.device)
+        token_indices = route_ids.to(torch.int32)
+        expert_indices = ((route_ids * 7 + 3) % num_experts).to(torch.int32)
+        route_weights = torch.linspace(
+            0.25,
+            1.0,
+            routes,
+            dtype=torch.float32,
+            device=x.device,
+        )
+        inputs = (
+            x[:routes],
+            w1,
+            w2,
+            token_indices,
+            expert_indices,
+            route_weights,
+            grad_output[:routes],
+        )
+        actual = sonic_moe_backward_routes(*inputs, config)
+        expected = _backward_routes_reference(*inputs)
+        torch.cuda.synchronize(x.device)
+
+        relative_l2_limits = (7.5e-4, 3.0e-4, 3.0e-4, 5.0e-4)
+        max_abs_limits = (0.0625, 0.5, 0.5, 0.25)
+        for (
+            gradient_name,
+            actual_gradient,
+            expected_gradient,
+            relative_l2_limit,
+            max_abs_limit,
+        ) in zip(
+            ("dx", "dw1", "dw2", "droute_weights"),
+            actual,
+            expected,
+            relative_l2_limits,
+            max_abs_limits,
+        ):
+            difference = actual_gradient.float() - expected_gradient.float()
+            relative_l2 = float(torch.linalg.vector_norm(difference)) / max(
+                float(torch.linalg.vector_norm(expected_gradient.float())),
+                1e-12,
+            )
+            assert torch.isfinite(actual_gradient).all()
+            assert relative_l2 <= relative_l2_limit, (
+                routes,
+                gradient_name,
+                relative_l2,
+            )
+            max_abs = float(difference.abs().max())
+            assert max_abs <= max_abs_limit, (routes, gradient_name, max_abs)
+
+    assert len(sorter_calls) == len(route_counts)
+    assert len(exact_queue_calls) == len(route_counts)
+    # R<=one sorter block uses metadata directly, including the inclusive
+    # R=64 boundary.  Compact W1 begins at R=64 and emits the same bounded
+    # active queue as larger shapes; at the boundary it also supplies the
+    # active count used by adaptive gradient zeroing.
+    assert metadata_tn_routes == [1, 1, 63, 63, 64, 64]
+    assert queue_tn_routes == (
+        [65] * 3
+        + [4095] * 3
+        + [4096] * 3
+        + [4097] * 2
+    )
+    assert compact_queue_calls == [True, True, True, True, True]
+
+
 @pytest.mark.parametrize(
     (
         "tokens",
@@ -3950,7 +4430,7 @@ def test_sonic_moe_backward_e16_routes_reuses_forward_sorter_metadata(
 
 
 @pytest.mark.large_shape
-@pytest.mark.parametrize("routes", (64, 257))
+@pytest.mark.parametrize("routes", (1, 16, 63, 64, 127, 128, 257))
 @pytest.mark.parametrize("shared", (False, True), ids=("private", "shared"))
 def test_sonic_moe_backward_dynamic_e16_expert_major_identity_dx_is_direct(
     monkeypatch,
@@ -4148,10 +4628,10 @@ def test_sonic_moe_backward_dynamic_e16_expert_major_identity_dx_is_direct(
 
 
 @pytest.mark.large_shape
-def test_sonic_moe_backward_small_e16_nonidentity_state_recomputes_safely(
+def test_sonic_moe_backward_small_e16_nonidentity_state_reuses_metadata_safely(
     monkeypatch,
 ):
-    """Sub-tile arbitrary routes ignore retained state and use the generic sort."""
+    """Sub-tile arbitrary routes retain metadata and use the exact queue."""
 
     routes = tokens = 17
     hidden_size, intermediate_size, num_experts = 2048, 768, 16
@@ -4220,21 +4700,16 @@ def test_sonic_moe_backward_small_e16_nonidentity_state_recomputes_safely(
         route_weights,
         expert_offsets=expert_offsets,
     )
-    assert state.sorted_token_ids is None
+    assert state.sorted_token_ids is not None
     assert state.token_indices_identity is False
 
-    original_sorter = sonic_backward_module.moe_ragged_sorting_flydsl
-    sort_calls = 0
-
-    def _counted_sort(*args, **kwargs):
-        nonlocal sort_calls
-        sort_calls += 1
-        return original_sorter(*args, **kwargs)
+    def _unexpected_sort(*_args, **_kwargs):
+        raise AssertionError("retained small E16 backward must reuse metadata")
 
     monkeypatch.setattr(
         sonic_backward_module,
         "moe_ragged_sorting_flydsl",
-        _counted_sort,
+        _unexpected_sort,
     )
     actual = sonic_moe_backward_routes(
         x,
@@ -4258,7 +4733,6 @@ def test_sonic_moe_backward_small_e16_nonidentity_state_recomputes_safely(
     )
     torch.cuda.synchronize(device)
 
-    assert sort_calls == 1
     for actual_gradient, expected_gradient in zip(actual, expected):
         torch.testing.assert_close(
             actual_gradient.float(),

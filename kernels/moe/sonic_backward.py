@@ -75,6 +75,11 @@ from kernels.moe.sonic_grouped_tn import (
     zero_inactive_weight_grads_flydsl,
     zero_weight_grads_adaptive_flydsl,
 )
+from kernels.moe.sonic_dynamic_policy import (
+    E16RoutePolicy,
+    e16_route_policy_representative,
+    select_e16_route_policy,
+)
 
 if TYPE_CHECKING:
     from kernels.moe.sonic import SonicMoEConfig
@@ -175,13 +180,9 @@ _GROUPED_DW2_SPARSE_EXPERTS = 32
 _E16_FIXED_STATE_GROUPED_SHAPE = (8192, 2048, 768, 16, 1)
 
 # Flat Qwen3-30B-A3B routing has a dynamic local route count after EP
-# all-to-all.  Retained-state calls use the same device queues for every R;
-# the historical R8192 bucket remains enabled for standalone compatibility.
+# all-to-all.  Both retained-state and standalone calls use the same bounded
+# device queues for every non-empty R.
 _E16_FLAT_GROUPED_SHAPE = (2048, 768, 16)
-_E16_LEGACY_STANDALONE_ROUTES = 8192
-_E16_FLAT_GROUPED_MIN_ROUTES = 64
-_E16_EP8_PRODUCTION_MIN_ROUTES = 8000
-_E16_EP8_PRODUCTION_MAX_ROUTES = 9000
 _E16_EXACT_BM = 128
 _E16_EXACT_BK = 64
 _E16_EXACT_DA_BN = 192
@@ -193,7 +194,6 @@ _E16_DIRECT_DA_RHS_ENABLED = True
 # hot expert.  Both contractions share the same BM128 exact-tile queue.
 _E16_EXACT_DX_BN = 128
 _E16_EXACT_N_WAVES = 4
-_E16_EXACT_DX_FULL_GRID_MIN_ROUTES = 65536
 _E16_FLAT_SEGMENTED_DX_GRID_CAP = 1024
 # A hot E16 shard exposes only 24 output tiles with the default 256x256 dW2
 # profile.  The 128x128 profile raises that to 96 tiles and is materially
@@ -214,13 +214,16 @@ _E16_DW2_HOT_EXPERT_MIN_ROWS = 1408
 # experts remains device-side.
 _E16_DW2_HOT_EXPERT_ROUTE_FRACTION_NUMERATOR = 11
 _E16_DW2_HOT_EXPERT_ROUTE_FRACTION_DENOMINATOR = 64
+# Quantize runtime row cutoffs to the exact-queue M tile.  The numeric cutoff
+# is already a runtime scalar (and therefore not a JIT key); quantization also
+# prevents tiny rank-to-rank R differences from reclassifying experts whose
+# workloads are otherwise identical at GEMM-tile granularity.
+_E16_DW2_HOT_EXPERT_ROW_QUANTUM = 128
 # dW2 consumes the same hot descriptors before dW1 and reuses the leading
 # portion of dW1's larger FP32 partial workspace on the same stream.  The
-# smaller dW2 contraction crosses over later than dW1.  Requiring 64K total
-# routes keeps the long-tail case's hot half large enough to benefit too and
-# avoids a new dynamic-shape cliff for 16K--32K batches.
+# smaller dW2 contraction crosses over later than dW1, so only the rank-shared
+# XLARGE policy enables its companion split.
 _E16_DW2_SPLITK_ENABLED = True
-_E16_DW2_SPLIT_MIN_ROUTES = 65536
 _E16_DW2_SPLIT_BM = 256
 _E16_DW2_SPLIT_BN = 256
 _E16_DW2_SPLIT_BK = 64
@@ -234,9 +237,8 @@ _E16_DW2_SPLIT_STAGES = 2
 # guards, so this selection never reads the count on the host.
 _E16_DW1_NARROW_MAX_ACTIVE_EXPERTS = 2
 _E16_DW1_SPLITK_ENABLED = True
-# Keep split-queue setup off the latency-sensitive <=16K route buckets even
-# when the per-expert crossover is tuned below that host-known route count.
-_E16_DW1_SPLIT_MIN_ROUTES = 16384
+# Keep split-queue setup off the latency-sensitive SMALL/MEDIUM policy classes
+# even when the per-expert crossover is tuned below their representative size.
 _E16_DW1_SPLIT_ROWS = 8192
 # One 8192-row partition has no parallelism benefit.  Start immediately above
 # that boundary so the 10K--12K experts in a large skewed EP shard split into
@@ -248,11 +250,22 @@ _E16_DW1_SPLIT_BK = 32
 _E16_DW1_SPLIT_M_WAVES = 2
 _E16_DW1_SPLIT_N_WAVES = 4
 _E16_DW1_SPLIT_STAGES = 2
+# Finite per-policy scratch ceilings prevent unbounded split metadata.  Actual
+# allocations are tightened from the local R, so a shared larger policy does
+# not inflate short ranks.  LARGE never exceeds 32K after automatic promotion;
+# XLARGE is open ended and adapts its runtime split length while retaining one
+# bounded descriptor ABI.
+_E16_DW1_LARGE_SPLIT_CAPACITY = 8
+_E16_DW1_XLARGE_SPLIT_CAPACITY = 32
+_E16_DW1_SPLIT_ROW_QUANTUM = 128
 # dW1 and dX are independent after the retained-state derivative has produced
 # dZ.  Large expert-major shards can overlap them profitably; smaller shards
 # keep the serial path because the two-event fork/join cost is not amortized.
-_E16_DW_DX_OVERLAP_ENABLED = True
-_E16_DW_DX_OVERLAP_MIN_ROUTES = 65536
+# Auxiliary-stream overlap made isolated large-R kernels faster, but exposed
+# more NCCL on real EP training and amplified rank arrival skew.  Keep the
+# implementation available for explicit experiments while the stable dynamic
+# policy defaults to one stream on every capacity class.
+_E16_DW_DX_OVERLAP_ENABLED = False
 
 _RoutesSorterMetadata = tuple[
     torch.Tensor,  # sorted_token_ids
@@ -265,31 +278,25 @@ _RoutesSorterMetadata = tuple[
 ]
 
 
-def _is_e16_ep8_production_routes(routes: int) -> bool:
-    """Return whether ``routes`` is in the measured per-rank training band."""
-
-    return _E16_EP8_PRODUCTION_MIN_ROUTES <= routes <= _E16_EP8_PRODUCTION_MAX_ROUTES
-
-
 def _use_e16_dw1_dual_profile(
     *,
     direct_rhs: bool,
     e16_flat_grouped: bool,
     metadata_direct: bool,
-    max_expert_rows: int,
+    route_policy: E16RoutePolicy,
 ) -> bool:
     """Select device-guarded narrow/dense direct-dW1 profiles.
 
-    The measured EP8 production band uses one BN128 launch on every rank; the
-    sparse guard's extra launch was neutral or slower there and amplified
-    arrival-time variance before the next collective.
+    The medium capacity class uses one minimax BN128 launch to reduce launch
+    pressure.  Every rank can select that class through the same scheduling
+    hint; the decision never depends on its exact local route count.
     """
 
     return (
         direct_rhs
         and e16_flat_grouped
         and not metadata_direct
-        and not _is_e16_ep8_production_routes(max_expert_rows)
+        and route_policy != E16RoutePolicy.MEDIUM
     )
 
 
@@ -300,7 +307,7 @@ def _use_e16_dw_dx_overlap(
     flat_identity_dx: bool,
     use_grouped_dw1: bool,
     use_grouped_dx: bool,
-    routes: int,
+    route_policy: E16RoutePolicy,
 ) -> bool:
     """Select the audited large-route dW1/dX stream overlap."""
 
@@ -311,7 +318,7 @@ def _use_e16_dw_dx_overlap(
         and flat_identity_dx
         and use_grouped_dw1
         and use_grouped_dx
-        and routes >= _E16_DW_DX_OVERLAP_MIN_ROUTES
+        and route_policy == E16RoutePolicy.XLARGE
     )
 
 
@@ -353,7 +360,7 @@ def _use_e16_flat_grouped_backward(
     has_bias: bool,
     reuse_forward_preactivation: bool = False,
 ) -> bool:
-    """Select dynamic retained E16 flat routing or the legacy R8192 path."""
+    """Select the dynamic E16 grouped path for every non-empty route list."""
 
     return (
         flat_routes
@@ -362,11 +369,7 @@ def _use_e16_flat_grouped_backward(
         and activation == "swiglu"
         and (hidden_size, intermediate_size, num_experts)
         == _E16_FLAT_GROUPED_SHAPE
-        and routes >= _E16_FLAT_GROUPED_MIN_ROUTES
-        and (
-            reuse_forward_preactivation
-            or routes == _E16_LEGACY_STANDALONE_ROUTES
-        )
+        and routes > 0
     )
 
 
@@ -431,6 +434,102 @@ def _grouped_dw2_stages(max_expert_rows: int) -> int:
     return 3 if max_expert_rows >= _GROUPED_DW2_PIPELINE_THRESHOLD else 2
 
 
+def _e16_dw2_hot_profile_min_rows(routes: int) -> int:
+    """Return a tile-quantized device row cutoff for the hot dW2 profile."""
+
+    scaled = (
+        routes * _E16_DW2_HOT_EXPERT_ROUTE_FRACTION_NUMERATOR
+        + _E16_DW2_HOT_EXPERT_ROUTE_FRACTION_DENOMINATOR
+        - 1
+    ) // _E16_DW2_HOT_EXPERT_ROUTE_FRACTION_DENOMINATOR
+    cutoff = max(_E16_DW2_HOT_EXPERT_MIN_ROWS, scaled)
+    quantum = _E16_DW2_HOT_EXPERT_ROW_QUANTUM
+    return ((cutoff + quantum - 1) // quantum) * quantum
+
+
+def _e16_hot_split_schedule(
+    routes: int,
+    num_experts: int,
+    route_policy: E16RoutePolicy,
+) -> tuple[int, int, int]:
+    """Return an actual-R capacity plus runtime split/hot row thresholds.
+
+    LARGE and XLARGE provide finite *upper* bounds of eight and 32 descriptors
+    respectively.  First choose a quantized partition length which is safe for
+    that policy, then tighten the allocation to the descriptor count provable
+    from this invocation's real route count.  A one-record minimum preserves
+    the same split/finalize launch topology when no expert can cross the hot
+    threshold, without reserving a policy-sized FP32 partial tensor.
+
+    For the open-ended XLARGE family, increase the runtime K partition length
+    just enough that all legal expert distributions fit the finite descriptor
+    bound.  The 128-row quantization prevents insignificant R jitter from
+    changing the scalar while preserving substantially more hot-expert
+    parallelism than a coarse power-of-two split length.
+    """
+
+    if route_policy == E16RoutePolicy.LARGE:
+        policy_capacity = _E16_DW1_LARGE_SPLIT_CAPACITY
+    elif route_policy == E16RoutePolicy.XLARGE:
+        policy_capacity = _E16_DW1_XLARGE_SPLIT_CAPACITY
+    else:
+        raise ValueError("hot split scheduling requires LARGE or XLARGE policy")
+
+    quantum = _E16_DW1_SPLIT_ROW_QUANTUM
+    minimum_units = (_E16_DW1_SPLIT_ROWS + quantum - 1) // quantum
+
+    def thresholds_for(units: int) -> tuple[int, int]:
+        split_rows = units * quantum
+        min_hot_rows = split_rows + 1
+        if route_policy == E16RoutePolicy.XLARGE:
+            # dW2 has a materially later split crossover than dW1.  XLARGE
+            # reuses one queue/scratch buffer for both gradients, so admit only
+            # experts which clear dW2's load-scaled threshold.  This keeps a
+            # balanced 134K shard on the regular grouped kernels while hot1,
+            # hot4, and long-tail shards retain split parallelism.
+            min_hot_rows = max(
+                min_hot_rows,
+                _e16_dw2_hot_profile_min_rows(routes),
+            )
+        return split_rows, min_hot_rows
+
+    def required_for(units: int) -> int:
+        split_rows, min_hot_rows = thresholds_for(units)
+        return hot_split_descriptor_capacity(
+            routes,
+            num_experts,
+            split_rows,
+            min_hot_rows,
+        )
+
+    if required_for(minimum_units) <= policy_capacity:
+        split_units = minimum_units
+    else:
+        low = minimum_units + 1
+        high = max(low, (routes + quantum - 1) // quantum)
+        while low < high:
+            middle = (low + high) // 2
+            if required_for(middle) <= policy_capacity:
+                high = middle
+            else:
+                low = middle + 1
+        split_units = low
+
+    split_rows, min_hot_rows = thresholds_for(split_units)
+    required = hot_split_descriptor_capacity(
+        routes,
+        num_experts,
+        split_rows,
+        min_hot_rows,
+    )
+    if required > policy_capacity:
+        raise RuntimeError(
+            "bounded E16 split schedule under-sized its descriptor storage: "
+            f"required={required}, capacity={policy_capacity}"
+        )
+    return max(1, required), split_rows, min_hot_rows
+
+
 def _use_e16_dw2_dual_profile(
     *,
     use_hostless_grouped: bool,
@@ -438,12 +537,12 @@ def _use_e16_dw2_dual_profile(
     num_experts: int,
     hidden_size: int,
     intermediate_size: int,
-    max_expert_rows: int,
+    route_policy: E16RoutePolicy,
 ) -> bool:
     """Select the device-guarded E16 small/wide dW2 profile pair.
 
-    The measured EP8 production band uses one 256x256 launch on every rank.
-    Its second guarded launch was empty or slower for the observed loads.
+    The medium capacity class uses one 256x256 minimax launch on every rank.
+    Other classes retain device-guarded sparse/hot and wide profiles.
     """
 
     return (
@@ -452,7 +551,7 @@ def _use_e16_dw2_dual_profile(
         and num_experts == 16
         and hidden_size == 2048
         and intermediate_size == 768
-        and not _is_e16_ep8_production_routes(max_expert_rows)
+        and route_policy != E16RoutePolicy.MEDIUM
     )
 
 
@@ -468,6 +567,7 @@ def _launch_grouped_dw2(
     use_hostless_grouped: bool,
     use_tn_metadata_direct: bool,
     max_expert_rows: int,
+    route_policy: E16RoutePolicy,
     hidden_size: int,
     intermediate_size: int,
     active_experts: int,
@@ -478,8 +578,41 @@ def _launch_grouped_dw2(
         torch.Tensor,
     ]
     | None = None,
+    hot_split_min_rows: int | None = None,
 ) -> None:
     """Launch the tuned grouped dW2 profiles after dy becomes available."""
+
+    use_e16_policy_geometry = (
+        use_hostless_grouped
+        and not use_tn_metadata_direct
+        and int(expert_frequency.numel()) == 16
+        and hidden_size == 2048
+        and intermediate_size == 768
+    )
+    use_e16_short_metadata_geometry = (
+        use_hostless_grouped
+        and use_tn_metadata_direct
+        and int(expert_frequency.numel()) == 16
+        and hidden_size == 2048
+        and intermediate_size == 768
+    )
+    profile_rows = (
+        e16_route_policy_representative(route_policy)
+        if use_e16_policy_geometry
+        else max_expert_rows
+    )
+    if hot_split_state is None:
+        if hot_split_min_rows is not None:
+            raise ValueError("hot_split_min_rows requires hot_split_state")
+        split_min_rows = _E16_DW1_SPLIT_MIN_HOT_ROWS
+    else:
+        split_min_rows = (
+            _E16_DW1_SPLIT_MIN_HOT_ROWS
+            if hot_split_min_rows is None
+            else hot_split_min_rows
+        )
+        if split_min_rows <= 0:
+            raise ValueError("hot_split_min_rows must be positive")
 
     if _use_e16_dw2_dual_profile(
         use_hostless_grouped=use_hostless_grouped,
@@ -487,28 +620,24 @@ def _launch_grouped_dw2(
         num_experts=int(expert_frequency.numel()),
         hidden_size=hidden_size,
         intermediate_size=intermediate_size,
-        max_expert_rows=max_expert_rows,
+        route_policy=route_policy,
     ):
         # The split-K companion already owns every expert above its boundary.
         # Clamp the regular-profile crossover to that boundary so lowering the
         # small-tile threshold for normal batches cannot retile split-K's cold
         # complement at R65536 and above.
-        load_scaled_hot_rows = max(
-            _E16_DW2_HOT_EXPERT_MIN_ROWS,
-            (
-                max_expert_rows * _E16_DW2_HOT_EXPERT_ROUTE_FRACTION_NUMERATOR
-                + _E16_DW2_HOT_EXPERT_ROUTE_FRACTION_DENOMINATOR
-                - 1
-            )
-            // _E16_DW2_HOT_EXPERT_ROUTE_FRACTION_DENOMINATOR,
-        )
+        # The cutoff is a runtime scalar consumed by device guards, but derive
+        # its value from the finite policy representative.  Ranks sharing one
+        # policy therefore keep the same device-side profile boundary even
+        # when their exact local route counts differ.
+        load_scaled_hot_rows = _e16_dw2_hot_profile_min_rows(profile_rows)
         hot_profile_min_rows = (
-            max(load_scaled_hot_rows, _E16_DW1_SPLIT_MIN_HOT_ROWS)
+            max(load_scaled_hot_rows, split_min_rows)
             if hot_split_state is not None
             else load_scaled_hot_rows
         )
         wide_dw2 = _grouped_dw2_tuning(
-            max_expert_rows,
+            profile_rows,
             hidden_size,
             intermediate_size,
             active_experts=16,
@@ -521,7 +650,7 @@ def _launch_grouped_dw2(
                 0,
                 2,
                 2,
-                _grouped_dw2_stages(max_expert_rows),
+                _grouped_dw2_stages(profile_rows),
                 0,
                 _E16_DW2_SMALL_TILE_MAX_ACTIVE_EXPERTS,
                 hot_profile_min_rows,
@@ -530,7 +659,7 @@ def _launch_grouped_dw2(
             ),
             (
                 *wide_dw2,
-                _grouped_dw2_stages(max_expert_rows),
+                _grouped_dw2_stages(profile_rows),
                 _E16_DW2_SMALL_TILE_MAX_ACTIVE_EXPERTS + 1,
                 None,
                 0,
@@ -547,7 +676,7 @@ def _launch_grouped_dw2(
         # model has at most 32 experts.  Avoid an unconditional empty launch
         # in E16's latency-sensitive training path.
         sparse_dw2 = _grouped_dw2_tuning(
-            max_expert_rows,
+            profile_rows,
             hidden_size,
             intermediate_size,
             active_experts=_GROUPED_DW2_SPARSE_EXPERTS,
@@ -555,7 +684,7 @@ def _launch_grouped_dw2(
         grouped_dw2_profiles = (
             (
                 *sparse_dw2,
-                _grouped_dw2_stages(max_expert_rows),
+                _grouped_dw2_stages(profile_rows),
                 0,
                 None,
                 0,
@@ -567,20 +696,20 @@ def _launch_grouped_dw2(
         # The queue count is already produced by compact W1.  Launch disjoint
         # sparse/dense profiles without a host-side active-count readback.
         sparse_dw2 = _grouped_dw2_tuning(
-            max_expert_rows,
+            profile_rows,
             hidden_size,
             intermediate_size,
             active_experts=_GROUPED_DW2_SPARSE_EXPERTS,
         )
         balanced_dw2 = _grouped_dw2_tuning(
-            min(max_expert_rows, 4),
+            min(profile_rows, 4),
             hidden_size,
             intermediate_size,
         )
         grouped_dw2_profiles = (
             (
                 *sparse_dw2,
-                _grouped_dw2_stages(max_expert_rows),
+                _grouped_dw2_stages(profile_rows),
                 0,
                 _GROUPED_DW2_SPARSE_EXPERTS,
                 0,
@@ -589,7 +718,7 @@ def _launch_grouped_dw2(
             ),
             (
                 *balanced_dw2,
-                _grouped_dw2_stages(min(max_expert_rows, 4)),
+                _grouped_dw2_stages(min(profile_rows, 4)),
                 _GROUPED_DW2_SPARSE_EXPERTS + 1,
                 None,
                 0,
@@ -601,12 +730,16 @@ def _launch_grouped_dw2(
         grouped_dw2_profiles = (
             (
                 *_grouped_dw2_tuning(
-                    max_expert_rows,
+                    profile_rows,
                     hidden_size,
                     intermediate_size,
                     active_experts=active_experts,
                 ),
-                _grouped_dw2_stages(max_expert_rows),
+                (
+                    2
+                    if use_e16_short_metadata_geometry
+                    else _grouped_dw2_stages(profile_rows)
+                ),
                 0,
                 None,
                 0,
@@ -643,7 +776,7 @@ def _launch_grouped_dw2(
         effective_min_profile_rows = min_profile_rows
         effective_active_guard = active_guard_or_expert_rows
         if hot_split_state is not None:
-            cold_max_rows = _E16_DW1_SPLIT_MIN_HOT_ROWS - 1
+            cold_max_rows = split_min_rows - 1
             effective_max_profile_rows = (
                 cold_max_rows
                 if max_profile_rows is None
@@ -750,12 +883,23 @@ _LARGE_GROUPED_DX_SHAPES = frozenset(
 _HOSTLESS_LARGE_STATE_SHAPES = frozenset({(4096, 3584, 512, 896, 16)})
 
 
-def _e16_exact_dx_grid(logical_grid: int, routes: int) -> int:
-    """Return the E16 exact dX launch size for a host-known route count."""
+def _e16_exact_dx_grid(logical_grid: int, grid_cap: int) -> int:
+    """Bound E16 dX to its finite persistent-grid occupancy cap."""
 
-    if routes >= _E16_EXACT_DX_FULL_GRID_MIN_ROUTES:
-        return logical_grid
-    return min(_GROUPED_DX_GRID_CAP, logical_grid)
+    return min(grid_cap, logical_grid)
+
+
+def _e16_exact_tile_launch_bound(
+    routes: int,
+    num_experts: int,
+) -> int:
+    """Return the actual-R exact-queue bound used only for launch grids."""
+
+    return exact_m_tile_queue_upper_bound(
+        routes,
+        num_experts,
+        _E16_EXACT_BM,
+    )
 
 
 def _grouped_da_hostless_profiles(
@@ -829,15 +973,13 @@ _E16_INACTIVE_WEIGHT_GRAD_ZERO_BLOCKS_PER_EXPERT = 16
 # cover latency without launching tens of thousands of idle CTAs for sparse
 # hot-expert distributions.
 _HOSTLESS_ROW_GRID_CAP = 1024
-# Qwen3's expert-major E16 route path has substantially more independent row
-# work than the E896 path.  A second gfx950 wave improves its long-route row
-# kernels, while keeping the original cap is safer for short and E896 shapes.
+# Qwen3's non-SMALL expert-major E16 families have substantially more
+# independent row work than the E896 path.  A second gfx950 wave is only an
+# occupancy cap: every launch first takes the minimum with an actual-R work
+# bound, and every row kernel reads its device-produced live extent.  SMALL
+# keeps the measured one-wave cap; a rank-shared policy makes this finite
+# tuning choice consistent across EP ranks.
 _E16_EXACT_ROW_GRID_CAP = 2048
-# Keep every observed Qwen3 EP8 local route count on the same row-kernel grid.
-# The production interval is 8K--9K; splitting it at 8191 made otherwise
-# similar ranks launch different amounts of row work immediately before the
-# next collective.
-_E16_EXACT_ROW_GRID_MIN_ROUTES = _E16_EP8_PRODUCTION_MIN_ROUTES
 
 
 def _inactive_weight_grad_zero_blocks_per_expert(
@@ -852,10 +994,14 @@ def _inactive_weight_grad_zero_blocks_per_expert(
     return 1
 
 
-def _hostless_row_grid_cap(*, use_e16_expert_major: bool, routes: int) -> int:
+def _hostless_row_grid_cap(
+    *,
+    use_e16_expert_major: bool,
+    route_policy: E16RoutePolicy = E16RoutePolicy.SMALL,
+) -> int:
     """Return the row-kernel grid cap for the audited hostless dataflow."""
 
-    if use_e16_expert_major and routes >= _E16_EXACT_ROW_GRID_MIN_ROUTES:
+    if use_e16_expert_major and route_policy != E16RoutePolicy.SMALL:
         return _E16_EXACT_ROW_GRID_CAP
     return _HOSTLESS_ROW_GRID_CAP
 
@@ -983,6 +1129,36 @@ def _use_compact_w1_descriptor_queue(
         tokens >= _COMPACT_W1_MIN_TOKENS
         and hidden_size % (_COMPACT_W1_K_WAVE * _COMPACT_W1_BK) == 0
         and intermediate_size % _COMPACT_W1_BN == 0
+    )
+
+
+def _use_standalone_e16_tn_metadata_direct(
+    *,
+    e16_flat_grouped: bool,
+    reuse_forward_preactivation: bool,
+    use_hostless_grouped: bool,
+    use_grouped_dw1: bool,
+    use_grouped_dw2: bool,
+    sort_unit: int,
+    routes: int,
+) -> bool:
+    """Use sorter blocks directly while every expert owns at most one.
+
+    ``routes <= sort_unit`` is a distribution-independent proof of the
+    one-block-per-expert contract required by grouped TN's metadata ABI.  This
+    remains valid at the inclusive boundary even though the independent W1
+    recompute policy starts using its compact descriptor queue there.  The
+    result is one finite short-route family, never a specialization on exact
+    ``routes``.
+    """
+
+    return (
+        e16_flat_grouped
+        and not reuse_forward_preactivation
+        and use_hostless_grouped
+        and (use_grouped_dw1 or use_grouped_dw2)
+        and sort_unit == _BACKWARD_SORT_UNIT
+        and 0 < routes <= sort_unit
     )
 
 
@@ -1194,18 +1370,23 @@ def _use_fused_da_dscore(
     """Select the first gfx950 unscaled-dA/route-score fusion rollout.
 
     The fused dataflow uses retained forward state plus an exact-row descriptor
-    schedule.  Short shapes reuse the BM16 compact W1/dX queue; the production
-    T4096 shape reuses its independently tuned BM64 dX queue.  ``dy`` initially
-    carries the exact gathered A16 output gradient, grouped dA computes
-    ``q = dout @ W2``, and one row kernel subsequently forms dA's score
-    scaling, dscore, and the scaled dW2 input.  Bias, ragged routes, legacy
-    host dispatch, and non-SwiGLU/dtype contracts retain the projection-
-    recompute implementation.
+    schedule.  Short fixed-K shapes reuse the BM16 compact W1/dX queue, E16
+    flat routes use their exact BM128 queue at every non-empty R, and the
+    production T4096 shape reuses its independently tuned BM64 dX queue.
+    ``dy`` initially carries the exact gathered A16 output gradient, grouped
+    dA computes ``q = dout @ W2``, and one row kernel subsequently forms dA's
+    score scaling, dscore, and the scaled dW2 input.  Bias, legacy host
+    dispatch, and non-SwiGLU/dtype contracts retain the projection-recompute
+    implementation.
     """
 
     return (
         reuse_forward_preactivation
-        and ((use_hostless_grouped and use_compact_w1) or use_large_grouped_dx)
+        and (
+            (use_hostless_grouped and use_compact_w1)
+            or use_large_grouped_dx
+            or e16_flat_grouped
+        )
         and (not flat_routes or e16_flat_grouped)
         and not has_bias
         and compute_dtype == "bf16"
@@ -3390,7 +3571,6 @@ def _compile_ragged_dx_reduction(hidden_size: int, compute_dtype: str, device_in
 @functools.lru_cache(maxsize=16)
 def _compile_flat_segmented_dx_reduction(
     hidden_size: int,
-    routes: int,
     compute_dtype: str,
     device_index: int,
 ):
@@ -3411,12 +3591,13 @@ def _compile_flat_segmented_dx_reduction(
             "flat segmented dX requires hidden_size to be a positive multiple "
             f"of {_BLOCK_THREADS * 8}"
         )
-    if routes <= 0:
-        raise ValueError("flat segmented dX requires a positive compile-time route bound")
-
     dwords_per_row = hidden_size // 2
     vectors_per_thread = hidden_size // (_BLOCK_THREADS * 8)
-    lower_bound_steps = max(1, routes.bit_length())
+    # R is a runtime extent and must not create a JIT specialization for every
+    # EP shard.  Signed-i32 route validation gives one fixed, sufficient trip
+    # count for all legal dynamic shapes; predicates suppress iterations after
+    # each lower bound converges.
+    lower_bound_steps = _MAX_SIGNED_I32.bit_length()
 
     @flyc.kernel(known_block_size=[_BLOCK_THREADS, 1, 1])
     def segmented_reduce_kernel(
@@ -3836,6 +4017,7 @@ def _validate_routes_forward_state(
     torch.cuda.Event,
     _RoutesSorterMetadata | None,
     bool,
+    int | None,
 ]:
     """Validate retained route-order state for dynamic E16 flat routing."""
 
@@ -3901,7 +4083,7 @@ def _validate_routes_forward_state(
 
     if (
         tokens != routes
-        or routes <= 0
+        or routes < 0
         or (
             int(config.hidden_size),
             int(config.intermediate_size),
@@ -4089,12 +4271,20 @@ def _validate_routes_forward_state(
             f"{type(token_indices_identity).__name__}"
         )
 
+    # New state producers carry a rank-shared performance-policy size.  It is
+    # deliberately optional so states produced before this field existed keep
+    # selecting from their local runtime R.  Validation is delegated to the
+    # common finite-policy mapper; the value is never an allocation bound.
+    route_policy_size = getattr(forward_state, "route_policy_size", None)
+    select_e16_route_policy(routes, route_policy_size)
+
     return (
         preactivation,
         producer_stream,
         ready_event,
         sorter_metadata,
         token_indices_identity,
+        route_policy_size,
     )
 
 
@@ -4163,8 +4353,12 @@ def _validate_backward_route_inputs(
         expected["b2"] = (num_experts, hidden_size)
         tensors["b1"] = b1
         tensors["b2"] = b2
-    if tokens <= 0:
-        raise ValueError(f"hidden_states must be non-empty 2D, got shape {tuple(hidden_states.shape)}")
+    if tokens < 0 or (tokens == 0 and routes != 0):
+        raise ValueError(
+            "hidden_states must be a 2D tensor with at least one row when "
+            f"routes are non-empty, got shape {tuple(hidden_states.shape)} "
+            f"and routes={routes}"
+        )
     if tokens > _TOKEN_MASK:
         raise ValueError(f"token count must fit the sorter's 24-bit token field, got {tokens}")
     if routes > _MAX_SIGNED_I32:
@@ -4174,8 +4368,11 @@ def _validate_backward_route_inputs(
         raise ValueError(f"padded route count exceeds the signed 32-bit limit, got {max_padded}")
     if max_padded * max(hidden_size, projection_size) * 2 > _MAX_BUFFER_BYTE_OFFSET:
         raise ValueError("ragged backward workspace exceeds the 32-bit buffer offset limit")
-    if tokens * hidden_size > _MAX_SIGNED_I32 or tokens * hidden_size * 4 > _MAX_BUFFER_BYTE_OFFSET:
-        raise ValueError("ragged backward FP32 input-gradient workspace exceeds the 32-bit buffer offset limit")
+    _validate_backward_dx_extent(
+        tokens,
+        hidden_size,
+        requires_fp32_accum=False,
+    )
     for name, tensor in tensors.items():
         if tuple(tensor.shape) != expected[name]:
             raise ValueError(f"{name} must have shape {expected[name]}, got {tuple(tensor.shape)}")
@@ -4198,6 +4395,36 @@ def _validate_backward_route_inputs(
     if hidden_size % 64 != 0 or intermediate_size % 64 != 0:
         raise ValueError("hidden_size and intermediate_size must be multiples of 64")
     return tokens, hidden_size, intermediate_size, num_experts, routes
+
+
+def _validate_backward_dx_extent(
+    tokens: int,
+    hidden_size: int,
+    *,
+    requires_fp32_accum: bool,
+) -> None:
+    """Validate only the dX buffers that a selected route path allocates.
+
+    Every backward path owns a 16-bit token-major ``dx`` tensor.  Only the
+    generic flat-route scatter additionally owns an FP32 accumulation tensor;
+    retained identity and sorted segmented routes write/reduce in route order
+    and must not inherit that stricter, unused allocation limit.
+    """
+
+    elements = tokens * hidden_size
+    if (
+        elements > _MAX_SIGNED_I32
+        or elements * 2 > _MAX_BUFFER_BYTE_OFFSET
+    ):
+        raise ValueError(
+            "ragged backward 16-bit input-gradient buffer exceeds the "
+            "32-bit buffer offset limit"
+        )
+    if requires_fp32_accum and elements * 4 > _MAX_BUFFER_BYTE_OFFSET:
+        raise ValueError(
+            "ragged backward FP32 input-gradient workspace exceeds the "
+            "32-bit buffer offset limit"
+        )
 
 
 def _ptr(tensor: torch.Tensor):
@@ -4282,12 +4509,14 @@ def _sonic_moe_backward_impl(
     forward_sorter_metadata: _RoutesSorterMetadata | None = None,
     token_indices_sorted: bool = False,
     token_indices_identity: bool = False,
+    route_policy_size: int | None = None,
 ) -> tuple[torch.Tensor, ...]:
     """Shared sorted-expert implementation for fixed-K and flat routes."""
 
     tokens, hidden_size, intermediate_size, num_experts = dimensions
     flat_routes = token_indices is not None
     routes = int(route_weights.numel())
+    route_policy = select_e16_route_policy(routes, route_policy_size)
     topk = int(config.top_k)
     compute_dtype = str(config.compute_dtype)
     activation_name = str(config.activation)
@@ -4341,6 +4570,12 @@ def _sonic_moe_backward_impl(
         token_indices_sorted=(token_indices_sorted and not use_flat_identity_dx),
     )
     use_flat_route_order_dx = use_flat_identity_dx or use_flat_segmented_dx
+    if flat_routes and not use_flat_route_order_dx:
+        _validate_backward_dx_extent(
+            tokens,
+            hidden_size,
+            requires_fp32_accum=True,
+        )
     use_e16_deduplicated_metadata = _use_e16_flat_deduplicated_metadata(
         e16_flat_grouped=use_e16_flat_grouped,
         reuse_forward_preactivation=reuse_forward_preactivation,
@@ -4447,9 +4682,20 @@ def _sonic_moe_backward_impl(
         e16_fixed_state_grouped=use_e16_fixed_state_grouped,
         e16_flat_grouped=use_e16_flat_grouped,
     )
+    use_standalone_e16_tn_metadata_direct = (
+        _use_standalone_e16_tn_metadata_direct(
+            e16_flat_grouped=use_e16_flat_grouped,
+            reuse_forward_preactivation=reuse_forward_preactivation,
+            use_hostless_grouped=use_hostless_grouped,
+            use_grouped_dw1=use_grouped_dw1,
+            use_grouped_dw2=use_grouped_dw2,
+            sort_unit=sort_unit,
+            routes=routes,
+        )
+    )
     hostless_row_grid_cap = _hostless_row_grid_cap(
         use_e16_expert_major=(use_hostless_grouped and use_flat_identity_dx),
-        routes=routes,
+        route_policy=route_policy,
     )
     use_sorter_native_backward_metadata = _use_sorter_native_backward_metadata(
         flat_routes=flat_routes,
@@ -4486,7 +4732,11 @@ def _sonic_moe_backward_impl(
     use_fused_forward_state_prepare = (
         reuse_forward_preactivation
         and not has_bias
-        and ((use_hostless_grouped and use_compact_w1) or use_large_grouped_dx)
+        and (
+            (use_hostless_grouped and use_compact_w1)
+            or use_large_grouped_dx
+            or use_e16_flat_grouped
+        )
     )
     use_direct_grouped_dw1_rhs = _use_direct_grouped_dw1_rhs(
         reuse_forward_preactivation=reuse_forward_preactivation,
@@ -4532,18 +4782,21 @@ def _sonic_moe_backward_impl(
         and forward_sorter_metadata is not None
         and use_direct_grouped_dw1_rhs
         and use_e16_deduplicated_metadata
-        and routes > _E16_DW1_SPLIT_MIN_ROUTES
+        and route_policy >= E16RoutePolicy.LARGE
     )
     use_e16_hot_dw2_splitk = (
         _E16_DW2_SPLITK_ENABLED
         and use_e16_hot_dw1_splitk
-        and routes >= _E16_DW2_SPLIT_MIN_ROUTES
+        and route_policy == E16RoutePolicy.XLARGE
     )
-    # If even the maximum possible active set falls below the measured
-    # selective-clear crossover, a normal dense memset is unconditionally the
-    # best choice.  This route-count test is host-known and distribution
-    # independent; all ambiguous hostless cases select on device later.
-    hostless_dense_weight_zero = use_hostless_grouped and routes * _INACTIVE_WEIGHT_GRAD_ZERO_ACTIVE_RATIO < num_experts
+    # Generic hostless shapes retain the latency-optimal eager memset for tiny
+    # batches.  Dynamic retained E16 always uses the device-adaptive zeroer so
+    # R=1/2 cannot change host launch topology or allocator initialization.
+    hostless_dense_weight_zero = (
+        use_hostless_grouped
+        and not use_e16_flat_grouped
+        and routes * _INACTIVE_WEIGHT_GRAD_ZERO_ACTIVE_RATIO < num_experts
+    )
     device = hidden_states.device
     device_index = device.index or 0
     with torch.cuda.device(device):
@@ -4612,13 +4865,20 @@ def _sonic_moe_backward_impl(
         )
         expert_frequency = torch.empty(num_experts, dtype=torch.int32, device=device)
     sorter_dummy = torch.empty(4, dtype=torch.int32, device=device)
-    active_expert_capacity = active_expert_descriptor_capacity(routes, num_experts)
+    # The retained E16 family uses one fixed queue ABI for every non-empty R.
+    # The live count remains device-produced, but storage and guarded launch
+    # bounds no longer shrink at R<num_experts.
+    active_expert_capacity = (
+        num_experts
+        if use_e16_flat_grouped
+        else active_expert_descriptor_capacity(routes, num_experts)
+    )
     # A compact descriptor builder can emit this queue in its existing two
     # launches.  Other routing regimes select metadata-direct or standalone
     # construction after the already-required frequency readback below.
     active_expert_storage = (
         torch.empty(
-            active_expert_queue_elements(routes, num_experts),
+            1 + 2 * active_expert_capacity,
             dtype=torch.int32,
             device=device,
         )
@@ -4648,19 +4908,37 @@ def _sonic_moe_backward_impl(
             dtype=torch.int32,
             device=device,
         )
+        # Queue storage and runtime launch geometry both follow the true local
+        # route count.  Exact dA/dX kernels read the live device counter and
+        # grid-stride over it; using the actual host-known bound avoids idle
+        # CTAs when a rank shares a larger compile/tuning policy with peers.
+        # This scalar controls only launch grids and never enters a JIT key.
+        exact_tile_launch_bound = (
+            _e16_exact_tile_launch_bound(routes, num_experts)
+            if use_e16_flat_grouped
+            else exact_tile_queue_bound
+        )
     else:
         exact_tile_queue_bound = 0
+        exact_tile_launch_bound = 0
         exact_tile_queue_storage = None
     if use_e16_hot_dw1_splitk:
-        split_descriptor_capacity = hot_split_descriptor_capacity(
+        (
+            split_descriptor_capacity,
+            hot_split_rows,
+            hot_split_min_rows,
+        ) = _e16_hot_split_schedule(
             routes,
             num_experts,
-            _E16_DW1_SPLIT_ROWS,
-            _E16_DW1_SPLIT_MIN_HOT_ROWS,
+            route_policy,
         )
-        hot_expert_capacity = min(
-            num_experts,
-            routes // _E16_DW1_SPLIT_MIN_HOT_ROWS,
+        # Allocate from the real route-count bound while retaining one record
+        # for a device-side no-op.  This keeps the host launch sequence stable
+        # across ranks without turning an XLARGE policy hint into hundreds of
+        # MiB of needless scratch on a short local shard.
+        hot_expert_capacity = max(
+            1,
+            min(num_experts, routes // hot_split_min_rows),
         )
         hot_split_storage = torch.empty(
             1 + 3 * split_descriptor_capacity,
@@ -4691,6 +4969,8 @@ def _sonic_moe_backward_impl(
             hot_dw2_partials = None
     else:
         split_descriptor_capacity = 0
+        hot_split_rows = 0
+        hot_split_min_rows = 0
         hot_expert_capacity = 0
         hot_split_storage = None
         hot_expert_storage = None
@@ -4741,7 +5021,7 @@ def _sonic_moe_backward_impl(
             assert exact_tile_queue_storage is not None
             state_row_schedule = exact_tile_queue_storage
             state_schedule_block_m = _E16_EXACT_BM
-            state_schedule_bound = exact_tile_queue_bound
+            state_schedule_bound = exact_tile_launch_bound
             state_schedule_exact_queue = True
         elif use_large_grouped_dx:
             assert large_dx_storage is not None
@@ -4984,12 +5264,10 @@ def _sonic_moe_backward_impl(
                     hot_expert_storage if use_e16_hot_dw1_splitk else None
                 ),
                 split_rows=(
-                    _E16_DW1_SPLIT_ROWS if use_e16_hot_dw1_splitk else None
+                    hot_split_rows if use_e16_hot_dw1_splitk else None
                 ),
                 min_hot_rows=(
-                    _E16_DW1_SPLIT_MIN_HOT_ROWS
-                    if use_e16_hot_dw1_splitk
-                    else None
+                    hot_split_min_rows if use_e16_hot_dw1_splitk else None
                 ),
                 stream=stream,
             )
@@ -5121,10 +5399,17 @@ def _sonic_moe_backward_impl(
         # shared queue above; long/non-compact regimes build it once here for
         # both weight-gradient TN contractions.
         use_tn_metadata_direct = (
-            (use_grouped_dw1 or use_grouped_dw2)
-            and active_expert_storage is None
-            and sort_unit == _BACKWARD_SORT_UNIT
-            and (routes <= sort_unit if use_hostless_grouped else max_expert_rows <= sort_unit)
+            use_standalone_e16_tn_metadata_direct
+            or (
+                (use_grouped_dw1 or use_grouped_dw2)
+                and active_expert_storage is None
+                and sort_unit == _BACKWARD_SORT_UNIT
+                and (
+                    routes <= sort_unit
+                    if use_hostless_grouped
+                    else max_expert_rows <= sort_unit
+                )
+            )
         )
         if (use_grouped_dw1 or use_grouped_dw2) and not use_tn_metadata_direct and active_expert_storage is None:
             active_expert_storage = torch.empty(
@@ -5291,6 +5576,7 @@ def _sonic_moe_backward_impl(
                 use_hostless_grouped=use_hostless_grouped,
                 use_tn_metadata_direct=use_tn_metadata_direct,
                 max_expert_rows=max_expert_rows,
+                route_policy=route_policy,
                 hidden_size=hidden_size,
                 intermediate_size=intermediate_size,
                 active_experts=len(segments),
@@ -5299,6 +5585,9 @@ def _sonic_moe_backward_impl(
                     (hot_split_storage, hot_expert_storage, hot_dw2_partials)
                     if use_e16_hot_dw2_splitk
                     else None
+                ),
+                hot_split_min_rows=(
+                    hot_split_min_rows if use_e16_hot_dw2_splitk else None
                 ),
             )
 
@@ -5316,7 +5605,7 @@ def _sonic_moe_backward_impl(
                     1,
                     min(
                         _GROUPED_DX_GRID_CAP,
-                        exact_tile_queue_bound
+                        exact_tile_launch_bound
                         * (intermediate_size // _E16_EXACT_DA_BN),
                     ),
                 )
@@ -5553,6 +5842,7 @@ def _sonic_moe_backward_impl(
                 use_hostless_grouped=use_hostless_grouped,
                 use_tn_metadata_direct=use_tn_metadata_direct,
                 max_expert_rows=max_expert_rows,
+                route_policy=route_policy,
                 hidden_size=hidden_size,
                 intermediate_size=intermediate_size,
                 active_experts=len(segments),
@@ -5561,6 +5851,9 @@ def _sonic_moe_backward_impl(
                     (hot_split_storage, hot_expert_storage, hot_dw2_partials)
                     if use_e16_hot_dw2_splitk
                     else None
+                ),
+                hot_split_min_rows=(
+                    hot_split_min_rows if use_e16_hot_dw2_splitk else None
                 ),
             )
         elif use_fused_forward_state_prepare:
@@ -5624,7 +5917,11 @@ def _sonic_moe_backward_impl(
                 grouped_dw1_m_waves,
                 grouped_dw1_n_waves,
             ) = _grouped_dw1_tuning(
-                max_expert_rows,
+                (
+                    e16_route_policy_representative(route_policy)
+                    if use_e16_flat_grouped
+                    else max_expert_rows
+                ),
                 hidden_size,
                 intermediate_size,
                 direct_rhs=use_direct_grouped_dw1_rhs,
@@ -5636,7 +5933,7 @@ def _sonic_moe_backward_impl(
                 direct_rhs=use_direct_grouped_dw1_rhs,
                 e16_flat_grouped=use_e16_flat_grouped,
                 metadata_direct=use_tn_metadata_direct,
-                max_expert_rows=max_expert_rows,
+                route_policy=route_policy,
             ):
                 grouped_dw1_profiles = (
                     (
@@ -5694,9 +5991,7 @@ def _sonic_moe_backward_impl(
                     "stream": launch_stream,
                 }
                 if use_e16_hot_dw1_splitk:
-                    grouped_dw1_kwargs["max_expert_rows"] = (
-                        _E16_DW1_SPLIT_MIN_HOT_ROWS - 1
-                    )
+                    grouped_dw1_kwargs["max_expert_rows"] = hot_split_min_rows - 1
                 if use_tn_metadata_direct:
                     grouped_tn_from_metadata_flydsl(
                         dz,
@@ -5777,7 +6072,7 @@ def _sonic_moe_backward_impl(
                         None,
                     ),
                 )
-                grouped_dx_m_tiles = exact_tile_queue_bound
+                grouped_dx_m_tiles = exact_tile_launch_bound
                 grouped_dx_compact = True
                 grouped_dx_schedule = exact_tile_queue_storage
             elif use_large_grouped_dx:
@@ -5885,7 +6180,10 @@ def _sonic_moe_backward_impl(
                 )
                 grouped_dx_grid = max(
                     1,
-                    _e16_exact_dx_grid(grouped_dx_logical_grid, routes)
+                    _e16_exact_dx_grid(
+                        grouped_dx_logical_grid,
+                        hostless_row_grid_cap,
+                    )
                     if use_e16_exact_queue
                     else min(_GROUPED_DX_GRID_CAP, grouped_dx_logical_grid),
                 )
@@ -5934,7 +6232,7 @@ def _sonic_moe_backward_impl(
             flat_identity_dx=use_flat_identity_dx,
             use_grouped_dw1=use_grouped_dw1,
             use_grouped_dx=use_grouped_dx,
-            routes=routes,
+            route_policy=route_policy,
         )
         if (
             use_e16_dw_dx_overlap
@@ -6045,7 +6343,6 @@ def _sonic_moe_backward_impl(
                 assert dx_routes is not None
                 reduce_routes = _compile_flat_segmented_dx_reduction(
                     hidden_size,
-                    1 << (routes - 1).bit_length(),
                     compute_dtype,
                     device_index,
                 )
@@ -6255,6 +6552,7 @@ def sonic_moe_backward_routes(
     forward_state: object | None = None,
     token_indices_sorted: bool = False,
     token_indices_identity: bool = False,
+    route_policy_size: int | None = None,
 ) -> tuple[torch.Tensor, ...]:
     """Differentiate SonicMoE over a flat variable-count route list.
 
@@ -6273,9 +6571,9 @@ def sonic_moe_backward_routes(
     removes both forward-projection recomputations from backward.  Newer state
     objects also carry invocation-owned sorter metadata; when all six tensors
     validate, backward reuses them and skips the ragged sorter.  Older or
-    partial states safely retain the established backward-owned sort.  Calls
-    below 64 routes conservatively recompute instead of reusing route-order
-    state because their generic short-route kernels use the BM64 metadata ABI.
+    partial states safely retain the established backward-owned sort.  Every
+    non-empty retained E16 state uses the same exact-queue dataflow, including
+    route counts below one sorter tile.
 
     Set ``token_indices_sorted=True`` only when ``token_indices`` is known to
     be nondecreasing.  The audited E16 retained-state path then uses a
@@ -6287,6 +6585,13 @@ def sonic_moe_backward_routes(
     write its final token-major result directly.  A state produced by
     ``forward_routes_training(..., token_indices_identity=True)`` carries this
     flag automatically, so callers normally do not need to repeat it.
+
+    ``route_policy_size`` optionally supplies a rank-shared tile/algorithm
+    policy floor.  It affects only finite kernel-policy classes, never tensor
+    bounds or runtime grids, and an unexpectedly larger local route count
+    promotes itself automatically.  When a retained state carries the policy
+    from forward, backward reuses it; an explicitly repeated hint must select
+    the same effective class.
 
     Token and expert ids must be in range. Value validation remains an unchecked
     hot-path precondition; the compatibility adapter validates it before launch.
@@ -6320,6 +6625,7 @@ def sonic_moe_backward_routes(
         forward_state_data = None
         forward_sorter_metadata = None
         state_token_indices_identity = False
+        select_e16_route_policy(validated[4], route_policy_size)
     else:
         (
             route_preactivation,
@@ -6327,6 +6633,7 @@ def sonic_moe_backward_routes(
             ready_event,
             forward_sorter_metadata,
             state_token_indices_identity,
+            state_route_policy_size,
         ) = _validate_routes_forward_state(
             forward_state,
             hidden_states,
@@ -6335,18 +6642,20 @@ def sonic_moe_backward_routes(
             interleaved_w1,
             b1 is not None,
         )
+        if route_policy_size is None:
+            route_policy_size = state_route_policy_size
+        elif state_route_policy_size is not None and (
+            select_e16_route_policy(validated[4], route_policy_size)
+            != select_e16_route_policy(validated[4], state_route_policy_size)
+        ):
+            raise ValueError(
+                "route_policy_size must select the same policy as forward_state"
+            )
         forward_state_data = (
             route_preactivation,
             producer_stream,
             ready_event,
         )
-        if validated[4] < _E16_FLAT_GROUPED_MIN_ROUTES:
-            # The retained route-order state is optimized for the dynamic E16
-            # grouped path.  Below one BM64 backward sort tile, the legacy
-            # flat state-preparation kernel cannot decode arbitrary route IDs;
-            # recomputing through the already-cheap generic path is safe.
-            forward_state_data = None
-            forward_sorter_metadata = None
     effective_token_indices_identity = (
         token_indices_identity or state_token_indices_identity
     )
@@ -6372,6 +6681,7 @@ def sonic_moe_backward_routes(
         forward_sorter_metadata=forward_sorter_metadata,
         token_indices_sorted=token_indices_sorted,
         token_indices_identity=effective_token_indices_identity,
+        route_policy_size=route_policy_size,
     )
 
 

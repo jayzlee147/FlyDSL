@@ -134,19 +134,20 @@ def active_expert_queue_elements(routes: int, num_experts: int) -> int:
 @functools.lru_cache(maxsize=128)
 def compile_active_expert_queue(
     num_experts: int,
-    max_metadata_blocks: int,
     device_index: int,
 ):
-    """Compile the standalone producer for the shared active-expert queue."""
+    """Compile the standalone producer for the shared active-expert queue.
+
+    Sorter metadata length is a runtime extent and must not specialize this
+    compiler cache.  The fixed lower-bound trip count covers every legal
+    signed-i32 padded-row extent; predicates stop the search once it converges.
+    """
 
     del device_index
     if num_experts <= 0:
         raise ValueError("num_experts must be positive")
-    if max_metadata_blocks <= 0:
-        raise ValueError("max_metadata_blocks must be positive")
-    if max_metadata_blocks > _MAX_SIGNED_I32 // _SORTED_BLOCK_M:
-        raise ValueError("sorter metadata exceeds signed int32 row capacity")
-    lower_bound_steps = max(1, max_metadata_blocks.bit_length())
+    max_metadata_blocks = _MAX_SIGNED_I32 // _SORTED_BLOCK_M
+    lower_bound_steps = max_metadata_blocks.bit_length()
 
     @flyc.kernel(known_block_size=[_BLOCK_THREADS, 1, 1])
     def clear_queue_count(queue_storage: fx.Tensor):
@@ -590,8 +591,6 @@ def zero_weight_grads_adaptive_flydsl(
 @functools.lru_cache(maxsize=32)
 def compile_hot_split_queues(
     num_experts: int,
-    split_rows: int,
-    min_hot_rows: int,
     device_index: int,
 ):
     """Split one active-expert queue into cold and hot split-K queues.
@@ -600,14 +599,13 @@ def compile_hot_split_queues(
     that ABI.  The split output is
     ``[count, (expert, first_row, valid_rows)*]`` and the hot-expert output is
     ``[count, (expert, first_partition, partition_count)*]``.  All routing
-    decisions remain device-side.
+    decisions remain device-side.  The split and hot thresholds are runtime
+    scalars so dynamic route counts reuse one compiled queue builder.
     """
 
     del device_index
     if num_experts <= 0 or num_experts > _BLOCK_THREADS:
         raise ValueError("hot split queue currently requires 1..256 experts")
-    if split_rows <= 0 or min_hot_rows < split_rows:
-        raise ValueError("invalid hot split row thresholds")
 
     @flyc.kernel(known_block_size=[_BLOCK_THREADS, 1, 1])
     def build(
@@ -619,6 +617,8 @@ def compile_hot_split_queues(
         i32_cold_capacity: fx.Int32,
         i32_split_capacity: fx.Int32,
         i32_hot_capacity: fx.Int32,
+        i32_split_rows: fx.Int32,
+        i32_min_hot_rows: fx.Int32,
     ):
         tid = gpu.thread_idx.x
         active_rsrc = buffer_ops.create_buffer_resource(active_queue, max_size=True)
@@ -651,10 +651,10 @@ def compile_hot_split_queues(
             frequency = fx.Int32(
                 buffer_ops.buffer_load(frequency_rsrc, expert, vec_width=1, dtype=T.i32)
             )
-            if frequency >= fx.Int32(min_hot_rows):
+            if frequency >= i32_min_hot_rows:
                 partition_count = (
-                    frequency + fx.Int32(split_rows - 1)
-                ) // fx.Int32(split_rows)
+                    frequency + i32_split_rows - fx.Int32(1)
+                ) // i32_split_rows
                 first_partition = fx.Int32(
                     atomic_add(
                         split_queue,
@@ -682,11 +682,11 @@ def compile_hot_split_queues(
                 for local_partition in range(0, partition_count, 1):
                     partition = first_partition + fx.Int32(local_partition)
                     if partition < i32_split_capacity:
-                        local_row = fx.Int32(local_partition) * fx.Int32(split_rows)
+                        local_row = fx.Int32(local_partition) * i32_split_rows
                         remaining = frequency - local_row
-                        valid_rows = (remaining < fx.Int32(split_rows)).select(
+                        valid_rows = (remaining < i32_split_rows).select(
                             remaining,
-                            fx.Int32(split_rows),
+                            i32_split_rows,
                         )
                         split_offset = fx.Int32(1) + partition * fx.Int32(3)
                         buffer_ops.buffer_store(expert, split_rsrc, split_offset)
@@ -750,6 +750,8 @@ def compile_hot_split_queues(
         i32_cold_capacity: fx.Int32,
         i32_split_capacity: fx.Int32,
         i32_hot_capacity: fx.Int32,
+        i32_split_rows: fx.Int32,
+        i32_min_hot_rows: fx.Int32,
         stream: fx.Stream = fx.Stream(None),
     ):
         build(
@@ -761,6 +763,8 @@ def compile_hot_split_queues(
             i32_cold_capacity,
             i32_split_capacity,
             i32_hot_capacity,
+            i32_split_rows,
+            i32_min_hot_rows,
         ).launch(grid=(1, 1, 1), block=(_BLOCK_THREADS, 1, 1), stream=stream)
 
     return launch
@@ -822,8 +826,6 @@ def build_hot_split_queues_flydsl(
         stream = torch.cuda.current_stream(expert_frequency.device)
     launcher = compile_hot_split_queues(
         num_experts,
-        split_rows,
-        min_hot_rows,
         expert_frequency.device.index or 0,
     )
     _run_compiled(
@@ -836,6 +838,8 @@ def build_hot_split_queues_flydsl(
         cold_capacity,
         split_capacity,
         hot_capacity,
+        split_rows,
+        min_hot_rows,
         stream,
     )
     for tensor in tensors:
@@ -2116,7 +2120,6 @@ def build_active_expert_queue_flydsl(
 
     launcher = compile_active_expert_queue(
         num_experts,
-        int(sorted_expert_ids.numel()),
         expert_frequency.device.index or 0,
     )
     _run_compiled(

@@ -17,32 +17,101 @@ Run modes in separate processes for allocator and JIT isolation.
 growable workspace's resident and transient allocation as route counts grow.
 ``--row-grid-abba`` compares 1024- and 2048-CTA hostless row-grid caps with
 paired backward-only GPU-event timings.
+
+``--jit-sequence`` keeps one operator alive while route counts cross every
+dynamic policy boundary.  It reports per-call compiler-cache deltas, cold
+wall time, steady GPU-event time, and growable-workspace capacity as JSONL.
 """
 
 from __future__ import annotations
 
 import argparse
+import gc
 import json
 import math
 import statistics
 import subprocess
 import sys
+import time
 
 import torch
 
+from kernels.moe import moe_ragged_sorting_kernel as sorting_module
+from kernels.moe import sonic as sonic_module
 from kernels.moe import sonic_backward as sonic_backward_module
+from kernels.moe import sonic_grouped_scheduler as grouped_scheduler_module
+from kernels.moe import sonic_grouped_tn as grouped_tn_module
 from kernels.moe.sonic import (
     SonicMoE,
     SonicMoEConfig,
     SonicMoEDynamicWorkspacePool,
     prepare_sonic_bf16_weights,
+    warmup_sonic_e16_training,
 )
 from kernels.moe.sonic_backward import sonic_moe_backward_routes
+from kernels.moe.sonic_dynamic_policy import (
+    E16RoutePolicy,
+    e16_route_policy_representative,
+    select_e16_route_policy,
+)
 
 
-_QWEN3_MATRIX_ROUTES = (4096, 8191, 8192, 16384, 32768, 65536)
+_QWEN3_MATRIX_ROUTES = (4096, 8192, 16384, 32768, 65536, 134000)
+_QWEN3_BOUNDARY_ROUTES = (
+    1,
+    15,
+    16,
+    63,
+    64,
+    127,
+    128,
+    4095,
+    4096,
+    4097,
+    8191,
+    8192,
+    8193,
+    16383,
+    16384,
+    16385,
+    32767,
+    32768,
+    32769,
+    65535,
+    65536,
+    65537,
+    134000,
+)
 _QWEN3_MATRIX_LOADS = ("balanced", "softmax-multinomial", "hot4")
+_QWEN3_DYNAMIC_STRESS_LOADS = (
+    "balanced",
+    "softmax-multinomial",
+    "hot1",
+    "hot2",
+    "hot4",
+    "long-tail",
+)
 _QWEN3_WORKSPACE_ROUTES = (8192, 65536, 4096, 16384)
+_QWEN3_JIT_SEQUENCE_ROUTES = (
+    1,
+    63,
+    64,
+    65,
+    4095,
+    4096,
+    4097,
+    8191,
+    8192,
+    8193,
+    8999,
+    16384,
+    16385,
+    32768,
+    32769,
+    65536,
+    65537,
+)
+_QWEN3_JIT_SEQUENCE_OUTLIER = 134000
 
 
 def _counts(routes: int, experts: int, load: str, seed: int) -> list[int]:
@@ -115,6 +184,7 @@ def _build_case(
     mode: str,
     *,
     shared_dynamic_workspace: bool = False,
+    route_policy_size: int | None = None,
 ):
     device = torch.device("cuda")
     config = _e16_config()
@@ -172,12 +242,12 @@ def _build_case(
     )
 
     def forward():
-        kwargs = {}
+        kwargs = {"route_policy_size": route_policy_size}
         if mode == "expert-major":
-            kwargs = {
-                "expert_offsets": expert_offsets,
-                "token_indices_identity": True,
-            }
+            kwargs.update(
+                expert_offsets=expert_offsets,
+                token_indices_identity=True,
+            )
         return operator.forward_routes_training(
             x,
             token_indices,
@@ -199,16 +269,21 @@ def _build_case(
             config,
             forward_state=(None if mode == "generic" else state),
             token_indices_sorted=True,
+            route_policy_size=route_policy_size,
         )
 
     return device, config, counts, x, operator, forward, backward
 
 
-def _run_qwen3_matrix(args: argparse.Namespace) -> None:
+def _run_qwen3_matrix(
+    args: argparse.Namespace,
+    routes_to_test: tuple[int, ...] = _QWEN3_MATRIX_ROUTES,
+    loads_to_test: tuple[str, ...] = _QWEN3_MATRIX_LOADS,
+) -> None:
     """Run canonical cases in isolated processes and emit one JSON row each."""
 
-    for routes in _QWEN3_MATRIX_ROUTES:
-        for load in _QWEN3_MATRIX_LOADS:
+    for routes in routes_to_test:
+        for load in loads_to_test:
             command = [
                 sys.executable,
                 __file__,
@@ -227,6 +302,10 @@ def _run_qwen3_matrix(args: argparse.Namespace) -> None:
             ]
             if args.shared_dynamic_workspace:
                 command.append("--shared-dynamic-workspace")
+            if args.route_policy_size is not None:
+                command.extend(
+                    ("--route-policy-size", str(args.route_policy_size))
+                )
             completed = subprocess.run(
                 command,
                 check=True,
@@ -293,6 +372,7 @@ def _run_row_grid_abba_case(args: argparse.Namespace) -> None:
         args.load,
         args.seed,
         args.mode,
+        route_policy_size=args.route_policy_size,
     )
     _, state = forward()
     original_cap = sonic_backward_module._E16_EXACT_ROW_GRID_CAP
@@ -352,6 +432,14 @@ def _run_row_grid_abba_case(args: argparse.Namespace) -> None:
         sonic_backward_module._E16_EXACT_ROW_GRID_CAP = original_cap
 
     assert last_gradients is not None and last_gradients[0].shape == x.shape
+    route_policy = select_e16_route_policy(
+        args.routes,
+        args.route_policy_size,
+    )
+    uses_policy_row_grid = (
+        args.mode == "expert-major"
+        and route_policy != E16RoutePolicy.SMALL
+    )
     median_speedup = _median(pairwise_speedup_pct)
     cycle_speedup_pct = []
     for index in range(0, len(baseline_pair_ms) - 1, 2):
@@ -363,16 +451,14 @@ def _run_row_grid_abba_case(args: argparse.Namespace) -> None:
         "baseline_cap": baseline_cap,
         "baseline_effective_cap": (
             baseline_cap
-            if args.mode == "expert-major"
-            and args.routes >= sonic_backward_module._E16_EXACT_ROW_GRID_MIN_ROUTES
+            if uses_policy_row_grid
             else sonic_backward_module._HOSTLESS_ROW_GRID_CAP
         ),
         "baseline_ms_median": _median(baseline_pair_ms),
         "candidate_cap": candidate_cap,
         "candidate_effective_cap": (
             candidate_cap
-            if args.mode == "expert-major"
-            and args.routes >= sonic_backward_module._E16_EXACT_ROW_GRID_MIN_ROUTES
+            if uses_policy_row_grid
             else sonic_backward_module._HOSTLESS_ROW_GRID_CAP
         ),
         "candidate_ms_median": _median(candidate_pair_ms),
@@ -437,6 +523,10 @@ def _run_row_grid_abba_matrix(args: argparse.Namespace) -> None:
                 "--seed",
                 str(args.seed),
             ]
+            if args.route_policy_size is not None:
+                command.extend(
+                    ("--route-policy-size", str(args.route_policy_size))
+                )
             completed = subprocess.run(
                 command,
                 check=True,
@@ -523,9 +613,290 @@ def _run_workspace_sequence(
         print(json.dumps(result, sort_keys=True), flush=True)
 
 
+def _jit_cache_registry() -> tuple[tuple[str, object], ...]:
+    """Return the in-process cached compiler entry points used by E16."""
+
+    modules = (
+        sonic_module,
+        sonic_backward_module,
+        grouped_tn_module,
+        grouped_scheduler_module,
+        sorting_module,
+    )
+    by_identity: dict[int, tuple[str, object]] = {}
+    for module in modules:
+        for local_name, candidate in vars(module).items():
+            if not callable(candidate) or not hasattr(candidate, "cache_info"):
+                continue
+            qualified_name = (
+                f"{getattr(candidate, '__module__', module.__name__)}."
+                f"{getattr(candidate, '__name__', local_name)}"
+            )
+            by_identity.setdefault(id(candidate), (qualified_name, candidate))
+    return tuple(sorted(by_identity.values(), key=lambda item: item[0]))
+
+
+def _jit_cache_snapshot(
+    registry: tuple[tuple[str, object], ...],
+) -> dict[str, tuple[int, int, int]]:
+    snapshot = {}
+    for name, cached_function in registry:
+        info = cached_function.cache_info()
+        snapshot[name] = (info.hits, info.misses, info.currsize)
+    return snapshot
+
+
+def _jit_cache_delta(
+    before: dict[str, tuple[int, int, int]],
+    after: dict[str, tuple[int, int, int]],
+    field: int,
+) -> dict[str, int]:
+    return {
+        name: after[name][field] - before[name][field]
+        for name in sorted(after)
+        if after[name][field] != before[name][field]
+    }
+
+
+def _build_reusable_jit_case(
+    routes: int,
+    load: str,
+    seed: int,
+    mode: str,
+    config: SonicMoEConfig,
+    w1: torch.Tensor,
+    w2: torch.Tensor,
+    operator: SonicMoE,
+    route_policy_size: int | None,
+):
+    """Build dynamic inputs while retaining one operator and its workspace."""
+
+    device = w1.device
+    experts = config.num_experts
+    hidden_size = config.hidden_size
+    counts = _counts(routes, experts, load, seed)
+    offsets_host = [0]
+    for count in counts:
+        offsets_host.append(offsets_host[-1] + count)
+    generator = torch.Generator(device=device).manual_seed(seed)
+    x = torch.randn(
+        (routes, hidden_size),
+        dtype=torch.bfloat16,
+        device=device,
+        generator=generator,
+    ).mul_(0.2)
+    grad_output = torch.randn(
+        (routes, hidden_size),
+        dtype=torch.bfloat16,
+        device=device,
+        generator=generator,
+    ).mul_(0.2)
+    token_indices = torch.arange(routes, dtype=torch.int32, device=device)
+    expert_indices = torch.repeat_interleave(
+        torch.arange(experts, dtype=torch.int32, device=device),
+        torch.tensor(counts, dtype=torch.int64, device=device),
+    ).contiguous()
+    expert_offsets = torch.tensor(offsets_host, dtype=torch.int32, device=device)
+    route_weights = torch.linspace(
+        0.25,
+        1.0,
+        routes,
+        dtype=torch.float32,
+        device=device,
+    )
+    output = torch.empty_like(x)
+
+    def forward():
+        kwargs = {"route_policy_size": route_policy_size}
+        if mode == "expert-major":
+            kwargs.update(
+                expert_offsets=expert_offsets,
+                token_indices_identity=True,
+            )
+        return operator.forward_routes_training(
+            x,
+            token_indices,
+            expert_indices,
+            route_weights,
+            out=output,
+            **kwargs,
+        )
+
+    def backward(state):
+        return sonic_moe_backward_routes(
+            x,
+            w1,
+            w2,
+            token_indices,
+            expert_indices,
+            route_weights,
+            grad_output,
+            config,
+            forward_state=(None if mode == "generic" else state),
+            token_indices_sorted=True,
+            route_policy_size=route_policy_size,
+        )
+
+    return counts, x, forward, backward
+
+
+def _run_jit_sequence(args: argparse.Namespace) -> None:
+    """Measure compile-family reuse across dynamic route-policy boundaries."""
+
+    routes_to_test = _QWEN3_JIT_SEQUENCE_ROUTES
+    if args.jit_sequence == "full":
+        routes_to_test += (_QWEN3_JIT_SEQUENCE_OUTLIER,)
+
+    device = torch.device("cuda")
+    config = _e16_config()
+    generator = torch.Generator(device=device).manual_seed(args.seed)
+    w1 = torch.randn(
+        (config.num_experts, 2 * config.intermediate_size, config.hidden_size),
+        dtype=torch.bfloat16,
+        device=device,
+        generator=generator,
+    ).mul_(0.02)
+    w2 = torch.randn(
+        (config.num_experts, config.hidden_size, config.intermediate_size),
+        dtype=torch.bfloat16,
+        device=device,
+        generator=generator,
+    ).mul_(0.02)
+    pool = SonicMoEDynamicWorkspacePool() if args.shared_dynamic_workspace else None
+    operator = SonicMoE(
+        config,
+        prepare_sonic_bf16_weights(w1, w2, config),
+        shared_dynamic_workspace_pool=pool,
+    )
+    warmed_policy_sizes = (
+        warmup_sonic_e16_training(operator, w1, w2)
+        if args.prewarm_policies
+        else ()
+    )
+    registry = _jit_cache_registry()
+
+    for index, routes in enumerate(routes_to_test):
+        counts, x, forward, backward = _build_reusable_jit_case(
+            routes,
+            args.load,
+            args.seed + index,
+            args.mode,
+            config,
+            w1,
+            w2,
+            operator,
+            args.route_policy_size,
+        )
+        before = _jit_cache_snapshot(registry)
+        sorter_entries_before = len(sorting_module._expert_major_cf_cache)
+        cold_start = time.perf_counter()
+        _, state = forward()
+        torch.cuda.synchronize(device)
+        forward_done = time.perf_counter()
+        after_forward = _jit_cache_snapshot(registry)
+        sorter_entries_after = len(sorting_module._expert_major_cf_cache)
+        gradients = backward(state)
+        torch.cuda.synchronize(device)
+        backward_done = time.perf_counter()
+        after_backward = _jit_cache_snapshot(registry)
+
+        for _ in range(args.warmup):
+            _, state = forward()
+            gradients = backward(state)
+        torch.cuda.synchronize(device)
+
+        forward_ms: list[float] = []
+        backward_ms: list[float] = []
+        e2e_ms: list[float] = []
+        for _ in range(args.iters):
+            start = torch.cuda.Event(enable_timing=True)
+            middle = torch.cuda.Event(enable_timing=True)
+            end = torch.cuda.Event(enable_timing=True)
+            start.record()
+            _, state = forward()
+            middle.record()
+            gradients = backward(state)
+            end.record()
+            end.synchronize()
+            forward_ms.append(start.elapsed_time(middle))
+            backward_ms.append(middle.elapsed_time(end))
+            e2e_ms.append(start.elapsed_time(end))
+        assert gradients[0].shape == x.shape
+
+        if pool is not None:
+            dynamic_workspace_entries = len(pool)
+            capacity = next(iter(pool._entries.values())).capacity
+        else:
+            dynamic_workspace_entries = len(operator._dynamic_route_workspaces)
+            capacity = next(iter(operator._dynamic_route_workspaces.values()))
+        assert capacity is not None
+        route_policy = select_e16_route_policy(routes, args.route_policy_size)
+        forward_misses = _jit_cache_delta(before, after_forward, 1)
+        backward_misses = _jit_cache_delta(after_forward, after_backward, 1)
+        sorter_entry_delta = sorter_entries_after - sorter_entries_before
+        if args.prewarm_policies and (
+            forward_misses or backward_misses or sorter_entry_delta
+        ):
+            raise RuntimeError(
+                "late compile after E16 policy warmup: "
+                f"forward={forward_misses}, backward={backward_misses}, "
+                f"sorter_entries={sorter_entry_delta}"
+            )
+        result = {
+            "active_experts": sum(count > 0 for count in counts),
+            "backward_cache_hits": sum(
+                _jit_cache_delta(after_forward, after_backward, 0).values()
+            ),
+            "backward_compile_misses": backward_misses,
+            "backward_compile_misses_total": sum(backward_misses.values()),
+            "cold_backward_wall_ms": 1000.0 * (backward_done - forward_done),
+            "cold_e2e_wall_ms": 1000.0 * (backward_done - cold_start),
+            "cold_forward_wall_ms": 1000.0 * (forward_done - cold_start),
+            "device": torch.cuda.get_device_name(device),
+            "dynamic_workspace_cache_entries": dynamic_workspace_entries,
+            "exact_workspace_cache_entries": len(operator._workspaces),
+            "forward_cache_hits": sum(
+                _jit_cache_delta(before, after_forward, 0).values()
+            ),
+            "forward_compile_misses": forward_misses,
+            "forward_compile_misses_total": sum(forward_misses.values()),
+            "kind": "dynamic-jit-sequence",
+            "load": args.load,
+            "mode": args.mode,
+            "route_policy": route_policy.name,
+            "route_policy_representative": e16_route_policy_representative(
+                route_policy
+            ),
+            "route_policy_size": args.route_policy_size,
+            "routes": routes,
+            "sequence": args.jit_sequence,
+            "sequence_index": index,
+            "sorter_cache_entries_delta": sorter_entry_delta,
+            "warmed_policy_sizes": warmed_policy_sizes,
+            "steady_backward_ms_median": _median(backward_ms),
+            "steady_e2e_ms_median": _median(e2e_ms),
+            "steady_forward_ms_median": _median(forward_ms),
+            "workspace_capacity_routes": capacity.routes,
+            "workspace_capacity_tokens": capacity.tokens,
+        }
+        print(json.dumps(result, sort_keys=True), flush=True)
+
+        del gradients, state, backward, forward, x
+        gc.collect()
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--routes", type=int, default=65536)
+    parser.add_argument(
+        "--route-policy-size",
+        type=int,
+        default=None,
+        help=(
+            "rank-shared scheduling size for expert-major mode; this selects "
+            "a finite kernel policy and does not change allocation bounds"
+        ),
+    )
     run_group = parser.add_mutually_exclusive_group()
     run_group.add_argument(
         "--matrix",
@@ -538,6 +909,14 @@ def main() -> None:
         help="measure growable workspace memory for the canonical T sequence",
     )
     run_group.add_argument(
+        "--boundary-matrix",
+        action="store_true",
+        help=(
+            "run boundary-before/at/after route counts, from one route through "
+            "the open-ended 134K class"
+        ),
+    )
+    run_group.add_argument(
         "--row-grid-abba",
         action="store_true",
         help="compare 1024/2048 hostless row-grid caps over the Qwen3 matrix",
@@ -546,6 +925,16 @@ def main() -> None:
         "--row-grid-abba-case",
         action="store_true",
         help=argparse.SUPPRESS,
+    )
+    run_group.add_argument(
+        "--jit-sequence",
+        nargs="?",
+        const="short",
+        choices=("short", "full"),
+        help=(
+            "run one-process cold/steady JIT-cache diagnostics across all "
+            "dynamic policy boundaries; 'full' also includes R=134000"
+        ),
     )
     parser.add_argument(
         "--mode",
@@ -577,6 +966,14 @@ def main() -> None:
         help="opt in to a dynamic scratch pool shared by all benchmark operators",
     )
     parser.add_argument(
+        "--prewarm-policies",
+        action="store_true",
+        help=(
+            "before --jit-sequence, execute retained forward/backward once "
+            "for each finite E16 policy family"
+        ),
+    )
+    parser.add_argument(
         "--workspace-instances",
         type=int,
         default=1,
@@ -591,17 +988,27 @@ def main() -> None:
         or args.baseline_cap <= 0
         or args.candidate_cap <= 0
         or args.workspace_instances <= 0
+        or (args.route_policy_size is not None and args.route_policy_size <= 0)
     ):
         parser.error(
             "routes/iters/pairs/caps/workspace-instances must be positive "
-            "and warmup non-negative"
+            "and warmup non-negative; route-policy-size must be positive"
         )
     if args.baseline_cap == args.candidate_cap:
         parser.error("row-grid baseline and candidate caps must differ")
+    if args.prewarm_policies and args.jit_sequence is None:
+        parser.error("--prewarm-policies requires --jit-sequence")
     if (args.row_grid_abba or args.row_grid_abba_case) and args.pairs % 2:
         parser.error("row-grid ABBA/BAAB comparison requires an even --pairs value")
     if args.matrix:
         _run_qwen3_matrix(args)
+        return
+    if args.boundary_matrix:
+        _run_qwen3_matrix(
+            args,
+            _QWEN3_BOUNDARY_ROUTES,
+            _QWEN3_DYNAMIC_STRESS_LOADS,
+        )
         return
     if args.workspace_sequence:
         _run_workspace_sequence(
@@ -609,6 +1016,9 @@ def main() -> None:
             args.workspace_instances,
             args.shared_dynamic_workspace,
         )
+        return
+    if args.jit_sequence is not None:
+        _run_jit_sequence(args)
         return
     if args.row_grid_abba:
         _run_row_grid_abba_matrix(args)
@@ -624,6 +1034,7 @@ def main() -> None:
         args.seed,
         args.mode,
         shared_dynamic_workspace=args.shared_dynamic_workspace,
+        route_policy_size=args.route_policy_size,
     )
 
     # Untimed compile followed by warmup.  Keep only the latest invocation's
@@ -656,6 +1067,7 @@ def main() -> None:
     # Keep the final result live until all event timings and memory readings
     # are complete; this mirrors the autograd consumer lifetime.
     assert gradients[0].shape == x.shape
+    effective_policy = select_e16_route_policy(routes, args.route_policy_size)
     result = {
         "active_experts": sum(count > 0 for count in counts),
         "device": torch.cuda.get_device_name(device),
@@ -667,6 +1079,11 @@ def main() -> None:
         "mode": args.mode,
         "load": args.load,
         "routes": routes,
+        "route_policy_size": args.route_policy_size,
+        "route_policy": effective_policy.name,
+        "route_policy_representative": e16_route_policy_representative(
+            effective_policy
+        ),
         "seed": args.seed,
         "shared_dynamic_workspace": args.shared_dynamic_workspace,
         "forward_ms_median": _median(forward_ms),

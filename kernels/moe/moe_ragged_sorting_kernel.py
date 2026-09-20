@@ -38,8 +38,6 @@ BLOCK_SIZE = 256
 UNIT_SIZE = 32
 _E16_EXPERT_MAJOR_SINGLE_LAUNCH = True
 _E16_EXPERT_MAJOR_MAX_PARTITIONS = 16
-_E16_EP8_PRODUCTION_MIN_ROUTES = 8000
-_E16_EP8_PRODUCTION_MAX_ROUTES = 9000
 
 
 _ragged_cf_cache = {}
@@ -63,7 +61,13 @@ def _expert_major_identity_fusion_parameters(
     token_indices_identity: bool,
     routes: int,
 ) -> tuple[bool, int]:
-    """Return whether to fuse E16 identity metadata and its CTA count."""
+    """Return whether to fuse E16 identity metadata and its runtime CTA count.
+
+    One partition covers one block of average per-expert work.  Rounding that
+    count to a power of two keeps the launch topology in a small, stable family
+    while still increasing parallelism with the route workload.  The returned
+    count is a runtime launcher argument, not a compile specialization.
+    """
 
     single_launch = (
         _E16_EXPERT_MAJOR_SINGLE_LAUNCH
@@ -72,20 +76,15 @@ def _expert_major_identity_fusion_parameters(
     )
     identity_partitions = 1
     if single_launch:
-        # Keep the measured Qwen3 EP8 production band on one stable launch
-        # shape instead of dropping from four partitions to two at R=8192.
-        if _E16_EP8_PRODUCTION_MIN_ROUTES <= routes <= _E16_EP8_PRODUCTION_MAX_ROUTES:
-            identity_partitions = 4
-        else:
-            target_partitions = max(
-                1,
-                (routes + num_experts * BLOCK_SIZE - 1)
-                // (num_experts * BLOCK_SIZE),
-            )
-            identity_partitions = min(
-                _E16_EXPERT_MAJOR_MAX_PARTITIONS,
-                1 << (target_partitions - 1).bit_length(),
-            )
+        target_partitions = max(
+            1,
+            (routes + num_experts * BLOCK_SIZE - 1)
+            // (num_experts * BLOCK_SIZE),
+        )
+        identity_partitions = min(
+            _E16_EXPERT_MAJOR_MAX_PARTITIONS,
+            1 << (target_partitions - 1).bit_length(),
+        )
     return single_launch, identity_partitions
 
 
@@ -498,7 +497,6 @@ def _compile_moe_expert_major_sorting(
     token_indices_identity: bool,
     clear_output: bool,
     single_launch_identity: bool,
-    identity_partitions: int,
 ):
     """Build the expert-major metadata adapter.
 
@@ -508,19 +506,14 @@ def _compile_moe_expert_major_sorting(
     ABI layout, and its second launch copies each route into that layout.  The
     E16 identity specialization instead derives both pieces per expert in one
     partitioned launch.
-    Runtime route count is an ordinary scalar argument and is deliberately not
-    part of the compile-cache key.
+    Runtime route and identity-partition counts are ordinary scalar arguments
+    and are deliberately not part of the compile-cache key.
     """
 
     if num_experts <= 0:
         raise ValueError(f"num_experts must be positive, got {num_experts}")
     if unit_size <= 0:
         raise ValueError(f"unit_size must be positive, got {unit_size}")
-    if identity_partitions <= 0:
-        raise ValueError(
-            f"identity_partitions must be positive, got {identity_partitions}"
-        )
-
     @flyc.kernel(known_block_size=[BLOCK_SIZE, 1, 1])
     def identity_expert_pack_kernel(
         route_weights: fx.Tensor,
@@ -537,6 +530,7 @@ def _compile_moe_expert_major_sorting(
         i32_routes: fx.Int32,
         i32_tokens: fx.Int32,
         i32_moe_buf_elems: fx.Int32,
+        i32_identity_partitions: fx.Int32,
     ):
         """Build E16 identity-route metadata with one expert-centric launch.
 
@@ -551,8 +545,11 @@ def _compile_moe_expert_major_sorting(
         c_one = fx.Int32(1)
         c_unit = fx.Int32(unit_size)
         c_block = fx.Int32(BLOCK_SIZE)
-        expert = gpu.block_idx.x // fx.Int32(identity_partitions)
-        partition = gpu.block_idx.x % fx.Int32(identity_partitions)
+        # Keep the divisor compile-time constant: partition-major block order
+        # avoids a dynamic integer divide/modulo in every lane while the grid
+        # and per-expert stride remain runtime-selectable.
+        expert = gpu.block_idx.x % fx.Int32(num_experts)
+        partition = gpu.block_idx.x // fx.Int32(num_experts)
         thread = gpu.thread_idx.x
         offsets_rsrc = buffer_ops.create_buffer_resource(expert_offsets, max_size=True)
         frequency_rsrc = buffer_ops.create_buffer_resource(expert_frequency, max_size=True)
@@ -662,7 +659,7 @@ def _compile_moe_expert_major_sorting(
                     if const_expr(emit_route_ids):
                         buffer_ops.buffer_store(i32_routes, route_ids_rsrc, output_row)
 
-        partition_stride = fx.Int32(identity_partitions * BLOCK_SIZE)
+        partition_stride = i32_identity_partitions * c_block
         partition_start = partition * c_block
         route_iters = (count + partition_stride - c_one) // partition_stride
         for iteration in range(
@@ -684,7 +681,7 @@ def _compile_moe_expert_major_sorting(
 
         if const_expr(clear_output):
             global_thread = gpu.block_idx.x * c_block + thread
-            global_stride = fx.Int32(num_experts * identity_partitions * BLOCK_SIZE)
+            global_stride = gpu.grid_dim.x * c_block
             clear_iters = (i32_moe_buf_elems + global_stride - c_one) // global_stride
             for iteration in range(
                 fx.Index(0),
@@ -868,6 +865,7 @@ def _compile_moe_expert_major_sorting(
         i32_routes: fx.Int32,
         i32_tokens: fx.Int32,
         i32_moe_buf_elems: fx.Int32,
+        i32_identity_partitions: fx.Int32,
         i32_route_grid: fx.Int32,
         stream: fx.Stream = fx.Stream(None),
     ):
@@ -887,9 +885,14 @@ def _compile_moe_expert_major_sorting(
                 i32_routes,
                 i32_tokens,
                 i32_moe_buf_elems,
+                i32_identity_partitions,
             )
             fused.launch(
-                grid=(num_experts * identity_partitions, 1, 1),
+                grid=(
+                    fx.Int64(i32_identity_partitions) * fx.Int64(num_experts),
+                    1,
+                    1,
+                ),
                 block=(BLOCK_SIZE, 1, 1),
                 stream=stream,
             )
@@ -956,6 +959,7 @@ def moe_expert_major_sorting_flydsl(
     expert_frequency_mirror: torch.Tensor | None = None,
     token_indices_identity: bool = False,
     clear_output: bool = False,
+    route_policy_size: int | None = None,
 ):
     """Build grouped-GEMM metadata from an already expert-major route list.
 
@@ -976,6 +980,11 @@ def moe_expert_major_sorting_flydsl(
     single partitioned expert-centric kernel.
     Set ``clear_output`` only when ``moe_buf`` owns an output/scratch tensor
     that must be zeroed as part of the second CTA launch.
+
+    ``route_policy_size`` is accepted for API compatibility with the shared
+    E16 tuning policy.  Sorter storage, work loops, and the runtime CTA count
+    always use the actual route count; the hint is validated but never enters
+    a compiler/cache key or inflates a short rank's launch.
     """
 
     routes = int(route_weights.numel())
@@ -1072,6 +1081,16 @@ def moe_expert_major_sorting_flydsl(
             raise ValueError("expert_frequency_mirror must not alias expert_frequency")
     if not isinstance(token_indices_identity, bool) or not isinstance(clear_output, bool):
         raise TypeError("token_indices_identity and clear_output must be bool")
+    if route_policy_size is not None:
+        if isinstance(route_policy_size, bool) or not isinstance(
+            route_policy_size, int
+        ):
+            raise TypeError("route_policy_size must be None or an integer")
+        if route_policy_size <= 0:
+            raise ValueError(
+                "route_policy_size must be positive when supplied, got "
+                f"{route_policy_size}"
+            )
 
     stream = torch.cuda.current_stream(device)
     moe_buf_i32 = moe_buf.view(torch.int32)
@@ -1089,7 +1108,6 @@ def moe_expert_major_sorting_flydsl(
         token_indices_identity=token_indices_identity,
         clear_output=clear_output,
         single_launch_identity=single_launch_identity,
-        identity_partitions=identity_partitions,
     )
     sorted_route_ids_arg = expert_frequency if sorted_route_ids is None else sorted_route_ids
     expert_frequency_mirror_arg = expert_frequency if expert_frequency_mirror is None else expert_frequency_mirror
@@ -1110,6 +1128,7 @@ def moe_expert_major_sorting_flydsl(
         routes,
         int(tokens),
         int(moe_buf_i32.numel()),
+        identity_partitions,
         route_grid,
     )
     cache_key = (
@@ -1120,7 +1139,6 @@ def moe_expert_major_sorting_flydsl(
         token_indices_identity,
         clear_output,
         single_launch_identity,
-        identity_partitions,
         moe_buf_i32.ndim,
         device.index,
     )

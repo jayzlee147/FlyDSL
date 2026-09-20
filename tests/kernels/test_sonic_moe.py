@@ -9,6 +9,7 @@ import math
 import threading
 import weakref
 from dataclasses import FrozenInstanceError, replace
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -36,8 +37,7 @@ from kernels.moe.sonic import (
     _stage2_stages,
     _training_stage1_tile_m,
     _training_stage1_tuning,
-    _use_e16_4096_expert_major_forward_tuning,
-    _use_e16_large_expert_major_forward_tuning,
+    _use_e16_expert_major_forward_tuning,
     _validate_training_preactivation_extent,
     prepare_sonic_bf16_weights,
     prepare_sonic_fp16_weights,
@@ -46,6 +46,7 @@ from kernels.moe.sonic import (
     sonic_moe_reference,
 )
 from kernels.moe.sonic_autotune import SonicMoEAutotuner, default_sonic_moe_candidates
+from kernels.moe.sonic_dynamic_policy import E16RoutePolicy
 
 pytestmark = [pytest.mark.l2_device, pytest.mark.rocm_lower]
 
@@ -394,6 +395,7 @@ def test_sonic_moe_routes_training_state_preserves_original_route_order(interlea
         out=out,
         interleaved_w1=interleaved_w1,
         expert_frequency_out=frequency,
+        route_policy_size=20000,
     )
     expected_state = _flat_routes_preactivation_oracle(
         x,
@@ -441,6 +443,7 @@ def test_sonic_moe_routes_training_state_preserves_original_route_order(interlea
     assert state.sorted_expert_ids is None
     assert state.num_valid_ids is None
     assert state.expert_frequency is None
+    assert state.route_policy_size == 32768
     assert op.workspace is not None and op.workspace.sorted_route_ids is not None
     assert state.preactivation.untyped_storage().data_ptr() not in op.workspace.storage_ptrs
     assert torch.equal(
@@ -907,7 +910,7 @@ def test_sonic_moe_training_stage1_t4096_policy_is_targeted():
     )
 
 
-def test_sonic_moe_training_stage1_e16_flat_m_policy_uses_route_interval():
+def test_sonic_moe_training_stage1_e16_flat_m_policy_uses_capacity_class():
     qwen3 = SonicMoEConfig(
         hidden_size=2048,
         intermediate_size=768,
@@ -927,13 +930,85 @@ def test_sonic_moe_training_stage1_e16_flat_m_policy_uses_route_interval():
         renormalize=False,
     )
 
-    for routes in (8000, 8191, 8192, 8193, 9000):
-        assert _training_stage1_tile_m(qwen3, routes, routes, False) == 64
-    assert _training_stage1_tile_m(qwen3, 8192, None, False) == 128
-    assert _training_stage1_tile_m(qwen3, 7999, 7999, False) == 128
-    assert _training_stage1_tile_m(qwen3, 9001, 9001, False) == 128
-    assert _training_stage1_tile_m(qwen3, 8192, 8191, False) == 128
-    assert _training_stage1_tile_m(qwen3, 8192, 8192, True) == 128
+    assert (
+        _training_stage1_tile_m(
+            qwen3,
+            4096,
+            4096,
+            False,
+            token_indices_identity=True,
+            route_policy=E16RoutePolicy.SMALL,
+        )
+        == 128
+    )
+    for policy in (E16RoutePolicy.MEDIUM, E16RoutePolicy.LARGE):
+        assert (
+            _training_stage1_tile_m(
+                qwen3,
+                8192,
+                8192,
+                False,
+                token_indices_identity=True,
+                route_policy=policy,
+            )
+            == 128
+        )
+    assert (
+        _training_stage1_tile_m(
+            qwen3,
+            65536,
+            65536,
+            False,
+            token_indices_identity=True,
+            route_policy=E16RoutePolicy.XLARGE,
+        )
+        == 64
+    )
+    # The policy is explicit and may be rank-shared independently of local R.
+    assert (
+        _training_stage1_tile_m(
+            qwen3,
+            1024,
+            1024,
+            False,
+            token_indices_identity=True,
+            route_policy=E16RoutePolicy.MEDIUM,
+        )
+        == 128
+    )
+    assert _training_stage1_tile_m(qwen3, 4096, 4096, False) == 128
+    assert (
+        _training_stage1_tile_m(
+            qwen3,
+            8192,
+            8191,
+            False,
+            token_indices_identity=True,
+            route_policy=E16RoutePolicy.MEDIUM,
+        )
+        == 128
+    )
+    assert (
+        _training_stage1_tile_m(
+            qwen3,
+            8192,
+            8192,
+            True,
+            token_indices_identity=True,
+            route_policy=E16RoutePolicy.MEDIUM,
+        )
+        == 128
+    )
+    assert (
+        _training_stage1_tile_m(
+            qwen3,
+            8192,
+            8192,
+            False,
+            route_policy=E16RoutePolicy.MEDIUM,
+        )
+        == 128
+    )
 
     fallbacks = (
         replace(qwen3, hidden_size=4096),
@@ -961,72 +1036,19 @@ def test_sonic_moe_training_stage1_e16_flat_m_policy_uses_route_interval():
     )
     for fallback in fallbacks:
         assert (
-            _training_stage1_tile_m(fallback, 8192, 8192, False)
+            _training_stage1_tile_m(
+                fallback,
+                8192,
+                8192,
+                False,
+                token_indices_identity=True,
+                route_policy=E16RoutePolicy.MEDIUM,
+            )
             == fallback.tile_m
         )
 
 
-def test_sonic_moe_large_e16_expert_major_forward_tuning_is_narrow():
-    qwen3 = SonicMoEConfig(
-        hidden_size=2048,
-        intermediate_size=768,
-        num_experts=16,
-        top_k=1,
-        tile_m=128,
-        tile_n=192,
-        tile_k=64,
-        down_tile_m=64,
-        down_tile_n=256,
-        down_tile_k=64,
-        stage1_xcd_swizzle=8,
-        stage2_xcd_swizzle=0,
-        stage2_pipeline_stages=2,
-        stage1_write_padded_rows=True,
-        stage1_lds_swizzle=True,
-        renormalize=False,
-    )
-
-    def selected(config=qwen3, tokens=65536, routes=65536, has_bias=False, identity=True):
-        return _use_e16_large_expert_major_forward_tuning(
-            config,
-            tokens,
-            routes,
-            has_bias,
-            token_indices_identity=identity,
-        )
-
-    assert selected()
-    assert selected(tokens=134000, routes=134000)
-    assert not selected(tokens=65535, routes=65535)
-    assert not selected(routes=None)
-    assert not selected(routes=65537)
-    assert not selected(has_bias=True)
-    assert not selected(identity=False)
-
-    fallbacks = (
-        replace(qwen3, tile_m=64),
-        replace(qwen3, tile_n=128),
-        replace(qwen3, tile_k=128),
-        replace(qwen3, down_tile_m=128),
-        replace(qwen3, down_tile_n=128),
-        replace(qwen3, down_tile_k=128),
-        replace(qwen3, stage1_b_cache_mod=2),
-        replace(qwen3, stage2_b_cache_mod=2),
-        replace(qwen3, stage1_xcd_swizzle=0),
-        replace(qwen3, stage2_xcd_swizzle=8),
-        replace(qwen3, waves_per_eu=1),
-        replace(qwen3, persistent_stage2=True),
-        replace(qwen3, stage2_pipeline_stages=1),
-        replace(qwen3, stage2_output_mode="reduce"),
-        replace(qwen3, stage1_write_padded_rows=False),
-        replace(qwen3, stage1_lds_swizzle=False),
-        replace(qwen3, activation="relu"),
-        replace(qwen3, compute_dtype="fp16"),
-    )
-    assert all(not selected(config=config) for config in fallbacks)
-
-
-def test_sonic_moe_4096_e16_expert_major_forward_tuning_is_narrow():
+def test_sonic_moe_e16_expert_major_forward_tuning_is_shape_only():
     qwen3 = SonicMoEConfig(
         hidden_size=2048,
         intermediate_size=768,
@@ -1047,7 +1069,7 @@ def test_sonic_moe_4096_e16_expert_major_forward_tuning_is_narrow():
     )
 
     def selected(config=qwen3, tokens=4096, routes=4096, has_bias=False, identity=True):
-        return _use_e16_4096_expert_major_forward_tuning(
+        return _use_e16_expert_major_forward_tuning(
             config,
             tokens,
             routes,
@@ -1056,19 +1078,14 @@ def test_sonic_moe_4096_e16_expert_major_forward_tuning_is_narrow():
         )
 
     assert selected()
-    assert not selected(tokens=4095, routes=4095)
-    assert not selected(tokens=4097, routes=4097)
-    assert not selected(tokens=8192, routes=8192)
+    assert selected(tokens=8193, routes=8193)
+    assert selected(tokens=134000, routes=134000)
     assert not selected(routes=None)
-    assert not selected(tokens=4096, routes=4097)
+    assert not selected(routes=4097)
     assert not selected(has_bias=True)
     assert not selected(identity=False)
 
     fallbacks = (
-        replace(qwen3, hidden_size=4096),
-        replace(qwen3, intermediate_size=1536),
-        replace(qwen3, num_experts=8),
-        replace(qwen3, top_k=2),
         replace(qwen3, tile_m=64),
         replace(qwen3, tile_n=128),
         replace(qwen3, tile_k=128),
@@ -1089,6 +1106,96 @@ def test_sonic_moe_4096_e16_expert_major_forward_tuning_is_narrow():
         replace(qwen3, compute_dtype="fp16"),
     )
     assert all(not selected(config=config) for config in fallbacks)
+
+
+@pytest.mark.parametrize(
+    (
+        "policy_size",
+        "expected_stage1_m",
+        "expected_stage1_n",
+        "expected_stage2_n",
+        "expected_stage2_stages",
+    ),
+    (
+        (4096, 128, 64, 256, 2),
+        (16384, 128, 192, 256, 2),
+        (32768, 128, 192, 256, 2),
+        (65536, 64, 128, 128, 1),
+    ),
+)
+def test_sonic_moe_e16_training_launch_plan_uses_shared_capacity_class(
+    monkeypatch,
+    policy_size,
+    expected_stage1_m,
+    expected_stage1_n,
+    expected_stage2_n,
+    expected_stage2_stages,
+):
+    """One local R follows a caller-supplied finite, rank-shared profile."""
+
+    config = SonicMoEConfig(
+        hidden_size=2048,
+        intermediate_size=768,
+        num_experts=16,
+        top_k=1,
+        tile_m=128,
+        tile_n=192,
+        tile_k=64,
+        down_tile_m=64,
+        down_tile_n=256,
+        down_tile_k=64,
+        stage1_xcd_swizzle=8,
+        stage2_xcd_swizzle=0,
+        stage2_pipeline_stages=2,
+        stage1_write_padded_rows=True,
+        stage1_lds_swizzle=True,
+        renormalize=False,
+    )
+    stage1_calls = []
+    stage2_calls = []
+
+    def fake_stage1(*args):
+        stage1_calls.append(args)
+        return "stage1"
+
+    def fake_stage2(*args):
+        stage2_calls.append(args)
+        return "stage2"
+
+    monkeypatch.setattr(sonic_module, "_get_stage1_training_launcher", fake_stage1)
+    monkeypatch.setattr(sonic_module, "_get_stage2_launcher", fake_stage2)
+    # A hint is a policy floor, so keep the local shard within the requested
+    # class; outlier promotion is covered by the dynamic-policy unit tests.
+    routes = min(8192, policy_size)
+    max_padded = routes + 16 * (config.route_tile_m - 1)
+    operator = SimpleNamespace(
+        config=config,
+        weights=SimpleNamespace(
+            has_bias=False,
+            device=torch.device("cuda", 0),
+        ),
+    )
+    workspace = SimpleNamespace(
+        tokens=routes,
+        routes=routes,
+        max_padded_tokens=max_padded,
+        stage2_max_m_blocks=max_padded // config.stage2_tile_m,
+        route_output=None,
+    )
+
+    plan = SonicMoE._prepare_grouped_gemms_training(
+        operator,
+        workspace,
+        interleaved_w1=False,
+        token_indices_identity=True,
+        route_policy_size=policy_size,
+    )
+
+    assert plan.route_policy_size == policy_size
+    assert stage1_calls[0][5] == expected_stage1_n
+    assert stage1_calls[0][8] == expected_stage1_m
+    assert stage2_calls[0][0].stage2_tile_n == expected_stage2_n
+    assert stage2_calls[0][5] == expected_stage2_stages
 
 
 def test_sonic_moe_training_stage1_launcher_accepts_private_overrides(monkeypatch):
@@ -1203,7 +1310,7 @@ def test_sonic_moe_training_stage1_private_m_override_recomputes_grid(monkeypatc
     monkeypatch.setattr(
         sonic_module,
         "_training_stage1_tile_m",
-        lambda _config, _tokens, _routes, _has_bias: 16,
+        lambda _config, _tokens, _routes, _has_bias, **_kwargs: 16,
     )
     output, state = op.forward_topk_training(x, ids, weights)
 
@@ -1861,9 +1968,13 @@ def test_sonic_moe_ragged_routes_match_reference_and_frequency():
         expert_frequency_out=frequency,
     )
     torch.cuda.synchronize()
+    first_capacity = next(iter(op._dynamic_route_workspaces.values()))
 
     expected_frequency = torch.bincount(expert_indices.to(torch.int64), minlength=NUM_EXPERTS).to(torch.int32)
     assert torch.equal(frequency, expected_frequency)
+    assert not op._workspaces
+    assert len(op._dynamic_route_workspaces) == 1
+    assert first_capacity.output is None
     assert op.workspace is not None
     assert op.workspace.routes == route_weights.numel()
     expected_blocks = sum(
@@ -1906,6 +2017,8 @@ def test_sonic_moe_ragged_routes_match_reference_and_frequency():
     )
     torch.cuda.synchronize()
     assert op.workspace is not None
+    assert next(iter(op._dynamic_route_workspaces.values())) is first_capacity
+    assert actual_tile16_again.untyped_storage().data_ptr() != actual.untyped_storage().data_ptr()
     assert int(op.workspace.num_valid_ids[0]) == expected_blocks * config.route_tile_m
     assert torch.equal(op.workspace.expert_frequency, expected_frequency)
     _assert_close(actual_tile16_again, expected)
@@ -1923,6 +2036,7 @@ def test_sonic_moe_ragged_routes_match_reference_and_frequency():
     torch.cuda.synchronize()
     assert torch.count_nonzero(empty_actual) == 0
     assert torch.count_nonzero(empty_frequency) == 0
+    assert next(iter(op._dynamic_route_workspaces.values())) is first_capacity
     assert op.workspace is not None and op.workspace.max_m_blocks == 0
 
 
@@ -2112,6 +2226,7 @@ def test_sonic_moe_e16_master_matches_fallback_across_dynamic_routes(
             expert_frequency_out=expected_frequency,
             expert_offsets=expert_offsets,
             token_indices_identity=True,
+            route_policy_size=16384,
         )
         monkeypatch.setattr(sonic_module, "_FUSE_E16_METADATA_STAGE1_DISPATCH", True)
         actual, actual_state = candidate.forward_routes_training(
@@ -2122,11 +2237,13 @@ def test_sonic_moe_e16_master_matches_fallback_across_dynamic_routes(
             expert_frequency_out=actual_frequency,
             expert_offsets=expert_offsets,
             token_indices_identity=True,
+            route_policy_size=16384,
         )
         torch.cuda.synchronize(hidden.device)
 
         assert torch.equal(actual, expected)
         assert torch.equal(actual_state.preactivation, expected_state.preactivation)
+        assert actual_state.route_policy_size == expected_state.route_policy_size == 16384
         assert torch.equal(actual_frequency, expected_frequency)
         assert torch.equal(
             actual_frequency,
@@ -2144,7 +2261,9 @@ def test_sonic_moe_e16_master_matches_fallback_across_dynamic_routes(
         1024,
     ]
     assert not hasattr(candidate, "_training_forward_launch_plans")
-    assert _get_e16_metadata_stage1_master_launcher.cache_info().currsize == 3
+    # Runtime metadata partitions and exact R do not create master variants;
+    # only the existing small/large Stage-1 cache-mod policies remain here.
+    assert _get_e16_metadata_stage1_master_launcher.cache_info().currsize == 2
     if pool is None:
         assert len(candidate._dynamic_route_workspaces) == 1
     else:

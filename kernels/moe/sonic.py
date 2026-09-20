@@ -33,6 +33,7 @@ import functools
 import math
 import threading
 from collections import OrderedDict
+from collections.abc import Iterable
 from dataclasses import dataclass, field, replace
 
 import torch
@@ -71,19 +72,18 @@ from kernels.moe.sonic_backward import (
 from kernels.moe.sonic_backward import (
     sonic_moe_backward_routes as sonic_moe_backward_routes,
 )
+from kernels.moe.sonic_dynamic_policy import (
+    E16_ROUTE_POLICY_SIZES,
+    E16RoutePolicy,
+    canonical_e16_route_policy_size,
+    e16_route_policy_representative,
+    select_e16_route_policy,
+)
 from kernels.moe.topk_gating_softmax_kernel import supports_topk_gating_layout
 
 _GFX950_LDS_BYTES = 160 * 1024
 _MAX_BUFFER_BYTE_OFFSET = 0xFFFFFFFF
 _MAX_SIGNED_I32 = 0x7FFFFFFF
-_E16_FLAT_GROUPED_MIN_ROUTES = 64
-_E16_EP8_PRODUCTION_MIN_ROUTES = 8000
-_E16_EP8_PRODUCTION_MAX_ROUTES = 9000
-# The expert-major Qwen3 training path exposes enough route-level parallelism
-# above this point for the lower-register Stage-1 tile and narrower Stage-2 N
-# tile to win for both balanced and skewed shards.  Keeping the threshold at
-# 64K avoids the measured small-route Stage-2 crossover.
-_E16_LARGE_EXPERT_MAJOR_FORWARD_MIN_ROUTES = 65536
 _DEFAULT_MAX_CACHED_WORKSPACES = 8
 _FUSE_E16_METADATA_STAGE1_DISPATCH = True
 _SUPPORTED_ROUTER_DTYPES = {
@@ -583,6 +583,10 @@ class SonicMoERoutesForwardState:
     # conservative path.
     expert_major: bool = False
     token_indices_identity: bool = False
+    # Rank-shared/coarsened route capacity used only for finite performance
+    # policy selection.  Actual ``routes`` remains the allocation and bounds
+    # authority.  ``None`` is retained for states from non-route entrypoints.
+    route_policy_size: int | None = None
 
 
 @dataclass
@@ -657,7 +661,7 @@ class SonicMoEWorkspace:
 
         if self.routes is None:
             raise ValueError("flat_active_view requires a flat-route workspace")
-        if tokens <= 0 or routes < 0 or tokens > self.tokens or routes > self.routes:
+        if tokens < 0 or routes < 0 or tokens > self.tokens or routes > self.routes:
             raise ValueError(
                 "active flat shape must fit the workspace capacity, got "
                 f"T={tokens}/R={routes} within T={self.tokens}/R={self.routes}"
@@ -712,8 +716,8 @@ class SonicMoEWorkspace:
         routes: int | None = None,
         reusable_output: bool = True,
     ) -> "SonicMoEWorkspace":
-        if tokens <= 0:
-            raise ValueError(f"tokens must be positive, got {tokens}")
+        if tokens < 0:
+            raise ValueError(f"tokens must be non-negative, got {tokens}")
         if routes is not None and routes < 0:
             raise ValueError(f"routes must be non-negative, got {routes}")
 
@@ -831,6 +835,7 @@ class _TrainingForwardLaunchPlan:
     grid1: int
     grid2: int
     output_mode: str
+    route_policy_size: int | None
 
 
 @dataclass
@@ -842,7 +847,7 @@ class _SonicMoEDynamicWorkspacePoolEntry:
 
 
 class SonicMoEDynamicWorkspacePool:
-    """Explicitly shared growable expert-major scratch storage.
+    """Explicitly shared growable flat-route scratch storage.
 
     A pool may be passed to multiple :class:`SonicMoE` instances.  Entries are
     isolated by the full :class:`SonicMoEConfig`, device, and current stream,
@@ -891,8 +896,8 @@ class SonicMoEDynamicWorkspacePool:
     ) -> SonicMoEWorkspace:
         """Return an active view over the key's single growable capacity."""
 
-        if tokens <= 0:
-            raise ValueError(f"tokens must be positive, got {tokens}")
+        if tokens < 0:
+            raise ValueError(f"tokens must be non-negative, got {tokens}")
         if routes < 0:
             raise ValueError(f"routes must be non-negative, got {routes}")
         with torch.cuda.device(device):
@@ -1628,151 +1633,80 @@ def _training_stage1_tuning(
     return config.tile_n, config.waves_per_eu
 
 
+def _use_e16_expert_major_forward_tuning(
+    config: SonicMoEConfig,
+    tokens: int,
+    routes: int | None,
+    has_bias: bool,
+    *,
+    token_indices_identity: bool,
+) -> bool:
+    """Match the Qwen3 E16 expert-major path eligible for finite profiles."""
+
+    return (
+        token_indices_identity
+        and routes is not None
+        and routes == tokens
+        and config.hidden_size == 2048
+        and config.intermediate_size == 768
+        and config.num_experts == 16
+        and config.top_k == 1
+        and (config.tile_m, config.tile_n, config.tile_k) == (128, 192, 64)
+        and (
+            config.stage2_tile_m,
+            config.stage2_tile_n,
+            config.stage2_tile_k,
+        )
+        == (64, 256, 64)
+        and config.route_tile_m == 128
+        and config.stage1_k_wave == 1
+        and config.stage1_b_cache_mod in (None, 0)
+        and config.stage2_b_cache_mod in (None, 0)
+        and config.stage1_xcd_swizzle == 8
+        and config.stage2_xcd_swizzle == 0
+        and config.waves_per_eu is None
+        and not config.persistent_stage1
+        and not config.persistent_stage2
+        and config.stage2_pipeline_stages == 2
+        and config.stage2_output_mode == "atomic"
+        and config.stage1_write_padded_rows
+        and config.stage1_lds_swizzle
+        and config.activation == "swiglu"
+        and config.compute_dtype == "bf16"
+        and not has_bias
+    )
+
+
 def _training_stage1_tile_m(
     config: SonicMoEConfig,
     tokens: int,
     routes: int | None,
     has_bias: bool,
+    *,
+    token_indices_identity: bool = False,
+    route_policy: E16RoutePolicy | None = None,
 ) -> int:
-    """Select the measured flat-route training Stage-1 M tile.
+    """Select Stage-1 M from a finite, rank-shareable route policy.
 
-    Qwen3-30B-A3B's EP8 local production route band benefits from a BM64
-    compute tile while retaining the BM128 sorter layout.  The smaller tile
-    lowers the dual-output kernel from 370 to 250 VGPRs on gfx950 without
-    changing route padding or the Stage-2 launch.  Keep the gate deliberately
-    shape-specific so fixed-K calls, inference, routes outside the measured
-    band, and explicitly retuned configs use ``config.tile_m`` unchanged.
+    The saturated large-route class uses BM64 to reduce register pressure.
+    Smaller classes retain BM128: broad sweeps show that extending the old
+    8K-only BM64 choice through 16K/32K hurts balanced workloads.  No exact
+    route count or production interval participates in this choice.
     """
 
     if (
-        routes is not None
-        and routes == tokens
-        and _E16_EP8_PRODUCTION_MIN_ROUTES <= routes <= _E16_EP8_PRODUCTION_MAX_ROUTES
-        and config.hidden_size == 2048
-        and config.intermediate_size == 768
-        and config.num_experts == 16
-        and config.top_k == 1
-        and (config.tile_m, config.tile_n, config.tile_k) == (128, 192, 64)
-        and (
-            config.stage2_tile_m,
-            config.stage2_tile_n,
-            config.stage2_tile_k,
+        route_policy is not None
+        and route_policy == E16RoutePolicy.XLARGE
+        and _use_e16_expert_major_forward_tuning(
+            config,
+            tokens,
+            routes,
+            has_bias,
+            token_indices_identity=token_indices_identity,
         )
-        == (64, 256, 64)
-        and config.route_tile_m == 128
-        and config.stage1_k_wave == 1
-        and config.stage1_b_cache_mod in (None, 0)
-        and config.stage2_b_cache_mod in (None, 0)
-        and config.stage1_xcd_swizzle == 8
-        and config.stage2_xcd_swizzle == 0
-        and config.waves_per_eu is None
-        and not config.persistent_stage1
-        and not config.persistent_stage2
-        and config.stage2_pipeline_stages == 2
-        and config.stage2_output_mode == "atomic"
-        and config.stage1_write_padded_rows
-        and config.stage1_lds_swizzle
-        and config.activation == "swiglu"
-        and config.compute_dtype == "bf16"
-        and not has_bias
     ):
         return 64
     return config.tile_m
-
-
-def _use_e16_4096_expert_major_forward_tuning(
-    config: SonicMoEConfig,
-    tokens: int,
-    routes: int | None,
-    has_bias: bool,
-    *,
-    token_indices_identity: bool,
-) -> bool:
-    """Select the measured R4096 Qwen3 expert-major Stage-1 N tile.
-
-    BM128/BN64 wins across balanced, skewed, and hot-four expert loads at this
-    host-known route count.  The neighboring R6144 bucket regresses, so keep
-    the specialization exact rather than consulting device-side frequencies.
-    """
-
-    return (
-        token_indices_identity
-        and routes is not None
-        and routes == tokens
-        and routes == 4096
-        and config.hidden_size == 2048
-        and config.intermediate_size == 768
-        and config.num_experts == 16
-        and config.top_k == 1
-        and (config.tile_m, config.tile_n, config.tile_k) == (128, 192, 64)
-        and (
-            config.stage2_tile_m,
-            config.stage2_tile_n,
-            config.stage2_tile_k,
-        )
-        == (64, 256, 64)
-        and config.route_tile_m == 128
-        and config.stage1_k_wave == 1
-        and config.stage1_b_cache_mod in (None, 0)
-        and config.stage2_b_cache_mod in (None, 0)
-        and config.stage1_xcd_swizzle == 8
-        and config.stage2_xcd_swizzle == 0
-        and config.waves_per_eu is None
-        and not config.persistent_stage1
-        and not config.persistent_stage2
-        and config.stage2_pipeline_stages == 2
-        and config.stage2_output_mode == "atomic"
-        and config.stage1_write_padded_rows
-        and config.stage1_lds_swizzle
-        and config.activation == "swiglu"
-        and config.compute_dtype == "bf16"
-        and not has_bias
-    )
-
-
-def _use_e16_large_expert_major_forward_tuning(
-    config: SonicMoEConfig,
-    tokens: int,
-    routes: int | None,
-    has_bias: bool,
-    *,
-    token_indices_identity: bool,
-) -> bool:
-    """Select the measured large-R Qwen3 expert-major training profile."""
-
-    return (
-        token_indices_identity
-        and routes is not None
-        and routes == tokens
-        and routes >= _E16_LARGE_EXPERT_MAJOR_FORWARD_MIN_ROUTES
-        and config.hidden_size == 2048
-        and config.intermediate_size == 768
-        and config.num_experts == 16
-        and config.top_k == 1
-        and (config.tile_m, config.tile_n, config.tile_k) == (128, 192, 64)
-        and (
-            config.stage2_tile_m,
-            config.stage2_tile_n,
-            config.stage2_tile_k,
-        )
-        == (64, 256, 64)
-        and config.route_tile_m == 128
-        and config.stage1_k_wave == 1
-        and config.stage1_b_cache_mod in (None, 0)
-        and config.stage2_b_cache_mod in (None, 0)
-        and config.stage1_xcd_swizzle == 8
-        and config.stage2_xcd_swizzle == 0
-        and config.waves_per_eu is None
-        and not config.persistent_stage1
-        and not config.persistent_stage2
-        and config.stage2_pipeline_stages == 2
-        and config.stage2_output_mode == "atomic"
-        and config.stage1_write_padded_rows
-        and config.stage1_lds_swizzle
-        and config.activation == "swiglu"
-        and config.compute_dtype == "bf16"
-        and not has_bias
-    )
 
 
 def _is_e16_flat_training_shape(
@@ -1786,10 +1720,6 @@ def _is_e16_flat_training_shape(
 
     return (
         tokens == routes
-        # Below one backward sort tile the conservative path is cheap and
-        # avoids mixing BM128 forward metadata with legacy BM64 short-route
-        # grouped kernels.
-        and routes >= _E16_FLAT_GROUPED_MIN_ROUTES
         and config.hidden_size == 2048
         and config.intermediate_size == 768
         and config.num_experts == 16
@@ -1908,7 +1838,6 @@ def _get_e16_metadata_stage1_master_launcher(
     stage1_launcher,
     *,
     num_experts: int,
-    identity_partitions: int,
 ):
     """Compose the E16 identity metadata kernel and Stage 1 in one dispatch."""
 
@@ -1933,6 +1862,7 @@ def _get_e16_metadata_stage1_master_launcher(
         i32_routes: fx.Int32,
         i32_tokens: fx.Int32,
         i32_moe_buf_elems: fx.Int32,
+        i32_identity_partitions: fx.Int32,
         arg_x: fx.Int64,
         arg_bq: fx.Int64,
         arg_bscale: fx.Int64,
@@ -1968,8 +1898,13 @@ def _get_e16_metadata_stage1_master_launcher(
             i32_routes,
             i32_tokens,
             i32_moe_buf_elems,
+            i32_identity_partitions,
         ).launch(
-            grid=(num_experts * identity_partitions, 1, 1),
+            grid=(
+                fx.Int64(i32_identity_partitions) * fx.Int64(num_experts),
+                1,
+                1,
+            ),
             block=(_ROUTE_METADATA_BLOCK_SIZE, 1, 1),
             stream=stream,
         )
@@ -2011,10 +1946,11 @@ class SonicMoE:
     Exact-shape and growable workspaces use independent LRU caches, each bounded
     by ``max_cached_workspaces``. Exact entries are keyed by ``(device, stream,
     token_count, route_count)``; dense top-k calls use a dedicated route-count
-    sentinel. Multiple operators may explicitly share growable expert-major
+    sentinel, while every flat-route call uses growable storage. Multiple
+    operators may explicitly share growable flat-route
     scratch by receiving the same :class:`SonicMoEDynamicWorkspacePool`.
-    Except for growable expert-major route
-    workspaces, the returned default output aliases that workspace and is
+    Except for growable flat-route workspaces, the returned default output
+    aliases that workspace and is
     overwritten by the next call with the same key; pass ``out=`` when the
     caller owns output storage. Growable route workspaces span multiple active
     shapes, so their default outputs are invocation-owned. Independent streams
@@ -2138,8 +2074,8 @@ class SonicMoE:
         returns cheap current-shape views over it.
         """
 
-        if tokens <= 0:
-            raise ValueError(f"tokens must be positive, got {tokens}")
+        if tokens < 0:
+            raise ValueError(f"tokens must be non-negative, got {tokens}")
         if routes < 0:
             raise ValueError(f"routes must be non-negative, got {routes}")
         if self._shared_dynamic_workspace_pool is not None:
@@ -2204,7 +2140,12 @@ class SonicMoE:
             self.workspace = workspace
             return workspace
 
-    def _validate_hidden(self, hidden_states: torch.Tensor) -> int:
+    def _validate_hidden(
+        self,
+        hidden_states: torch.Tensor,
+        *,
+        allow_empty: bool = False,
+    ) -> int:
         if not hidden_states.is_cuda:
             raise ValueError("hidden_states must be on a ROCm device")
         if hidden_states.device != self.weights.device:
@@ -2226,8 +2167,11 @@ class SonicMoE:
         if hidden_states.requires_grad:
             raise ValueError("SonicMoE is inference-only; hidden_states must not require gradients")
         tokens = int(hidden_states.shape[0])
-        if tokens <= 0 or tokens > 0xFFFFFF:
-            raise ValueError(f"tokens must be in [1, 2^24-1], got {tokens}")
+        minimum_tokens = 0 if allow_empty else 1
+        if tokens < minimum_tokens or tokens > 0xFFFFFF:
+            raise ValueError(
+                f"tokens must be in [{minimum_tokens}, 2^24-1], got {tokens}"
+            )
         if tokens * self.config.hidden_size * 2 > _MAX_BUFFER_BYTE_OFFSET:
             raise ValueError(
                 "16-bit atomic output addressing exceeds the 32-bit byte-offset limit: "
@@ -2239,10 +2183,18 @@ class SonicMoE:
         _validate_stage1_persistent_runtime(self.config, tokens, arch)
         return tokens
 
-    def _validate_training_hidden(self, hidden_states: torch.Tensor) -> int:
+    def _validate_training_hidden(
+        self,
+        hidden_states: torch.Tensor,
+        *,
+        allow_empty: bool = False,
+    ) -> int:
         """Apply the physical forward ABI while permitting autograd inputs."""
 
-        return self._validate_hidden(hidden_states.detach() if hidden_states.requires_grad else hidden_states)
+        return self._validate_hidden(
+            hidden_states.detach() if hidden_states.requires_grad else hidden_states,
+            allow_empty=allow_empty,
+        )
 
     def _validate_out(
         self,
@@ -2274,11 +2226,19 @@ class SonicMoE:
             raise ValueError("SonicMoE is inference-only; out must not require gradients")
 
         workspace_storages = workspace.storage_ptrs
-        if any(tensor.untyped_storage().data_ptr() in workspace_storages for tensor in read_tensors):
+        if any(
+            tensor.numel() > 0
+            and tensor.untyped_storage().data_ptr() in workspace_storages
+            for tensor in read_tensors
+        ):
             raise ValueError("inputs and prepared weights must not alias internal workspace storage")
 
         out_storage = out.untyped_storage().data_ptr()
-        if any(out_storage == tensor.untyped_storage().data_ptr() for tensor in read_tensors):
+        if out.numel() > 0 and any(
+            tensor.numel() > 0
+            and out_storage == tensor.untyped_storage().data_ptr()
+            for tensor in read_tensors
+        ):
             raise ValueError("out must not alias an input or prepared-weight storage")
         workspace_output_storage = (
             workspace.output.untyped_storage().data_ptr()
@@ -2336,6 +2296,7 @@ class SonicMoE:
         out: torch.Tensor,
         *,
         token_indices_identity: bool = False,
+        route_policy_size: int | None = None,
     ) -> torch.Tensor:
         cfg = self.config
         tokens = workspace.tokens
@@ -2350,9 +2311,27 @@ class SonicMoE:
         if output_mode == "reduce" and workspace.route_output is None:
             raise RuntimeError("reduce stage2 output requires a fixed-top-k route workspace")
 
+        # Expert-major inference shares the same finite scheduling policy as
+        # training/backward.  The real token count remains the runtime extent
+        # and grid bound; only compile-time cache/pipeline choices consult the
+        # representative.  Fixed-top-k and generic ragged callers keep their
+        # established token-based policy by leaving the hint unset.
+        dynamic_e16_flat = (
+            route_policy_size is not None
+            and workspace.routes is not None
+            and token_indices_identity
+            and _is_e16_flat_training_shape(
+                cfg,
+                tokens,
+                int(workspace.routes),
+                has_bias=self.weights.has_bias,
+            )
+        )
+        policy_tokens = route_policy_size if dynamic_e16_flat else tokens
+
         stage1 = _get_stage1_launcher(
             cfg,
-            _stage1_cache_mod(cfg, tokens),
+            _stage1_cache_mod(cfg, policy_tokens),
             self.weights.weight_dtype,
             self.weights.has_bias,
             hidden_states.device.index or 0,
@@ -2384,16 +2363,7 @@ class SonicMoE:
             stream,
         )
 
-        stage2_stages = _stage2_stages(cfg, tokens)
-        dynamic_e16_flat = (
-            workspace.routes is not None
-            and _is_e16_flat_training_shape(
-                cfg,
-                tokens,
-                int(workspace.routes),
-                has_bias=self.weights.has_bias,
-            )
-        )
+        stage2_stages = _stage2_stages(cfg, policy_tokens)
         if (
             (workspace.routes is not None and not dynamic_e16_flat)
             or self.weights.weight_dtype != "bf16"
@@ -2403,7 +2373,7 @@ class SonicMoE:
             stage2_stages = 1
         stage2 = _get_stage2_launcher(
             cfg,
-            _stage2_cache_mod(cfg, tokens),
+            _stage2_cache_mod(cfg, policy_tokens),
             self.weights.weight_dtype,
             self.weights.has_bias,
             output_mode,
@@ -2461,6 +2431,7 @@ class SonicMoE:
         *,
         interleaved_w1: bool,
         token_indices_identity: bool,
+        route_policy_size: int | None = None,
     ) -> _TrainingForwardLaunchPlan:
         """Resolve launch choices before expert-major metadata dispatch.
 
@@ -2475,6 +2446,16 @@ class SonicMoE:
         cfg = self.config
         tokens = workspace.tokens
         flat_routes = workspace.routes is not None
+        route_policy = (
+            select_e16_route_policy(int(workspace.routes), route_policy_size)
+            if workspace.routes is not None
+            else None
+        )
+        policy_representative = (
+            e16_route_policy_representative(route_policy)
+            if route_policy is not None
+            else None
+        )
         output_mode = (
             cfg.stage2_output_mode
             if not flat_routes
@@ -2495,37 +2476,51 @@ class SonicMoE:
             tokens,
             workspace.routes,
             self.weights.has_bias,
+            token_indices_identity=token_indices_identity,
+            route_policy=route_policy,
         )
-        if _use_e16_4096_expert_major_forward_tuning(
+        use_e16_expert_major_tuning = _use_e16_expert_major_forward_tuning(
             cfg,
             tokens,
             workspace.routes,
             self.weights.has_bias,
             token_indices_identity=token_indices_identity,
+        )
+        use_xlarge_e16_expert_major_tuning = (
+            use_e16_expert_major_tuning
+            and route_policy == E16RoutePolicy.XLARGE
+        )
+        if (
+            use_e16_expert_major_tuning
+            and route_policy == E16RoutePolicy.SMALL
         ):
+            # This is a capacity-class specialization, not the former exact
+            # R==4096 gate.  BN64 supplies enough independent N tiles for the
+            # entire <=4K class; the next class returns to the baseline BN192.
             training_tile_n = 64
             training_waves_per_eu = None
-        use_large_e16_expert_major_tuning = (
-            _use_e16_large_expert_major_forward_tuning(
-                cfg,
-                tokens,
-                workspace.routes,
-                self.weights.has_bias,
-                token_indices_identity=token_indices_identity,
-            )
-        )
-        if use_large_e16_expert_major_tuning:
-            training_tile_m = 64
+        elif use_xlarge_e16_expert_major_tuning:
             training_tile_n = 128
             training_waves_per_eu = None
 
-        stage1_cache_mod = _stage1_cache_mod(cfg, tokens)
+        # Cache policy is part of the compiled GEMM family.  Once the caller
+        # supplies a rank-shared E16 route policy, do not let the exact local
+        # route count select a different cache mode (for example around the
+        # historical 2K cutoff).  Actual ``tokens`` still controls all tensor
+        # bounds and the runtime launch grid below.
+        policy_tokens = (
+            policy_representative
+            if use_e16_expert_major_tuning
+            and policy_representative is not None
+            else tokens
+        )
+        stage1_cache_mod = _stage1_cache_mod(cfg, policy_tokens)
         stage2_cfg = (
             replace(cfg, down_tile_n=128, stage2_pipeline_stages=1)
-            if use_large_e16_expert_major_tuning
+            if use_xlarge_e16_expert_major_tuning
             else cfg
         )
-        stage2_stages = _stage2_stages(stage2_cfg, tokens)
+        stage2_stages = _stage2_stages(stage2_cfg, policy_tokens)
         dynamic_e16_flat = (
             workspace.routes is not None
             and _is_e16_flat_training_shape(
@@ -2541,7 +2536,7 @@ class SonicMoE:
             or output_mode not in ("atomic", "identity")
         ):
             stage2_stages = 1
-        stage2_cache_mod = _stage2_cache_mod(stage2_cfg, tokens)
+        stage2_cache_mod = _stage2_cache_mod(stage2_cfg, policy_tokens)
         grid1 = gemm1_a16w4_grid(
             training_tile_m,
             INTER=cfg.intermediate_size,
@@ -2593,6 +2588,7 @@ class SonicMoE:
             grid1=int(grid1),
             grid2=int(grid2),
             output_mode=output_mode,
+            route_policy_size=policy_representative,
         )
 
     def _launch_e16_identity_metadata_and_stage1(
@@ -2618,7 +2614,7 @@ class SonicMoE:
         if not _FUSE_E16_METADATA_STAGE1_DISPATCH:
             return False
         routes = int(workspace.routes or 0)
-        single_launch, identity_partitions = (
+        single_launch, _ = (
             _route_sorting_module._expert_major_identity_fusion_parameters(
                 self.config.num_experts,
                 True,
@@ -2627,6 +2623,14 @@ class SonicMoE:
         )
         if not single_launch:
             return False
+        single_launch, identity_partitions = (
+            _route_sorting_module._expert_major_identity_fusion_parameters(
+                self.config.num_experts,
+                True,
+                routes,
+            )
+        )
+        assert single_launch
 
         sorter_launcher = _compile_moe_expert_major_sorting(
             num_experts=self.config.num_experts,
@@ -2636,13 +2640,11 @@ class SonicMoE:
             token_indices_identity=True,
             clear_output=False,
             single_launch_identity=True,
-            identity_partitions=identity_partitions,
         )
         master = _get_e16_metadata_stage1_master_launcher(
             sorter_launcher,
             launch_plan.stage1,
             num_experts=self.config.num_experts,
-            identity_partitions=identity_partitions,
         )
         mirror_arg = frequency if frequency_mirror is None else frequency_mirror
         output_i32 = out.view(torch.int32)
@@ -2662,6 +2664,7 @@ class SonicMoE:
             routes,
             workspace.tokens,
             int(output_i32.numel()),
+            identity_partitions,
             hidden_states.data_ptr(),
             self.weights.gate_up.data_ptr(),
             self.weights.dummy_scale.data_ptr(),
@@ -3018,6 +3021,7 @@ class SonicMoE:
         *,
         expert_offsets: torch.Tensor | None = None,
         token_indices_identity: bool = False,
+        route_policy_size: int | None = None,
     ) -> torch.Tensor:
         """Run the grouped MLP from a flat variable-K route list.
 
@@ -3039,6 +3043,11 @@ class SonicMoE:
         ``token_indices_identity=True`` only when ``routes == tokens`` and
         ``token_indices[r] == r``; Stage 2 can then store directly without
         clearing or atomically accumulating the output.
+
+        ``route_policy_size`` is an optional rank-shared performance-policy
+        floor for expert-major tile/cache selection.  It is coarsened to a
+        finite capacity class, automatically promoted by a larger local route
+        count, and never changes allocation, runtime grids, or route bounds.
         """
 
         if not hidden_states.is_cuda:
@@ -3053,6 +3062,7 @@ class SonicMoE:
                 expert_frequency_out,
                 expert_offsets=expert_offsets,
                 token_indices_identity=token_indices_identity,
+                route_policy_size=route_policy_size,
             )
 
     def _forward_routes_on_current_device(
@@ -3066,8 +3076,9 @@ class SonicMoE:
         *,
         expert_offsets: torch.Tensor | None,
         token_indices_identity: bool,
+        route_policy_size: int | None,
     ) -> torch.Tensor:
-        tokens = self._validate_hidden(hidden_states)
+        tokens = self._validate_hidden(hidden_states, allow_empty=True)
         if token_indices.ndim != 1 or expert_indices.ndim != 1 or route_weights.ndim != 1:
             raise ValueError("token_indices, expert_indices, and route_weights must be one-dimensional")
         routes = int(route_weights.numel())
@@ -3075,6 +3086,9 @@ class SonicMoE:
             raise ValueError("token_indices, expert_indices, and route_weights must have equal length")
         if routes > _MAX_SIGNED_I32:
             raise ValueError(f"route count exceeds the sorting kernel's signed 32-bit limit: {routes}")
+        policy_representative = e16_route_policy_representative(
+            select_e16_route_policy(routes, route_policy_size)
+        )
         if (
             not token_indices.is_cuda
             or not expert_indices.is_cuda
@@ -3103,11 +3117,7 @@ class SonicMoE:
             token_indices_identity=token_indices_identity,
         )
 
-        workspace = (
-            self.reserve_dynamic_routes(tokens, routes)
-            if expert_major
-            else self.reserve(tokens, routes=routes)
-        )
+        workspace = self.reserve_dynamic_routes(tokens, routes)
         output = self._validate_out(
             out,
             workspace,
@@ -3117,7 +3127,7 @@ class SonicMoE:
             route_weights,
             *((expert_offsets,) if expert_offsets is not None else ()),
             *self.weights.tensors,
-            invocation_owned_default=expert_major,
+            invocation_owned_default=True,
         )
 
         frequency = workspace.expert_frequency
@@ -3156,6 +3166,7 @@ class SonicMoE:
                     unit_size=self.config.route_tile_m,
                     token_indices_identity=token_indices_identity,
                     clear_output=not token_indices_identity,
+                    route_policy_size=policy_representative,
                 )
             else:
                 moe_ragged_sorting_flydsl(
@@ -3181,6 +3192,9 @@ class SonicMoE:
                 workspace,
                 output,
                 token_indices_identity=token_indices_identity,
+                route_policy_size=(
+                    policy_representative if expert_major else None
+                ),
             )
 
     def forward_routes_training(
@@ -3195,6 +3209,7 @@ class SonicMoE:
         expert_frequency_out: torch.Tensor | None = None,
         expert_offsets: torch.Tensor | None = None,
         token_indices_identity: bool = False,
+        route_policy_size: int | None = None,
     ) -> tuple[torch.Tensor, SonicMoERoutesForwardState]:
         """Run arbitrary flat routes and retain route-order W1 preactivation.
 
@@ -3213,6 +3228,10 @@ class SonicMoE:
         generated padded metadata is owned by the returned state and reused by
         backward.  ``token_indices_identity=True`` additionally selects direct
         Stage-2 output stores and records the identity mapping in that state.
+        ``route_policy_size`` may carry one rank-shared tile/cache policy floor; it
+        selects only a bounded performance profile and is automatically
+        promoted by larger local route counts.  Actual ``routes`` remains
+        authoritative for allocation, bounds, and retained state.
         """
 
         if not isinstance(interleaved_w1, bool):
@@ -3243,6 +3262,7 @@ class SonicMoE:
                 expert_frequency_out=expert_frequency_out,
                 expert_offsets=expert_offsets,
                 token_indices_identity=token_indices_identity,
+                route_policy_size=route_policy_size,
             )
 
     def _forward_routes_training_on_current_device(
@@ -3257,8 +3277,12 @@ class SonicMoE:
         expert_frequency_out: torch.Tensor | None,
         expert_offsets: torch.Tensor | None,
         token_indices_identity: bool,
+        route_policy_size: int | None,
     ) -> tuple[torch.Tensor, SonicMoERoutesForwardState]:
-        tokens = self._validate_training_hidden(hidden_states)
+        tokens = self._validate_training_hidden(
+            hidden_states,
+            allow_empty=True,
+        )
         if token_indices.ndim != 1 or expert_indices.ndim != 1 or route_weights.ndim != 1:
             raise ValueError("token_indices, expert_indices, and route_weights must be one-dimensional")
         routes = int(route_weights.numel())
@@ -3266,6 +3290,9 @@ class SonicMoE:
             raise ValueError("token_indices, expert_indices, and route_weights must have equal length")
         if routes > _MAX_SIGNED_I32:
             raise ValueError(f"route count exceeds the sorting kernel's signed 32-bit limit: {routes}")
+        policy_representative = e16_route_policy_representative(
+            select_e16_route_policy(routes, route_policy_size)
+        )
         if (
             not token_indices.is_cuda
             or not expert_indices.is_cuda
@@ -3297,11 +3324,7 @@ class SonicMoE:
             routes,
             self.config.intermediate_size,
         )
-        workspace = (
-            self.reserve_dynamic_routes(tokens, routes)
-            if expert_major
-            else self.reserve(tokens, routes=routes)
-        )
+        workspace = self.reserve_dynamic_routes(tokens, routes)
         output = self._validate_out(
             out,
             workspace,
@@ -3311,7 +3334,7 @@ class SonicMoE:
             route_weights,
             *((expert_offsets,) if expert_offsets is not None else ()),
             *self.weights.tensors,
-            invocation_owned_default=expert_major,
+            invocation_owned_default=True,
         )
         retain_sorter_metadata = _retain_e16_flat_sorter_metadata(
             self.config,
@@ -3365,6 +3388,7 @@ class SonicMoE:
             workspace,
             interleaved_w1=interleaved_w1,
             token_indices_identity=token_indices_identity,
+            route_policy_size=policy_representative,
         )
         assert workspace.sorting_workspace is not None
         assert workspace.sorted_route_ids is not None
@@ -3416,6 +3440,7 @@ class SonicMoE:
                         expert_frequency_mirror=frequency_mirror,
                         token_indices_identity=token_indices_identity,
                         clear_output=not token_indices_identity,
+                        route_policy_size=launch_plan.route_policy_size,
                     )
             else:
                 moe_ragged_sorting_flydsl(
@@ -3488,14 +3513,36 @@ class SonicMoE:
             has_bias=self.weights.has_bias,
             producer_stream=int(stream.cuda_stream),
             ready_event=ready_event,
-            sorted_token_ids=(sorted_token_ids if retain_sorter_metadata else None),
-            sorted_route_ids=(sorted_route_ids if retain_sorter_metadata else None),
-            sorted_weights=(sorted_weights if retain_sorter_metadata else None),
-            sorted_expert_ids=(sorted_expert_ids if retain_sorter_metadata else None),
+            # Empty launches keep one backing element so the generated sorter
+            # always receives a valid buffer resource.  Expose only the
+            # mathematical active extent in the retained-state ABI; this lets
+            # backward validate and reuse an empty rank's metadata exactly as
+            # it does for every non-empty dynamic route count.
+            sorted_token_ids=(
+                sorted_token_ids[: workspace.max_padded_tokens]
+                if retain_sorter_metadata
+                else None
+            ),
+            sorted_route_ids=(
+                sorted_route_ids[: workspace.max_padded_tokens]
+                if retain_sorter_metadata
+                else None
+            ),
+            sorted_weights=(
+                sorted_weights[: workspace.max_padded_tokens]
+                if retain_sorter_metadata
+                else None
+            ),
+            sorted_expert_ids=(
+                sorted_expert_ids[: workspace.max_m_blocks]
+                if retain_sorter_metadata
+                else None
+            ),
             num_valid_ids=(num_valid_ids if retain_sorter_metadata else None),
             expert_frequency=(frequency if retain_sorter_metadata else None),
             expert_major=expert_major,
             token_indices_identity=token_indices_identity,
+            route_policy_size=launch_plan.route_policy_size,
         )
         return result, state
 
@@ -3815,6 +3862,121 @@ class SonicMoE:
 
 
 @torch.no_grad()
+def warmup_sonic_e16_training(
+    operator: SonicMoE,
+    w1: torch.Tensor,
+    w2: torch.Tensor,
+    *,
+    route_policy_sizes: Iterable[int] | None = None,
+    interleaved_w1: bool = False,
+    synchronize: bool = True,
+) -> tuple[int, ...]:
+    """Compile the finite dynamic-E16 forward/backward policy families.
+
+    The warmup executes a real retained-state expert-major forward and
+    backward because FlyDSL device compilation happens on first launch, not
+    when a cached launcher factory is created.  A fixed 16-route probe keeps
+    allocations small; only ``route_policy_size`` changes, so this does not
+    reintroduce exact-R compiler variants.  The returned tuple contains the
+    canonical policy sizes that were warmed.
+
+    This helper is intentionally restricted to the retained expert-major
+    identity lifecycle of the tuned bias-free BF16 Qwen3-30B-A3B local-expert
+    shape. ``w1`` and ``w2`` are the logical contiguous BF16 backward weights,
+    not the operator's preshuffled forward storage; an interleaved W1 must be
+    declared consistently.  Each process/device should call it once, then the
+    integration should synchronize its EP ranks before timed work.  With
+    ``synchronize=False`` it only guarantees compilation and enqueue on the
+    current stream, so the caller owns the corresponding synchronization.
+
+    Warmup intentionally uses a tiny probe and does not reserve production-size
+    scratch.  An application which knows a high-water route count can call
+    ``operator.reserve_dynamic_routes(max_routes, max_routes)`` during startup
+    (preferably through a shared dynamic workspace pool).  At runtime, derive
+    one policy size from the current EP-wide maximum local route count with
+    :func:`canonical_e16_route_policy_size` and pass that same value to every
+    rank's forward; backward inherits it from the retained state.  The shared
+    maximum must cover every local rank—automatic promotion of an underestimated
+    hint preserves correctness, but cannot keep rank launch policies aligned.
+    """
+
+    if not isinstance(operator, SonicMoE):
+        raise TypeError("operator must be a SonicMoE instance")
+    if not isinstance(interleaved_w1, bool):
+        raise TypeError("interleaved_w1 must be bool")
+    if not isinstance(synchronize, bool):
+        raise TypeError("synchronize must be bool")
+    config = operator.config
+    if operator.weights.weight_dtype != "bf16" or not _use_e16_expert_major_forward_tuning(
+        config,
+        16,
+        16,
+        operator.weights.has_bias,
+        token_indices_identity=True,
+    ):
+        raise ValueError(
+            "warmup_sonic_e16_training requires the tuned bias-free BF16 "
+            "H2048/I768/E16/K1 expert-major configuration"
+        )
+
+    requested_sizes = (
+        E16_ROUTE_POLICY_SIZES
+        if route_policy_sizes is None
+        else tuple(route_policy_sizes)
+    )
+    if not requested_sizes:
+        raise ValueError("route_policy_sizes must contain at least one value")
+    canonical_sizes = tuple(
+        dict.fromkeys(
+            canonical_e16_route_policy_size(size)
+            for size in requested_sizes
+        )
+    )
+
+    device = operator.weights.device
+    routes = config.num_experts
+    hidden_states = torch.zeros(
+        (routes, config.hidden_size),
+        dtype=torch.bfloat16,
+        device=device,
+    )
+    token_indices = torch.arange(routes, dtype=torch.int32, device=device)
+    expert_indices = torch.arange(routes, dtype=torch.int32, device=device)
+    route_weights = torch.ones(routes, dtype=torch.float32, device=device)
+    expert_offsets = torch.arange(routes + 1, dtype=torch.int32, device=device)
+    grad_output = torch.zeros_like(hidden_states)
+
+    for policy_size in canonical_sizes:
+        _, state = operator.forward_routes_training(
+            hidden_states,
+            token_indices,
+            expert_indices,
+            route_weights,
+            interleaved_w1=interleaved_w1,
+            expert_offsets=expert_offsets,
+            token_indices_identity=True,
+            route_policy_size=policy_size,
+        )
+        sonic_moe_backward_routes(
+            hidden_states,
+            w1,
+            w2,
+            token_indices,
+            expert_indices,
+            route_weights,
+            grad_output,
+            config,
+            interleaved_w1=interleaved_w1,
+            forward_state=state,
+            token_indices_sorted=True,
+        )
+
+    if synchronize:
+        torch.cuda.synchronize(device)
+    return canonical_sizes
+
+
+@torch.no_grad()
 def sonic_moe_reference(
     hidden_states: torch.Tensor,
     w1: torch.Tensor,
@@ -3942,6 +4104,7 @@ def sonic_moe_mxfp4_reference(
 
 
 __all__ = [
+    "E16_ROUTE_POLICY_SIZES",
     "SonicMoE",
     "SonicMoEConfig",
     "SonicMoEDynamicWorkspacePool",
@@ -3949,6 +4112,7 @@ __all__ = [
     "SonicMoERoutesForwardState",
     "SonicMoEWeights",
     "SonicMoEWorkspace",
+    "canonical_e16_route_policy_size",
     "prepare_sonic_bf16_weights",
     "prepare_sonic_fp16_weights",
     "prepare_sonic_mxfp4_weights",
@@ -3956,4 +4120,5 @@ __all__ = [
     "sonic_moe_backward_routes",
     "sonic_moe_mxfp4_reference",
     "sonic_moe_reference",
+    "warmup_sonic_e16_training",
 ]

@@ -67,8 +67,8 @@ RUN_BENCH = os.environ.get("MOE_SORTING_BENCH", "0") == "1"
         (16, True, 4096, (True, 1)),
         (16, True, 4097, (True, 2)),
         (16, True, 7999, (True, 2)),
-        (16, True, 8000, (True, 4)),
-        (16, True, 8192, (True, 4)),
+        (16, True, 8000, (True, 2)),
+        (16, True, 8192, (True, 2)),
         (16, True, 8193, (True, 4)),
         (16, True, 9000, (True, 4)),
         (16, True, 9001, (True, 4)),
@@ -101,7 +101,6 @@ def test_expert_major_identity_composition_hook_has_stable_signature():
         token_indices_identity=True,
         clear_output=False,
         single_launch_identity=True,
-        identity_partitions=2,
     )
     kernel = _get_expert_major_identity_kernel(launcher)
     assert tuple(kernel._sig.parameters) == (
@@ -119,6 +118,7 @@ def test_expert_major_identity_composition_hook_has_stable_signature():
         "i32_routes",
         "i32_tokens",
         "i32_moe_buf_elems",
+        "i32_identity_partitions",
     )
     with pytest.raises(ValueError, match="does not expose"):
         _get_expert_major_identity_kernel(lambda: None)
@@ -357,7 +357,7 @@ def test_ragged_sorting_mirrors_frequency_in_prefix_dispatch():
         (8192, *([0] * 15)),
     ),
 )
-def test_expert_major_sorting_dynamic_padded_abi(counts):
+def test_expert_major_sorting_dynamic_padded_abi(counts, *, route_policy_size=None):
     """Expert-major adapters match the flat ragged-sorter ABI.
 
     The route count and load distribution deliberately vary while E/unit stay
@@ -413,6 +413,7 @@ def test_expert_major_sorting_dynamic_padded_abi(counts):
         expert_frequency_mirror=mirror,
         token_indices_identity=True,
         clear_output=True,
+        route_policy_size=route_policy_size,
     )
     torch.cuda.synchronize(device)
 
@@ -476,13 +477,21 @@ def test_expert_major_sorting_dynamic_padded_abi(counts):
 
 
 def test_expert_major_sorting_cache_is_dynamic_in_route_count():
-    """Different small R values share one compile-cache specialization."""
+    """Route and partition-count changes share one compile specialization."""
 
     _expert_major_cf_cache.clear()
-    # The parametrized ABI test compiles three distinct runtime-R calls under
-    # one E/unit/feature key; this test keeps the cache invariant explicit.
-    test_expert_major_sorting_dynamic_padded_abi((3, 0, 5, 1))
-    test_expert_major_sorting_dynamic_padded_abi((16, 17, 31, 2))
+    # Actual R exercises P1/P2/P4 while deliberately unrelated policy hints
+    # cannot inflate the runtime CTA count.  All calls share one E/unit/feature
+    # compile key and every output bound uses actual R.
+    test_expert_major_sorting_dynamic_padded_abi(
+        (9, *([0] * 15)),
+        route_policy_size=65536,
+    )
+    test_expert_major_sorting_dynamic_padded_abi(
+        (4097, *([0] * 15)),
+        route_policy_size=4096,
+    )
+    test_expert_major_sorting_dynamic_padded_abi((8193, *([0] * 15)))
     assert len(_expert_major_cf_cache) == 1
 
 
