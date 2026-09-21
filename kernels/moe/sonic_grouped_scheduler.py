@@ -284,6 +284,8 @@ def compile_exact_m_tile_queue_builder(
         i32_hot_expert_capacity: fx.Int32,
         i32_split_rows: fx.Int32,
         i32_min_hot_rows: fx.Int32,
+        i32_split_activation_rows: fx.Int32,
+        i32_sparse_split_max_experts: fx.Int32,
     ):
         if const_expr(num_experts <= _BLOCK_THREADS):
             # The Qwen3 E16 target fits in one workgroup, so clear and build in
@@ -308,7 +310,76 @@ def compile_exact_m_tile_queue_builder(
                         max_size=True,
                     )
                     buffer_ops.buffer_store(fx.Int32(0), split_rsrc, fx.Int32(0))
-                    buffer_ops.buffer_store(fx.Int32(0), hot_rsrc, fx.Int32(0))
+                    # A negative hot count is a workgroup-local disabled
+                    # sentinel.  Count experts which are actually eligible
+                    # for splitting rather than all non-empty experts: one
+                    # hot expert plus many tiny tails should retain the sparse
+                    # split path.  Dense cohorts wait for the shard-wide
+                    # crossover before any member is split.
+                    frequency_rsrc = buffer_ops.create_buffer_resource(
+                        expert_frequency,
+                        max_size=True,
+                    )
+                    cohort_count = fx.Int32(0)
+                    max_frequency = fx.Int32(0)
+                    eligible_hot_count = fx.Int32(0)
+                    required_split_count = fx.Int32(0)
+                    # Treat experts within one regular M tile of the split
+                    # cutoff as one cohort.  This keeps small route-count
+                    # jitter (for example 8193/8191/8190 rows) from enabling
+                    # an isolated split launch, while tiny long-tail experts
+                    # still do not suppress the sparse hot1/hot2 path.
+                    cohort_floor = i32_min_hot_rows - fx.Int32(block_m)
+                    cohort_min_rows = (cohort_floor > fx.Int32(0)).select(
+                        cohort_floor,
+                        fx.Int32(1),
+                    )
+                    for candidate_expert in range_constexpr(num_experts):
+                        candidate_frequency = fx.Int32(
+                            buffer_ops.buffer_load(
+                                frequency_rsrc,
+                                fx.Int32(candidate_expert),
+                                vec_width=1,
+                                dtype=T.i32,
+                            )
+                        )
+                        in_hot_cohort = candidate_frequency >= cohort_min_rows
+                        cohort_count = cohort_count + in_hot_cohort.select(
+                            fx.Int32(1),
+                            fx.Int32(0),
+                        )
+                        eligible_hot = candidate_frequency >= i32_min_hot_rows
+                        eligible_hot_count = (
+                            eligible_hot_count
+                            + eligible_hot.select(fx.Int32(1), fx.Int32(0))
+                        )
+                        candidate_partitions = (
+                            candidate_frequency
+                            + i32_split_rows
+                            - fx.Int32(1)
+                        ) // i32_split_rows
+                        required_split_count = (
+                            required_split_count
+                            + eligible_hot.select(
+                                candidate_partitions,
+                                fx.Int32(0),
+                            )
+                        )
+                        max_frequency = (
+                            candidate_frequency > max_frequency
+                        ).select(candidate_frequency, max_frequency)
+                    capacities_sufficient = (
+                        eligible_hot_count <= i32_hot_expert_capacity
+                    ) & (required_split_count <= i32_hot_split_capacity)
+                    split_enabled = (max_frequency >= i32_min_hot_rows) & (
+                        (cohort_count <= i32_sparse_split_max_experts)
+                        | (max_frequency >= i32_split_activation_rows)
+                    ) & capacities_sufficient
+                    buffer_ops.buffer_store(
+                        split_enabled.select(fx.Int32(0), fx.Int32(-1)),
+                        hot_rsrc,
+                        fx.Int32(0),
+                    )
             gpu.barrier()
         expert = gpu.block_idx.x * fx.Int32(_BLOCK_THREADS) + gpu.thread_idx.x
         if expert < fx.Int32(num_experts):
@@ -387,7 +458,19 @@ def compile_exact_m_tile_queue_builder(
                     output_start = fx.Int32(reservation)
                     first_sorted_row = lo * fx.Int32(sorted_block_m)
                     if const_expr(emit_hot_splits):
-                        if frequency >= i32_min_hot_rows:
+                        hot_rsrc = buffer_ops.create_buffer_resource(
+                            hot_expert_storage,
+                            max_size=True,
+                        )
+                        split_enabled = fx.Int32(
+                            buffer_ops.buffer_load(
+                                hot_rsrc,
+                                fx.Int32(0),
+                                vec_width=1,
+                                dtype=T.i32,
+                            )
+                        ) >= fx.Int32(0)
+                        if split_enabled & (frequency >= i32_min_hot_rows):
                             partition_count = (
                                 frequency + i32_split_rows - fx.Int32(1)
                             ) // i32_split_rows
@@ -408,10 +491,6 @@ def compile_exact_m_tile_queue_builder(
                                 )
                             )
                             if hot_slot < i32_hot_expert_capacity:
-                                hot_rsrc = buffer_ops.create_buffer_resource(
-                                    hot_expert_storage,
-                                    max_size=True,
-                                )
                                 hot_offset = fx.Int32(1) + hot_slot * fx.Int32(3)
                                 buffer_ops.buffer_store(expert, hot_rsrc, hot_offset)
                                 buffer_ops.buffer_store(
@@ -546,6 +625,10 @@ def compile_exact_m_tile_queue_builder(
                             dtype=T.i32,
                         )
                     )
+                    nonnegative_hot = (required_hot >= fx.Int32(0)).select(
+                        required_hot,
+                        fx.Int32(0),
+                    )
                     buffer_ops.buffer_store(
                         (required_splits < i32_hot_split_capacity).select(
                             required_splits,
@@ -555,8 +638,8 @@ def compile_exact_m_tile_queue_builder(
                         fx.Int32(0),
                     )
                     buffer_ops.buffer_store(
-                        (required_hot < i32_hot_expert_capacity).select(
-                            required_hot,
+                        (nonnegative_hot < i32_hot_expert_capacity).select(
+                            nonnegative_hot,
                             i32_hot_expert_capacity,
                         ),
                         hot_rsrc,
@@ -578,6 +661,8 @@ def compile_exact_m_tile_queue_builder(
         i32_hot_expert_capacity: fx.Int32,
         i32_split_rows: fx.Int32,
         i32_min_hot_rows: fx.Int32,
+        i32_split_activation_rows: fx.Int32,
+        i32_sparse_split_max_experts: fx.Int32,
         stream: fx.Stream = fx.Stream(None),
     ):
         if num_experts > _BLOCK_THREADS:
@@ -600,6 +685,8 @@ def compile_exact_m_tile_queue_builder(
             i32_hot_expert_capacity,
             i32_split_rows,
             i32_min_hot_rows,
+            i32_split_activation_rows,
+            i32_sparse_split_max_experts,
         ).launch(
             grid=((num_experts + _BLOCK_THREADS - 1) // _BLOCK_THREADS, 1, 1),
             block=(_BLOCK_THREADS, 1, 1),
@@ -638,6 +725,8 @@ def build_exact_m_tile_queue(
     hot_expert_storage: torch.Tensor | None = None,
     split_rows: int | None = None,
     min_hot_rows: int | None = None,
+    split_activation_rows: int | None = None,
+    sparse_split_max_experts: int | None = None,
     stream: torch.cuda.Stream | None = None,
 ) -> torch.Tensor:
     """Asynchronously build a self-contained exact M-tile work queue.
@@ -712,6 +801,32 @@ def build_exact_m_tile_queue(
             raise ValueError("hot split emission requires split_rows and min_hot_rows")
         if split_rows <= 0 or min_hot_rows < split_rows:
             raise ValueError("hot split emission requires 0 < split_rows <= min_hot_rows")
+        split_activation_rows = (
+            min_hot_rows
+            if split_activation_rows is None
+            else split_activation_rows
+        )
+        sparse_split_max_experts = (
+            int(expert_frequency.numel())
+            if sparse_split_max_experts is None
+            else sparse_split_max_experts
+        )
+        if (
+            not isinstance(split_activation_rows, int)
+            or isinstance(split_activation_rows, bool)
+            or split_activation_rows < min_hot_rows
+        ):
+            raise ValueError(
+                "split_activation_rows must be an int at least min_hot_rows"
+            )
+        if (
+            not isinstance(sparse_split_max_experts, int)
+            or isinstance(sparse_split_max_experts, bool)
+            or not 0 <= sparse_split_max_experts <= int(expert_frequency.numel())
+        ):
+            raise ValueError(
+                "sparse_split_max_experts must be in [0, num_experts]"
+            )
         for name, tensor, record_width in (
             ("hot_split_storage", hot_split_storage, 3),
             ("hot_expert_storage", hot_expert_storage, 3),
@@ -730,7 +845,12 @@ def build_exact_m_tile_queue(
         hot_split_arg = hot_split_storage
         hot_expert_arg = hot_expert_storage
     else:
-        if split_rows is not None or min_hot_rows is not None:
+        if (
+            split_rows is not None
+            or min_hot_rows is not None
+            or split_activation_rows is not None
+            or sparse_split_max_experts is not None
+        ):
             raise ValueError("split thresholds require hot split storage")
         hot_split_capacity = 0
         hot_expert_capacity = 0
@@ -738,6 +858,8 @@ def build_exact_m_tile_queue(
         hot_expert_arg = queue
         split_rows = 0
         min_hot_rows = 0
+        split_activation_rows = 0
+        sparse_split_max_experts = 0
     if not isinstance(block_m, int) or isinstance(block_m, bool) or block_m <= 0:
         raise ValueError(f"block_m must be a positive int, got {block_m}")
     if (
@@ -813,6 +935,8 @@ def build_exact_m_tile_queue(
         hot_expert_capacity,
         split_rows,
         min_hot_rows,
+        split_activation_rows,
+        sparse_split_max_experts,
         stream,
     )
     return queue

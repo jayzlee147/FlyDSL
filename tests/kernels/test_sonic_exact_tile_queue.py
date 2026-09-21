@@ -368,6 +368,209 @@ def test_exact_queue_builder_also_emits_hot_split_queues():
     }
 
 
+@pytest.mark.parametrize(
+    ("frequencies", "expected_hot_experts"),
+    (
+        (
+            [8193, 8192, 8192, 8192, *([0] * 12)],
+            (),
+        ),
+        (
+            [8193, 8192, 8192, *([0] * 13)],
+            (),
+        ),
+        (
+            [8193, 8191, 8190, *([0] * 13)],
+            (),
+        ),
+        (
+            [14335, 14335, 14335, 14335, *([0] * 12)],
+            (),
+        ),
+        (
+            [14336, 14335, 14335, 14335, *([0] * 12)],
+            (0, 1, 2, 3),
+        ),
+        (
+            [9000, *([1] * 15)],
+            (0,),
+        ),
+        (
+            [9000, 8500, *([1] * 14)],
+            (0, 1),
+        ),
+        # Once the global trigger fires, every per-expert eligible descriptor
+        # must fit even when only one expert reached the higher trigger.
+        (
+            [14336, *([8193] * 15)],
+            tuple(range(16)),
+        ),
+    ),
+    ids=(
+        "hot4-base-boundary-disabled",
+        "hot3-base-boundary-disabled",
+        "hot3-near-boundary-disabled",
+        "hot4-below-activation-disabled",
+        "hot4-activation-enables-whole-cohort",
+        "hot1-with-small-active-tails",
+        "hot2-with-small-active-tails",
+        "activation-capacity-adversary",
+    ),
+)
+def test_exact_queue_device_hot_split_gate(frequencies, expected_hot_experts):
+    device = _gfx950_device()
+    split_rows = 8192
+    min_hot_rows = 8193
+    split_activation_rows = 14336
+    routes = sum(frequencies)
+    frequency, sorted_experts, num_valid = _metadata_from_frequencies(
+        frequencies,
+        device,
+    )
+    exact_capacity = exact_m_tile_queue_upper_bound(
+        routes,
+        len(frequencies),
+        128,
+    )
+    exact_queue = torch.empty(
+        (1 + 3 * exact_capacity,),
+        dtype=torch.int32,
+        device=device,
+    )
+    active_queue = torch.empty(
+        (1 + 2 * len(frequencies),),
+        dtype=torch.int32,
+        device=device,
+    )
+    split_capacity = hot_split_descriptor_capacity(
+        routes,
+        len(frequencies),
+        split_rows,
+        min_hot_rows,
+    )
+    split_queue = torch.full(
+        (1 + 3 * max(1, split_capacity),),
+        _CANARY,
+        dtype=torch.int32,
+        device=device,
+    )
+    hot_capacity = max(1, min(len(frequencies), routes // min_hot_rows))
+    hot_queue = torch.full(
+        (1 + 3 * hot_capacity,),
+        _CANARY,
+        dtype=torch.int32,
+        device=device,
+    )
+
+    build_exact_m_tile_queue(
+        frequency,
+        sorted_experts,
+        num_valid,
+        exact_queue,
+        block_m=128,
+        sorted_block_m=_SORTED_BLOCK_M,
+        active_expert_storage=active_queue,
+        active_expert_capacity=len(frequencies),
+        hot_split_storage=split_queue,
+        hot_expert_storage=hot_queue,
+        split_rows=split_rows,
+        min_hot_rows=min_hot_rows,
+        split_activation_rows=split_activation_rows,
+        sparse_split_max_experts=2,
+    )
+    torch.cuda.synchronize(device)
+
+    hot_count = int(hot_queue[0].item())
+    split_count = int(split_queue[0].item())
+    observed_hot_experts = tuple(
+        sorted(
+            hot_queue[1 : 1 + 3 * hot_count]
+            .view(-1, 3)[:, 0]
+            .cpu()
+            .tolist()
+        )
+    )
+    expected_split_count = sum(
+        (frequencies[expert] + split_rows - 1) // split_rows
+        for expert in expected_hot_experts
+    )
+
+    assert hot_count == len(expected_hot_experts)
+    assert observed_hot_experts == expected_hot_experts
+    assert split_count == expected_split_count
+    assert split_count <= split_capacity
+    assert int(active_queue[0].item()) == sum(count > 0 for count in frequencies)
+
+
+@pytest.mark.parametrize(
+    ("split_capacity", "hot_capacity"),
+    ((1, 3), (9, 2), (0, 0)),
+    ids=("short-split-queue", "short-hot-queue", "empty-queues"),
+)
+def test_exact_queue_disables_hot_split_when_storage_is_too_short(
+    split_capacity,
+    hot_capacity,
+):
+    device = _gfx950_device()
+    frequencies = [65, 129, 256, 0]
+    routes = sum(frequencies)
+    frequency, sorted_experts, num_valid = _metadata_from_frequencies(
+        frequencies,
+        device,
+    )
+    exact_capacity = exact_m_tile_queue_upper_bound(
+        routes,
+        len(frequencies),
+        128,
+    )
+    exact_queue = torch.empty(
+        (1 + 3 * exact_capacity,),
+        dtype=torch.int32,
+        device=device,
+    )
+    active_queue = torch.empty(
+        (1 + 2 * len(frequencies),),
+        dtype=torch.int32,
+        device=device,
+    )
+    split_queue = torch.full(
+        (1 + 3 * split_capacity,),
+        _CANARY,
+        dtype=torch.int32,
+        device=device,
+    )
+    hot_queue = torch.full(
+        (1 + 3 * hot_capacity,),
+        _CANARY,
+        dtype=torch.int32,
+        device=device,
+    )
+
+    build_exact_m_tile_queue(
+        frequency,
+        sorted_experts,
+        num_valid,
+        exact_queue,
+        block_m=128,
+        sorted_block_m=_SORTED_BLOCK_M,
+        active_expert_storage=active_queue,
+        active_expert_capacity=len(frequencies),
+        hot_split_storage=split_queue,
+        hot_expert_storage=hot_queue,
+        split_rows=64,
+        min_hot_rows=65,
+    )
+    torch.cuda.synchronize(device)
+
+    # Split-K is all-or-nothing: publishing partial metadata would make the
+    # regular consumer skip rows which the truncated split path cannot own.
+    assert int(split_queue[0].item()) == 0
+    assert int(hot_queue[0].item()) == 0
+    assert torch.all(split_queue[1:] == _CANARY)
+    assert torch.all(hot_queue[1:] == _CANARY)
+    assert int(active_queue[0].item()) == 3
+
+
 def test_exact_queue_clamps_short_active_expert_capacity():
     device = _gfx950_device()
     frequencies = [1, 65, 0, 129, 257]

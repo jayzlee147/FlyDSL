@@ -312,6 +312,7 @@ def test_grouped_tn_runtime_hot_cutoff_does_not_change_compile_family(
     rhs = _FakeTensor((256, 768), torch.bfloat16, device=device)
     frequency = _FakeTensor((16,), torch.int32, device=device)
     queue = _FakeTensor((1 + 2 * 16,), torch.int32, device=device)
+    hot_queue = _FakeTensor((1 + 3 * 16,), torch.int32, device=device)
     output = _FakeTensor((16, 2048, 768), torch.bfloat16, device=device)
     stream = object()
     route_counts = (8192, 8193, 9000, 32769, 65536, 134000)
@@ -335,12 +336,17 @@ def test_grouped_tn_runtime_hot_cutoff_does_not_change_compile_family(
             n_waves=4,
             stages=2,
             min_expert_rows=cutoff,
+            hot_expert_storage=hot_queue,
+            hot_split_min_rows=cutoff,
             stream=stream,
         )
 
     assert len(set(runtime_cutoffs)) > 1
     assert all(call == compile_calls[0] for call in compile_calls)
-    assert tuple(call[-4] for call in runtime_calls) == runtime_cutoffs
+    assert compile_calls[0][1]["exclude_hot_experts"] is True
+    assert tuple(call[-6] for call in runtime_calls) == runtime_cutoffs
+    assert tuple(call[-3] for call in runtime_calls) == runtime_cutoffs
+    assert all(call[-4] is hot_queue for call in runtime_calls)
 
 
 @pytest.mark.parametrize(
@@ -536,7 +542,7 @@ def test_hot_split_scratch_is_actual_sized_and_policy_bounded(routes):
     """Dynamic scratch is minimal while XLARGE retains a finite upper bound."""
 
     policy = select_e16_route_policy(routes)
-    capacity, split_rows, min_hot_rows = (
+    capacity, split_rows, min_hot_rows, split_activation_rows = (
         sonic_backward_module._e16_hot_split_schedule(routes, 16, policy)
     )
     required = grouped_tn_module.hot_split_descriptor_capacity(
@@ -562,6 +568,17 @@ def test_hot_split_scratch_is_actual_sized_and_policy_bounded(routes):
             sonic_backward_module._e16_dw2_hot_profile_min_rows(routes),
         )
     assert min_hot_rows == expected_min_hot_rows
+    expected_activation_rows = max(
+        min_hot_rows + 1,
+        (
+            split_rows
+            * sonic_backward_module._E16_DW1_DENSE_SPLIT_TRIGGER_NUMERATOR
+            + sonic_backward_module._E16_DW1_DENSE_SPLIT_TRIGGER_DENOMINATOR
+            - 1
+        )
+        // sonic_backward_module._E16_DW1_DENSE_SPLIT_TRIGGER_DENOMINATOR,
+    )
+    assert split_activation_rows == expected_activation_rows
     # dW1 FP32 partials stay bounded at 384 MiB for [32, 1536, 2048]
     # while smaller invocations reserve proportionally less.
     assert capacity * 1536 * 2048 * 4 <= 384 * 1024 * 1024

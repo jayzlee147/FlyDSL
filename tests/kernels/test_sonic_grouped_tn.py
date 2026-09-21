@@ -10,6 +10,10 @@ import pytest
 import torch
 
 from flydsl.runtime.device import get_rocm_arch
+from kernels.moe.sonic_grouped_scheduler import (
+    build_exact_m_tile_queue,
+    exact_m_tile_queue_upper_bound,
+)
 from kernels.moe.sonic_grouped_tn import (
     active_expert_descriptor_capacity,
     active_expert_queue_elements,
@@ -170,6 +174,185 @@ def test_grouped_tn_reuses_prebuilt_active_expert_queue():
     descriptors = queue[1 : 1 + 2 * live_count].view(-1, 2).cpu().tolist()
     assert sorted(descriptors) == sorted([expert, start] for expert, start, _ in segments)
     torch.testing.assert_close(first.float(), second.float(), rtol=0, atol=0)
+
+
+def test_grouped_tn_hot_count_conditionally_excludes_split_owned_experts():
+    frequencies = [33, 65, 129]
+    lhs, rhs, frequency, sorted_experts, num_valid, segments = _make_sorted_inputs(
+        frequencies,
+        128,
+        64,
+        seed=1421,
+    )
+    queue = build_active_expert_queue_flydsl(
+        frequency,
+        sorted_experts,
+        num_valid,
+        routes=sum(frequencies),
+    )
+    disabled_hot_queue = torch.zeros(1, dtype=torch.int32, device=lhs.device)
+    enabled_hot_queue = torch.tensor(
+        [1, 1, 0, 1],
+        dtype=torch.int32,
+        device=lhs.device,
+    )
+    disabled_output = torch.zeros(
+        (len(frequencies), 128, 64),
+        dtype=torch.bfloat16,
+        device=lhs.device,
+    )
+    enabled_output = torch.zeros_like(disabled_output)
+    expected = torch.zeros_like(disabled_output)
+    for expert, start, rows in segments:
+        expected[expert] = (
+            lhs[start : start + rows].float().transpose(0, 1)
+            @ rhs[start : start + rows].float()
+        ).to(torch.bfloat16)
+
+    common = {
+        "block_m": 128,
+        "block_n": 64,
+        "block_k": 32,
+        "k_padding": 0,
+        "m_waves": 2,
+        "n_waves": 2,
+        "hot_split_min_rows": 65,
+    }
+    grouped_tn_from_queue_flydsl(
+        lhs,
+        rhs,
+        frequency,
+        queue,
+        disabled_output,
+        hot_expert_storage=disabled_hot_queue,
+        **common,
+    )
+    grouped_tn_from_queue_flydsl(
+        lhs,
+        rhs,
+        frequency,
+        queue,
+        enabled_output,
+        hot_expert_storage=enabled_hot_queue,
+        **common,
+    )
+    torch.cuda.synchronize()
+
+    torch.testing.assert_close(
+        disabled_output.float(),
+        expected.float(),
+        rtol=3e-2,
+        atol=5e-2,
+    )
+    torch.testing.assert_close(
+        enabled_output[0].float(),
+        expected[0].float(),
+        rtol=3e-2,
+        atol=5e-2,
+    )
+    assert torch.count_nonzero(enabled_output[1:]) == 0
+
+
+def test_short_hot_split_queue_falls_back_to_complete_regular_result():
+    frequencies = [65, 129, 256]
+    lhs, rhs, frequency, sorted_experts, num_valid, segments = _make_sorted_inputs(
+        frequencies,
+        128,
+        64,
+        seed=1423,
+    )
+    routes = sum(frequencies)
+    exact_capacity = exact_m_tile_queue_upper_bound(
+        routes,
+        len(frequencies),
+        128,
+    )
+    exact_queue = torch.empty(
+        (1 + 3 * exact_capacity,),
+        dtype=torch.int32,
+        device=lhs.device,
+    )
+    active_queue = torch.empty(
+        (1 + 2 * len(frequencies),),
+        dtype=torch.int32,
+        device=lhs.device,
+    )
+    # The three hot experts require nine split descriptors, so one record is
+    # deliberately insufficient and must disable split-K as a whole.
+    split_queue = torch.empty(4, dtype=torch.int32, device=lhs.device)
+    hot_queue = torch.empty(
+        (1 + 3 * len(frequencies),),
+        dtype=torch.int32,
+        device=lhs.device,
+    )
+    partials = torch.empty(
+        (1, 128, 64),
+        dtype=torch.float32,
+        device=lhs.device,
+    )
+    output = torch.zeros(
+        (len(frequencies), 128, 64),
+        dtype=torch.bfloat16,
+        device=lhs.device,
+    )
+    expected = torch.zeros_like(output)
+    for expert, start, rows in segments:
+        expected[expert] = (
+            lhs[start : start + rows].float().transpose(0, 1)
+            @ rhs[start : start + rows].float()
+        ).to(torch.bfloat16)
+
+    build_exact_m_tile_queue(
+        frequency,
+        sorted_experts,
+        num_valid,
+        exact_queue,
+        block_m=128,
+        sorted_block_m=_SORTED_BLOCK_M,
+        active_expert_storage=active_queue,
+        active_expert_capacity=len(frequencies),
+        hot_split_storage=split_queue,
+        hot_expert_storage=hot_queue,
+        split_rows=64,
+        min_hot_rows=65,
+    )
+    grouped_tn_from_queue_flydsl(
+        lhs,
+        rhs,
+        frequency,
+        active_queue,
+        output,
+        block_m=128,
+        block_n=64,
+        block_k=32,
+        m_waves=2,
+        n_waves=2,
+        hot_expert_storage=hot_queue,
+        hot_split_min_rows=65,
+    )
+    grouped_tn_splitk_from_queue_flydsl(
+        lhs,
+        rhs,
+        frequency,
+        split_queue,
+        partials,
+        block_m=128,
+        block_n=64,
+        block_k=32,
+        m_waves=2,
+        n_waves=2,
+    )
+    finalize_hot_splitk_flydsl(split_queue, hot_queue, partials, output)
+    torch.cuda.synchronize()
+
+    assert int(split_queue[0].item()) == 0
+    assert int(hot_queue[0].item()) == 0
+    torch.testing.assert_close(
+        output.float(),
+        expected.float(),
+        rtol=3e-2,
+        atol=5e-2,
+    )
 
 
 @pytest.mark.parametrize("active_experts", (32, 33))
@@ -701,6 +884,8 @@ def test_compile_grouped_tn_preserves_sorted_rhs_launcher_abi():
         "output",
         "i32_min_expert_rows",
         "i32_max_expert_rows",
+        "hot_expert_storage",
+        "i32_hot_split_min_rows",
         "i32_grid",
         "stream",
     )
@@ -714,6 +899,8 @@ def test_compile_grouped_tn_preserves_sorted_rhs_launcher_abi():
         "output",
         "i32_min_expert_rows",
         "i32_max_expert_rows",
+        "hot_expert_storage",
+        "i32_hot_split_min_rows",
         "i32_grid",
         "stream",
     )

@@ -244,6 +244,16 @@ _E16_DW1_SPLIT_ROWS = 8192
 # that boundary so the 10K--12K experts in a large skewed EP shard split into
 # two independent contractions while an exact 8192-row expert stays cold.
 _E16_DW1_SPLIT_MIN_HOT_ROWS = 8193
+# With three or more live experts, do not enable split-K until the hottest
+# expert reaches the measured gfx950 crossover.  The device queue builder
+# evaluates this trigger from the resident frequency vector; once enabled it
+# still applies the lower per-expert cutoff below.  Separating the shard-wide
+# trigger from per-expert eligibility avoids partial-cohort cliffs such as
+# hot4 at R=32769 and R=49151.  Express the crossover as a fraction of the
+# adaptive split length so the open-ended XLARGE family scales past 134K.
+_E16_DW1_DENSE_SPLIT_TRIGGER_NUMERATOR = 7
+_E16_DW1_DENSE_SPLIT_TRIGGER_DENOMINATOR = 4
+_E16_DW1_SPLIT_SPARSE_MAX_ACTIVE_EXPERTS = 2
 _E16_DW1_SPLIT_BM = 128
 _E16_DW1_SPLIT_BN = 256
 _E16_DW1_SPLIT_BK = 32
@@ -451,8 +461,8 @@ def _e16_hot_split_schedule(
     routes: int,
     num_experts: int,
     route_policy: E16RoutePolicy,
-) -> tuple[int, int, int]:
-    """Return an actual-R capacity plus runtime split/hot row thresholds.
+) -> tuple[int, int, int, int]:
+    """Return capacity, partition, per-expert, and shard trigger thresholds.
 
     LARGE and XLARGE provide finite *upper* bounds of eight and 32 descriptors
     respectively.  First choose a quantized partition length which is safe for
@@ -478,7 +488,7 @@ def _e16_hot_split_schedule(
     quantum = _E16_DW1_SPLIT_ROW_QUANTUM
     minimum_units = (_E16_DW1_SPLIT_ROWS + quantum - 1) // quantum
 
-    def thresholds_for(units: int) -> tuple[int, int]:
+    def thresholds_for(units: int) -> tuple[int, int, int]:
         split_rows = units * quantum
         min_hot_rows = split_rows + 1
         if route_policy == E16RoutePolicy.XLARGE:
@@ -491,10 +501,19 @@ def _e16_hot_split_schedule(
                 min_hot_rows,
                 _e16_dw2_hot_profile_min_rows(routes),
             )
-        return split_rows, min_hot_rows
+        split_activation_rows = max(
+            min_hot_rows + 1,
+            (
+                split_rows * _E16_DW1_DENSE_SPLIT_TRIGGER_NUMERATOR
+                + _E16_DW1_DENSE_SPLIT_TRIGGER_DENOMINATOR
+                - 1
+            )
+            // _E16_DW1_DENSE_SPLIT_TRIGGER_DENOMINATOR,
+        )
+        return split_rows, min_hot_rows, split_activation_rows
 
     def required_for(units: int) -> int:
-        split_rows, min_hot_rows = thresholds_for(units)
+        split_rows, min_hot_rows, _ = thresholds_for(units)
         return hot_split_descriptor_capacity(
             routes,
             num_experts,
@@ -515,7 +534,7 @@ def _e16_hot_split_schedule(
                 low = middle + 1
         split_units = low
 
-    split_rows, min_hot_rows = thresholds_for(split_units)
+    split_rows, min_hot_rows, split_activation_rows = thresholds_for(split_units)
     required = hot_split_descriptor_capacity(
         routes,
         num_experts,
@@ -527,7 +546,7 @@ def _e16_hot_split_schedule(
             "bounded E16 split schedule under-sized its descriptor storage: "
             f"required={required}, capacity={policy_capacity}"
         )
-    return max(1, required), split_rows, min_hot_rows
+    return max(1, required), split_rows, min_hot_rows, split_activation_rows
 
 
 def _use_e16_dw2_dual_profile(
@@ -776,17 +795,12 @@ def _launch_grouped_dw2(
         effective_min_profile_rows = min_profile_rows
         effective_active_guard = active_guard_or_expert_rows
         if hot_split_state is not None:
-            cold_max_rows = split_min_rows - 1
-            effective_max_profile_rows = (
-                cold_max_rows
-                if max_profile_rows is None
-                else min(max_profile_rows, cold_max_rows)
-            )
-            if active_guard_or_expert_rows:
-                # With split-K owning every hot expert, the small-tile launch
-                # is selected only by active count and computes cold experts.
-                effective_min_profile_rows = 0
-                effective_active_guard = False
+            # The queue builder may disable split-K for a dense cohort without
+            # changing the host launch graph.  Keep the normal small/wide dW2
+            # profile predicates, then exclude only the experts present in an
+            # active split queue through its device-resident count.
+            grouped_dw2_kwargs["hot_expert_storage"] = hot_split_state[1]
+            grouped_dw2_kwargs["hot_split_min_rows"] = split_min_rows
         if use_tn_metadata_direct:
             grouped_tn_from_metadata_flydsl(
                 dy,
@@ -4927,6 +4941,7 @@ def _sonic_moe_backward_impl(
             split_descriptor_capacity,
             hot_split_rows,
             hot_split_min_rows,
+            hot_split_activation_rows,
         ) = _e16_hot_split_schedule(
             routes,
             num_experts,
@@ -4971,6 +4986,7 @@ def _sonic_moe_backward_impl(
         split_descriptor_capacity = 0
         hot_split_rows = 0
         hot_split_min_rows = 0
+        hot_split_activation_rows = 0
         hot_expert_capacity = 0
         hot_split_storage = None
         hot_expert_storage = None
@@ -5268,6 +5284,16 @@ def _sonic_moe_backward_impl(
                 ),
                 min_hot_rows=(
                     hot_split_min_rows if use_e16_hot_dw1_splitk else None
+                ),
+                split_activation_rows=(
+                    hot_split_activation_rows
+                    if use_e16_hot_dw1_splitk
+                    else None
+                ),
+                sparse_split_max_experts=(
+                    _E16_DW1_SPLIT_SPARSE_MAX_ACTIVE_EXPERTS
+                    if use_e16_hot_dw1_splitk
+                    else None
                 ),
                 stream=stream,
             )
@@ -5991,7 +6017,9 @@ def _sonic_moe_backward_impl(
                     "stream": launch_stream,
                 }
                 if use_e16_hot_dw1_splitk:
-                    grouped_dw1_kwargs["max_expert_rows"] = hot_split_min_rows - 1
+                    assert hot_expert_storage is not None
+                    grouped_dw1_kwargs["hot_expert_storage"] = hot_expert_storage
+                    grouped_dw1_kwargs["hot_split_min_rows"] = hot_split_min_rows
                 if use_tn_metadata_direct:
                     grouped_tn_from_metadata_flydsl(
                         dz,

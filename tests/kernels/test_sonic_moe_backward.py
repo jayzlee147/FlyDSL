@@ -543,7 +543,7 @@ def test_e16_hot_split_scratch_uses_actual_proven_capacity(
     route_policy,
     expected_capacity,
 ):
-    capacity, split_rows, min_hot_rows = _e16_hot_split_schedule(
+    capacity, split_rows, min_hot_rows, split_activation_rows = _e16_hot_split_schedule(
         routes,
         16,
         route_policy,
@@ -551,6 +551,7 @@ def test_e16_hot_split_scratch_uses_actual_proven_capacity(
     assert capacity == expected_capacity
     assert split_rows >= 8192
     assert min_hot_rows >= split_rows + 1
+    assert split_activation_rows >= min_hot_rows
     if route_policy == E16RoutePolicy.XLARGE:
         assert min_hot_rows >= sonic_backward_module._e16_dw2_hot_profile_min_rows(
             routes
@@ -564,7 +565,7 @@ def test_e16_hot_split_scratch_uses_actual_proven_capacity(
 def test_e16_hot_split_schedule_keeps_balanced_xlarge_on_regular_path(routes):
     """Balanced high-R shards must not pay split partial/finalize traffic."""
 
-    capacity, split_rows, min_hot_rows = _e16_hot_split_schedule(
+    capacity, split_rows, min_hot_rows, split_activation_rows = _e16_hot_split_schedule(
         routes,
         16,
         E16RoutePolicy.XLARGE,
@@ -582,6 +583,7 @@ def test_e16_hot_split_schedule_keeps_balanced_xlarge_on_regular_path(routes):
 
     assert descriptors == 0
     assert descriptors <= capacity
+    assert split_activation_rows > min_hot_rows
 
 
 @pytest.mark.parametrize(
@@ -616,7 +618,7 @@ def test_e16_hot_split_schedule_bounds_skewed_descriptors(routes, distribution):
         ]
 
     policy = select_e16_route_policy(routes)
-    capacity, split_rows, min_hot_rows = _e16_hot_split_schedule(
+    capacity, split_rows, min_hot_rows, split_activation_rows = _e16_hot_split_schedule(
         routes,
         16,
         policy,
@@ -637,6 +639,7 @@ def test_e16_hot_split_schedule_bounds_skewed_descriptors(routes, distribution):
             min_hot_rows,
         ),
     )
+    assert split_activation_rows >= min_hot_rows
 
 
 @pytest.mark.parametrize(
@@ -827,11 +830,13 @@ def test_e16_dw2_split_companion_owns_hot_experts(monkeypatch):
             kwargs["min_expert_rows"],
             kwargs["max_expert_rows"],
             kwargs["active_guard_or_expert_rows"],
+            kwargs["hot_expert_storage"] is hot_queue,
+            kwargs["hot_split_min_rows"],
         )
         for _, kwargs in regular_calls
     ] == [
-        (128, 64, 0, 4, 0, 8192, False),
-        (256, 256, 5, None, 0, 8192, False),
+        (128, 64, 0, 4, 11264, None, True, True, 8193),
+        (256, 256, 5, None, 0, 11263, False, True, 8193),
     ]
     assert len(split_calls) == 1
     split_args, split_kwargs = split_calls[0]

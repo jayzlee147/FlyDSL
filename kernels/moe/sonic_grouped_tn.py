@@ -931,6 +931,7 @@ def compile_grouped_tn(
     filter_expert_rows: bool = False,
     has_max_expert_rows: bool = False,
     active_guard_or_expert_rows: bool = False,
+    exclude_hot_experts: bool = False,
     split_k_partials: bool = False,
 ):
     """Compile the persistent grouped TN consumer for a prebuilt queue.
@@ -954,6 +955,11 @@ def compile_grouped_tn(
     matches and only row-selected descriptors otherwise; this lets one
     small-tile launch cover both sparse shards and a hot expert in an otherwise
     dense shard.
+    ``exclude_hot_experts`` reads a device-produced hot-queue count and omits
+    rows at or above a runtime split threshold only when that queue is active.
+    A zero hot count therefore leaves the regular contraction unfiltered,
+    which lets a device-side cohort gate disable split-K without changing the
+    host launch sequence.
     ``gather_rhs`` loads token-major RHS rows through packed sorter token IDs,
     eliminating their otherwise materialized sorter-order copy.
     ``split_k_partials`` consumes
@@ -1011,6 +1017,12 @@ def compile_grouped_tn(
         )
     if split_k_partials and metadata_direct:
         raise ValueError("split-K partials require queue metadata")
+    if not isinstance(exclude_hot_experts, bool):
+        raise TypeError("exclude_hot_experts must be a bool")
+    if exclude_hot_experts and (metadata_direct or split_k_partials):
+        raise ValueError(
+            "hot-expert exclusion requires regular queue metadata"
+        )
     if block_k not in (32, 64):
         raise ValueError("grouped TN block_k must be 32 or 64")
     if stages not in (2, 3, 4):
@@ -1075,6 +1087,7 @@ def compile_grouped_tn(
             f"_amin{min_active_experts}_amax{max_active_experts}"
             f"_rf{int(filter_expert_rows)}_rmax{int(has_max_expert_rows)}"
             f"_aor{int(active_guard_or_expert_rows)}"
+            f"_hx{int(exclude_hot_experts)}"
         ),
         known_block_size=[block_threads, 1, 1],
     )
@@ -1088,6 +1101,8 @@ def compile_grouped_tn(
         output: fx.Tensor,
         i32_min_expert_rows: fx.Int32,
         i32_max_expert_rows: fx.Int32,
+        hot_expert_storage: fx.Tensor,
+        i32_hot_split_min_rows: fx.Int32,
         tiled_mma: fx.TiledMma,
     ):
         tid = gpu.thread_idx.x
@@ -1629,7 +1644,7 @@ def compile_grouped_tn(
                         buffer_ops.buffer_store(value, output_rsrc, output_offset)
 
         def run_output_tile(work_index):
-            if const_expr(not filter_expert_rows):
+            if const_expr(not filter_expert_rows and not exclude_hot_experts):
                 run_output_tile_unchecked(work_index)
             else:
                 descriptor_index = work_index // fx.Int32(output_tiles_per_expert)
@@ -1669,18 +1684,40 @@ def compile_grouped_tn(
                         )
                     ),
                 )
-                selected = frequency >= i32_min_expert_rows
-                if const_expr(has_max_expert_rows):
-                    selected = selected & (frequency <= i32_max_expert_rows)
-                if const_expr(active_guard_or_expert_rows):
-                    active_selected = descriptor_count >= fx.Int32(
-                        min_active_experts
-                    )
-                    if const_expr(max_active_experts is not None):
-                        active_selected = active_selected & (
-                            descriptor_count <= fx.Int32(max_active_experts)
+                selected = frequency >= fx.Int32(0)
+                if const_expr(filter_expert_rows):
+                    selected = frequency >= i32_min_expert_rows
+                    if const_expr(has_max_expert_rows):
+                        selected = selected & (frequency <= i32_max_expert_rows)
+                    if const_expr(active_guard_or_expert_rows):
+                        active_selected = descriptor_count >= fx.Int32(
+                            min_active_experts
                         )
-                    selected = selected | active_selected
+                        if const_expr(max_active_experts is not None):
+                            active_selected = active_selected & (
+                                descriptor_count <= fx.Int32(max_active_experts)
+                            )
+                        selected = selected | active_selected
+                if const_expr(exclude_hot_experts):
+                    hot_rsrc = buffer_ops.create_buffer_resource(
+                        hot_expert_storage,
+                        max_size=True,
+                    )
+                    hot_count = rocdl.readfirstlane(
+                        T.i32,
+                        _raw(
+                            buffer_ops.buffer_load(
+                                hot_rsrc,
+                                fx.Int32(0),
+                                vec_width=1,
+                                dtype=T.i32,
+                            )
+                        ),
+                    )
+                    selected = selected & (
+                        (hot_count == fx.Int32(0))
+                        | (frequency < i32_hot_split_min_rows)
+                    )
                 if selected:
                     run_output_tile_unchecked(work_index)
 
@@ -1703,6 +1740,8 @@ def compile_grouped_tn(
             output: fx.Tensor,
             i32_min_expert_rows: fx.Int32,
             i32_max_expert_rows: fx.Int32,
+            hot_expert_storage: fx.Tensor,
+            i32_hot_split_min_rows: fx.Int32,
             i32_grid: fx.Int32,
             stream: fx.Stream = fx.Stream(None),
         ):
@@ -1726,6 +1765,8 @@ def compile_grouped_tn(
                 output,
                 i32_min_expert_rows,
                 i32_max_expert_rows,
+                hot_expert_storage,
+                i32_hot_split_min_rows,
                 tiled_mma,
             ).launch(
                 grid=(i32_grid, 1, 1),
@@ -1745,6 +1786,8 @@ def compile_grouped_tn(
             output: fx.Tensor,
             i32_min_expert_rows: fx.Int32,
             i32_max_expert_rows: fx.Int32,
+            hot_expert_storage: fx.Tensor,
+            i32_hot_split_min_rows: fx.Int32,
             i32_grid: fx.Int32,
             stream: fx.Stream = fx.Stream(None),
         ):
@@ -1768,6 +1811,8 @@ def compile_grouped_tn(
                 output,
                 i32_min_expert_rows,
                 i32_max_expert_rows,
+                hot_expert_storage,
+                i32_hot_split_min_rows,
                 tiled_mma,
             ).launch(
                 grid=(i32_grid, 1, 1),
@@ -1869,6 +1914,8 @@ def grouped_tn_splitk_from_queue_flydsl(
             partials,
             0,
             _MAX_SIGNED_I32,
+            split_queue,
+            0,
             grid,
             stream,
         )
@@ -1884,6 +1931,8 @@ def grouped_tn_splitk_from_queue_flydsl(
             partials,
             0,
             _MAX_SIGNED_I32,
+            split_queue,
+            0,
             grid,
             stream,
         )
@@ -2155,6 +2204,8 @@ def grouped_tn_from_queue_flydsl(
     min_expert_rows: int = 0,
     max_expert_rows: int | None = None,
     active_guard_or_expert_rows: bool = False,
+    hot_expert_storage: torch.Tensor | None = None,
+    hot_split_min_rows: int | None = None,
     stream: torch.cuda.Stream | None = None,
 ) -> torch.Tensor:
     """Consume a prebuilt active-expert queue for one grouped TN contraction.
@@ -2168,6 +2219,9 @@ def grouped_tn_from_queue_flydsl(
     falls outside it.  Inclusive expert-row bounds can independently filter
     queue entries without a host frequency readback.  OR mode admits an entry
     when either its row predicate or the active-count predicate matches.
+    A hot-expert queue can independently exclude split-K-owned experts.  Its
+    zero device count disables that exclusion, allowing a device-side cohort
+    gate to keep the regular contraction without changing the launch graph.
     """
 
     if lhs_rows.ndim != 2 or rhs_rows.ndim != 2 or output.ndim != 3:
@@ -2229,6 +2283,33 @@ def grouped_tn_from_queue_flydsl(
         raise ValueError(
             "active_guard_or_expert_rows requires active and row guards"
         )
+    exclude_hot_experts = hot_expert_storage is not None
+    if exclude_hot_experts:
+        assert hot_expert_storage is not None
+        if hot_expert_storage.device != lhs_rows.device:
+            raise ValueError("hot_expert_storage must share the grouped TN device")
+        if hot_expert_storage.dtype != torch.int32:
+            raise TypeError("hot_expert_storage must use int32")
+        if (
+            not hot_expert_storage.is_contiguous()
+            or hot_expert_storage.ndim != 1
+            or hot_expert_storage.numel() < 1
+            or (hot_expert_storage.numel() - 1) % 3
+        ):
+            raise ValueError(
+                "hot_expert_storage must use "
+                "[count, (expert, first_partition, partition_count) * capacity] ABI"
+            )
+        if (
+            not isinstance(hot_split_min_rows, int)
+            or isinstance(hot_split_min_rows, bool)
+            or hot_split_min_rows <= 0
+        ):
+            raise ValueError(
+                "hot_split_min_rows must be positive with hot_expert_storage"
+            )
+    elif hot_split_min_rows is not None:
+        raise ValueError("hot_split_min_rows requires hot_expert_storage")
 
     capacity = (int(queue_storage.numel()) - 1) // 2
     if capacity == 0:
@@ -2277,9 +2358,16 @@ def grouped_tn_from_queue_flydsl(
         filter_expert_rows=filter_expert_rows,
         has_max_expert_rows=has_max_expert_rows,
         active_guard_or_expert_rows=active_guard_or_expert_rows,
+        exclude_hot_experts=exclude_hot_experts,
     )
     runtime_max_expert_rows = (
         _MAX_SIGNED_I32 if max_expert_rows is None else max_expert_rows
+    )
+    hot_expert_arg = (
+        queue_storage if hot_expert_storage is None else hot_expert_storage
+    )
+    runtime_hot_split_min_rows = (
+        0 if hot_split_min_rows is None else hot_split_min_rows
     )
     if gather_rhs:
         _run_compiled(
@@ -2293,6 +2381,8 @@ def grouped_tn_from_queue_flydsl(
             output,
             min_expert_rows,
             runtime_max_expert_rows,
+            hot_expert_arg,
+            runtime_hot_split_min_rows,
             grid,
             stream,
         )
@@ -2307,12 +2397,16 @@ def grouped_tn_from_queue_flydsl(
             output,
             min_expert_rows,
             runtime_max_expert_rows,
+            hot_expert_arg,
+            runtime_hot_split_min_rows,
             grid,
             stream,
         )
     queue_storage.record_stream(stream)
     if sorted_token_ids is not None:
         sorted_token_ids.record_stream(stream)
+    if hot_expert_storage is not None:
+        hot_expert_storage.record_stream(stream)
     return output
 
 
@@ -2449,6 +2543,8 @@ def grouped_tn_from_metadata_flydsl(
             output,
             0,
             _MAX_SIGNED_I32,
+            num_valid_ids,
+            0,
             grid,
             stream,
         )
@@ -2463,6 +2559,8 @@ def grouped_tn_from_metadata_flydsl(
             output,
             0,
             _MAX_SIGNED_I32,
+            num_valid_ids,
+            0,
             grid,
             stream,
         )
