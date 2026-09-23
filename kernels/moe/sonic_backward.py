@@ -4306,14 +4306,16 @@ def _validate_backward_route_inputs(
     hidden_states: torch.Tensor,
     w1: torch.Tensor,
     w2: torch.Tensor,
-    token_indices: torch.Tensor,
-    expert_indices: torch.Tensor,
+    token_indices: torch.Tensor | None,
+    expert_indices: torch.Tensor | None,
     route_weights: torch.Tensor,
     grad_output: torch.Tensor,
     config: "SonicMoEConfig",
     b1: torch.Tensor | None,
     b2: torch.Tensor | None,
     interleaved_w1: bool,
+    *,
+    implicit_identity_routes: bool = False,
 ) -> tuple[int, int, int, int, int]:
     dtype_by_name = {"bf16": torch.bfloat16, "fp16": torch.float16}
     if config.compute_dtype not in dtype_by_name:
@@ -4333,8 +4335,30 @@ def _validate_backward_route_inputs(
             "interleaved_w1 is valid only for GLU activations "
             f"{sorted(_GLU_ACTIVATIONS)}, got activation={config.activation!r}"
         )
-    if token_indices.ndim != 1 or expert_indices.ndim != 1 or route_weights.ndim != 1:
-        raise ValueError("token_indices, expert_indices, and route_weights must be one-dimensional")
+    if not isinstance(implicit_identity_routes, bool):
+        raise TypeError("implicit_identity_routes must be bool")
+    if implicit_identity_routes:
+        if token_indices is not None or expert_indices is not None:
+            raise ValueError(
+                "implicit identity routes must not supply token_indices or "
+                "expert_indices"
+            )
+        if route_weights.ndim != 1:
+            raise ValueError("route_weights must be one-dimensional")
+    else:
+        if token_indices is None or expert_indices is None:
+            raise ValueError(
+                "explicit flat routes require token_indices and expert_indices"
+            )
+        if (
+            token_indices.ndim != 1
+            or expert_indices.ndim != 1
+            or route_weights.ndim != 1
+        ):
+            raise ValueError(
+                "token_indices, expert_indices, and route_weights must be "
+                "one-dimensional"
+            )
 
     tokens = int(hidden_states.shape[0]) if hidden_states.ndim == 2 else -1
     routes = int(route_weights.numel())
@@ -4348,8 +4372,6 @@ def _validate_backward_route_inputs(
         "hidden_states": (tokens, hidden_size),
         "w1": (num_experts, projection_size, hidden_size),
         "w2": (num_experts, hidden_size, intermediate_size),
-        "token_indices": (routes,),
-        "expert_indices": (routes,),
         "route_weights": (routes,),
         "grad_output": (tokens, hidden_size),
     }
@@ -4357,11 +4379,16 @@ def _validate_backward_route_inputs(
         "hidden_states": hidden_states,
         "w1": w1,
         "w2": w2,
-        "token_indices": token_indices,
-        "expert_indices": expert_indices,
         "route_weights": route_weights,
         "grad_output": grad_output,
     }
+    if not implicit_identity_routes:
+        assert token_indices is not None
+        assert expert_indices is not None
+        expected["token_indices"] = (routes,)
+        expected["expert_indices"] = (routes,)
+        tensors["token_indices"] = token_indices
+        tensors["expert_indices"] = expert_indices
     if b1 is not None:
         expected["b1"] = (num_experts, projection_size)
         expected["b2"] = (num_experts, hidden_size)
@@ -4400,10 +4427,14 @@ def _validate_backward_route_inputs(
     for name in floating_names:
         if tensors[name].dtype != expected_dtype:
             raise TypeError(f"{name} must be {expected_dtype}, got {tensors[name].dtype}")
-    if token_indices.dtype != torch.int32 or expert_indices.dtype != torch.int32:
-        raise TypeError(
-            "token_indices and expert_indices must be int32, got " f"{token_indices.dtype}/{expert_indices.dtype}"
-        )
+    if not implicit_identity_routes:
+        assert token_indices is not None
+        assert expert_indices is not None
+        if token_indices.dtype != torch.int32 or expert_indices.dtype != torch.int32:
+            raise TypeError(
+                "token_indices and expert_indices must be int32, got "
+                f"{token_indices.dtype}/{expert_indices.dtype}"
+            )
     if route_weights.dtype != torch.float32:
         raise TypeError(f"route_weights must be float32, got {route_weights.dtype}")
     if hidden_size % 64 != 0 or intermediate_size % 64 != 0:
@@ -4509,7 +4540,7 @@ def _sonic_moe_backward_impl(
     hidden_states: torch.Tensor,
     w1: torch.Tensor,
     w2: torch.Tensor,
-    expert_ids: torch.Tensor,
+    expert_ids: torch.Tensor | None,
     route_weights: torch.Tensor,
     grad_output: torch.Tensor,
     config: "SonicMoEConfig",
@@ -4524,11 +4555,22 @@ def _sonic_moe_backward_impl(
     token_indices_sorted: bool = False,
     token_indices_identity: bool = False,
     route_policy_size: int | None = None,
+    implicit_identity_routes: bool = False,
 ) -> tuple[torch.Tensor, ...]:
     """Shared sorted-expert implementation for fixed-K and flat routes."""
 
     tokens, hidden_size, intermediate_size, num_experts = dimensions
-    flat_routes = token_indices is not None
+    if implicit_identity_routes:
+        if token_indices is not None or expert_ids is not None:
+            raise ValueError(
+                "implicit identity backward must not receive materialized ids"
+            )
+        if not token_indices_identity or forward_sorter_metadata is None:
+            raise ValueError(
+                "implicit identity backward requires identity routing and "
+                "retained sorter metadata"
+            )
+    flat_routes = token_indices is not None or implicit_identity_routes
     routes = int(route_weights.numel())
     route_policy = select_e16_route_policy(routes, route_policy_size)
     topk = int(config.top_k)
@@ -5171,7 +5213,7 @@ def _sonic_moe_backward_impl(
     x_arg = hidden_states.detach()
     w1_arg = w1.detach()
     w2_arg = w2.detach()
-    ids_arg = expert_ids.detach()
+    ids_arg = expert_ids.detach() if expert_ids is not None else None
     weights_arg = route_weights.detach()
     token_arg = token_indices.detach() if token_indices is not None else None
     dout_arg = grad_output.detach()
@@ -5202,9 +5244,10 @@ def _sonic_moe_backward_impl(
             _run_compiled(clear_bias_gradients, db1, db2, stream)
 
         if flat_routes:
-            assert token_arg is not None
             assert sorted_route_ids is not None
             if forward_sorter_metadata is None:
+                assert token_arg is not None
+                assert ids_arg is not None
                 assert sorting_workspace is not None
                 moe_ragged_sorting_flydsl(
                     token_arg,
@@ -5224,6 +5267,7 @@ def _sonic_moe_backward_impl(
                     sorted_route_ids=sorted_route_ids,
                 )
         else:
+            assert ids_arg is not None
             if not use_sorter_native_backward_metadata:
                 route_grid = max(1, (routes + _BLOCK_THREADS - 1) // _BLOCK_THREADS)
                 histogram = _compile_expert_histogram(num_experts, device_index)
@@ -6436,6 +6480,7 @@ def _sonic_moe_backward_impl(
                 )
 
             assert dx_routes is not None
+            assert ids_arg is not None
             if not direct_grouped_dx_routes:
                 assert dx_sorted is not None
                 unsort = _compile_unsort(
@@ -6713,4 +6758,111 @@ def sonic_moe_backward_routes(
     )
 
 
-__all__ = ["sonic_moe_backward", "sonic_moe_backward_routes"]
+def sonic_moe_backward_expert_major(
+    hidden_states: torch.Tensor,
+    w1: torch.Tensor,
+    w2: torch.Tensor,
+    route_weights: torch.Tensor,
+    grad_output: torch.Tensor,
+    config: "SonicMoEConfig",
+    *,
+    forward_state: object,
+    b1: torch.Tensor | None = None,
+    b2: torch.Tensor | None = None,
+    interleaved_w1: bool = False,
+    route_policy_size: int | None = None,
+) -> tuple[torch.Tensor, ...]:
+    """Differentiate retained E16 expert-major identity routes without IDs.
+
+    The matching training forward already retained the padded route metadata
+    needed by every backward kernel.  Consequently neither an identity
+    ``arange`` nor a repeated expert-id vector is part of this API.  Unlike the
+    compatibility route entry point, this function fails closed instead of
+    falling back to a sorter when the state is incomplete or was not produced
+    under the expert-major identity contract.
+    """
+
+    validated = _validate_backward_route_inputs(
+        hidden_states,
+        w1,
+        w2,
+        None,
+        None,
+        route_weights,
+        grad_output,
+        config,
+        b1,
+        b2,
+        interleaved_w1,
+        implicit_identity_routes=True,
+    )
+    (
+        route_preactivation,
+        producer_stream,
+        ready_event,
+        forward_sorter_metadata,
+        state_token_indices_identity,
+        state_route_policy_size,
+    ) = _validate_routes_forward_state(
+        forward_state,
+        hidden_states,
+        validated[4],
+        config,
+        interleaved_w1,
+        b1 is not None,
+    )
+    state_expert_major = getattr(forward_state, "expert_major", False)
+    if type(state_expert_major) is not bool:
+        raise TypeError(
+            "forward_state.expert_major must be bool, got "
+            f"{type(state_expert_major).__name__}"
+        )
+    if (
+        not state_expert_major
+        or not state_token_indices_identity
+        or forward_sorter_metadata is None
+    ):
+        raise ValueError(
+            "implicit expert-major backward requires a complete retained state "
+            "with expert_major=True and token_indices_identity=True"
+        )
+    if route_policy_size is None:
+        route_policy_size = state_route_policy_size
+    elif state_route_policy_size is not None and (
+        select_e16_route_policy(validated[4], route_policy_size)
+        != select_e16_route_policy(validated[4], state_route_policy_size)
+    ):
+        raise ValueError(
+            "route_policy_size must select the same policy as forward_state"
+        )
+
+    return _sonic_moe_backward_impl(
+        hidden_states,
+        w1,
+        w2,
+        None,
+        route_weights,
+        grad_output,
+        config,
+        token_indices=None,
+        dimensions=validated[:4],
+        b1=b1,
+        b2=b2,
+        interleaved_w1=interleaved_w1,
+        forward_state_data=(
+            route_preactivation,
+            producer_stream,
+            ready_event,
+        ),
+        forward_sorter_metadata=forward_sorter_metadata,
+        token_indices_identity=True,
+        route_policy_size=route_policy_size,
+        implicit_identity_routes=True,
+    )
+
+
+__all__ = [
+    "sonic_moe_backward",
+    "sonic_moe_backward_expert_major",
+    "sonic_moe_backward_routes",
+]

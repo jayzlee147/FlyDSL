@@ -70,6 +70,9 @@ from kernels.moe.sonic_backward import (
     sonic_moe_backward as sonic_moe_backward,
 )
 from kernels.moe.sonic_backward import (
+    sonic_moe_backward_expert_major as sonic_moe_backward_expert_major,
+)
+from kernels.moe.sonic_backward import (
     sonic_moe_backward_routes as sonic_moe_backward_routes,
 )
 from kernels.moe.sonic_dynamic_policy import (
@@ -1798,6 +1801,48 @@ def _validate_expert_major_routes(
     return True
 
 
+def _validate_expert_major_counts(
+    expert_counts: torch.Tensor | None,
+    *,
+    hidden_states: torch.Tensor,
+    routes: int,
+    num_experts: int,
+) -> bool:
+    """Validate device counts for the implicit E16 expert-major contract.
+
+    Count values deliberately remain an asynchronous caller precondition:
+    they must be non-negative and sum to ``routes``.  Reading them on the host
+    here would serialize the dynamic training path.
+    """
+
+    if expert_counts is None:
+        return False
+    if not isinstance(expert_counts, torch.Tensor):
+        raise TypeError("expert_counts must be a torch.Tensor or None")
+    expected_shape = (num_experts,)
+    if tuple(expert_counts.shape) != expected_shape:
+        raise ValueError(
+            f"expert_counts must have shape {expected_shape}, got "
+            f"{tuple(expert_counts.shape)}"
+        )
+    if (
+        not expert_counts.is_cuda
+        or expert_counts.device != hidden_states.device
+        or expert_counts.dtype != torch.int32
+        or not expert_counts.is_contiguous()
+    ):
+        raise ValueError(
+            "expert_counts must be contiguous int32 on the same ROCm device "
+            "as hidden_states"
+        )
+    if routes != int(hidden_states.shape[0]):
+        raise ValueError(
+            "implicit expert-major counts require routes == tokens, got "
+            f"{routes} and {int(hidden_states.shape[0])}"
+        )
+    return True
+
+
 @functools.lru_cache(maxsize=256)
 def _get_stage2_launcher(
     config: SonicMoEConfig,
@@ -2598,7 +2643,7 @@ class SonicMoE:
         out: torch.Tensor,
         route_preactivation: torch.Tensor,
         route_weights: torch.Tensor,
-        expert_offsets: torch.Tensor,
+        expert_boundaries: torch.Tensor,
         frequency: torch.Tensor,
         frequency_mirror: torch.Tensor | None,
         sorted_token_ids: torch.Tensor,
@@ -2608,6 +2653,8 @@ class SonicMoE:
         num_valid_ids: torch.Tensor,
         launch_plan: _TrainingForwardLaunchPlan,
         stream: torch.cuda.Stream,
+        *,
+        expert_counts_input: bool = False,
     ) -> bool:
         """Enqueue identity metadata and training Stage 1 with one host call."""
 
@@ -2640,6 +2687,7 @@ class SonicMoE:
             token_indices_identity=True,
             clear_output=False,
             single_launch_identity=True,
+            expert_counts_input=expert_counts_input,
         )
         master = _get_e16_metadata_stage1_master_launcher(
             sorter_launcher,
@@ -2651,7 +2699,7 @@ class SonicMoE:
         _run_compiled(
             master,
             route_weights,
-            expert_offsets,
+            expert_boundaries,
             frequency,
             mirror_arg,
             workspace.sorting_workspace,
@@ -3061,71 +3109,198 @@ class SonicMoE:
                 out,
                 expert_frequency_out,
                 expert_offsets=expert_offsets,
+                expert_counts=None,
                 token_indices_identity=token_indices_identity,
+                route_policy_size=route_policy_size,
+            )
+
+    def forward_expert_major(
+        self,
+        hidden_states: torch.Tensor,
+        expert_offsets: torch.Tensor,
+        route_weights: torch.Tensor,
+        out: torch.Tensor | None = None,
+        expert_frequency_out: torch.Tensor | None = None,
+        *,
+        route_policy_size: int | None = None,
+    ) -> torch.Tensor:
+        """Run E16 expert-major identity routes without materialized IDs.
+
+        Rows are already grouped by expert according to ``expert_offsets``;
+        route ``r`` is token ``r``.  The E16 identity metadata kernel derives
+        both token and expert IDs from that contract, so allocating
+        ``arange(routes)`` and ``repeat_interleave(experts, counts)`` is
+        unnecessary.  This entry point deliberately fails closed if that
+        specialization is disabled instead of passing synthetic IDs to a
+        sorter that could read them.
+        """
+
+        if not hidden_states.is_cuda:
+            raise ValueError("hidden_states must be on a ROCm device")
+        with torch.cuda.device(hidden_states.device):
+            return self._forward_routes_on_current_device(
+                hidden_states,
+                None,
+                None,
+                route_weights,
+                out,
+                expert_frequency_out,
+                expert_offsets=expert_offsets,
+                expert_counts=None,
+                token_indices_identity=True,
+                route_policy_size=route_policy_size,
+            )
+
+    def forward_expert_major_counts(
+        self,
+        hidden_states: torch.Tensor,
+        expert_counts: torch.Tensor,
+        route_weights: torch.Tensor,
+        out: torch.Tensor | None = None,
+        expert_frequency_out: torch.Tensor | None = None,
+        *,
+        route_policy_size: int | None = None,
+    ) -> torch.Tensor:
+        """Run E16 expert-major identity routes directly from expert counts.
+
+        ``expert_counts`` is device int32 ``[16]``. Its values must be
+        non-negative and sum to the number of rows. The identity metadata
+        kernel computes both raw and padded prefixes, eliminating the
+        caller-side ``cumsum`` as well as materialized token/expert ids. The
+        value contract is intentionally unchecked to avoid a D2H
+        synchronization on the dynamic-route hot path.
+        """
+
+        if not hidden_states.is_cuda:
+            raise ValueError("hidden_states must be on a ROCm device")
+        with torch.cuda.device(hidden_states.device):
+            return self._forward_routes_on_current_device(
+                hidden_states,
+                None,
+                None,
+                route_weights,
+                out,
+                expert_frequency_out,
+                expert_offsets=None,
+                expert_counts=expert_counts,
+                token_indices_identity=True,
                 route_policy_size=route_policy_size,
             )
 
     def _forward_routes_on_current_device(
         self,
         hidden_states: torch.Tensor,
-        token_indices: torch.Tensor,
-        expert_indices: torch.Tensor,
+        token_indices: torch.Tensor | None,
+        expert_indices: torch.Tensor | None,
         route_weights: torch.Tensor,
         out: torch.Tensor | None,
         expert_frequency_out: torch.Tensor | None,
         *,
         expert_offsets: torch.Tensor | None,
+        expert_counts: torch.Tensor | None,
         token_indices_identity: bool,
         route_policy_size: int | None,
     ) -> torch.Tensor:
         tokens = self._validate_hidden(hidden_states, allow_empty=True)
-        if token_indices.ndim != 1 or expert_indices.ndim != 1 or route_weights.ndim != 1:
-            raise ValueError("token_indices, expert_indices, and route_weights must be one-dimensional")
+        implicit_identity_ids = token_indices is None and expert_indices is None
+        if (token_indices is None) != (expert_indices is None):
+            raise ValueError(
+                "token_indices and expert_indices must either both be tensors "
+                "or both be None"
+            )
+        if route_weights.ndim != 1:
+            raise ValueError("route_weights must be one-dimensional")
         routes = int(route_weights.numel())
-        if int(token_indices.numel()) != routes or int(expert_indices.numel()) != routes:
-            raise ValueError("token_indices, expert_indices, and route_weights must have equal length")
+        if not implicit_identity_ids:
+            assert token_indices is not None
+            assert expert_indices is not None
+            if token_indices.ndim != 1 or expert_indices.ndim != 1:
+                raise ValueError(
+                    "token_indices and expert_indices must be one-dimensional"
+                )
+            if int(token_indices.numel()) != routes or int(expert_indices.numel()) != routes:
+                raise ValueError(
+                    "token_indices, expert_indices, and route_weights must have equal length"
+                )
         if routes > _MAX_SIGNED_I32:
             raise ValueError(f"route count exceeds the sorting kernel's signed 32-bit limit: {routes}")
         policy_representative = e16_route_policy_representative(
             select_e16_route_policy(routes, route_policy_size)
         )
-        if (
-            not token_indices.is_cuda
-            or not expert_indices.is_cuda
-            or not route_weights.is_cuda
-            or token_indices.device != hidden_states.device
-            or expert_indices.device != hidden_states.device
-            or route_weights.device != hidden_states.device
-        ):
+        if not route_weights.is_cuda or route_weights.device != hidden_states.device:
             raise ValueError("route tensors must be on the same ROCm device as hidden_states")
-        if token_indices.dtype != torch.int32 or expert_indices.dtype != torch.int32:
-            raise TypeError(
-                "token_indices/expert_indices must be int32, got " f"{token_indices.dtype}/{expert_indices.dtype}"
-            )
+        if not implicit_identity_ids:
+            assert token_indices is not None
+            assert expert_indices is not None
+            if (
+                not token_indices.is_cuda
+                or not expert_indices.is_cuda
+                or token_indices.device != hidden_states.device
+                or expert_indices.device != hidden_states.device
+            ):
+                raise ValueError(
+                    "route tensors must be on the same ROCm device as hidden_states"
+                )
+            if token_indices.dtype != torch.int32 or expert_indices.dtype != torch.int32:
+                raise TypeError(
+                    "token_indices/expert_indices must be int32, got "
+                    f"{token_indices.dtype}/{expert_indices.dtype}"
+                )
         if route_weights.dtype != torch.float32:
             raise TypeError(f"route_weights must be float32, got {route_weights.dtype}")
-        if not token_indices.is_contiguous() or not expert_indices.is_contiguous() or not route_weights.is_contiguous():
+        if not route_weights.is_contiguous() or (
+            not implicit_identity_ids
+            and (
+                not token_indices.is_contiguous()
+                or not expert_indices.is_contiguous()
+            )
+        ):
             raise ValueError("route tensors must be contiguous")
         if route_weights.requires_grad:
             raise ValueError("SonicMoE is inference-only; route_weights must not require gradients")
 
-        expert_major = _validate_expert_major_routes(
+        if expert_offsets is not None and expert_counts is not None:
+            raise ValueError("expert_offsets and expert_counts are mutually exclusive")
+        counts_major = _validate_expert_major_counts(
+            expert_counts,
+            hidden_states=hidden_states,
+            routes=routes,
+            num_experts=self.config.num_experts,
+        )
+        expert_major = counts_major or _validate_expert_major_routes(
             expert_offsets,
             hidden_states=hidden_states,
             routes=routes,
             num_experts=self.config.num_experts,
             token_indices_identity=token_indices_identity,
         )
+        if implicit_identity_ids:
+            single_launch_identity, _ = (
+                _route_sorting_module._expert_major_identity_fusion_parameters(
+                    self.config.num_experts,
+                    token_indices_identity,
+                    routes,
+                )
+            )
+            if not expert_major or not single_launch_identity:
+                raise NotImplementedError(
+                    "implicit expert-major ids require the E16 single-launch "
+                    "identity metadata specialization"
+                )
 
         workspace = self.reserve_dynamic_routes(tokens, routes)
+        route_inputs = (
+            (route_weights,)
+            if implicit_identity_ids
+            else (token_indices, expert_indices, route_weights)
+        )
         output = self._validate_out(
             out,
             workspace,
             hidden_states,
-            token_indices,
-            expert_indices,
-            route_weights,
+            *route_inputs,
             *((expert_offsets,) if expert_offsets is not None else ()),
+            *((expert_counts,) if expert_counts is not None else ()),
             *self.weights.tensors,
             invocation_owned_default=True,
         )
@@ -3137,22 +3312,24 @@ class SonicMoE:
                 workspace,
                 output,
                 hidden_states,
-                token_indices,
-                expert_indices,
-                route_weights,
+                *route_inputs,
                 *((expert_offsets,) if expert_offsets is not None else ()),
+                *((expert_counts,) if expert_counts is not None else ()),
                 *self.weights.tensors,
             )
 
         assert workspace.sorting_workspace is not None
         with workspace._launch_lock:
             if expert_major:
-                assert expert_offsets is not None
+                expert_boundaries = (
+                    expert_counts if counts_major else expert_offsets
+                )
+                assert expert_boundaries is not None
                 moe_expert_major_sorting_flydsl(
                     token_indices,
                     expert_indices,
                     route_weights,
-                    expert_offsets,
+                    expert_boundaries,
                     frequency,
                     workspace.sorting_workspace,
                     workspace.sorted_token_ids,
@@ -3167,6 +3344,7 @@ class SonicMoE:
                     token_indices_identity=token_indices_identity,
                     clear_output=not token_indices_identity,
                     route_policy_size=policy_representative,
+                    expert_counts_input=counts_major,
                 )
             else:
                 moe_ragged_sorting_flydsl(
@@ -3261,21 +3439,133 @@ class SonicMoE:
                 interleaved_w1=interleaved_w1,
                 expert_frequency_out=expert_frequency_out,
                 expert_offsets=expert_offsets,
+                expert_counts=None,
                 token_indices_identity=token_indices_identity,
+                route_policy_size=route_policy_size,
+            )
+
+    def forward_expert_major_training(
+        self,
+        hidden_states: torch.Tensor,
+        expert_offsets: torch.Tensor,
+        route_weights: torch.Tensor,
+        out: torch.Tensor | None = None,
+        *,
+        interleaved_w1: bool = False,
+        expert_frequency_out: torch.Tensor | None = None,
+        route_policy_size: int | None = None,
+    ) -> tuple[torch.Tensor, SonicMoERoutesForwardState]:
+        """Train E16 expert-major identity routes without materialized IDs.
+
+        This is the training counterpart of :meth:`forward_expert_major`.
+        The returned state owns all padded route metadata needed by
+        :func:`sonic_moe_backward_expert_major`, so an autograd adapter need
+        not construct or save flat token/expert ID tensors.  The lifecycle is
+        deliberately limited to the audited bias-free BF16 SwiGLU
+        H2048/I768/E16/top-k-1 shape; unsupported configurations fail before
+        allocating invocation state.
+        """
+
+        if not isinstance(interleaved_w1, bool):
+            raise TypeError("interleaved_w1 must be bool")
+        if self.weights.weight_dtype != "bf16" or self.config.compute_dtype != "bf16":
+            raise NotImplementedError(
+                "forward_expert_major_training currently supports only dense "
+                "BF16 weights and compute"
+            )
+        if self.config.activation != "swiglu":
+            raise NotImplementedError(
+                "forward_expert_major_training currently supports only "
+                "activation='swiglu'"
+            )
+        if not hidden_states.is_cuda:
+            raise ValueError("hidden_states must be on a ROCm device")
+        with torch.cuda.device(hidden_states.device):
+            if torch.cuda.is_current_stream_capturing():
+                raise RuntimeError(
+                    "forward_expert_major_training does not support graph capture "
+                    "without a graph-private preallocated state slot"
+                )
+            return self._forward_routes_training_on_current_device(
+                hidden_states,
+                None,
+                None,
+                route_weights,
+                out,
+                interleaved_w1=interleaved_w1,
+                expert_frequency_out=expert_frequency_out,
+                expert_offsets=expert_offsets,
+                expert_counts=None,
+                token_indices_identity=True,
+                route_policy_size=route_policy_size,
+            )
+
+    def forward_expert_major_counts_training(
+        self,
+        hidden_states: torch.Tensor,
+        expert_counts: torch.Tensor,
+        route_weights: torch.Tensor,
+        out: torch.Tensor | None = None,
+        *,
+        interleaved_w1: bool = False,
+        expert_frequency_out: torch.Tensor | None = None,
+        route_policy_size: int | None = None,
+    ) -> tuple[torch.Tensor, SonicMoERoutesForwardState]:
+        """Train E16 expert-major identity routes directly from counts.
+
+        Counts follow :meth:`forward_expert_major_counts`. The retained state
+        is consumed by :func:`sonic_moe_backward_expert_major`; neither side
+        materializes a length-``routes`` token or expert-id tensor. This has
+        the same audited retained-backward shape contract as
+        :meth:`forward_expert_major_training`.
+        """
+
+        if not isinstance(interleaved_w1, bool):
+            raise TypeError("interleaved_w1 must be bool")
+        if self.weights.weight_dtype != "bf16" or self.config.compute_dtype != "bf16":
+            raise NotImplementedError(
+                "forward_expert_major_counts_training currently supports only "
+                "dense BF16 weights and compute"
+            )
+        if self.config.activation != "swiglu":
+            raise NotImplementedError(
+                "forward_expert_major_counts_training currently supports only "
+                "activation='swiglu'"
+            )
+        if not hidden_states.is_cuda:
+            raise ValueError("hidden_states must be on a ROCm device")
+        with torch.cuda.device(hidden_states.device):
+            if torch.cuda.is_current_stream_capturing():
+                raise RuntimeError(
+                    "forward_expert_major_counts_training does not support graph "
+                    "capture without a graph-private preallocated state slot"
+                )
+            return self._forward_routes_training_on_current_device(
+                hidden_states,
+                None,
+                None,
+                route_weights,
+                out,
+                interleaved_w1=interleaved_w1,
+                expert_frequency_out=expert_frequency_out,
+                expert_offsets=None,
+                expert_counts=expert_counts,
+                token_indices_identity=True,
                 route_policy_size=route_policy_size,
             )
 
     def _forward_routes_training_on_current_device(
         self,
         hidden_states: torch.Tensor,
-        token_indices: torch.Tensor,
-        expert_indices: torch.Tensor,
+        token_indices: torch.Tensor | None,
+        expert_indices: torch.Tensor | None,
         route_weights: torch.Tensor,
         out: torch.Tensor | None,
         *,
         interleaved_w1: bool,
         expert_frequency_out: torch.Tensor | None,
         expert_offsets: torch.Tensor | None,
+        expert_counts: torch.Tensor | None,
         token_indices_identity: bool,
         route_policy_size: int | None,
     ) -> tuple[torch.Tensor, SonicMoERoutesForwardState]:
@@ -3283,56 +3573,119 @@ class SonicMoE:
             hidden_states,
             allow_empty=True,
         )
-        if token_indices.ndim != 1 or expert_indices.ndim != 1 or route_weights.ndim != 1:
-            raise ValueError("token_indices, expert_indices, and route_weights must be one-dimensional")
+        implicit_identity_ids = token_indices is None and expert_indices is None
+        if (token_indices is None) != (expert_indices is None):
+            raise ValueError(
+                "token_indices and expert_indices must either both be tensors "
+                "or both be None"
+            )
+        if route_weights.ndim != 1:
+            raise ValueError("route_weights must be one-dimensional")
         routes = int(route_weights.numel())
-        if int(token_indices.numel()) != routes or int(expert_indices.numel()) != routes:
-            raise ValueError("token_indices, expert_indices, and route_weights must have equal length")
+        if not implicit_identity_ids:
+            assert token_indices is not None
+            assert expert_indices is not None
+            if token_indices.ndim != 1 or expert_indices.ndim != 1:
+                raise ValueError(
+                    "token_indices and expert_indices must be one-dimensional"
+                )
+            if int(token_indices.numel()) != routes or int(expert_indices.numel()) != routes:
+                raise ValueError(
+                    "token_indices, expert_indices, and route_weights must have equal length"
+                )
         if routes > _MAX_SIGNED_I32:
             raise ValueError(f"route count exceeds the sorting kernel's signed 32-bit limit: {routes}")
         policy_representative = e16_route_policy_representative(
             select_e16_route_policy(routes, route_policy_size)
         )
-        if (
-            not token_indices.is_cuda
-            or not expert_indices.is_cuda
-            or not route_weights.is_cuda
-            or token_indices.device != hidden_states.device
-            or expert_indices.device != hidden_states.device
-            or route_weights.device != hidden_states.device
-        ):
+        if not route_weights.is_cuda or route_weights.device != hidden_states.device:
             raise ValueError("route tensors must be on the same ROCm device as hidden_states")
-        if token_indices.dtype != torch.int32 or expert_indices.dtype != torch.int32:
-            raise TypeError(
-                "token_indices/expert_indices must be int32, got "
-                f"{token_indices.dtype}/{expert_indices.dtype}"
-            )
+        if not implicit_identity_ids:
+            assert token_indices is not None
+            assert expert_indices is not None
+            if (
+                not token_indices.is_cuda
+                or not expert_indices.is_cuda
+                or token_indices.device != hidden_states.device
+                or expert_indices.device != hidden_states.device
+            ):
+                raise ValueError(
+                    "route tensors must be on the same ROCm device as hidden_states"
+                )
+            if token_indices.dtype != torch.int32 or expert_indices.dtype != torch.int32:
+                raise TypeError(
+                    "token_indices/expert_indices must be int32, got "
+                    f"{token_indices.dtype}/{expert_indices.dtype}"
+                )
         if route_weights.dtype != torch.float32:
             raise TypeError(f"route_weights must be float32, got {route_weights.dtype}")
-        if not token_indices.is_contiguous() or not expert_indices.is_contiguous() or not route_weights.is_contiguous():
+        if not route_weights.is_contiguous() or (
+            not implicit_identity_ids
+            and (
+                not token_indices.is_contiguous()
+                or not expert_indices.is_contiguous()
+            )
+        ):
             raise ValueError("route tensors must be contiguous")
 
-        expert_major = _validate_expert_major_routes(
+        if expert_offsets is not None and expert_counts is not None:
+            raise ValueError("expert_offsets and expert_counts are mutually exclusive")
+        counts_major = _validate_expert_major_counts(
+            expert_counts,
+            hidden_states=hidden_states,
+            routes=routes,
+            num_experts=self.config.num_experts,
+        )
+        expert_major = counts_major or _validate_expert_major_routes(
             expert_offsets,
             hidden_states=hidden_states,
             routes=routes,
             num_experts=self.config.num_experts,
             token_indices_identity=token_indices_identity,
         )
+        if implicit_identity_ids:
+            single_launch_identity, _ = (
+                _route_sorting_module._expert_major_identity_fusion_parameters(
+                    self.config.num_experts,
+                    token_indices_identity,
+                    routes,
+                )
+            )
+            if not expert_major or not single_launch_identity:
+                raise NotImplementedError(
+                    "implicit expert-major ids require the E16 single-launch "
+                    "identity metadata specialization"
+                )
+
+        if implicit_identity_ids and not _retain_e16_flat_sorter_metadata(
+            self.config,
+            tokens,
+            routes,
+            has_bias=self.weights.has_bias,
+        ):
+            raise NotImplementedError(
+                "implicit expert-major training requires the complete "
+                "bias-free BF16 SwiGLU H2048/I768/E16/top_k=1 retained-state "
+                "lifecycle with routes == tokens"
+            )
 
         _validate_routes_training_preactivation_extent(
             routes,
             self.config.intermediate_size,
         )
         workspace = self.reserve_dynamic_routes(tokens, routes)
+        route_inputs = (
+            (route_weights,)
+            if implicit_identity_ids
+            else (token_indices, expert_indices, route_weights)
+        )
         output = self._validate_out(
             out,
             workspace,
             hidden_states,
-            token_indices,
-            expert_indices,
-            route_weights,
+            *route_inputs,
             *((expert_offsets,) if expert_offsets is not None else ()),
+            *((expert_counts,) if expert_counts is not None else ()),
             *self.weights.tensors,
             invocation_owned_default=True,
         )
@@ -3354,10 +3707,9 @@ class SonicMoE:
                 workspace,
                 output,
                 hidden_states,
-                token_indices,
-                expert_indices,
-                route_weights,
+                *route_inputs,
                 *((expert_offsets,) if expert_offsets is not None else ()),
+                *((expert_counts,) if expert_counts is not None else ()),
                 *self.weights.tensors,
             )
             if retain_sorter_metadata:
@@ -3397,7 +3749,10 @@ class SonicMoE:
         with workspace._launch_lock:
             stage1_enqueued = False
             if expert_major:
-                assert expert_offsets is not None
+                expert_boundaries = (
+                    expert_counts if counts_major else expert_offsets
+                )
+                assert expert_boundaries is not None
                 stage1_enqueued = (
                     token_indices_identity
                     and routes > 0
@@ -3407,7 +3762,7 @@ class SonicMoE:
                         output,
                         preactivation,
                         route_weights,
-                        expert_offsets,
+                        expert_boundaries,
                         frequency,
                         frequency_mirror,
                         sorted_token_ids,
@@ -3417,6 +3772,7 @@ class SonicMoE:
                         num_valid_ids,
                         launch_plan,
                         stream,
+                        expert_counts_input=counts_major,
                     )
                 )
                 if not stage1_enqueued:
@@ -3424,7 +3780,7 @@ class SonicMoE:
                         token_indices,
                         expert_indices,
                         route_weights,
-                        expert_offsets,
+                        expert_boundaries,
                         frequency,
                         workspace.sorting_workspace,
                         sorted_token_ids,
@@ -3441,6 +3797,7 @@ class SonicMoE:
                         token_indices_identity=token_indices_identity,
                         clear_output=not token_indices_identity,
                         route_policy_size=launch_plan.route_policy_size,
+                        expert_counts_input=counts_major,
                     )
             else:
                 moe_ragged_sorting_flydsl(
@@ -3497,6 +3854,7 @@ class SonicMoE:
                 frequency,
                 frequency_mirror,
                 expert_offsets,
+                expert_counts,
             )
             ready_event.record(stream)
 
@@ -3940,35 +4298,27 @@ def warmup_sonic_e16_training(
         dtype=torch.bfloat16,
         device=device,
     )
-    token_indices = torch.arange(routes, dtype=torch.int32, device=device)
-    expert_indices = torch.arange(routes, dtype=torch.int32, device=device)
     route_weights = torch.ones(routes, dtype=torch.float32, device=device)
-    expert_offsets = torch.arange(routes + 1, dtype=torch.int32, device=device)
+    expert_counts = torch.ones(routes, dtype=torch.int32, device=device)
     grad_output = torch.zeros_like(hidden_states)
 
     for policy_size in canonical_sizes:
-        _, state = operator.forward_routes_training(
+        _, state = operator.forward_expert_major_counts_training(
             hidden_states,
-            token_indices,
-            expert_indices,
+            expert_counts,
             route_weights,
             interleaved_w1=interleaved_w1,
-            expert_offsets=expert_offsets,
-            token_indices_identity=True,
             route_policy_size=policy_size,
         )
-        sonic_moe_backward_routes(
+        sonic_moe_backward_expert_major(
             hidden_states,
             w1,
             w2,
-            token_indices,
-            expert_indices,
             route_weights,
             grad_output,
             config,
             interleaved_w1=interleaved_w1,
             forward_state=state,
-            token_indices_sorted=True,
         )
 
     if synchronize:
@@ -4117,6 +4467,7 @@ __all__ = [
     "prepare_sonic_fp16_weights",
     "prepare_sonic_mxfp4_weights",
     "sonic_moe_backward",
+    "sonic_moe_backward_expert_major",
     "sonic_moe_backward_routes",
     "sonic_moe_mxfp4_reference",
     "sonic_moe_reference",

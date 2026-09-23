@@ -13,7 +13,7 @@ This guide covers the available FlyDSL kernels — normalization, softmax, GEMM,
 | **GEMM** | `compile_preshuffle_gemm(...)` | `@flyc.kernel` | fp8, int8, fp16, bf16 | Preshuffle B, ping-pong LDS, MFMA 16x16 |
 | **FlashAttention** | `build_flash_attn_func_module(...)` | `@flyc.kernel` | bf16, f16 (any arch); fp8 e4m3fn (gfx950, D=128, dense) | Dual-wave SWP fwd, GQA/MQA, causal, descale ABI |
 | **SonicMoE forward** | `SonicMoE(config, weights)` | Host-composed FlyDSL | BF16/FP16 activation and dense weight; MXFP4 weight with BF16 activation | Routing/top-k + sort, fused activation, weighted down scatter |
-| **SonicMoE backward** | `sonic_moe_backward(...)`, `sonic_moe_backward_routes(...)` | Host-composed FlyDSL | BF16/FP16 activation, dense weight, optional bias | Fixed-K and flat ragged-route gradients for all seven Sonic activations |
+| **SonicMoE backward** | `sonic_moe_backward(...)`, `sonic_moe_backward_routes(...)`, `sonic_moe_backward_expert_major(...)` | Host-composed FlyDSL | BF16/FP16 activation, dense weight, optional bias | Fixed-K, flat ragged-route, and retained E16 expert-major gradients |
 
 All kernels use the `@flyc.kernel`/`@flyc.jit` API from `flydsl.compiler` and `flydsl.expr` (`python/flydsl/`).
 
@@ -321,6 +321,7 @@ from kernels.moe.sonic import (
     prepare_sonic_mxfp4_weights,
     canonical_e16_route_policy_size,
     sonic_moe_backward,
+    sonic_moe_backward_expert_major,
     sonic_moe_backward_routes,
     warmup_sonic_e16_training,
 )
@@ -402,26 +403,24 @@ op.reserve_dynamic_routes(max_local_routes, max_local_routes)
 # Derive this from the current all-to-all split metadata (or a safe shared
 # bound), not from one rank's local R and not from an exact-R JIT key.
 policy_size = canonical_e16_route_policy_size(ep_wide_max_local_routes)
-out, route_state = op.forward_routes_training(
+
+# The EP exchange already returns expert-major identity rows. Pass its device
+# int32 [16] counts directly: no caller-side cumsum, arange(T), or
+# repeat_interleave(counts) is needed.
+out, route_state = op.forward_expert_major_counts_training(
     expert_major_hidden_bf16,
-    token_indices_i32,
-    expert_indices_i32,
+    tokens_per_expert_i32,
     route_scores_f32,
-    expert_offsets=cu_seqlens_i32,
-    token_indices_identity=True,
     route_policy_size=policy_size,
 )
-dx, dw1, dw2, droute_scores = sonic_moe_backward_routes(
+dx, dw1, dw2, droute_scores = sonic_moe_backward_expert_major(
     expert_major_hidden_bf16,
     w1,
     w2,
-    token_indices_i32,
-    expert_indices_i32,
     route_scores_f32,
     grad_output_bf16,
     cfg,
     forward_state=route_state,
-    token_indices_sorted=True,
 )
 ```
 
@@ -439,6 +438,16 @@ family can be suboptimal for genuinely small shards even though scratch and
 launch grids are dynamically right-sized. Compile warmup uses a tiny probe and
 does not itself reserve production-size workspace; `synchronize=False` also
 requires the caller to synchronize the current stream or device before timing.
+`tokens_per_expert_i32` is a contiguous device `torch.int32` tensor of shape
+`[16]`; its values must be non-negative and sum to `R`. These value checks are
+an asynchronous caller precondition so the hot path never performs a D2H
+synchronization. If an application already owns device cumulative offsets, the
+equivalent compatibility entry points are `forward_expert_major(...)` and
+`forward_expert_major_training(...)`; they still avoid materializing the two
+length-`R` ID tensors. The retained ID-free training/backward lifecycle is
+currently specialized to bias-free BF16 SwiGLU with `H=2048`, `I=768`,
+`E=16`, and `top_k=1`; unsupported training shapes fail before allocating
+invocation state.
 
 `forward_topk_training` currently supports dense BF16 SwiGLU with fixed-K
 routes.  The state is tied to the exact forward invocation (including W1, B1,

@@ -497,11 +497,15 @@ def _compile_moe_expert_major_sorting(
     token_indices_identity: bool,
     clear_output: bool,
     single_launch_identity: bool,
+    expert_counts_input: bool = False,
 ):
     """Build the expert-major metadata adapter.
 
-    ``expert_offsets`` describes the already expert-major input as half-open
-    route intervals.  Unlike :func:`_compile_moe_ragged_sorting`, this path
+    ``expert_offsets`` normally describes the already expert-major input as
+    half-open route intervals.  In the E16 single-launch identity
+    specialization, ``expert_counts_input=True`` instead interprets that
+    tensor as per-expert row counts and derives the raw prefix in-kernel.
+    Unlike :func:`_compile_moe_ragged_sorting`, this path
     has no histogram or atomic scatter: its first launch derives the padded
     ABI layout, and its second launch copies each route into that layout.  The
     E16 identity specialization instead derives both pieces per expert in one
@@ -514,6 +518,10 @@ def _compile_moe_expert_major_sorting(
         raise ValueError(f"num_experts must be positive, got {num_experts}")
     if unit_size <= 0:
         raise ValueError(f"unit_size must be positive, got {unit_size}")
+    if expert_counts_input and not single_launch_identity:
+        raise ValueError(
+            "expert_counts_input requires the single-launch identity kernel"
+        )
     @flyc.kernel(known_block_size=[BLOCK_SIZE, 1, 1])
     def identity_expert_pack_kernel(
         route_weights: fx.Tensor,
@@ -534,9 +542,10 @@ def _compile_moe_expert_major_sorting(
     ):
         """Build E16 identity-route metadata with one expert-centric launch.
 
-        Every CTA owns one expert.  Since ``expert_offsets`` already provides
-        disjoint expert intervals, the CTA can derive its padded destination
-        without the cross-CTA dependency that required the old prefix launch.
+        Every CTA owns one expert.  ``expert_offsets`` either provides
+        disjoint expert intervals or, for the E16 counts specialization, the
+        16 raw expert lengths.  The CTA derives its padded destination without
+        the cross-CTA dependency that required the old prefix launch.
         Lane zero computes the small E16 padded prefix and broadcasts it
         through 16 bytes of LDS while the lanes cooperatively copy routes.
         """
@@ -575,39 +584,67 @@ def _compile_moe_expert_major_sorting(
         shared = fx.SharedAllocator().allocate(16, alignment=16).peek()
         metadata = fx.recast_iter(fx.Int32, shared.ptr)
         if thread == c_zero:
-            begin_lane0 = buffer_ops.buffer_load(
-                offsets_rsrc, expert, vec_width=1, dtype=T.i32
-            )
-            end_lane0 = buffer_ops.buffer_load(
-                offsets_rsrc, expert + c_one, vec_width=1, dtype=T.i32
-            )
-            count_lane0 = end_lane0 - begin_lane0
+            if const_expr(expert_counts_input):
+                count_lane0 = buffer_ops.buffer_load(
+                    offsets_rsrc, expert, vec_width=1, dtype=T.i32
+                )
+                begin_lane0 = c_zero
+                padded_offset_lane0 = c_zero
+                for prefix_expert_id in range_constexpr(num_experts):
+                    prefix_expert = fx.Int32(prefix_expert_id)
+                    prefix_count = buffer_ops.buffer_load(
+                        offsets_rsrc,
+                        prefix_expert,
+                        vec_width=1,
+                        dtype=T.i32,
+                    )
+                    prefix_blocks = (prefix_count + c_unit - c_one) // c_unit
+                    prefix_padded = (prefix_count == c_zero).select(
+                        c_zero, prefix_blocks * c_unit
+                    )
+                    is_prior = prefix_expert < expert
+                    begin_lane0 = begin_lane0 + is_prior.select(
+                        prefix_count,
+                        c_zero,
+                    )
+                    padded_offset_lane0 = padded_offset_lane0 + is_prior.select(
+                        prefix_padded,
+                        c_zero,
+                    )
+            else:
+                begin_lane0 = buffer_ops.buffer_load(
+                    offsets_rsrc, expert, vec_width=1, dtype=T.i32
+                )
+                end_lane0 = buffer_ops.buffer_load(
+                    offsets_rsrc, expert + c_one, vec_width=1, dtype=T.i32
+                )
+                count_lane0 = end_lane0 - begin_lane0
+                padded_offset_lane0 = begin_lane0
+                prefix_begin = buffer_ops.buffer_load(
+                    offsets_rsrc, c_zero, vec_width=1, dtype=T.i32
+                )
+                for prefix_expert_id in range_constexpr(num_experts):
+                    prefix_expert = fx.Int32(prefix_expert_id)
+                    prefix_end = buffer_ops.buffer_load(
+                        offsets_rsrc,
+                        prefix_expert + c_one,
+                        vec_width=1,
+                        dtype=T.i32,
+                    )
+                    prefix_count = prefix_end - prefix_begin
+                    prefix_blocks = (prefix_count + c_unit - c_one) // c_unit
+                    prefix_padded = (prefix_count == c_zero).select(
+                        c_zero, prefix_blocks * c_unit
+                    )
+                    prefix_padding = prefix_padded - prefix_count
+                    padded_offset_lane0 = padded_offset_lane0 + (
+                        prefix_expert < expert
+                    ).select(prefix_padding, c_zero)
+                    prefix_begin = prefix_end
             blocks_lane0 = (count_lane0 + c_unit - c_one) // c_unit
             padded_lane0 = (count_lane0 == c_zero).select(
                 c_zero, blocks_lane0 * c_unit
             )
-            padded_offset_lane0 = begin_lane0
-            prefix_begin = buffer_ops.buffer_load(
-                offsets_rsrc, c_zero, vec_width=1, dtype=T.i32
-            )
-            for prefix_expert_id in range_constexpr(num_experts):
-                prefix_expert = fx.Int32(prefix_expert_id)
-                prefix_end = buffer_ops.buffer_load(
-                    offsets_rsrc,
-                    prefix_expert + c_one,
-                    vec_width=1,
-                    dtype=T.i32,
-                )
-                prefix_count = prefix_end - prefix_begin
-                prefix_blocks = (prefix_count + c_unit - c_one) // c_unit
-                prefix_padded = (prefix_count == c_zero).select(
-                    c_zero, prefix_blocks * c_unit
-                )
-                prefix_padding = prefix_padded - prefix_count
-                padded_offset_lane0 = padded_offset_lane0 + (
-                    prefix_expert < expert
-                ).select(prefix_padding, c_zero)
-                prefix_begin = prefix_end
             fx.ptr_store(begin_lane0, metadata)
             fx.ptr_store(count_lane0, metadata + fx.Int64(1))
             fx.ptr_store(padded_lane0, metadata + fx.Int64(2))
@@ -939,8 +976,8 @@ def _compile_moe_expert_major_sorting(
 
 
 def moe_expert_major_sorting_flydsl(
-    token_indices: torch.Tensor,
-    expert_indices: torch.Tensor,
+    token_indices: torch.Tensor | None,
+    expert_indices: torch.Tensor | None,
     route_weights: torch.Tensor,
     expert_offsets: torch.Tensor,
     expert_frequency: torch.Tensor,
@@ -960,15 +997,17 @@ def moe_expert_major_sorting_flydsl(
     token_indices_identity: bool = False,
     clear_output: bool = False,
     route_policy_size: int | None = None,
+    expert_counts_input: bool = False,
 ):
     """Build grouped-GEMM metadata from an already expert-major route list.
 
-    ``expert_offsets`` is contiguous int32 ``[E + 1]`` and defines the
-    half-open input interval for each expert.  The caller guarantees that the
-    intervals partition ``[0, R)`` and that every route in an interval has the
-    matching value in ``expert_indices``.  Keeping that value check outside
-    this asynchronous launch is deliberate: it avoids device-to-host reads on
-    the dynamic-R hot path.
+    ``expert_offsets`` is normally contiguous int32 ``[E + 1]`` and defines
+    the half-open input interval for each expert.  With
+    ``expert_counts_input=True`` it is instead contiguous int32 ``[E]`` raw
+    counts; this mode is restricted to implicit E16 identity ids.  The caller
+    guarantees that the intervals/counts partition ``[0, R)``.  Keeping that
+    value check outside this asynchronous launch is deliberate: it avoids
+    device-to-host reads on the dynamic-R hot path.
 
     ``expert_padded_offsets`` is caller-owned contiguous int32 ``[E]`` scratch
     connecting the prefix and parallel pack launches.  The emitted tensors
@@ -977,7 +1016,10 @@ def moe_expert_major_sorting_flydsl(
     use ``R`` as sentinel, and ``num_valid_ids == [P, tokens]`` where
     ``P = sum_e ceil(count_e / unit_size) * unit_size``.  Generic calls launch
     one prefix/padding CTA and one parallel pack CTA; E16 identity calls use a
-    single partitioned expert-centric kernel.
+    single partitioned expert-centric kernel.  That E16 identity specialization
+    also accepts ``token_indices=expert_indices=None``: route and expert ids are
+    derived from the identity/expert-major contract without materializing the
+    two input vectors.  No other specialization accepts omitted ids.
     Set ``clear_output`` only when ``moe_buf`` owns an output/scratch tensor
     that must be zeroed as part of the second CTA launch.
 
@@ -990,20 +1032,25 @@ def moe_expert_major_sorting_flydsl(
     routes = int(route_weights.numel())
     if num_experts <= 0 or unit_size <= 0:
         raise ValueError("num_experts and unit_size must be positive")
-    if (
-        token_indices.ndim != 1
-        or expert_indices.ndim != 1
-        or route_weights.ndim != 1
-    ):
+    if route_weights.ndim != 1:
+        raise ValueError("route_weights must be one-dimensional")
+    implicit_identity_ids = token_indices is None and expert_indices is None
+    if (token_indices is None) != (expert_indices is None):
         raise ValueError(
-            "token_indices, expert_indices, and route_weights must be one-dimensional"
+            "token_indices and expert_indices must either both be tensors or "
+            "both be None"
         )
-    if int(token_indices.numel()) != routes or int(expert_indices.numel()) != routes:
-        raise ValueError("token_indices, expert_indices, and route_weights must have equal length")
+    if not implicit_identity_ids:
+        assert token_indices is not None
+        assert expert_indices is not None
+        if token_indices.ndim != 1 or expert_indices.ndim != 1:
+            raise ValueError("token_indices and expert_indices must be one-dimensional")
+        if int(token_indices.numel()) != routes or int(expert_indices.numel()) != routes:
+            raise ValueError(
+                "token_indices, expert_indices, and route_weights must have equal length"
+            )
     device = route_weights.device
     tensors = {
-        "token_indices": token_indices,
-        "expert_indices": expert_indices,
         "expert_offsets": expert_offsets,
         "expert_frequency": expert_frequency,
         "expert_padded_offsets": expert_padded_offsets,
@@ -1013,19 +1060,39 @@ def moe_expert_major_sorting_flydsl(
         "num_valid_ids": num_valid_ids,
         "moe_buf": moe_buf,
     }
+    if not implicit_identity_ids:
+        assert token_indices is not None
+        assert expert_indices is not None
+        tensors["token_indices"] = token_indices
+        tensors["expert_indices"] = expert_indices
     if not route_weights.is_cuda:
         raise ValueError("route tensors must be CUDA/ROCm tensors")
     if route_weights.dtype != torch.float32 or not route_weights.is_contiguous():
         raise ValueError("route_weights must be contiguous float32")
-    if token_indices.dtype != torch.int32 or expert_indices.dtype != torch.int32:
-        raise TypeError("token_indices and expert_indices must be int32")
+    if not implicit_identity_ids:
+        assert token_indices is not None
+        assert expert_indices is not None
+        if token_indices.dtype != torch.int32 or expert_indices.dtype != torch.int32:
+            raise TypeError("token_indices and expert_indices must be int32")
     for name, tensor in tensors.items():
         if not isinstance(tensor, torch.Tensor):
             raise TypeError(f"{name} must be a torch.Tensor")
         if tensor.device != device or not tensor.is_contiguous():
             raise ValueError(f"{name} must be contiguous on the route tensor device")
-    if expert_offsets.dtype != torch.int32 or tuple(expert_offsets.shape) != (num_experts + 1,):
-        raise ValueError(f"expert_offsets must be contiguous int32 with shape ({num_experts + 1},)")
+    if not isinstance(expert_counts_input, bool):
+        raise TypeError("expert_counts_input must be bool")
+    expected_boundaries_shape = (
+        (num_experts,) if expert_counts_input else (num_experts + 1,)
+    )
+    if (
+        expert_offsets.dtype != torch.int32
+        or tuple(expert_offsets.shape) != expected_boundaries_shape
+    ):
+        input_name = "expert_counts" if expert_counts_input else "expert_offsets"
+        raise ValueError(
+            f"{input_name} must be contiguous int32 with shape "
+            f"{expected_boundaries_shape}"
+        )
     if expert_frequency.dtype != torch.int32 or tuple(expert_frequency.shape) != (num_experts,):
         raise ValueError(f"expert_frequency must be contiguous int32 with shape ({num_experts},)")
     if (
@@ -1100,6 +1167,15 @@ def moe_expert_major_sorting_flydsl(
         token_indices_identity,
         routes,
     )
+    if implicit_identity_ids and not single_launch_identity:
+        raise NotImplementedError(
+            "implicit expert-major ids require the E16 single-launch identity "
+            "metadata specialization"
+        )
+    if expert_counts_input and not implicit_identity_ids:
+        raise ValueError(
+            "expert_counts_input requires omitted token/expert ids"
+        )
     launch_fn = _compile_moe_expert_major_sorting(
         num_experts=num_experts,
         unit_size=unit_size,
@@ -1108,12 +1184,22 @@ def moe_expert_major_sorting_flydsl(
         token_indices_identity=token_indices_identity,
         clear_output=clear_output,
         single_launch_identity=single_launch_identity,
+        expert_counts_input=expert_counts_input,
     )
     sorted_route_ids_arg = expert_frequency if sorted_route_ids is None else sorted_route_ids
     expert_frequency_mirror_arg = expert_frequency if expert_frequency_mirror is None else expert_frequency_mirror
+    # Preserve the existing compiled launcher ABI.  In the guarded
+    # single-launch identity branch these first two arguments are not
+    # dereferenced; use the already validated int32 offsets tensor instead of
+    # allocating fake route-id vectors.  The check immediately above prevents
+    # this placeholder from ever reaching the generic pack branch.
+    token_indices_arg = expert_offsets if implicit_identity_ids else token_indices
+    expert_indices_arg = expert_offsets if implicit_identity_ids else expert_indices
+    assert token_indices_arg is not None
+    assert expert_indices_arg is not None
     args = (
-        token_indices,
-        expert_indices,
+        token_indices_arg,
+        expert_indices_arg,
         route_weights,
         expert_offsets,
         expert_frequency,
@@ -1139,6 +1225,7 @@ def moe_expert_major_sorting_flydsl(
         token_indices_identity,
         clear_output,
         single_launch_identity,
+        expert_counts_input,
         moe_buf_i32.ndim,
         device.index,
     )

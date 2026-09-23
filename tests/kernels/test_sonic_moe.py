@@ -81,6 +81,7 @@ def _config(**overrides):
         ({"hidden_size": 4096}, False),
         ({"intermediate_size": 960}, False),
         ({"num_experts": 64}, False),
+        ({"top_k": 2}, False),
         ({"activation": "geglu"}, False),
         ({"compute_dtype": "fp16"}, False),
         ({"has_bias": True}, False),

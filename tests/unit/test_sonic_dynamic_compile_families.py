@@ -77,10 +77,10 @@ def test_e16_warmup_executes_each_finite_family_with_one_small_probe(
             route_policy_size=kwargs["route_policy_size"]
         )
 
-    operator.forward_routes_training = fake_forward
+    operator.forward_expert_major_counts_training = fake_forward
     monkeypatch.setattr(
         sonic_module,
-        "sonic_moe_backward_routes",
+        "sonic_moe_backward_expert_major",
         lambda *args, **kwargs: backward_calls.append((args, kwargs)),
     )
     fake_tensor = _FakeTensor((16, 2048), torch.bfloat16)
@@ -105,6 +105,8 @@ def test_e16_warmup_executes_each_finite_family_with_one_small_probe(
     assert warmed == (4096, 16384, 32768, 65536)
     assert [call[1]["route_policy_size"] for call in forward_calls] == list(warmed)
     assert all(call[0][0].shape == (16, 2048) for call in forward_calls)
+    assert all(call[0][1].shape == (16,) for call in forward_calls)
+    assert all(len(call[0]) == 3 for call in forward_calls)
     assert len(backward_calls) == len(warmed)
     assert all(call[1]["forward_state"].route_policy_size == policy for call, policy in zip(backward_calls, warmed))
     assert all("route_policy_size" not in call[1] for call in backward_calls)
