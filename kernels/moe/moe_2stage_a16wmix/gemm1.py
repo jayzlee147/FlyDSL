@@ -1,13 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (C) 2025-2026 FlyDSL Project Contributors
 
-import weakref
-
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm
-from flydsl.expr import arith, const_expr, gpu, range_constexpr, rocdl
+from flydsl.expr import arith, const_expr, gpu, math as fmath, range_constexpr, rocdl
 from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
 from kernels.common import buffer_ops
@@ -38,18 +36,6 @@ from .utils import (
 # compile-time opt-in so the established one-CTA-per-tile kernels remain
 # byte-for-byte unchanged unless a caller explicitly selects this schedule.
 NUM_CU = 256
-
-
-_GEMM1_COMPOSITION_HOOKS = weakref.WeakKeyDictionary()
-
-
-def _get_gemm1_composition_hook(launcher):
-    """Return the kernel and launch attributes for an internal master launch."""
-
-    try:
-        return _GEMM1_COMPOSITION_HOOKS[launcher]
-    except KeyError as error:
-        raise ValueError("launcher does not expose a GEMM1 composition hook") from error
 
 
 def _silu_mul_batch(gs, us):
@@ -165,6 +151,11 @@ def _gemm1_body_a16w4(
     f32_situ_linbeta,
     f32_situ_linbeta_rcp,
     f32_swiglu_limit,
+    identity_expert,
+    identity_raw_begin,
+    identity_padded_begin,
+    identity_count,
+    identity_padded_total,
     *,
     BM,
     SORTED_BM,
@@ -190,6 +181,7 @@ def _gemm1_body_a16w4(
     route_preactivation_by_route_id=False,
     skip_epilogue_id_reload=False,
     a_lds_swizzle=False,
+    fused_identity_metadata=False,
 ):
     """A16W4/A16W16 fused stage1 GEMM body.
 
@@ -301,10 +293,17 @@ def _gemm1_body_a16w4(
     # ---- grid decode: m-block (expert block) x n-block (inter tile) -----------
     n_block_idx = bx_i32 % fx.Int32(NUM_N_BLOCKS)
     m_block_idx = bx_i32 // fx.Int32(NUM_N_BLOCKS)
-    # The sorter emits one expert id per SORTED_BM rows.  A smaller compute BM
-    # subdivides that route tile, so all of its sub-blocks share the same id.
-    metadata_block_idx = m_block_idx // fx.Int32(SORTED_BM // BM)
-    e = rocdl.readfirstlane(T.i32, _raw(_global_i32_at(arg_eids, metadata_block_idx)))
+    # The ordinary route path consumes sorter metadata.  The expert-major
+    # identity specialization instead derives the expert and raw segment from
+    # device counts/offsets in the Stage-1 wrapper.  It must not read metadata
+    # that this same kernel launch is still producing for Stage 2/backward.
+    if const_expr(fused_identity_metadata):
+        e = identity_expert
+    else:
+        # The sorter emits one expert id per SORTED_BM rows.  A smaller compute
+        # BM subdivides that route tile, so all of its sub-blocks share the id.
+        metadata_block_idx = m_block_idx // fx.Int32(SORTED_BM // BM)
+        e = rocdl.readfirstlane(T.i32, _raw(_global_i32_at(arg_eids, metadata_block_idx)))
     bx_m = m_block_idx * fx.Int32(BM)  # first sorted row of this m-block
     by_n = n_block_idx * fx.Int32(TILE_N)
     expert_off = e * fx.Int32(N_OUT)
@@ -342,7 +341,11 @@ def _gemm1_body_a16w4(
     # (clamped) stores land OOB. KEPT RAW: the output resource + masked buffer_store need a
     # dynamic (runtime cumsum0) num_records and per-store predication; the fx.copy layout
     # API does not express the masked scalar scatter this epilogue relies on.
-    _cumsum0 = _global_i32_at(arg_cumsum, fx.Int32(0))
+    _cumsum0 = (
+        identity_padded_total
+        if const_expr(fused_identity_metadata)
+        else _global_i32_at(arg_cumsum, fx.Int32(0))
+    )
     _OUT_COLS = N_OUT if store_preactivation else INTER
     out_rsrc = buffer_ops.create_buffer_resource_from_addr(
         _raw(fx.Int64(arg_out)),
@@ -386,9 +389,17 @@ def _gemm1_body_a16w4(
         x_row_local.append(row_local)
         x_col_dw.append(col_dw)
         sorted_row = bx_m + row_local
-        fused = fx.Int32(_global_i32_at(arg_mind, sorted_row))
-        t_i32 = fused & fx.Int32(0x00FFFFFF)
-        row_valid = t_i32 < i32_ntok
+        if const_expr(fused_identity_metadata):
+            expert_row = bx_m - identity_padded_begin + row_local
+            row_valid = expert_row < identity_count
+            t_i32 = row_valid.select(
+                identity_raw_begin + expert_row,
+                i32_ntok,
+            )
+        else:
+            fused = fx.Int32(_global_i32_at(arg_mind, sorted_row))
+            t_i32 = fused & fx.Int32(0x00FFFFFF)
+            row_valid = t_i32 < i32_ntok
         safe_t = row_valid.select(t_i32, fx.Int32(0)) if const_expr(store_preactivation) else t_i32
         x_row_base_div4.append(safe_t * fx.Int32(c_k_div4))
         x_row_valid.append(row_valid)
@@ -925,9 +936,18 @@ def _gemm1_body_a16w4(
                     # Only the primary split-K wave owns the reduced value.
                     valid = valid & _is_primary
             else:
-                fused = fx.Int32(_global_i32_at(arg_mind, sorted_row))
-                token = fused & fx.Int32(0x00FFFFFF)
-                valid = token < i32_ntok
+                if const_expr(fused_identity_metadata):
+                    expert_row = bx_m - identity_padded_begin + row_in_tile
+                    valid = expert_row < identity_count
+                    token = identity_raw_begin + expert_row
+                    # Identity top-1 routes have slot zero.  Keep the packed
+                    # spelling for the fixed-K branch below without loading
+                    # the concurrently generated sorted-token array.
+                    fused = token
+                else:
+                    fused = fx.Int32(_global_i32_at(arg_mind, sorted_row))
+                    token = fused & fx.Int32(0x00FFFFFF)
+                    valid = token < i32_ntok
                 if const_expr(k_wave > 1):
                     valid = valid & _is_primary
                     preactivation_valid = _is_primary
@@ -1003,7 +1023,10 @@ def _gemm1_body_a16w4(
                         # route id because arbitrary routing has no bounded
                         # slot dimension.  Both forms write directly to caller
                         # route order; ``valid`` excludes padding rows.
-                        if const_expr(route_preactivation_by_route_id):
+                        if const_expr(fused_identity_metadata):
+                            route_row = token
+                            route_valid = valid & (route_row < i32_nroutes)
+                        elif const_expr(route_preactivation_by_route_id):
                             route_row = fx.Int32(
                                 buffer_ops.buffer_load(
                                     _raw(sorted_route_ids_rsrc),
@@ -1089,6 +1112,9 @@ def compile_gemm1_a16w4_port(
     persist=False,
     skip_epilogue_id_reload=False,
     a_lds_swizzle=False,
+    fused_identity_metadata=False,
+    identity_expert_counts_input=False,
+    identity_emit_route_ids=False,
 ):
     """A16W4/A16W16 fused stage1 builder.
 
@@ -1140,6 +1166,13 @@ def compile_gemm1_a16w4_port(
     ``a_lds_swizzle`` uses an XOR-permuted GMEM gather plus the inverse LDS
     read address. The direct-to-LDS destination remains linear because gfx950
     lowers it through a wave-uniform M0 base.
+
+    ``fused_identity_metadata`` is the E16 expert-major specialization.  Stage
+    1 consumes device counts/offsets directly and designated Stage-1 CTAs emit
+    the padded arrays needed by Stage 2 and retained backward.  No CTA reads
+    those arrays in the same launch; the following Stage-2 launch is the
+    device-wide visibility boundary.  ``identity_expert_counts_input`` selects
+    ``int32[E]`` counts instead of ``int32[E+1]`` raw offsets.
     """
     SORTED_BM = BM if SORTED_BM is None else SORTED_BM
     assert w_dtype in ("mxfp4", "int4", "bf16", "fp16"), (
@@ -1172,11 +1205,32 @@ def compile_gemm1_a16w4_port(
     assert isinstance(route_preactivation_by_route_id, bool), "route_preactivation_by_route_id must be bool"
     assert isinstance(skip_epilogue_id_reload, bool), "skip_epilogue_id_reload must be bool"
     assert isinstance(a_lds_swizzle, bool), "a_lds_swizzle must be bool"
+    assert isinstance(fused_identity_metadata, bool), "fused_identity_metadata must be bool"
+    assert isinstance(identity_expert_counts_input, bool), "identity_expert_counts_input must be bool"
+    assert isinstance(identity_emit_route_ids, bool), "identity_emit_route_ids must be bool"
     assert isinstance(expert_grid, bool), "expert_grid must be bool"
     assert isinstance(compact_grid, bool), "compact_grid must be bool"
     assert isinstance(persist, bool), "persist must be bool"
     assert sum((expert_grid, compact_grid, persist)) <= 1, (
         "expert_grid, compact_grid, and persistent route-grid scheduling are mutually exclusive"
+    )
+    assert not fused_identity_metadata or NE == 16, (
+        "fused identity metadata is restricted to the audited E16 path"
+    )
+    assert not fused_identity_metadata or BM <= 256, (
+        "fused identity metadata requires one workgroup to cover a compute M tile"
+    )
+    assert not fused_identity_metadata or not (expert_grid or compact_grid or persist), (
+        "fused identity metadata requires the ordinary one-CTA-per-tile schedule"
+    )
+    assert not identity_expert_counts_input or fused_identity_metadata, (
+        "identity_expert_counts_input requires fused_identity_metadata"
+    )
+    assert not identity_emit_route_ids or fused_identity_metadata, (
+        "identity_emit_route_ids requires fused_identity_metadata"
+    )
+    assert not identity_emit_route_ids or store_route_preactivation, (
+        "identity_emit_route_ids requires store_route_preactivation"
     )
     assert not (
         store_preactivation and store_route_preactivation
@@ -1272,12 +1326,19 @@ def compile_gemm1_a16w4_port(
     _persist_tag = "_persist" if persist else ""
     _padding_store_tag = "_padstore" if skip_epilogue_id_reload else ""
     _a_lds_swizzle_tag = "_aldsxor16" if a_lds_swizzle else ""
+    _identity_metadata_tag = (
+        ("_idmeta_counts" if identity_expert_counts_input else "_idmeta_offsets")
+        + ("_rid" if identity_emit_route_ids else "")
+        if fused_identity_metadata
+        else ""
+    )
     _sorted_tag = f"_sbm{SORTED_BM}" if SORTED_BM != BM else ""
     name_suffix = (
         f"a16w4{_wd_tag}{_ad_tag}{_wl_tag}_h{_K}_i{_INTER}_ne{NE}_bm{BM}"
         f"{_sorted_tag}_tn{TILE_N}_tk{TILE_K}{_act_tag}{_bcm_tag}{_xcd_tag}"
         f"{_wpe_tag}{_kw_tag}{_round_tag}{_bias_tag}{_logical_w_tag}{_preact_tag}{_route_preact_tag}"
         f"{_expert_grid_tag}{_compact_grid_tag}{_persist_tag}{_padding_store_tag}{_a_lds_swizzle_tag}"
+        f"{_identity_metadata_tag}"
     )
 
     @fx.struct
@@ -1303,15 +1364,150 @@ def compile_gemm1_a16w4_port(
         arg_route_preactivation: fx.Int64,
         arg_sorted_route_ids: fx.Int64,
         i32_nroutes: fx.Int32,
+        arg_identity_boundaries: fx.Int64,
+        arg_identity_route_weights: fx.Int64,
+        arg_identity_frequency: fx.Int64,
+        arg_identity_frequency_mirror: fx.Int64,
+        arg_identity_padded_offsets: fx.Int64,
+        arg_identity_sorted_weights: fx.Int64,
     ):
         lds_raw_ptr = fx.SharedAllocator().allocate(SharedStorage).peek().raw.ptr
         tx_i32 = fx.Int32(gpu.thread_id("x"))
         bx_i32 = fx.Int32(gpu.block_id("x"))
         lane = tx_i32 % fx.Int32(64)
         wave = rocdl.readfirstlane(T.i32, tx_i32 // fx.Int32(64))
-        cumsum0 = _global_i32_at(arg_cumsum, fx.Int32(0))
+
+        # Every wave maps its Stage-1 tile from the same tiny E16 boundary
+        # table.  Lanes 0..15 load one expert each, then a row-local DPP scan
+        # constructs raw and padded prefixes in O(log E).  This replaces two
+        # serial 16-expert scans per CTA without adding a workgroup barrier.
+        identity_boundary_lane = fx.Int32(0)
+        if const_expr(fused_identity_metadata):
+            identity_boundary_lanes = (
+                NE if identity_expert_counts_input else NE + 1
+            )
+            if lane < fx.Int32(identity_boundary_lanes):
+                identity_boundary_lane = fx.Int32(
+                    _global_i32_at(arg_identity_boundaries, lane)
+                )
+
+        def _identity_row16_prefix(value):
+            value_raw = _raw(value)
+            zero_raw = _raw(fx.Int32(0))
+            lane_in_row = lane & fx.Int32(15)
+            for shift, dpp_ctrl in (
+                (1, 0x111),
+                (2, 0x112),
+                (4, 0x114),
+                (8, 0x118),
+            ):
+                remote = rocdl.update_dpp(
+                    T.i32,
+                    zero_raw,
+                    value_raw,
+                    dpp_ctrl,
+                    0xF,
+                    0xF,
+                    True,
+                )
+                value = (lane_in_row >= fx.Int32(shift)).select(
+                    value + fx.Int32(remote),
+                    value,
+                )
+                value_raw = _raw(value)
+            return value
+
+        identity_count_lane = fx.Int32(0)
+        identity_padded_lane = fx.Int32(0)
+        identity_raw_end_lane = fx.Int32(0)
+        identity_padded_end_lane = fx.Int32(0)
+        if const_expr(fused_identity_metadata):
+            if const_expr(identity_expert_counts_input):
+                identity_count_lane = (lane < fx.Int32(NE)).select(
+                    identity_boundary_lane,
+                    fx.Int32(0),
+                )
+            else:
+                next_boundary = fx.Int32(
+                    rocdl.ds_bpermute(
+                        T.i32,
+                        (lane + fx.Int32(1)) * fx.Int32(4),
+                        identity_boundary_lane,
+                    )
+                )
+                identity_count_lane = (lane < fx.Int32(NE)).select(
+                    next_boundary - identity_boundary_lane,
+                    fx.Int32(0),
+                )
+            identity_padded_lane = (
+                (identity_count_lane + fx.Int32(SORTED_BM - 1))
+                // fx.Int32(SORTED_BM)
+            ) * fx.Int32(SORTED_BM)
+            identity_raw_end_lane = _identity_row16_prefix(identity_count_lane)
+            identity_padded_end_lane = _identity_row16_prefix(
+                identity_padded_lane
+            )
+
+        if const_expr(fused_identity_metadata):
+            cumsum0 = fx.Int32(
+                rocdl.readlane(
+                    T.i32,
+                    _raw(identity_padded_end_lane),
+                    fx.Int32(NE - 1),
+                )
+            )
+        else:
+            cumsum0 = _global_i32_at(arg_cumsum, fx.Int32(0))
         total_m_blocks = cumsum0 // fx.Int32(BM)
         bound = total_m_blocks * fx.Int32(NUM_N_BLOCKS)
+
+        # One Stage-1 CTA publishes the O(E) prefix state.  Stage 1 itself
+        # never consumes these stores; the following kernel launch provides
+        # device-wide visibility for Stage 2 and retained backward.
+        if const_expr(fused_identity_metadata):
+            if bx_i32 == fx.Int32(0):
+                if tx_i32 < fx.Int32(NE):
+                    metadata_expert = tx_i32
+                    metadata_count = identity_count_lane
+                    metadata_padded_begin = (
+                        identity_padded_end_lane - identity_padded_lane
+                    )
+
+                    frequency_base = _global_base_ptr1(arg_identity_frequency)
+                    frequency_mirror_base = _global_base_ptr1(
+                        arg_identity_frequency_mirror
+                    )
+                    padded_offsets_base = _global_base_ptr1(
+                        arg_identity_padded_offsets
+                    )
+                    metadata_byte = metadata_expert * fx.Int32(4)
+                    llvm.StoreOp(
+                        _raw(metadata_count),
+                        _gep1(frequency_base, metadata_byte),
+                        alignment=4,
+                    )
+                    llvm.StoreOp(
+                        _raw(metadata_count),
+                        _gep1(frequency_mirror_base, metadata_byte),
+                        alignment=4,
+                    )
+                    llvm.StoreOp(
+                        _raw(metadata_padded_begin),
+                        _gep1(padded_offsets_base, metadata_byte),
+                        alignment=4,
+                    )
+                if tx_i32 == fx.Int32(0):
+                    valid_base = _global_base_ptr1(arg_cumsum)
+                    llvm.StoreOp(
+                        _raw(cumsum0),
+                        _gep1(valid_base, fx.Int32(0)),
+                        alignment=4,
+                    )
+                    llvm.StoreOp(
+                        _raw(i32_ntok),
+                        _gep1(valid_base, fx.Int32(4)),
+                        alignment=4,
+                    )
 
         # Bijective XCD round-robin over valid tiles [0, bound) to balance per-XCD/HBM
         # weight-load traffic; xcd_swizzle>0 also M-group-swizzles for per-XCD L2
@@ -1335,6 +1531,125 @@ def compile_gemm1_a16w4_port(
             return m_block * fx.Int32(NUM_N_BLOCKS) + n_block
 
         def _run_body(tile):
+            if const_expr(fused_identity_metadata):
+                identity_m_block = tile // fx.Int32(NUM_N_BLOCKS)
+                identity_n_block = tile % fx.Int32(NUM_N_BLOCKS)
+                identity_row = identity_m_block * fx.Int32(BM)
+                owner_lanes = fx.Int64(
+                    rocdl.ballot(
+                        T.i64,
+                        (lane < fx.Int32(NE))
+                        & (identity_row < identity_padded_end_lane),
+                    )
+                )
+                identity_expert = fx.Int32(fmath.cttz(owner_lanes))
+                identity_count = fx.Int32(
+                    rocdl.readlane(
+                        T.i32,
+                        _raw(identity_count_lane),
+                        identity_expert,
+                    )
+                )
+                identity_raw_end = fx.Int32(
+                    rocdl.readlane(
+                        T.i32,
+                        _raw(identity_raw_end_lane),
+                        identity_expert,
+                    )
+                )
+                identity_padded_end = fx.Int32(
+                    rocdl.readlane(
+                        T.i32,
+                        _raw(identity_padded_end_lane),
+                        identity_expert,
+                    )
+                )
+                identity_raw_begin = identity_raw_end - identity_count
+                identity_padded_begin = (
+                    identity_padded_end
+                    - (
+                        (identity_count + fx.Int32(SORTED_BM - 1))
+                        // fx.Int32(SORTED_BM)
+                    )
+                    * fx.Int32(SORTED_BM)
+                )
+
+                # Exactly the N==0 CTA for every M tile materializes that
+                # tile's route metadata.  This preserves one writer per row
+                # for BM64/BM128 and leaves Stage-1's other N tiles untouched.
+                if identity_n_block == fx.Int32(0):
+                    identity_local_begin = identity_row - identity_padded_begin
+                    if tx_i32 < fx.Int32(BM):
+                        local_row = identity_local_begin + tx_i32
+                        sorted_row = identity_row + tx_i32
+                        real_row = local_row < identity_count
+                        route = identity_raw_begin + local_row
+                        token = real_row.select(route, i32_ntok)
+                        ids_base = _global_base_ptr1(arg_mind)
+                        weights_base = _global_base_ptr1(
+                            arg_identity_sorted_weights
+                        )
+                        route_ids_base = _global_base_ptr1(arg_sorted_route_ids)
+                        row_byte = sorted_row * fx.Int32(4)
+                        llvm.StoreOp(
+                            _raw(token),
+                            _gep1(ids_base, row_byte),
+                            alignment=4,
+                        )
+                        route_weights_base = _global_base_ptr1(
+                            arg_identity_route_weights
+                        )
+                        safe_route = real_row.select(route, fx.Int32(0))
+                        loaded_weight_bits = fx.Int32(
+                            llvm.load(
+                                T.i32,
+                                _gep1(
+                                    route_weights_base,
+                                    safe_route * fx.Int32(4),
+                                ),
+                                invariant=True,
+                            )
+                        )
+                        weight_bits = real_row.select(
+                            loaded_weight_bits,
+                            fx.Int32(0),
+                        )
+                        llvm.StoreOp(
+                            _raw(weight_bits),
+                            _gep1(weights_base, row_byte),
+                            alignment=4,
+                        )
+                        if const_expr(identity_emit_route_ids):
+                            route_id = real_row.select(route, i32_nroutes)
+                            llvm.StoreOp(
+                                _raw(route_id),
+                                _gep1(route_ids_base, row_byte),
+                                alignment=4,
+                            )
+                    identity_local_begin = identity_row - identity_padded_begin
+                    if (
+                        (tx_i32 == fx.Int32(0))
+                        & (
+                            identity_local_begin % fx.Int32(SORTED_BM)
+                            == fx.Int32(0)
+                        )
+                    ):
+                        experts_base = _global_base_ptr1(arg_eids)
+                        metadata_block = identity_row // fx.Int32(SORTED_BM)
+                        llvm.StoreOp(
+                            _raw(identity_expert),
+                            _gep1(
+                                experts_base,
+                                metadata_block * fx.Int32(4),
+                            ),
+                            alignment=4,
+                        )
+            else:
+                identity_expert = fx.Int32(0)
+                identity_raw_begin = fx.Int32(0)
+                identity_padded_begin = fx.Int32(0)
+                identity_count = fx.Int32(0)
+
             _gemm1_body_a16w4(
                 lds_raw_ptr,
                 arg_x,
@@ -1357,6 +1672,11 @@ def compile_gemm1_a16w4_port(
                 f32_situ_linbeta,
                 f32_situ_linbeta_rcp,
                 f32_swiglu_limit,
+                identity_expert,
+                identity_raw_begin,
+                identity_padded_begin,
+                identity_count,
+                cumsum0,
                 BM=BM,
                 SORTED_BM=SORTED_BM,
                 TILE_N=TILE_N,
@@ -1381,6 +1701,7 @@ def compile_gemm1_a16w4_port(
                 route_preactivation_by_route_id=route_preactivation_by_route_id,
                 skip_epilogue_id_reload=skip_epilogue_id_reload,
                 a_lds_swizzle=a_lds_swizzle,
+                fused_identity_metadata=fused_identity_metadata,
             )
 
         if const_expr(compact_grid):
@@ -1460,6 +1781,227 @@ def compile_gemm1_a16w4_port(
                     _tile = bx_i32
                 _run_body(_tile)
 
+    if fused_identity_metadata and store_route_preactivation:
+
+        @flyc.kernel(name=f"gemm1_a16w4_port_{name_suffix}", known_block_size=[256, 1, 1])
+        def gemm1_kernel_identity_metadata_route_preactivation(
+            arg_x: fx.Int64,
+            arg_bq: fx.Int64,
+            arg_bscale: fx.Int64,
+            arg_bias: fx.Int64,
+            arg_eids: fx.Int64,
+            arg_cumsum: fx.Int64,
+            arg_mind: fx.Int64,
+            i32_ntok: fx.Int32,
+            f32_situ_beta: fx.Float32,
+            f32_situ_beta_rcp: fx.Float32,
+            f32_situ_linbeta: fx.Float32,
+            f32_situ_linbeta_rcp: fx.Float32,
+            f32_swiglu_limit: fx.Float32,
+            arg_out: fx.Int64,
+            arg_route_preactivation: fx.Int64,
+            arg_sorted_route_ids: fx.Int64,
+            i32_nroutes: fx.Int32,
+            arg_identity_boundaries: fx.Int64,
+            arg_identity_route_weights: fx.Int64,
+            arg_identity_frequency: fx.Int64,
+            arg_identity_frequency_mirror: fx.Int64,
+            arg_identity_padded_offsets: fx.Int64,
+            arg_identity_sorted_weights: fx.Int64,
+        ):
+            _gemm1_kernel_body(
+                arg_x,
+                arg_bq,
+                arg_bscale,
+                arg_bias,
+                arg_eids,
+                arg_cumsum,
+                arg_mind,
+                i32_ntok,
+                f32_situ_beta,
+                f32_situ_beta_rcp,
+                f32_situ_linbeta,
+                f32_situ_linbeta_rcp,
+                f32_swiglu_limit,
+                arg_out,
+                arg_route_preactivation,
+                arg_sorted_route_ids,
+                i32_nroutes,
+                arg_identity_boundaries,
+                arg_identity_route_weights,
+                arg_identity_frequency,
+                arg_identity_frequency_mirror,
+                arg_identity_padded_offsets,
+                arg_identity_sorted_weights,
+            )
+
+        @flyc.jit
+        def launch_gemm1_identity_metadata_route_preactivation(
+            arg_x: fx.Int64,
+            arg_bq: fx.Int64,
+            arg_bscale: fx.Int64,
+            arg_bias: fx.Int64,
+            arg_eids: fx.Int64,
+            arg_cumsum: fx.Int64,
+            arg_mind: fx.Int64,
+            i32_ntok: fx.Int32,
+            i32_grid: fx.Int32,
+            f32_situ_beta: fx.Float32,
+            f32_situ_beta_rcp: fx.Float32,
+            f32_situ_linbeta: fx.Float32,
+            f32_situ_linbeta_rcp: fx.Float32,
+            f32_swiglu_limit: fx.Float32,
+            arg_out: fx.Int64,
+            arg_route_preactivation: fx.Int64,
+            arg_sorted_route_ids: fx.Int64,
+            i32_nroutes: fx.Int32,
+            arg_identity_boundaries: fx.Int64,
+            arg_identity_route_weights: fx.Int64,
+            arg_identity_frequency: fx.Int64,
+            arg_identity_frequency_mirror: fx.Int64,
+            arg_identity_padded_offsets: fx.Int64,
+            arg_identity_sorted_weights: fx.Int64,
+            stream: fx.Stream,
+        ):
+            gemm1_kernel_identity_metadata_route_preactivation(
+                arg_x,
+                arg_bq,
+                arg_bscale,
+                arg_bias,
+                arg_eids,
+                arg_cumsum,
+                arg_mind,
+                i32_ntok,
+                f32_situ_beta,
+                f32_situ_beta_rcp,
+                f32_situ_linbeta,
+                f32_situ_linbeta_rcp,
+                f32_swiglu_limit,
+                arg_out,
+                arg_route_preactivation,
+                arg_sorted_route_ids,
+                i32_nroutes,
+                arg_identity_boundaries,
+                arg_identity_route_weights,
+                arg_identity_frequency,
+                arg_identity_frequency_mirror,
+                arg_identity_padded_offsets,
+                arg_identity_sorted_weights,
+                value_attrs={"rocdl.waves_per_eu": waves_per_eu} if waves_per_eu else None,
+            ).launch(
+                grid=(fx.Int64(i32_grid), 1, 1),
+                block=(256, 1, 1),
+                stream=stream,
+            )
+
+        return launch_gemm1_identity_metadata_route_preactivation
+
+    if fused_identity_metadata:
+
+        @flyc.kernel(name=f"gemm1_a16w4_port_{name_suffix}", known_block_size=[256, 1, 1])
+        def gemm1_kernel_identity_metadata(
+            arg_x: fx.Int64,
+            arg_bq: fx.Int64,
+            arg_bscale: fx.Int64,
+            arg_bias: fx.Int64,
+            arg_eids: fx.Int64,
+            arg_cumsum: fx.Int64,
+            arg_mind: fx.Int64,
+            i32_ntok: fx.Int32,
+            f32_situ_beta: fx.Float32,
+            f32_situ_beta_rcp: fx.Float32,
+            f32_situ_linbeta: fx.Float32,
+            f32_situ_linbeta_rcp: fx.Float32,
+            f32_swiglu_limit: fx.Float32,
+            arg_out: fx.Int64,
+            arg_identity_boundaries: fx.Int64,
+            arg_identity_route_weights: fx.Int64,
+            arg_identity_frequency: fx.Int64,
+            arg_identity_frequency_mirror: fx.Int64,
+            arg_identity_padded_offsets: fx.Int64,
+            arg_identity_sorted_weights: fx.Int64,
+        ):
+            _gemm1_kernel_body(
+                arg_x,
+                arg_bq,
+                arg_bscale,
+                arg_bias,
+                arg_eids,
+                arg_cumsum,
+                arg_mind,
+                i32_ntok,
+                f32_situ_beta,
+                f32_situ_beta_rcp,
+                f32_situ_linbeta,
+                f32_situ_linbeta_rcp,
+                f32_swiglu_limit,
+                arg_out,
+                fx.Int64(0),
+                fx.Int64(0),
+                i32_ntok,
+                arg_identity_boundaries,
+                arg_identity_route_weights,
+                arg_identity_frequency,
+                arg_identity_frequency_mirror,
+                arg_identity_padded_offsets,
+                arg_identity_sorted_weights,
+            )
+
+        @flyc.jit
+        def launch_gemm1_identity_metadata(
+            arg_x: fx.Int64,
+            arg_bq: fx.Int64,
+            arg_bscale: fx.Int64,
+            arg_bias: fx.Int64,
+            arg_eids: fx.Int64,
+            arg_cumsum: fx.Int64,
+            arg_mind: fx.Int64,
+            i32_ntok: fx.Int32,
+            i32_grid: fx.Int32,
+            f32_situ_beta: fx.Float32,
+            f32_situ_beta_rcp: fx.Float32,
+            f32_situ_linbeta: fx.Float32,
+            f32_situ_linbeta_rcp: fx.Float32,
+            f32_swiglu_limit: fx.Float32,
+            arg_out: fx.Int64,
+            arg_identity_boundaries: fx.Int64,
+            arg_identity_route_weights: fx.Int64,
+            arg_identity_frequency: fx.Int64,
+            arg_identity_frequency_mirror: fx.Int64,
+            arg_identity_padded_offsets: fx.Int64,
+            arg_identity_sorted_weights: fx.Int64,
+            stream: fx.Stream,
+        ):
+            gemm1_kernel_identity_metadata(
+                arg_x,
+                arg_bq,
+                arg_bscale,
+                arg_bias,
+                arg_eids,
+                arg_cumsum,
+                arg_mind,
+                i32_ntok,
+                f32_situ_beta,
+                f32_situ_beta_rcp,
+                f32_situ_linbeta,
+                f32_situ_linbeta_rcp,
+                f32_swiglu_limit,
+                arg_out,
+                arg_identity_boundaries,
+                arg_identity_route_weights,
+                arg_identity_frequency,
+                arg_identity_frequency_mirror,
+                arg_identity_padded_offsets,
+                arg_identity_sorted_weights,
+                value_attrs={"rocdl.waves_per_eu": waves_per_eu} if waves_per_eu else None,
+            ).launch(
+                grid=(fx.Int64(i32_grid), 1, 1),
+                block=(256, 1, 1),
+                stream=stream,
+            )
+
+        return launch_gemm1_identity_metadata
+
     if store_route_preactivation:
 
         @flyc.kernel(name=f"gemm1_a16w4_port_{name_suffix}", known_block_size=[256, 1, 1])
@@ -1500,6 +2042,12 @@ def compile_gemm1_a16w4_port(
                 arg_route_preactivation,
                 arg_sorted_route_ids,
                 i32_nroutes,
+                fx.Int64(0),
+                fx.Int64(0),
+                fx.Int64(0),
+                fx.Int64(0),
+                fx.Int64(0),
+                fx.Int64(0),
             )
 
         @flyc.jit
@@ -1546,10 +2094,6 @@ def compile_gemm1_a16w4_port(
                 value_attrs={"rocdl.waves_per_eu": waves_per_eu} if waves_per_eu else None,
             ).launch(grid=(grid_x, 1, 1), block=(256, 1, 1), stream=stream)
 
-        _GEMM1_COMPOSITION_HOOKS[launch_gemm1_route_preactivation] = (
-            gemm1_kernel_route_preactivation,
-            waves_per_eu,
-        )
         return launch_gemm1_route_preactivation
 
     @flyc.kernel(name=f"gemm1_a16w4_port_{name_suffix}", known_block_size=[256, 1, 1])
@@ -1587,6 +2131,12 @@ def compile_gemm1_a16w4_port(
             fx.Int64(0),
             fx.Int64(0),
             fx.Int32(0),
+            fx.Int64(0),
+            fx.Int64(0),
+            fx.Int64(0),
+            fx.Int64(0),
+            fx.Int64(0),
+            fx.Int64(0),
         )
 
     @flyc.jit

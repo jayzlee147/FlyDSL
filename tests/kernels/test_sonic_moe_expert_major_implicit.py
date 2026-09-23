@@ -197,9 +197,9 @@ def _assert_states_equal(materialized, implicit, *, route_tile_m: int) -> None:
         assert isinstance(materialized_tensor, torch.Tensor), field
         assert torch.equal(implicit_tensor, materialized_tensor), field
 
-    # Retained sorter arrays are capacity-sized.  Only the prefix identified
-    # by num_valid_ids is initialized; comparing the unused tail would compare
-    # allocator garbage rather than state semantics.
+    # Retained route-metadata arrays are capacity-sized.  Only the prefix
+    # identified by num_valid_ids is initialized; comparing the unused tail
+    # would compare allocator garbage rather than state semantics.
     padded_rows = int(implicit.num_valid_ids[0].item())
     padded_blocks = padded_rows // route_tile_m
     for field in ("sorted_token_ids", "sorted_route_ids", "sorted_weights"):
@@ -504,11 +504,11 @@ def test_expert_major_backward_rejects_incomplete_or_damaged_state(
             )
 
 
-def test_expert_major_without_ids_rejects_disabled_single_launch(
+def test_expert_major_without_ids_is_independent_of_legacy_sorter_gate(
     e16_operators,
     monkeypatch,
 ):
-    """No-ID forward APIs fail closed when their only safe kernel is off."""
+    """No-ID APIs use fused Stage 1 even if the old sorter path is disabled."""
 
     values = _make_expert_major_case(e16_operators, 1)
     monkeypatch.setattr(
@@ -517,42 +517,35 @@ def test_expert_major_without_ids_rejects_disabled_single_launch(
         False,
     )
 
-    with pytest.raises(
-        NotImplementedError,
-        match="implicit expert-major ids require the E16 single-launch",
-    ):
-        e16_operators.implicit.forward_expert_major(
-            values.hidden,
-            values.expert_offsets,
-            values.route_weights,
-        )
-    with pytest.raises(
-        NotImplementedError,
-        match="implicit expert-major ids require the E16 single-launch",
-    ):
+    offsets_output = e16_operators.implicit.forward_expert_major(
+        values.hidden,
+        values.expert_offsets,
+        values.route_weights,
+    )
+    offsets_training_output, _ = (
         e16_operators.implicit.forward_expert_major_training(
             values.hidden,
             values.expert_offsets,
             values.route_weights,
         )
-    with pytest.raises(
-        NotImplementedError,
-        match="implicit expert-major ids require the E16 single-launch",
-    ):
-        e16_operators.counts.forward_expert_major_counts(
-            values.hidden,
-            values.expert_counts,
-            values.route_weights,
-        )
-    with pytest.raises(
-        NotImplementedError,
-        match="implicit expert-major ids require the E16 single-launch",
-    ):
+    )
+    counts_output = e16_operators.counts.forward_expert_major_counts(
+        values.hidden,
+        values.expert_counts,
+        values.route_weights,
+    )
+    counts_training_output, _ = (
         e16_operators.counts.forward_expert_major_counts_training(
             values.hidden,
             values.expert_counts,
             values.route_weights,
         )
+    )
+    torch.cuda.synchronize(values.hidden.device)
+
+    assert torch.equal(offsets_training_output, offsets_output)
+    assert torch.equal(counts_output, offsets_output)
+    assert torch.equal(counts_training_output, offsets_output)
 
 
 @pytest.mark.parametrize(

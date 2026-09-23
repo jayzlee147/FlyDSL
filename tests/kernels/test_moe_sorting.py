@@ -36,7 +36,6 @@ from kernels.moe.moe_ragged_sorting_kernel import (  # noqa: E402
     _compile_moe_expert_major_sorting,
     _expert_major_cf_cache,
     _expert_major_identity_fusion_parameters,
-    _get_expert_major_identity_kernel,
     _ragged_cf_cache,
     moe_expert_major_sorting_flydsl,
     moe_ragged_sorting_flydsl,
@@ -90,38 +89,6 @@ def test_expert_major_identity_fusion_policy_is_e16_only(
         _expert_major_identity_fusion_parameters(experts, identity, routes)
         == expected
     )
-
-
-def test_expert_major_identity_composition_hook_has_stable_signature():
-    launcher = _compile_moe_expert_major_sorting(
-        num_experts=16,
-        unit_size=64,
-        emit_route_ids=True,
-        mirror_expert_frequency=True,
-        token_indices_identity=True,
-        clear_output=False,
-        single_launch_identity=True,
-    )
-    kernel = _get_expert_major_identity_kernel(launcher)
-    assert tuple(kernel._sig.parameters) == (
-        "route_weights",
-        "expert_offsets",
-        "expert_frequency",
-        "expert_frequency_mirror",
-        "expert_padded_offsets",
-        "sorted_token_ids",
-        "sorted_weights",
-        "sorted_route_ids",
-        "sorted_expert_ids",
-        "num_valid_ids",
-        "moe_buf_i32",
-        "i32_routes",
-        "i32_tokens",
-        "i32_moe_buf_elems",
-        "i32_identity_partitions",
-    )
-    with pytest.raises(ValueError, match="does not expose"):
-        _get_expert_major_identity_kernel(lambda: None)
 
 
 def test_e16_partitioned_identity_metadata_is_bitwise_legacy(monkeypatch):

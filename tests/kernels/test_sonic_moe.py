@@ -16,10 +16,7 @@ import torch
 
 from flydsl.runtime.device import get_rocm_arch
 from kernels.moe import sonic as sonic_module
-from kernels.moe.moe_2stage_a16wmix.gemm1 import (
-    _get_gemm1_composition_hook,
-    compile_gemm1_a16w4_port,
-)
+from kernels.moe.moe_2stage_a16wmix.gemm1 import compile_gemm1_a16w4_port
 from kernels.moe.sonic import (
     SonicMoE,
     SonicMoEConfig,
@@ -28,12 +25,11 @@ from kernels.moe.sonic import (
     SonicMoERoutesForwardState,
     SonicMoEWeights,
     SonicMoEWorkspace,
-    _get_e16_metadata_stage1_master_launcher,
     _get_stage1_launcher,
     _get_stage1_training_launcher,
     _get_stage2_launcher,
     _quantize_mxfp4_weight,
-    _retain_e16_flat_sorter_metadata,
+    _retain_e16_flat_route_metadata,
     _stage2_stages,
     _training_stage1_tile_m,
     _training_stage1_tuning,
@@ -111,7 +107,7 @@ def test_sonic_moe_e16_flat_sorter_metadata_retention_is_narrow(overrides, expec
     routes = values.pop("routes")
     config = SonicMoEConfig(**values)
     assert (
-        _retain_e16_flat_sorter_metadata(
+        _retain_e16_flat_route_metadata(
             config,
             tokens,
             routes,
@@ -1242,34 +1238,6 @@ def test_sonic_moe_training_stage1_launcher_accepts_private_overrides(monkeypatc
         _get_stage1_training_launcher.cache_clear()
 
 
-def test_sonic_moe_training_stage1_composition_hook_has_stable_signature():
-    config = _config()
-    launcher = _get_stage1_training_launcher(config, 0, False, False, 0)
-    kernel, waves_per_eu = _get_gemm1_composition_hook(launcher)
-    assert waves_per_eu == config.waves_per_eu
-    assert tuple(kernel._sig.parameters) == (
-        "arg_x",
-        "arg_bq",
-        "arg_bscale",
-        "arg_bias",
-        "arg_eids",
-        "arg_cumsum",
-        "arg_mind",
-        "i32_ntok",
-        "f32_situ_beta",
-        "f32_situ_beta_rcp",
-        "f32_situ_linbeta",
-        "f32_situ_linbeta_rcp",
-        "f32_swiglu_limit",
-        "arg_out",
-        "arg_route_preactivation",
-        "arg_sorted_route_ids",
-        "i32_nroutes",
-    )
-    with pytest.raises(ValueError, match="does not expose"):
-        _get_gemm1_composition_hook(lambda: None)
-
-
 def test_sonic_moe_training_stage1_private_override_is_numerically_exact(monkeypatch):
     import kernels.moe.sonic as sonic_module
 
@@ -2159,7 +2127,7 @@ def test_sonic_moe_expert_major_identity_routes_match_generic_and_reuse_capacity
 
 
 @pytest.mark.parametrize("shared", (False, True), ids=("private", "shared"))
-def test_sonic_moe_e16_master_matches_fallback_across_dynamic_routes(
+def test_sonic_moe_e16_stage1_metadata_fusion_matches_fallback_across_dynamic_routes(
     monkeypatch,
     shared,
 ):
@@ -2179,18 +2147,17 @@ def test_sonic_moe_e16_master_matches_fallback_across_dynamic_routes(
         prepared,
         shared_dynamic_workspace_pool=pool,
     )
-    original_launch = SonicMoE._launch_e16_identity_metadata_and_stage1
+    original_launch = SonicMoE._launch_e16_identity_stage1
     observed = []
-    _get_e16_metadata_stage1_master_launcher.cache_clear()
+    _get_stage1_training_launcher.cache_clear()
 
     def tracked_launch(operator, *args, **kwargs):
-        launched = original_launch(operator, *args, **kwargs)
-        observed.append((operator, int(args[1].routes), launched))
-        return launched
+        original_launch(operator, *args, **kwargs)
+        observed.append((operator, int(args[1].routes)))
 
     monkeypatch.setattr(
         SonicMoE,
-        "_launch_e16_identity_metadata_and_stage1",
+        "_launch_e16_identity_stage1",
         tracked_launch,
     )
     for case_index, (routes, active_experts) in enumerate(
@@ -2218,7 +2185,11 @@ def test_sonic_moe_e16_master_matches_fallback_across_dynamic_routes(
         expected_frequency = torch.empty(16, dtype=torch.int32, device=hidden.device)
         actual_frequency = torch.empty_like(expected_frequency)
 
-        monkeypatch.setattr(sonic_module, "_FUSE_E16_METADATA_STAGE1_DISPATCH", False)
+        monkeypatch.setattr(
+            sonic_module,
+            "_can_fuse_e16_identity_metadata_stage1",
+            lambda *_args, **_kwargs: False,
+        )
         expected, expected_state = reference.forward_routes_training(
             hidden,
             token_indices,
@@ -2229,7 +2200,11 @@ def test_sonic_moe_e16_master_matches_fallback_across_dynamic_routes(
             token_indices_identity=True,
             route_policy_size=16384,
         )
-        monkeypatch.setattr(sonic_module, "_FUSE_E16_METADATA_STAGE1_DISPATCH", True)
+        monkeypatch.setattr(
+            sonic_module,
+            "_can_fuse_e16_identity_metadata_stage1",
+            lambda *_args, **_kwargs: True,
+        )
         actual, actual_state = candidate.forward_routes_training(
             hidden,
             token_indices,
@@ -2251,7 +2226,7 @@ def test_sonic_moe_e16_master_matches_fallback_across_dynamic_routes(
             torch.tensor(counts, dtype=torch.int32, device=hidden.device),
         )
 
-    assert [routes for op, routes, launched in observed if op is candidate and launched] == [
+    assert [routes for op, routes in observed if op is candidate] == [
         257,
         4097,
         8000,
@@ -2262,16 +2237,17 @@ def test_sonic_moe_e16_master_matches_fallback_across_dynamic_routes(
         1024,
     ]
     assert not hasattr(candidate, "_training_forward_launch_plans")
-    # Runtime metadata partitions and exact R do not create master variants;
-    # only the existing small/large Stage-1 cache-mod policies remain here.
-    assert _get_e16_metadata_stage1_master_launcher.cache_info().currsize == 2
+    # Runtime route counts do not create exact-R Stage-1 variants.  The test
+    # compiles one legacy reference and one fused launcher for each of the two
+    # existing cache-mod policies.
+    assert _get_stage1_training_launcher.cache_info().currsize == 4
     if pool is None:
         assert len(candidate._dynamic_route_workspaces) == 1
     else:
         assert len(pool) == 1
 
 
-def test_sonic_moe_e16_master_is_stream_correct(monkeypatch):
+def test_sonic_moe_e16_stage1_metadata_fusion_is_stream_correct(monkeypatch):
     config = _config(
         num_experts=16,
         top_k=1,
@@ -2293,7 +2269,11 @@ def test_sonic_moe_e16_master_is_stream_correct(monkeypatch):
             )
         )
 
-    monkeypatch.setattr(sonic_module, "_FUSE_E16_METADATA_STAGE1_DISPATCH", False)
+    monkeypatch.setattr(
+        sonic_module,
+        "_can_fuse_e16_identity_metadata_stage1",
+        lambda *_args, **_kwargs: False,
+    )
     expected = [
         reference.forward_routes_training(
             hidden,
@@ -2307,7 +2287,11 @@ def test_sonic_moe_e16_master_is_stream_correct(monkeypatch):
     ]
     torch.cuda.synchronize(cases[0][0].device)
 
-    monkeypatch.setattr(sonic_module, "_FUSE_E16_METADATA_STAGE1_DISPATCH", True)
+    monkeypatch.setattr(
+        sonic_module,
+        "_can_fuse_e16_identity_metadata_stage1",
+        lambda *_args, **_kwargs: True,
+    )
     streams = [torch.cuda.Stream(device=cases[0][0].device) for _ in cases]
     current = torch.cuda.current_stream(cases[0][0].device)
     actual = []
@@ -2337,15 +2321,11 @@ def test_sonic_moe_e16_master_is_stream_correct(monkeypatch):
     assert len(candidate._dynamic_route_workspaces) == 2
 
 
-def test_sonic_moe_e896_cannot_enter_e16_master_dispatch(monkeypatch):
-    monkeypatch.setattr(sonic_module, "_FUSE_E16_METADATA_STAGE1_DISPATCH", True)
-    fake_operator = type("FakeOperator", (), {"config": type("C", (), {"num_experts": 896})()})()
-    fake_workspace = type("FakeWorkspace", (), {"routes": 65536})()
-    assert not SonicMoE._launch_e16_identity_metadata_and_stage1(
-        fake_operator,
-        None,
-        fake_workspace,
-        *([None] * 13),
+def test_sonic_moe_e896_cannot_enter_e16_stage1_metadata_fusion():
+    config = _config(num_experts=896)
+    assert not sonic_module._can_fuse_e16_identity_metadata_stage1(
+        config,
+        token_indices_identity=True,
     )
 
 

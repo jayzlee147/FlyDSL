@@ -739,12 +739,12 @@ def test_sorter_runtime_routes_and_partitions_are_absent_from_cache_key():
     )
 
 
-def test_fused_metadata_master_signature_has_no_runtime_partition_key():
-    """The fused forward master is compiled by component launchers, not R/P."""
+def test_fused_metadata_stage1_launcher_has_no_runtime_route_key():
+    """The fused Stage-1 launcher is compiled by policy, not exact R/P."""
 
     function = _function_node(
         _REPO_ROOT / "kernels/moe/sonic.py",
-        "_get_e16_metadata_stage1_master_launcher",
+        "_get_stage1_training_launcher",
     )
     parameter_names = {
         argument.arg

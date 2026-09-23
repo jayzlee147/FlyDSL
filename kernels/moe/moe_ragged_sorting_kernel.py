@@ -22,7 +22,6 @@ edges well-defined: every input edge occupies its own output slot.
 from __future__ import annotations
 
 import functools
-import weakref
 
 import torch
 
@@ -42,18 +41,6 @@ _E16_EXPERT_MAJOR_MAX_PARTITIONS = 16
 
 _ragged_cf_cache = {}
 _expert_major_cf_cache = {}
-_EXPERT_MAJOR_IDENTITY_KERNELS = weakref.WeakKeyDictionary()
-
-
-def _get_expert_major_identity_kernel(launcher):
-    """Return the explicitly registered identity metadata composition kernel."""
-
-    try:
-        return _EXPERT_MAJOR_IDENTITY_KERNELS[launcher]
-    except KeyError as error:
-        raise ValueError(
-            "launcher does not expose an expert-major identity composition kernel"
-        ) from error
 
 
 def _expert_major_identity_fusion_parameters(
@@ -969,9 +956,6 @@ def _compile_moe_expert_major_sorting(
             stream=stream,
         )
 
-    _EXPERT_MAJOR_IDENTITY_KERNELS[launch_expert_major_sorting] = (
-        identity_expert_pack_kernel
-    )
     return launch_expert_major_sorting
 
 

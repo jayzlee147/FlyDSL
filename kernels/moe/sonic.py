@@ -42,9 +42,7 @@ import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl.runtime.device import get_rocm_arch
 from kernels.common.tensor_shim import _run_compiled
-from kernels.moe import moe_ragged_sorting_kernel as _route_sorting_module
 from kernels.moe.moe_2stage_a16wmix.gemm1 import (
-    _get_gemm1_composition_hook,
     compile_gemm1_a16w4_port,
     gemm1_a16w4_grid,
 )
@@ -54,9 +52,6 @@ from kernels.moe.moe_2stage_a16wmix.gemm2 import (
 )
 from kernels.moe.moe_gemm_2stage.moe_reduce import compile_moe_reduction
 from kernels.moe.moe_ragged_sorting_kernel import (
-    BLOCK_SIZE as _ROUTE_METADATA_BLOCK_SIZE,
-    _compile_moe_expert_major_sorting,
-    _get_expert_major_identity_kernel,
     moe_expert_major_sorting_flydsl,
     moe_ragged_sorting_flydsl,
 )
@@ -88,7 +83,6 @@ _GFX950_LDS_BYTES = 160 * 1024
 _MAX_BUFFER_BYTE_OFFSET = 0xFFFFFFFF
 _MAX_SIGNED_I32 = 0x7FFFFFFF
 _DEFAULT_MAX_CACHED_WORKSPACES = 8
-_FUSE_E16_METADATA_STAGE1_DISPATCH = True
 _SUPPORTED_ROUTER_DTYPES = {
     torch.float32: "f32",
     torch.float16: "f16",
@@ -550,10 +544,10 @@ class SonicMoERoutesForwardState:
 
     ``preactivation`` has shape ``[routes, 2 * intermediate_size]`` and is in
     the original caller route order, even though Stage 1 computes in
-    expert-sorted order.  The ragged sorter emits the inverse route mapping so
-    Stage 1 can write this compact state directly without a separate gather or
-    permutation kernel.  Eligible dynamic Qwen3 E16 calls retain the six optional
-    sorter outputs below.  Those tensors are invocation-owned and allow
+    expert-sorted order.  Route metadata supplies the inverse mapping so Stage
+    1 can write this compact state directly without a separate gather or
+    permutation kernel.  Eligible dynamic Qwen3 E16 calls retain the six
+    optional metadata tensors below.  They are invocation-owned and allow
     backward to skip sorting; other shapes leave them as ``None``.
     """
 
@@ -569,10 +563,10 @@ class SonicMoERoutesForwardState:
     has_bias: bool
     producer_stream: int
     ready_event: torch.cuda.Event
-    # Eligible Qwen3 E16 training calls retain their forward sorter outputs so
-    # backward can consume the same invocation-owned metadata without running
-    # the four-launch ragged sorter again.  Generic route shapes leave these
-    # optional fields unset and retain the established backward-owned sort.
+    # Eligible Qwen3 E16 training calls retain their forward route metadata so
+    # backward can consume the same invocation-owned tensors without running
+    # the four-launch ragged sorter.  Generic route shapes leave these optional
+    # fields unset and retain the established backward-owned sort.
     sorted_token_ids: torch.Tensor | None = None
     sorted_route_ids: torch.Tensor | None = None
     sorted_weights: torch.Tensor | None = None
@@ -1520,6 +1514,8 @@ def _get_stage1_launcher(
     weight_dtype: str,
     has_bias: bool,
     device_index: int,
+    fused_identity_metadata: bool = False,
+    identity_expert_counts_input: bool = False,
 ):
     # ``device_index`` is intentionally part of the LRU key.  Compiled
     # launchers cache a device-loaded function after first use and cannot be
@@ -1547,6 +1543,8 @@ def _get_stage1_launcher(
         has_bias=has_bias,
         skip_epilogue_id_reload=config.stage1_write_padded_rows,
         a_lds_swizzle=config.stage1_lds_swizzle,
+        fused_identity_metadata=fused_identity_metadata,
+        identity_expert_counts_input=identity_expert_counts_input,
     )
 
 
@@ -1561,6 +1559,8 @@ def _get_stage1_training_launcher(
     waves_per_eu_override: int | None = None,
     route_preactivation_by_route_id: bool = False,
     tile_m_override: int | None = None,
+    fused_identity_metadata: bool = False,
+    identity_expert_counts_input: bool = False,
 ):
     """Compile the BF16 dual-output Stage-1 specialization."""
 
@@ -1596,6 +1596,9 @@ def _get_stage1_training_launcher(
         route_preactivation_interleaved=interleaved_w1,
         route_preactivation_by_route_id=route_preactivation_by_route_id,
         a_lds_swizzle=config.stage1_lds_swizzle,
+        fused_identity_metadata=fused_identity_metadata,
+        identity_expert_counts_input=identity_expert_counts_input,
+        identity_emit_route_ids=fused_identity_metadata,
     )
 
 
@@ -1733,20 +1736,41 @@ def _is_e16_flat_training_shape(
     )
 
 
-def _retain_e16_flat_sorter_metadata(
+def _retain_e16_flat_route_metadata(
     config: SonicMoEConfig,
     tokens: int,
     routes: int,
     *,
     has_bias: bool,
 ) -> bool:
-    """Keep sorter output for dynamic Qwen3 EP8 retained-state backward."""
+    """Keep forward route metadata for dynamic Qwen3 EP8 backward."""
 
     return _is_e16_flat_training_shape(
         config,
         tokens,
         routes,
         has_bias=has_bias,
+    )
+
+
+def _can_fuse_e16_identity_metadata_stage1(
+    config: SonicMoEConfig,
+    *,
+    token_indices_identity: bool,
+) -> bool:
+    """Whether Stage 1 can own the complete identity-metadata production.
+
+    Keep one definitive host predicate for launcher selection and execution:
+    selecting an extended-ABI Stage-1 kernel and later falling back to the
+    legacy call shape would be unsafe.
+    """
+
+    return (
+        token_indices_identity
+        and config.num_experts == 16
+        and config.tile_m <= 256
+        and config.route_tile_m % config.tile_m == 0
+        and not config.persistent_stage1
     )
 
 
@@ -1875,114 +1899,6 @@ def _get_stage2_launcher(
         TOPK=config.top_k,
         stages=stages,
     )
-
-
-@functools.lru_cache(maxsize=128)
-def _get_e16_metadata_stage1_master_launcher(
-    sorter_launcher,
-    stage1_launcher,
-    *,
-    num_experts: int,
-):
-    """Compose the E16 identity metadata kernel and Stage 1 in one dispatch."""
-
-    metadata_kernel = _get_expert_major_identity_kernel(sorter_launcher)
-    stage1_kernel, stage1_waves_per_eu = _get_gemm1_composition_hook(
-        stage1_launcher
-    )
-
-    @flyc.jit
-    def launch_metadata_stage1(
-        route_weights: fx.Tensor,
-        expert_offsets: fx.Tensor,
-        expert_frequency: fx.Tensor,
-        expert_frequency_mirror: fx.Tensor,
-        expert_padded_offsets: fx.Tensor,
-        sorted_token_ids: fx.Tensor,
-        sorted_weights: fx.Tensor,
-        sorted_route_ids: fx.Tensor,
-        sorted_expert_ids: fx.Tensor,
-        num_valid_ids: fx.Tensor,
-        moe_buf_i32: fx.Tensor,
-        i32_routes: fx.Int32,
-        i32_tokens: fx.Int32,
-        i32_moe_buf_elems: fx.Int32,
-        i32_identity_partitions: fx.Int32,
-        arg_x: fx.Int64,
-        arg_bq: fx.Int64,
-        arg_bscale: fx.Int64,
-        arg_bias: fx.Int64,
-        arg_eids: fx.Int64,
-        arg_cumsum: fx.Int64,
-        arg_mind: fx.Int64,
-        i32_ntok: fx.Int32,
-        i32_stage1_grid: fx.Int32,
-        f32_situ_beta: fx.Float32,
-        f32_situ_beta_rcp: fx.Float32,
-        f32_situ_linbeta: fx.Float32,
-        f32_situ_linbeta_rcp: fx.Float32,
-        f32_swiglu_limit: fx.Float32,
-        arg_out: fx.Int64,
-        arg_route_preactivation: fx.Int64,
-        arg_sorted_route_ids: fx.Int64,
-        i32_nroutes: fx.Int32,
-        stream: fx.Stream,
-    ):
-        metadata_kernel(
-            route_weights,
-            expert_offsets,
-            expert_frequency,
-            expert_frequency_mirror,
-            expert_padded_offsets,
-            sorted_token_ids,
-            sorted_weights,
-            sorted_route_ids,
-            sorted_expert_ids,
-            num_valid_ids,
-            moe_buf_i32,
-            i32_routes,
-            i32_tokens,
-            i32_moe_buf_elems,
-            i32_identity_partitions,
-        ).launch(
-            grid=(
-                fx.Int64(i32_identity_partitions) * fx.Int64(num_experts),
-                1,
-                1,
-            ),
-            block=(_ROUTE_METADATA_BLOCK_SIZE, 1, 1),
-            stream=stream,
-        )
-        stage1_kernel(
-            arg_x,
-            arg_bq,
-            arg_bscale,
-            arg_bias,
-            arg_eids,
-            arg_cumsum,
-            arg_mind,
-            i32_ntok,
-            f32_situ_beta,
-            f32_situ_beta_rcp,
-            f32_situ_linbeta,
-            f32_situ_linbeta_rcp,
-            f32_swiglu_limit,
-            arg_out,
-            arg_route_preactivation,
-            arg_sorted_route_ids,
-            i32_nroutes,
-            value_attrs=(
-                {"rocdl.waves_per_eu": stage1_waves_per_eu}
-                if stage1_waves_per_eu
-                else None
-            ),
-        ).launch(
-            grid=(fx.Int64(i32_stage1_grid), 1, 1),
-            block=(256, 1, 1),
-            stream=stream,
-        )
-
-    return launch_metadata_stage1
 
 
 class SonicMoE:
@@ -2342,6 +2258,11 @@ class SonicMoE:
         *,
         token_indices_identity: bool = False,
         route_policy_size: int | None = None,
+        identity_boundaries: torch.Tensor | None = None,
+        identity_route_weights: torch.Tensor | None = None,
+        identity_frequency: torch.Tensor | None = None,
+        identity_frequency_mirror: torch.Tensor | None = None,
+        identity_expert_counts_input: bool = False,
     ) -> torch.Tensor:
         cfg = self.config
         tokens = workspace.tokens
@@ -2374,12 +2295,35 @@ class SonicMoE:
         )
         policy_tokens = route_policy_size if dynamic_e16_flat else tokens
 
-        stage1 = _get_stage1_launcher(
+        fused_identity_metadata = identity_boundaries is not None
+        if fused_identity_metadata:
+            if (
+                identity_route_weights is None
+                or identity_frequency is None
+                or workspace.sorting_workspace is None
+            ):
+                raise RuntimeError(
+                    "fused identity Stage 1 requires boundaries, weights, "
+                    "frequency, and padded-prefix storage"
+                )
+            if identity_frequency_mirror is None:
+                identity_frequency_mirror = identity_frequency
+
+        stage1_args = (
             cfg,
             _stage1_cache_mod(cfg, policy_tokens),
             self.weights.weight_dtype,
             self.weights.has_bias,
             hidden_states.device.index or 0,
+        )
+        stage1 = (
+            _get_stage1_launcher(
+                *stage1_args,
+                fused_identity_metadata=True,
+                identity_expert_counts_input=identity_expert_counts_input,
+            )
+            if fused_identity_metadata
+            else _get_stage1_launcher(*stage1_args)
         )
         grid1 = gemm1_a16w4_grid(
             cfg.tile_m,
@@ -2388,8 +2332,7 @@ class SonicMoE:
             max_m_blocks=workspace.stage1_max_m_blocks,
             persist=cfg.persistent_stage1,
         )
-        _run_compiled(
-            stage1,
+        stage1_args = (
             hidden_states.data_ptr(),
             self.weights.gate_up.data_ptr(),
             (self.weights.dummy_scale if self.weights.gate_up_scale is None else self.weights.gate_up_scale).data_ptr(),
@@ -2398,15 +2341,38 @@ class SonicMoE:
             workspace.num_valid_ids.data_ptr(),
             workspace.sorted_token_ids.data_ptr(),
             tokens,
-            int(grid1),
+            max(1, int(grid1)) if fused_identity_metadata else int(grid1),
             1.0,
             1.0,
             1.0,
             1.0,
             float("inf"),
             workspace.intermediate.data_ptr(),
-            stream,
         )
+        if fused_identity_metadata:
+            assert identity_boundaries is not None
+            assert identity_route_weights is not None
+            assert identity_frequency is not None
+            assert identity_frequency_mirror is not None
+            assert workspace.sorting_workspace is not None
+            _run_compiled(
+                stage1,
+                *stage1_args,
+                identity_boundaries.data_ptr(),
+                identity_route_weights.data_ptr(),
+                identity_frequency.data_ptr(),
+                identity_frequency_mirror.data_ptr(),
+                workspace.sorting_workspace.data_ptr(),
+                workspace.sorted_weights.data_ptr(),
+                stream,
+            )
+        else:
+            _run_compiled(stage1, *stage1_args, stream)
+
+        # Empty expert-major calls still launch Stage 1 once to publish the
+        # all-zero retained/public metadata, but have no GEMM2 work.
+        if fused_identity_metadata and workspace.routes == 0:
+            return out
 
         stage2_stages = _stage2_stages(cfg, policy_tokens)
         if (
@@ -2477,15 +2443,16 @@ class SonicMoE:
         interleaved_w1: bool,
         token_indices_identity: bool,
         route_policy_size: int | None = None,
+        fused_identity_metadata: bool = False,
+        identity_expert_counts_input: bool = False,
     ) -> _TrainingForwardLaunchPlan:
-        """Resolve launch choices before expert-major metadata dispatch.
+        """Resolve launch choices before expert-major compute dispatch.
 
-        The sorter kernels take only a few microseconds for E16.  Resolving
-        cached JIT launchers, tuning policy, and grids after enqueueing them can
-        therefore leave a visible device bubble before Stage 1.  This helper
-        moves that host work ahead of the sorter.  The returned plan is
-        invocation-local: real EP training has highly variable route counts,
-        so caching exact runtime grids here would merely churn a small LRU.
+        Resolving cached JIT launchers, tuning policy, and grids on the critical
+        path can leave a visible device bubble before Stage 1.  This helper does
+        that host work first.  The returned plan is invocation-local: real EP
+        training has highly variable route counts, so caching exact runtime
+        grids here would merely churn a small LRU.
         """
 
         cfg = self.config
@@ -2597,7 +2564,7 @@ class SonicMoE:
             persist=stage2_cfg.persistent_stage2,
         )
         device_index = self.weights.device.index or 0
-        stage1 = _get_stage1_training_launcher(
+        stage1_args = (
             cfg,
             stage1_cache_mod,
             self.weights.has_bias,
@@ -2607,6 +2574,15 @@ class SonicMoE:
             training_waves_per_eu,
             flat_routes,
             training_tile_m,
+        )
+        stage1 = (
+            _get_stage1_training_launcher(
+                *stage1_args,
+                fused_identity_metadata=True,
+                identity_expert_counts_input=identity_expert_counts_input,
+            )
+            if fused_identity_metadata
+            else _get_stage1_training_launcher(*stage1_args)
         )
         stage2 = _get_stage2_launcher(
             stage2_cfg,
@@ -2636,11 +2612,10 @@ class SonicMoE:
             route_policy_size=policy_representative,
         )
 
-    def _launch_e16_identity_metadata_and_stage1(
+    def _launch_e16_identity_stage1(
         self,
         hidden_states: torch.Tensor,
         workspace: SonicMoEWorkspace,
-        out: torch.Tensor,
         route_preactivation: torch.Tensor,
         route_weights: torch.Tensor,
         expert_boundaries: torch.Tensor,
@@ -2653,66 +2628,16 @@ class SonicMoE:
         num_valid_ids: torch.Tensor,
         launch_plan: _TrainingForwardLaunchPlan,
         stream: torch.cuda.Stream,
-        *,
-        expert_counts_input: bool = False,
-    ) -> bool:
-        """Enqueue identity metadata and training Stage 1 with one host call."""
+    ) -> None:
+        """Run the counts-scheduled Stage 1 which also emits route metadata."""
 
-        if not _FUSE_E16_METADATA_STAGE1_DISPATCH:
-            return False
+        if self.config.num_experts != 16:
+            raise RuntimeError("fused identity Stage 1 requires exactly 16 experts")
         routes = int(workspace.routes or 0)
-        single_launch, _ = (
-            _route_sorting_module._expert_major_identity_fusion_parameters(
-                self.config.num_experts,
-                True,
-                routes,
-            )
-        )
-        if not single_launch:
-            return False
-        single_launch, identity_partitions = (
-            _route_sorting_module._expert_major_identity_fusion_parameters(
-                self.config.num_experts,
-                True,
-                routes,
-            )
-        )
-        assert single_launch
-
-        sorter_launcher = _compile_moe_expert_major_sorting(
-            num_experts=self.config.num_experts,
-            unit_size=self.config.route_tile_m,
-            emit_route_ids=True,
-            mirror_expert_frequency=frequency_mirror is not None,
-            token_indices_identity=True,
-            clear_output=False,
-            single_launch_identity=True,
-            expert_counts_input=expert_counts_input,
-        )
-        master = _get_e16_metadata_stage1_master_launcher(
-            sorter_launcher,
-            launch_plan.stage1,
-            num_experts=self.config.num_experts,
-        )
         mirror_arg = frequency if frequency_mirror is None else frequency_mirror
-        output_i32 = out.view(torch.int32)
+        assert workspace.sorting_workspace is not None
         _run_compiled(
-            master,
-            route_weights,
-            expert_boundaries,
-            frequency,
-            mirror_arg,
-            workspace.sorting_workspace,
-            sorted_token_ids,
-            sorted_weights,
-            sorted_route_ids,
-            sorted_expert_ids,
-            num_valid_ids,
-            output_i32,
-            routes,
-            workspace.tokens,
-            int(output_i32.numel()),
-            identity_partitions,
+            launch_plan.stage1,
             hidden_states.data_ptr(),
             self.weights.gate_up.data_ptr(),
             self.weights.dummy_scale.data_ptr(),
@@ -2725,7 +2650,7 @@ class SonicMoE:
             num_valid_ids.data_ptr(),
             sorted_token_ids.data_ptr(),
             workspace.tokens,
-            launch_plan.grid1,
+            max(1, launch_plan.grid1),
             1.0,
             1.0,
             1.0,
@@ -2735,9 +2660,14 @@ class SonicMoE:
             route_preactivation.data_ptr(),
             sorted_route_ids.data_ptr(),
             routes,
+            expert_boundaries.data_ptr(),
+            route_weights.data_ptr(),
+            frequency.data_ptr(),
+            mirror_arg.data_ptr(),
+            workspace.sorting_workspace.data_ptr(),
+            sorted_weights.data_ptr(),
             stream,
         )
-        return True
 
     def _run_grouped_gemms_training(
         self,
@@ -3127,8 +3057,8 @@ class SonicMoE:
         """Run E16 expert-major identity routes without materialized IDs.
 
         Rows are already grouped by expert according to ``expert_offsets``;
-        route ``r`` is token ``r``.  The E16 identity metadata kernel derives
-        both token and expert IDs from that contract, so allocating
+        route ``r`` is token ``r``.  The E16 Stage-1 kernel derives both token
+        and expert IDs from that contract, so allocating
         ``arange(routes)`` and ``repeat_interleave(experts, counts)`` is
         unnecessary.  This entry point deliberately fails closed if that
         specialization is disabled instead of passing synthetic IDs to a
@@ -3164,11 +3094,11 @@ class SonicMoE:
         """Run E16 expert-major identity routes directly from expert counts.
 
         ``expert_counts`` is device int32 ``[16]``. Its values must be
-        non-negative and sum to the number of rows. The identity metadata
-        kernel computes both raw and padded prefixes, eliminating the
-        caller-side ``cumsum`` as well as materialized token/expert ids. The
-        value contract is intentionally unchecked to avoid a D2H
-        synchronization on the dynamic-route hot path.
+        non-negative and sum to the number of rows. The E16 Stage-1 kernel
+        computes both raw and padded prefixes while performing the first GEMM,
+        eliminating the caller-side ``cumsum`` as well as materialized
+        token/expert ids. The value contract is intentionally unchecked to
+        avoid a D2H synchronization on the dynamic-route hot path.
         """
 
         if not hidden_states.is_cuda:
@@ -3275,17 +3205,13 @@ class SonicMoE:
             token_indices_identity=token_indices_identity,
         )
         if implicit_identity_ids:
-            single_launch_identity, _ = (
-                _route_sorting_module._expert_major_identity_fusion_parameters(
-                    self.config.num_experts,
-                    token_indices_identity,
-                    routes,
-                )
-            )
-            if not expert_major or not single_launch_identity:
+            if not expert_major or not _can_fuse_e16_identity_metadata_stage1(
+                self.config,
+                token_indices_identity=token_indices_identity,
+            ):
                 raise NotImplementedError(
-                    "implicit expert-major ids require the E16 single-launch "
-                    "identity metadata specialization"
+                    "implicit expert-major ids require the E16 fused identity "
+                    "Stage-1 specialization"
                 )
 
         workspace = self.reserve_dynamic_routes(tokens, routes)
@@ -3320,6 +3246,29 @@ class SonicMoE:
 
         assert workspace.sorting_workspace is not None
         with workspace._launch_lock:
+            fuse_identity_stage1 = (
+                expert_major
+                and _can_fuse_e16_identity_metadata_stage1(
+                    self.config,
+                    token_indices_identity=token_indices_identity,
+                )
+            )
+            if fuse_identity_stage1:
+                expert_boundaries = (
+                    expert_counts if counts_major else expert_offsets
+                )
+                assert expert_boundaries is not None
+                return self._run_grouped_gemms(
+                    hidden_states,
+                    workspace,
+                    output,
+                    token_indices_identity=True,
+                    route_policy_size=policy_representative,
+                    identity_boundaries=expert_boundaries,
+                    identity_route_weights=route_weights,
+                    identity_frequency=frequency,
+                    identity_expert_counts_input=counts_major,
+                )
             if expert_major:
                 expert_boundaries = (
                     expert_counts if counts_major else expert_offsets
@@ -3644,20 +3593,16 @@ class SonicMoE:
             token_indices_identity=token_indices_identity,
         )
         if implicit_identity_ids:
-            single_launch_identity, _ = (
-                _route_sorting_module._expert_major_identity_fusion_parameters(
-                    self.config.num_experts,
-                    token_indices_identity,
-                    routes,
-                )
-            )
-            if not expert_major or not single_launch_identity:
+            if not expert_major or not _can_fuse_e16_identity_metadata_stage1(
+                self.config,
+                token_indices_identity=token_indices_identity,
+            ):
                 raise NotImplementedError(
-                    "implicit expert-major ids require the E16 single-launch "
-                    "identity metadata specialization"
+                    "implicit expert-major ids require the E16 fused identity "
+                    "Stage-1 specialization"
                 )
 
-        if implicit_identity_ids and not _retain_e16_flat_sorter_metadata(
+        if implicit_identity_ids and not _retain_e16_flat_route_metadata(
             self.config,
             tokens,
             routes,
@@ -3689,7 +3634,7 @@ class SonicMoE:
             *self.weights.tensors,
             invocation_owned_default=True,
         )
-        retain_sorter_metadata = _retain_e16_flat_sorter_metadata(
+        retain_route_metadata = _retain_e16_flat_route_metadata(
             self.config,
             tokens,
             routes,
@@ -3697,7 +3642,7 @@ class SonicMoE:
         )
         frequency = (
             torch.empty_like(workspace.expert_frequency)
-            if retain_sorter_metadata
+            if retain_route_metadata
             else workspace.expert_frequency
         )
         frequency_mirror = None
@@ -3712,11 +3657,11 @@ class SonicMoE:
                 *((expert_counts,) if expert_counts is not None else ()),
                 *self.weights.tensors,
             )
-            if retain_sorter_metadata:
+            if retain_route_metadata:
                 frequency_mirror = validated_frequency_out
             else:
                 frequency = validated_frequency_out
-        if retain_sorter_metadata:
+        if retain_route_metadata:
             sorted_token_ids = torch.empty_like(workspace.sorted_token_ids)
             sorted_route_ids = torch.empty_like(workspace.sorted_route_ids)
             sorted_weights = torch.empty_like(workspace.sorted_weights)
@@ -3736,11 +3681,20 @@ class SonicMoE:
         if preactivation.untyped_storage().data_ptr() in workspace.storage_ptrs:
             raise RuntimeError("training preactivation unexpectedly aliases reusable workspace storage")
 
+        fuse_identity_stage1 = (
+            expert_major
+            and _can_fuse_e16_identity_metadata_stage1(
+                self.config,
+                token_indices_identity=token_indices_identity,
+            )
+        )
         launch_plan = self._prepare_grouped_gemms_training(
             workspace,
             interleaved_w1=interleaved_w1,
             token_indices_identity=token_indices_identity,
             route_policy_size=policy_representative,
+            fused_identity_metadata=fuse_identity_stage1,
+            identity_expert_counts_input=counts_major,
         )
         assert workspace.sorting_workspace is not None
         assert workspace.sorted_route_ids is not None
@@ -3753,13 +3707,10 @@ class SonicMoE:
                     expert_counts if counts_major else expert_offsets
                 )
                 assert expert_boundaries is not None
-                stage1_enqueued = (
-                    token_indices_identity
-                    and routes > 0
-                    and self._launch_e16_identity_metadata_and_stage1(
+                if fuse_identity_stage1:
+                    self._launch_e16_identity_stage1(
                         hidden_states,
                         workspace,
-                        output,
                         preactivation,
                         route_weights,
                         expert_boundaries,
@@ -3772,9 +3723,8 @@ class SonicMoE:
                         num_valid_ids,
                         launch_plan,
                         stream,
-                        expert_counts_input=counts_major,
                     )
-                )
+                    stage1_enqueued = True
                 if not stage1_enqueued:
                     moe_expert_major_sorting_flydsl(
                         token_indices,
@@ -3871,33 +3821,33 @@ class SonicMoE:
             has_bias=self.weights.has_bias,
             producer_stream=int(stream.cuda_stream),
             ready_event=ready_event,
-            # Empty launches keep one backing element so the generated sorter
-            # always receives a valid buffer resource.  Expose only the
+            # Empty launches keep one backing element so Stage 1 always
+            # receives a valid buffer resource.  Expose only the
             # mathematical active extent in the retained-state ABI; this lets
             # backward validate and reuse an empty rank's metadata exactly as
             # it does for every non-empty dynamic route count.
             sorted_token_ids=(
                 sorted_token_ids[: workspace.max_padded_tokens]
-                if retain_sorter_metadata
+                if retain_route_metadata
                 else None
             ),
             sorted_route_ids=(
                 sorted_route_ids[: workspace.max_padded_tokens]
-                if retain_sorter_metadata
+                if retain_route_metadata
                 else None
             ),
             sorted_weights=(
                 sorted_weights[: workspace.max_padded_tokens]
-                if retain_sorter_metadata
+                if retain_route_metadata
                 else None
             ),
             sorted_expert_ids=(
                 sorted_expert_ids[: workspace.max_m_blocks]
-                if retain_sorter_metadata
+                if retain_route_metadata
                 else None
             ),
-            num_valid_ids=(num_valid_ids if retain_sorter_metadata else None),
-            expert_frequency=(frequency if retain_sorter_metadata else None),
+            num_valid_ids=(num_valid_ids if retain_route_metadata else None),
+            expert_frequency=(frequency if retain_route_metadata else None),
             expert_major=expert_major,
             token_indices_identity=token_indices_identity,
             route_policy_size=launch_plan.route_policy_size,
